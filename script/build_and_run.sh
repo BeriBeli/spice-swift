@@ -6,6 +6,10 @@ APP_NAME="SpiceViewer"
 PRODUCT_NAME="spice-viewer"
 BUNDLE_ID="com.beribeli.SpiceViewer"
 MIN_SYSTEM_VERSION="26.0"
+BUILD_CONFIGURATION="debug"
+if [[ "$MODE" == "package" || "$MODE" == "--package" ]]; then
+  BUILD_CONFIGURATION="release"
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
@@ -13,7 +17,6 @@ APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_BINARY="$APP_MACOS/$APP_NAME"
-APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 
 if [[ "$MODE" != "--stage" && "$MODE" != "stage" ]]; then
@@ -21,11 +24,31 @@ if [[ "$MODE" != "--stage" && "$MODE" != "stage" ]]; then
 fi
 
 cd "$ROOT_DIR"
-swift build --product "$PRODUCT_NAME"
-BUILD_BINARY="$(swift build --show-bin-path)/$PRODUCT_NAME"
+mkdir -p "$ROOT_DIR/.build/module-cache"
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT_DIR/.build/module-cache}"
+export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT_DIR/.build/module-cache}"
+if [[ "$BUILD_CONFIGURATION" == "release" ]]; then
+  ARM64_SCRATCH="$ROOT_DIR/.build/release-arm64"
+  X86_64_SCRATCH="$ROOT_DIR/.build/release-x86_64"
+  UNIVERSAL_DIR="$ROOT_DIR/.build/release-universal"
+  swift build --disable-sandbox -c release --triple arm64-apple-macosx26.0 \
+    --scratch-path "$ARM64_SCRATCH" --product "$PRODUCT_NAME"
+  swift build --disable-sandbox -c release --triple x86_64-apple-macosx26.0 \
+    --scratch-path "$X86_64_SCRATCH" --product "$PRODUCT_NAME"
+  ARM64_BINARY="$(swift build --disable-sandbox -c release --triple arm64-apple-macosx26.0 \
+    --scratch-path "$ARM64_SCRATCH" --show-bin-path)/$PRODUCT_NAME"
+  X86_64_BINARY="$(swift build --disable-sandbox -c release --triple x86_64-apple-macosx26.0 \
+    --scratch-path "$X86_64_SCRATCH" --show-bin-path)/$PRODUCT_NAME"
+  mkdir -p "$UNIVERSAL_DIR"
+  lipo -create "$ARM64_BINARY" "$X86_64_BINARY" -output "$UNIVERSAL_DIR/$PRODUCT_NAME"
+  BUILD_BINARY="$UNIVERSAL_DIR/$PRODUCT_NAME"
+else
+  swift build --disable-sandbox -c "$BUILD_CONFIGURATION" --product "$PRODUCT_NAME"
+  BUILD_BINARY="$(swift build --disable-sandbox -c "$BUILD_CONFIGURATION" --show-bin-path)/$PRODUCT_NAME"
+fi
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS"
+mkdir -p "$APP_MACOS"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 
@@ -54,10 +77,8 @@ cat >"$INFO_PLIST" <<PLIST
 </plist>
 PLIST
 
-"$ROOT_DIR/Scripts/bundle-homebrew-dylibs.sh" \
-  "$APP_BINARY" "$APP_FRAMEWORKS"
-codesign --force --deep --sign - "$APP_BUNDLE"
-"$ROOT_DIR/Scripts/verify-relocatable-macho.sh" "$APP_BUNDLE"
+codesign --force --sign - "$APP_BUNDLE"
+"$ROOT_DIR/Scripts/verify-native-closure.sh"
 
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
@@ -82,12 +103,17 @@ case "$MODE" in
     /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\""
     ;;
   --verify|verify)
+    "$ROOT_DIR/Scripts/verify-native-closure.sh"
     open_app
     sleep 1
     pgrep -x "$APP_NAME" >/dev/null
     ;;
+  --package|package)
+    "$ROOT_DIR/Scripts/verify-native-closure.sh"
+    echo "$APP_BUNDLE"
+    ;;
   *)
-    echo "usage: $0 [--stage|run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [--stage|run|--debug|--logs|--telemetry|--verify|--package]" >&2
     exit 2
     ;;
 esac

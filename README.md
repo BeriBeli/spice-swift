@@ -26,6 +26,12 @@ SPICE input messages carry physical PC scan codes. They do not transport
 Unicode text or synchronize an IME composition session. UTF-8 text uses the
 separate SPICE Agent clipboard path.
 
+QUIC images use the exact `spice-common` 0.42 backend supplied as a static,
+universal XCFramework by this package, behind a bounded C shim that owns
+alignment and non-local error handling. GRAY, RGB16, RGB24, RGB32, and RGBA
+have byte-exact fixtures; malformed payloads remain transactional at the
+Display boundary.
+
 See [Current milestone](docs/CURRENT_MILESTONE.md) for the detailed evidence and
 pending gates.
 
@@ -33,18 +39,13 @@ pending gates.
 
 - macOS 26 or later
 - Swift 6.3 and Xcode 26.6
-- Homebrew development packages for `jpeg-turbo`, `spice-gtk`, `usbredir`, and
-  `zlib`
 
-Install the native dependencies with:
-
-```sh
-brew install jpeg-turbo spice-gtk usbredir zlib
-```
-
-Raw SwiftPM products link these Homebrew libraries dynamically. The staging
-script copies non-system libraries into the app bundle and rewrites their load
-paths for local distribution.
+The package includes universal macOS static XCFrameworks for libjpeg-turbo,
+spice-common QUIC, usbredir, and libusb. SwiftPM builds and packaged apps do not
+require Homebrew or `pkg-config`. The artifacts are reproducible from pinned,
+checksum-verified upstream sources with
+`Scripts/build-native-dependencies.sh`; licenses and provenance are recorded in
+`THIRD_PARTY_NOTICES.md`.
 
 ## Build and test
 
@@ -53,6 +54,8 @@ swift build
 swift test
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 ./script/build_and_run.sh --stage
+./script/build_and_run.sh --package
+./Scripts/verify-native-closure.sh
 ```
 
 Run the viewer after staging it:
@@ -61,9 +64,10 @@ Run the viewer after staging it:
 ./script/build_and_run.sh
 ```
 
-Generated app bundles are written to the ignored `dist/` directory. Staged
-bundles use an ad hoc signature. Release builds still require Developer ID
-signing, notarization, and the notices required by bundled dependencies.
+Generated app bundles are written to the ignored `dist/` directory. Staged and
+package bundles use an ad hoc signature. Release distribution still requires
+Developer ID signing and notarization; third-party notices ship with the native
+artifacts.
 
 ## Use the library
 

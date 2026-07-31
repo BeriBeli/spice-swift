@@ -46,37 +46,29 @@ let package = Package(
             name: "SpiceCodecInterop",
             dependencies: ["CTurboJPEG", "CSpiceQUIC", "CZlib"]
         ),
-        .systemLibrary(
+        .binaryTarget(
             name: "CTurboJPEG",
-            pkgConfig: "libturbojpeg",
-            providers: [
-                .brew(["jpeg-turbo"]),
-            ]
+            path: "Artifacts/CTurboJPEG.xcframework"
         ),
-        .systemLibrary(
+        .binaryTarget(
             name: "CSpiceQUIC",
-            pkgConfig: "spice-client-glib-2.0",
-            providers: [
-                .brew(["spice-gtk"]),
-            ]
+            path: "Artifacts/CSpiceQUIC.xcframework"
         ),
         .systemLibrary(
-            name: "CZlib",
-            pkgConfig: "zlib",
-            providers: [
-                .brew(["zlib"]),
-            ]
+            name: "CZlib"
         ),
-        .systemLibrary(
+        .binaryTarget(
             name: "CUSBRedir",
-            pkgConfig: "libusbredirhost",
-            providers: [
-                .brew(["usbredir"]),
-            ]
+            path: "Artifacts/CUSBRedir.xcframework"
         ),
         .target(
             name: "CUSBRedirShim",
-            dependencies: ["CUSBRedir"]
+            dependencies: ["CUSBRedir"],
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Security"),
+            ]
         ),
         .target(
             name: "SpiceChannels",

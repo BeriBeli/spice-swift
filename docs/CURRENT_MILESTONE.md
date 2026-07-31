@@ -173,9 +173,9 @@ palette/pixel formats are implemented.
 - Added a TurboJPEG decoder using `@concurrent`; socket parsing and Surface
   mutation remain serialized in DisplayChannel while CPU decode runs outside
   its inherited actor executor.
-- Added a `CTurboJPEG` SwiftPM system-library target resolved through
-  `pkg-config libturbojpeg` with a Homebrew `jpeg-turbo` provider. All C handles
-  and unsafe buffer access are isolated in the `SpiceCodecInterop` target.
+- Added a `CTurboJPEG` SwiftPM binary target backed by the package's universal
+  static XCFramework. All C handles and unsafe buffer access are isolated in
+  the `SpiceCodecInterop` target.
 - TurboJPEG validates the JPEG header dimensions before writing into a bounded,
   preallocated destination and treats decoder warnings as failures. RGB-family
   inputs decode directly to BGRA; CMYK/YCCK inputs use TurboJPEG's required
@@ -195,12 +195,8 @@ EOI from a valid JPEG exercises libjpeg-turbo's warning path, and both the codec
 boundary and a real DisplayChannel integration test confirm rejection without
 Surface mutation. The local Stage D JPEG acceptance gate is closed.
 
-Raw SwiftPM products dynamically link Homebrew's `libturbojpeg.0.dylib`.
-The staged app recursively bundles non-system dylibs under `Contents/Frameworks`,
-rewrites their load commands to `@rpath`, rejects absolute non-system load paths,
-and applies an ad-hoc signature for local validation. Distribution still
-requires a real Developer ID signature, notarization, and the licenses/notices
-required by the bundled third-party libraries.
+The TurboJPEG portion is statically linked from the checked-in, reproducible
+native dependency artifact.
 
 ### LZ RGB-family slice
 
@@ -241,8 +237,8 @@ The LZ RGB family is locally closed.
 
 - Added strict `SPICE_IMAGE_TYPE_QUIC` BinaryData parsing and a bounded async
   decoder for GRAY, RGB16, RGB24, RGB32, and RGBA.
-- The exact backend uses the `spice-common` QUIC ABI exported by Homebrew
-  `spice-gtk` 0.42.3. A C-only shim copies input to aligned words, catches the
+- The exact backend uses the `spice-common` QUIC implementation supplied by the
+  package from `spice-gtk` 0.42. A C-only shim copies input to aligned words, catches the
   backend's non-returning error callback with `setjmp`/`longjmp`, rejects
   warnings, and writes only into a preallocated BGRA buffer. Swift never holds
   a QUIC context or C pointer.
@@ -359,13 +355,10 @@ The LZ RGB family is locally closed.
   frames, 2x2 to 4x4 scaling, Data Sized overrides, bottom-up partial sources,
   failed-decode recovery, stream capacity, Destroy, and Destroy All.
 
-The development products dynamically link the Homebrew codec backends. The
-staged app now copies their complete non-system dependency closure into
-`Contents/Frameworks` and rewrites every load command to `@rpath`; CI rejects
-absolute Homebrew and other non-system dylib references. A distributable build
-must replace the local ad-hoc signature with a Developer ID signature and pass
-notarization; it must also ship the licenses/notices required by those bundled
-third-party libraries.
+Development and release products now statically link the checked-in universal
+artifacts for libjpeg-turbo, spice-common QUIC, usbredir, and libusb. The QUIC
+slice no longer pulls in spice-gtk or GLib. `Scripts/verify-native-closure.sh`
+rejects Homebrew, local build-tree, and other non-relocatable load paths.
 
 ## Stage D local closure
 
@@ -806,11 +799,11 @@ SHA-256: baf58449f6e89d19f475899ad5fb9196fdc46c03cc53233f4e39cf2978f9cff7
 License: BSD-3-Clause
 ```
 
-QUIC development backend:
+QUIC backend:
 
 ```text
-Package: spice-gtk 0.42.3 (spice-common QUIC ABI)
-Linkage: dynamic via pkg-config spice-client-glib-2.0
+Package: spice-gtk 0.42 source release (spice-common QUIC implementation)
+Linkage: package-provided universal static XCFramework
 License: LGPL-2.1-or-later
 ```
 
