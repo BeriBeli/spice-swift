@@ -165,8 +165,12 @@ EOI from a valid JPEG exercises libjpeg-turbo's warning path, and both the codec
 boundary and a real DisplayChannel integration test confirm rejection without
 Surface mutation. The local Stage D JPEG acceptance gate is closed.
 
-The TurboJPEG portion dynamically links Homebrew's `libturbojpeg.0.dylib`;
-release packaging constraints are summarized after the QUIC backend below.
+Raw SwiftPM products dynamically link Homebrew's `libturbojpeg.0.dylib`.
+The staged app recursively bundles non-system dylibs under `Contents/Frameworks`,
+rewrites their load commands to `@rpath`, rejects absolute non-system load paths,
+and applies an ad-hoc signature for local validation. Distribution still
+requires a real Developer ID signature, notarization, and the licenses/notices
+required by the bundled third-party libraries.
 
 ### LZ RGB-family slice
 
@@ -325,10 +329,13 @@ The LZ RGB family is locally closed.
   frames, 2x2 to 4x4 scaling, Data Sized overrides, bottom-up partial sources,
   failed-decode recovery, stream capacity, Destroy, and Destroy All.
 
-The development products now dynamically link both Homebrew
-`libturbojpeg.0.dylib` and `libspice-client-glib-2.0.dylib`. Release packaging
-must bundle/sign compatible libraries or replace them with vetted static
-artifacts; the current products are development builds, not standalone apps.
+The development products dynamically link the Homebrew codec backends. The
+staged app now copies their complete non-system dependency closure into
+`Contents/Frameworks` and rewrites every load command to `@rpath`; CI rejects
+absolute Homebrew and other non-system dylib references. A distributable build
+must replace the local ad-hoc signature with a Developer ID signature and pass
+notarization; it must also ship the licenses/notices required by those bundled
+third-party libraries.
 
 ## Stage D local closure
 

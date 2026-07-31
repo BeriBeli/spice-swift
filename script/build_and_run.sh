@@ -13,16 +13,19 @@ APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
 APP_BINARY="$APP_MACOS/$APP_NAME"
+APP_FRAMEWORKS="$APP_CONTENTS/Frameworks"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+if [[ "$MODE" != "--stage" && "$MODE" != "stage" ]]; then
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+fi
 
 cd "$ROOT_DIR"
 swift build --product "$PRODUCT_NAME"
 BUILD_BINARY="$(swift build --show-bin-path)/$PRODUCT_NAME"
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS"
+mkdir -p "$APP_MACOS" "$APP_FRAMEWORKS"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 
@@ -51,11 +54,19 @@ cat >"$INFO_PLIST" <<PLIST
 </plist>
 PLIST
 
+"$ROOT_DIR/Scripts/bundle-homebrew-dylibs.sh" \
+  "$APP_BINARY" "$APP_FRAMEWORKS"
+codesign --force --deep --sign - "$APP_BUNDLE"
+"$ROOT_DIR/Scripts/verify-relocatable-macho.sh" "$APP_BUNDLE"
+
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
 }
 
 case "$MODE" in
+  --stage|stage)
+    echo "$APP_BUNDLE"
+    ;;
   run)
     open_app
     ;;
@@ -76,7 +87,7 @@ case "$MODE" in
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [--stage|run|--debug|--logs|--telemetry|--verify]" >&2
     exit 2
     ;;
 esac
