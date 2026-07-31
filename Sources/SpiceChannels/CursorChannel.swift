@@ -107,9 +107,9 @@ package actor CursorChannel: SpiceManagedChannel {
     private func apply(_ command: SpiceCursorCommand) throws(ChannelError) -> CursorEvent {
         switch command {
         case let .initialize(position, trailLength, trailFrequency, visible, cursor):
-            guard !isInitialized else {
-                throw .protocolViolation("Cursor Init may only appear once")
-            }
+            // spice-server can re-emit Cursor Init after a display topology
+            // change without reconnecting the Cursor Channel. Treat it as an
+            // authoritative state/cache reset.
             cache.removeAll(keepingCapacity: false)
             let resolved = try resolve(cursor)
             isInitialized = true

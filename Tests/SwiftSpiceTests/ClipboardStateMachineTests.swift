@@ -56,6 +56,20 @@ struct ClipboardStateMachineTests {
         #expect(state.isReady)
     }
 
+    @Test func acceptsLinuxDemandClipboardWithoutLegacyClipboardBit() throws {
+        var state = ClipboardStateMachine(maximumTextBytes: 100)
+        _ = state.connected()
+        let linuxCapabilities = VDAgentCapabilities(words: [
+            UInt32(1) << UInt32(VDAgentCapability.clipboardByDemand.rawValue),
+        ])
+
+        #expect(try state.receive(.announceCapabilities(
+            requestReply: false,
+            capabilities: linuxCapabilities
+        )) == [.emit(.ready)])
+        #expect(state.isReady)
+    }
+
     @Test func offersLocalTextAndAnswersDemandRequest() throws {
         var state = try readyState()
         let bytes = Data("local text".utf8)

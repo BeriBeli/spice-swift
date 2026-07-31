@@ -1,0 +1,139 @@
+#!/bin/sh
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export HOME=/root
+export DISPLAY=:0
+export XDG_RUNTIME_DIR=/tmp/runtime-root
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+
+mkdir -p /dev/pts /dev/shm /dev/virtio-ports /run/dbus /run/spice-vdagentd
+mkdir -p "$XDG_RUNTIME_DIR" /tmp/Downloads /tmp/.X11-unix
+chmod 0700 "$XDG_RUNTIME_DIR"
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+
+dbus-uuidgen --ensure=/etc/machine-id
+dbus-daemon --system --fork --nopidfile
+
+attempt=0
+while ! test -e /dev/virtio-ports/com.redhat.spice.0; do
+    mdev -s
+    attempt=$((attempt + 1))
+    if test "$attempt" -ge 30; then
+        echo "AGENT_ERROR virtio port unavailable"
+        exec sh
+    fi
+    sleep 1
+done
+
+spice-vdagentd --foreground --debug --debug --one-session &
+
+Xorg :0 -ac -noreset -nolisten tcp -logfile /tmp/Xorg.0.log \
+    -config /etc/X11/xorg.conf &
+attempt=0
+while ! test -S /tmp/.X11-unix/X0; do
+    attempt=$((attempt + 1))
+    if test "$attempt" -ge 30; then
+        echo "AGENT_ERROR Xorg unavailable"
+        test -f /tmp/Xorg.0.log && tail -n 100 /tmp/Xorg.0.log
+        exec sh
+    fi
+    sleep 1
+done
+
+echo "XRANDR_INITIAL"
+xrandr --query || true
+
+dbus-run-session -- sh -c \
+    'exec spice-vdagent --foreground --debug --debug --file-xfer-save-dir=/tmp/Downloads' &
+
+echo "AGENT_STACK_STARTED"
+echo "SwiftSpice Agent guest is running" > /dev/tty0
+
+(
+    while true; do
+        if xrandr --query > /tmp/xrandr-current.txt 2>/dev/null \
+            && grep -q '^Virtual-1 connected' /tmp/xrandr-current.txt \
+            && grep -q '^Virtual-2 connected' /tmp/xrandr-current.txt; then
+            # QEMU's SPICE display backend handles client monitor config via
+            # UI-info rather than forwarding it to vdagent. A desktop would
+            # apply the resulting connector hotplug; this bare Xorg guest uses
+            # the equivalent explicit auto-layout policy.
+            xrandr \
+                --output Virtual-1 --mode 800x600 --pos 0x0 --primary \
+                --output Virtual-2 --mode 640x480 --pos 800x0
+            xrandr --query > /tmp/xrandr-current.txt 2>/dev/null
+        fi
+        if grep -q '^Virtual-1 connected.*800x600+0+0' /tmp/xrandr-current.txt \
+            && grep -q '^Virtual-2 connected.*640x480+800+0' /tmp/xrandr-current.txt; then
+            echo "XRANDR_DUAL_MONITOR_COMPLETE"
+            cat /tmp/xrandr-current.txt
+            break
+        fi
+        sleep 1
+    done
+) &
+
+(
+    while ! test -f /tmp/Downloads/swiftspice-live.txt; do
+        sleep 1
+    done
+    transferred_bytes="$(wc -c < /tmp/Downloads/swiftspice-live.txt | tr -d ' ')"
+    transferred_sha256="$(sha256sum /tmp/Downloads/swiftspice-live.txt | cut -d ' ' -f 1)"
+    echo "FILE_TRANSFER_COMPLETE name=swiftspice-live.txt bytes=${transferred_bytes} sha256=${transferred_sha256}"
+) &
+
+(
+    printf 'SwiftSpice host clipboard\n' > /tmp/expected-host-clipboard.txt
+    while true; do
+        if xclip -selection clipboard -out > /tmp/observed-host-clipboard.txt 2>/dev/null \
+            && cmp -s /tmp/expected-host-clipboard.txt /tmp/observed-host-clipboard.txt; then
+            clipboard_bytes="$(wc -c < /tmp/observed-host-clipboard.txt | tr -d ' ')"
+            clipboard_sha256="$(sha256sum /tmp/observed-host-clipboard.txt | cut -d ' ' -f 1)"
+            echo "CLIPBOARD_HOST_TO_GUEST_COMPLETE bytes=${clipboard_bytes} sha256=${clipboard_sha256}"
+            break
+        fi
+        sleep 1
+    done
+    printf 'SwiftSpice guest clipboard\n' \
+        | xclip -selection clipboard -in -loops 1 &
+    echo "CLIPBOARD_GUEST_TO_HOST_OFFERED"
+) &
+
+(
+    while true; do
+        for device in /dev/input/event*; do
+            test -e "$device" || continue
+            device_name="$(basename "$device")"
+            marker="/tmp/monitor-${device_name}"
+            test -e "$marker" && continue
+            touch "$marker"
+            (
+                echo "monitoring $device"
+                event_file="/tmp/${device_name}.event"
+                while true; do
+                    if dd if="$device" of="$event_file" bs=24 count=1 2>/dev/null; then
+                        echo "INPUT_EVENT $device"
+                        od -An -tx1 "$event_file"
+                    fi
+                done
+            ) &
+        done
+        sleep 1
+    done
+) &
+
+counter=0
+while true; do
+    echo "SwiftSpice Agent framebuffer tick $counter" > /dev/tty0
+    counter=$((counter + 1))
+    sleep 1
+done

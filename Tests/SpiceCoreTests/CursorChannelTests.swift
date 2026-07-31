@@ -72,6 +72,31 @@ struct CursorChannelTests {
         }
     }
 
+    @Test func repeatedInitResetsCursorStateAndCache() async throws {
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 101, body: cursorInitBody())),
+            .success(encodeMini(id: 101, body: cursorNoneInitBody())),
+            .success(encodeMini(id: 103, body: cachedCursorSetBody())),
+        ])
+        try await transport.connect()
+        let channel = CursorChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 4, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.processNext()
+
+        guard case let .initialized(reset) = try await channel.processNext() else {
+            Issue.record("expected repeated Cursor Init")
+            return
+        }
+        #expect(!reset.visible)
+        #expect(reset.cursor == nil)
+        await #expect(throws: ChannelError.protocolViolation("unknown cached Cursor 77")) {
+            try await channel.processNext()
+        }
+    }
+
     @Test func rebindingPreservesCursorCacheAndSnapshot() async throws {
         let source = FakeTransport(inbound: [
             .success(encodeMini(id: 101, body: cursorInitBody())),

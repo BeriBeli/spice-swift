@@ -61,8 +61,9 @@ package struct ClipboardStateMachine: Sendable {
         guard clipboardEnabled, agentConnected, let peerCapabilities else {
             return false
         }
-        return peerCapabilities.contains(.clipboard)
-            && peerCapabilities.contains(.clipboardByDemand)
+        // Modern Linux spice-vdagent advertises the demand protocol without
+        // also setting the legacy VD_AGENT_CAP_CLIPBOARD bit.
+        return peerCapabilities.contains(.clipboardByDemand)
     }
 
     package var isAgentConnected: Bool {

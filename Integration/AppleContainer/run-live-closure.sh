@@ -13,6 +13,11 @@ readonly GUEST_PORT="${SWIFTSPICE_GUEST_PORT:-5930}"
 readonly PASSWORD="${SWIFTSPICE_PASSWORD:-swiftspice-local}"
 readonly OBSERVE_SECONDS="${SWIFTSPICE_OBSERVE_SECONDS:-8}"
 readonly GUEST_SETTLE_SECONDS="${SWIFTSPICE_GUEST_SETTLE_SECONDS:-2}"
+readonly REQUIRE_AGENT="${SWIFTSPICE_REQUIRE_AGENT:-0}"
+readonly EXERCISE_FILE_TRANSFER="${SWIFTSPICE_EXERCISE_FILE_TRANSFER:-0}"
+readonly EXERCISE_CLIPBOARD="${SWIFTSPICE_EXERCISE_CLIPBOARD:-0}"
+readonly EXERCISE_MONITOR_CONFIGURATION="${SWIFTSPICE_EXERCISE_MONITOR_CONFIGURATION:-0}"
+readonly TRACE_AGENT="${SWIFTSPICE_TRACE_AGENT:-0}"
 readonly KERNEL_DIR="$(cd "$(dirname "${OUTER_KERNEL}")" && pwd)"
 readonly INITRAMFS_DIR="$(cd "$(dirname "${GUEST_INITRAMFS}")" && pwd)"
 readonly KERNEL_NAME="$(basename "${OUTER_KERNEL}")"
@@ -47,6 +52,17 @@ trap finish EXIT INT TERM
 
 remove_container
 
+qemu_trace_arguments=()
+if [[ "${TRACE_AGENT}" == 1 ]]; then
+    qemu_trace_arguments+=(
+        -trace enable=spice_vmc_write
+        -trace enable=spice_vmc_read
+        -trace enable=spice_chr_discard_write
+        -trace enable=vdagent_*
+        -trace enable=qemu_spice_ui_info
+    )
+fi
+
 container run \
     --detach \
     --name "${CONTAINER_NAME}" \
@@ -76,6 +92,7 @@ container run \
         -device virtserialport,chardev=vdagent,name=com.redhat.spice.0 \
         -object "secret,id=spice-password,data=${PASSWORD}" \
         -spice "port=${GUEST_PORT},addr=0.0.0.0,password-secret=spice-password" \
+        "${qemu_trace_arguments[@]}" \
         -display none \
         -serial stdio \
         -monitor none \
@@ -100,10 +117,24 @@ sleep "${GUEST_SETTLE_SECONDS}"
 
 (
     cd "${REPO_ROOT}"
-    SPICE_PASSWORD="${PASSWORD}" swift run spice-probe \
-        127.0.0.1 "${HOST_PORT}" \
-        --observe-seconds "${OBSERVE_SECONDS}" \
+    probe_arguments=(
+        127.0.0.1 "${HOST_PORT}"
+        --observe-seconds "${OBSERVE_SECONDS}"
         --exercise-input
+    )
+    if [[ "${REQUIRE_AGENT}" == 1 ]]; then
+        probe_arguments+=(--require-agent)
+    fi
+    if [[ "${EXERCISE_FILE_TRANSFER}" == 1 ]]; then
+        probe_arguments+=(--exercise-file-transfer)
+    fi
+    if [[ "${EXERCISE_CLIPBOARD}" == 1 ]]; then
+        probe_arguments+=(--exercise-clipboard)
+    fi
+    if [[ "${EXERCISE_MONITOR_CONFIGURATION}" == 1 ]]; then
+        probe_arguments+=(--exercise-monitor-config)
+    fi
+    SPICE_PASSWORD="${PASSWORD}" swift run spice-probe "${probe_arguments[@]}"
 )
 
 echo "Guest evidence:"
@@ -111,5 +142,32 @@ guest_log="$(container logs "${CONTAINER_NAME}")"
 printf '%s\n' "${guest_log}" | tail -n 100
 if ! printf '%s\n' "${guest_log}" | grep -q '01 00 1e 00 01 00 00 00'; then
     echo "Guest did not record the injected A-key down event (EV_KEY code 30)." >&2
+    exit 1
+fi
+if [[ "${REQUIRE_AGENT}" == 1 ]] \
+    && ! printf '%s\n' "${guest_log}" | grep -q 'AGENT_STACK_STARTED'; then
+    echo "Guest Agent stack did not reach its started marker." >&2
+    exit 1
+fi
+if [[ "${EXERCISE_FILE_TRANSFER}" == 1 ]] \
+    && ! printf '%s\n' "${guest_log}" \
+        | grep -q 'FILE_TRANSFER_COMPLETE name=swiftspice-live.txt bytes=30 sha256=4bf33369c4fbbc129f229aad561aaf480cb483e0e3bc419c0e95fa648bc8bc10'; then
+    echo "Guest did not persist the expected Agent file-transfer fixture." >&2
+    exit 1
+fi
+if [[ "${EXERCISE_CLIPBOARD}" == 1 ]] \
+    && ! printf '%s\n' "${guest_log}" \
+        | grep -q 'CLIPBOARD_HOST_TO_GUEST_COMPLETE bytes=26 sha256=24fc28c7400c5b8aa8d2ba4d4223d555f76391235f1d2b4de2c26f904c58b90f'; then
+    echo "Guest did not read the expected host clipboard fixture." >&2
+    exit 1
+fi
+if [[ "${EXERCISE_MONITOR_CONFIGURATION}" == 1 ]] \
+    && ! printf '%s\n' "${guest_log}" | grep -q 'XRANDR_DUAL_MONITOR_COMPLETE'; then
+    echo "Guest XRandR did not enable both requested monitors." >&2
+    exit 1
+fi
+if [[ "${EXERCISE_CLIPBOARD}" == 1 ]] \
+    && ! printf '%s\n' "${guest_log}" | grep -q 'CLIPBOARD_GUEST_TO_HOST_OFFERED'; then
+    echo "Guest did not offer its clipboard fixture to the host." >&2
     exit 1
 fi

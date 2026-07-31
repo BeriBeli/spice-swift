@@ -1,9 +1,23 @@
-# Current milestone: compressed display
+# Current milestone and validation evidence
 
-SwiftSpice has locally closed stages B and C and started stage D from `PLANS.md`.
-The repository-backed Apple/container QEMU gate now covers a booted arm64 guest
-plus live Main, Display, Cursor, and Inputs behavior, including system-trusted
-TLS.
+This document is the detailed engineering ledger for the current implementation.
+For setup and first use, start with the [project README](../README.md). For the
+stable design rules, see [architecture and roadmap](PLANS.md).
+
+Local tests, independent fixtures, and external interoperability are reported
+separately. A locally implemented feature remains pending until its required
+external gate is complete. The repository-backed Apple/container QEMU gate now
+covers a booted arm64 guest plus live Main, Display, Cursor, Inputs, and selected
+Agent behavior, including system-trusted TLS.
+
+## Navigation
+
+- [Stage B: connection and live QEMU closure](#stage-b-local-closure)
+- [Stage C: basic desktop](#stage-c-delivered-so-far)
+- [Stage D: compressed display](#stage-d-delivered-so-far)
+- [Stage E: audio and Agent integration](#stage-e-local-closure)
+- [Stage F: video, migration, and peripheral channels](#stage-f-advanced-video-groundwork)
+- [Acceptance commands](#acceptance-commands)
 
 ## Stage B local closure
 
@@ -68,9 +82,25 @@ TLS.
   ticket authentication, two Display/Cursor channels, two monitor
   configurations, 57 immutable frames including the live 1280x800 framebuffer,
   keyboard-modifier state, two mouse-motion acknowledgements, and a guest raw
-  `EV_KEY` code-30 value-1 record. The two QEMU heads prove multi-channel Display
-  discovery and rendering, but do not close the separate Agent-negotiated
-  multi-monitor layout gate.
+  `EV_KEY` code-30 value-1 record.
+- A richer pinned Alpine 3.22 Agent initramfs now adds Xorg 21.1.19,
+  spice-vdagent 0.22.1, xrandr, and xclip. One combined live run closed exact
+  30-byte host-to-guest file transfer, 26-byte host-to-guest and 27-byte
+  guest-to-host UTF-8 clipboard payloads, two Display heads, Inputs delivery,
+  and an applied 1440x600 XRandR layout composed from 800x600 and 640x480
+  outputs.
+- Linux spice-vdagent advertises clipboard-by-demand without the obsolete
+  legacy clipboard bit. Clipboard readiness now follows that interoperable
+  capability shape and has a focused regression test.
+- For virtio-gpu, spice-server intercepts `VD_AGENT_MONITORS_CONFIG` and calls
+  QEMU's `client_monitors_config` UI-info path instead of forwarding the packet
+  to guest vdagent; an Agent reply is therefore absent by design. QEMU trace
+  recorded head 1 as 640x480 and head 0 as 800x600, connector hotplug reached
+  Xorg, and the bare guest's explicit auto-layout policy applied both outputs.
+  Display Channel messages then reported both heads and produced frames.
+- The topology change also showed that spice-server may re-emit Cursor Init on
+  an existing Cursor Channel. Cursor Init is now an authoritative state/cache
+  reset, with a regression test, rather than a false protocol failure.
 
 ## Stage B external TLS gate closure
 
@@ -359,7 +389,7 @@ acceptance gate rather than evidence supplied by the local corpus.
   validated before channel state changes.
 - PlaybackChannel implements the protocol ordering rules: supported MODE before
   START, DATA only while active, and STOP only from the active state. The local
-  slice supports RAW signed 16-bit little-endian PCM at 8–192 kHz and at most
+  slice supports RAW signed 16-bit little-endian PCM from 8 to 192 kHz and at most
   eight channels. PCM packets must align to complete interleaved sample frames.
 - `SpiceSession.playbackEvents` is a dedicated 32-entry newest-first bounded
   stream, separate from UI/session events, so slow audio consumption cannot
@@ -400,7 +430,7 @@ acceptance rather than a claim made from the local test suite.
 ### Record protocol and bounded AVAudioEngine capture source
 
 - Record Channel strictly decodes server START 101, STOP 102, VOLUME 103, and
-  MUTE 104. RAW S16LE streams are limited to 1–8 channels and 8–192 kHz;
+  MUTE 104. RAW S16LE streams are limited to 1 to 8 channels and 8 to 192 kHz;
   duplicate START, STOP while inactive, DATA while inactive, and incomplete
   interleaved PCM frames fail the channel.
 - Client capture traffic enforces the protocol sequence RAW MODE 102,
@@ -761,10 +791,10 @@ such by an embedding application.
   selected implicitly.
 
 The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate passes 270 tests in 63 suites. External interoperability
+warnings-as-errors gate passes 272 tests in 63 suites. External interoperability
 is still pending for real H.264/H.265 stream capability advertisement,
 Smartcard hardware, a redirected USB device, guest WebDAV mounting, audible
-Playback, microphone/Record, file transfer, multi-monitor, and migration. These
+Playback, microphone/Record, and migration. These
 remain explicit external gates rather than locally validated claims.
 
 ## Source baseline
@@ -786,7 +816,7 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 270 tests in 63 suites, `swift build`,
+The current warnings-as-errors gate passes 272 tests in 63 suites, `swift build`,
 and the generated-protocol consistency check.
 
 ```sh
@@ -801,12 +831,25 @@ The repository-backed Apple/container live gate is:
 Integration/AppleContainer/build-qemu-image.sh
 Integration/AppleContainer/build-guest-initramfs.sh
 Integration/AppleContainer/run-live-closure.sh
+
+# Rich Agent closure (file transfer, clipboard, and two-head layout)
+Integration/AppleContainer/build-agent-initramfs.sh
+SWIFTSPICE_GUEST_INITRAMFS="$PWD/Integration/AppleContainer/Artifacts/agent-initramfs.cpio.gz" \
+SWIFTSPICE_REQUIRE_AGENT=1 \
+SWIFTSPICE_EXERCISE_FILE_TRANSFER=1 \
+SWIFTSPICE_EXERCISE_CLIPBOARD=1 \
+SWIFTSPICE_EXERCISE_MONITOR_CONFIGURATION=1 \
+SWIFTSPICE_GUEST_SETTLE_SECONDS=5 \
+Integration/AppleContainer/run-live-closure.sh
 ```
 
 The live script requires the custom nested-virtualization kernel described in
-`Integration/AppleContainer/README.md`. It validates ticket authentication,
-Display/Cursor/Inputs observations, and guest receipt of the injected physical
-A-key scan code. It does not install or change macOS CA trust.
+`Integration/AppleContainer/README.md`. Its base gate validates ticket
+authentication, Display/Cursor/Inputs observations, and guest receipt of the
+injected physical A-key scan code. The richer opt-in gate additionally validates
+Agent file transfer, bidirectional UTF-8 clipboard, QEMU UI-info monitor
+configuration, and the final XRandR layout. It does not install or change macOS
+CA trust.
 
 When a server becomes available:
 
