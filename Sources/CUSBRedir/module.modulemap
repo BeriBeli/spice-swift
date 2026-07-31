@@ -1,0 +1,5 @@
+module CUSBRedir [system] {
+    header "shim.h"
+    link "usbredirhost"
+    export *
+}

@@ -1,0 +1,8 @@
+{
+  "generator": "spice-common QUIC via spice-gtk 0.42.3",
+  "format": "gray",
+  "width": 7,
+  "height": 5,
+  "compressedBase64": "UVVJQwAAAAABAAAABwAAAAUAAAAaAACAXqGePloNAIC8ZICmscpLSaFNxhosoqQGqviRcEWy1AaFBgLRAAAAAA==",
+  "expectedBGRABase64": "AAAAAD09PQB6enoA9/f3APT09ABxcXEA7u7uABUVFQA2NjYAFxcXAJCQkACJiYkAKioqANvb2wAqKioAJycnAGxsbAChoaEALi4uABsbGwAgICAAb29vAAgICABBQUEAurq6ANPT0wDMzMwAdXV1AFRUVADh4eEATk5OAFtbWwDY2NgAFRUVAEJCQgA="
+}

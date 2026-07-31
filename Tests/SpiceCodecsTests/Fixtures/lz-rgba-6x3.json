@@ -1,0 +1,8 @@
+{
+  "generator": "spice-common lz.c from spice-gtk 0.41 source tree",
+  "format": "rgba",
+  "width": 6,
+  "height": 3,
+  "compressedBase64": "ICBaTAABAAEAAAAJAAAABgAAAAMAAAAYAAAAAQEBAgMEBQaAAQsHCAkHCAkHCAkKCwwKCwwKCwwBAgMEBQYBAgMEBQYBAgMEBQYEEUBvns3gAQQCEUBv",
+  "expectedXRGBBase64": "AQIDEQQFBkABAgNvBAUGngECA80EBQYRBwgJQAcICW8HCAmeCgsMzQoLDBEKCwxAAQIDbwQFBp4BAgPNBAUGEQECA0AEBQZv"
+}

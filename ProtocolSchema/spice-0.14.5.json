@@ -1,0 +1,292 @@
+{
+  "source": {
+    "name": "spice-protocol",
+    "version": "0.14.5",
+    "url": "https://www.spice-space.org/download/releases/spice-protocol-0.14.5.tar.xz",
+    "sha256": "baf58449f6e89d19f475899ad5fb9196fdc46c03cc53233f4e39cf2978f9cff7",
+    "license": "BSD-3-Clause"
+  },
+  "messages": [
+    {
+      "name": "SpiceLinkHeader",
+      "direction": "link",
+      "fields": [
+        { "name": "magic", "type": "uint32" },
+        { "name": "majorVersion", "type": "uint32" },
+        { "name": "minorVersion", "type": "uint32" },
+        { "name": "size", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceLinkMessage",
+      "direction": "link",
+      "fields": [
+        { "name": "connectionID", "type": "uint32" },
+        { "name": "channelType", "type": "uint8" },
+        { "name": "channelID", "type": "uint8" },
+        { "name": "commonCapabilityWordCount", "type": "uint32" },
+        { "name": "channelCapabilityWordCount", "type": "uint32" },
+        { "name": "capabilitiesOffset", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceLinkReply",
+      "direction": "link",
+      "fields": [
+        { "name": "error", "type": "uint32" },
+        { "name": "publicKey", "type": "fixedBytes", "count": 162 },
+        { "name": "commonCapabilityWordCount", "type": "uint32" },
+        { "name": "channelCapabilityWordCount", "type": "uint32" },
+        { "name": "capabilitiesOffset", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceLinkAuthMechanism",
+      "direction": "link",
+      "fields": [
+        { "name": "authenticationMechanism", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceLinkEncryptedTicket",
+      "direction": "link",
+      "fields": [
+        { "name": "encryptedData", "type": "fixedBytes", "count": 128 }
+      ]
+    },
+    {
+      "name": "SpiceLinkResult",
+      "direction": "link",
+      "fields": [
+        { "name": "error", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceChannelID",
+      "direction": "structure",
+      "fields": [
+        { "name": "type", "type": "uint8" },
+        { "name": "id", "type": "uint8" }
+      ]
+    },
+    {
+      "name": "SpiceMsgSetAck",
+      "direction": "serverCommon",
+      "messageID": 3,
+      "fields": [
+        { "name": "generation", "type": "uint32" },
+        { "name": "window", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgPing",
+      "direction": "serverCommon",
+      "messageID": 4,
+      "fields": [
+        { "name": "id", "type": "uint32" },
+        { "name": "time", "type": "uint64" }
+      ]
+    },
+    {
+      "name": "SpiceMsgDisconnect",
+      "direction": "serverCommon",
+      "messageID": 6,
+      "fields": [
+        { "name": "timeStamp", "type": "uint64" },
+        { "name": "reason", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcAckSync",
+      "direction": "clientCommon",
+      "messageID": 1,
+      "fields": [
+        { "name": "generation", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcAck",
+      "direction": "clientCommon",
+      "messageID": 2,
+      "fields": []
+    },
+    {
+      "name": "SpiceMsgcPong",
+      "direction": "clientCommon",
+      "messageID": 3,
+      "fields": [
+        { "name": "id", "type": "uint32" },
+        { "name": "time", "type": "uint64" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcDisconnect",
+      "direction": "clientCommon",
+      "messageID": 6,
+      "fields": [
+        { "name": "timeStamp", "type": "uint64" },
+        { "name": "reason", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgMainInit",
+      "direction": "serverMain",
+      "messageID": 103,
+      "fields": [
+        { "name": "sessionID", "type": "uint32" },
+        { "name": "displayChannelsHint", "type": "uint32" },
+        { "name": "supportedMouseModes", "type": "uint32" },
+        { "name": "currentMouseMode", "type": "uint32" },
+        { "name": "agentConnected", "type": "uint32" },
+        { "name": "agentTokens", "type": "uint32" },
+        { "name": "multimediaTime", "type": "uint32" },
+        { "name": "ramHint", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgMainChannelsList",
+      "direction": "serverMain",
+      "messageID": 104,
+      "fields": [
+        { "name": "channels", "type": "channelIDs" }
+      ]
+    },
+    {
+      "name": "SpiceMsgMainMouseMode",
+      "direction": "serverMain",
+      "messageID": 105,
+      "fields": [
+        { "name": "supportedModes", "type": "uint32" },
+        { "name": "currentMode", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgMainMultimediaTime",
+      "direction": "serverMain",
+      "messageID": 106,
+      "fields": [
+        { "name": "multimediaTime", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcMainAttachChannels",
+      "direction": "clientMain",
+      "messageID": 104,
+      "fields": []
+    },
+    {
+      "name": "SpiceMsgcMainMouseModeRequest",
+      "direction": "clientMain",
+      "messageID": 105,
+      "fields": [
+        { "name": "mode", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgDisplaySurfaceCreate",
+      "direction": "serverDisplay",
+      "messageID": 314,
+      "fields": [
+        { "name": "surfaceID", "type": "uint32" },
+        { "name": "width", "type": "uint32" },
+        { "name": "height", "type": "uint32" },
+        { "name": "format", "type": "uint32" },
+        { "name": "flags", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgDisplaySurfaceDestroy",
+      "direction": "serverDisplay",
+      "messageID": 315,
+      "fields": [
+        { "name": "surfaceID", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcDisplayInit",
+      "direction": "clientDisplay",
+      "messageID": 101,
+      "fields": [
+        { "name": "pixmapCacheID", "type": "uint8" },
+        { "name": "pixmapCacheSize", "type": "uint64" },
+        { "name": "glzDictionaryID", "type": "uint8" },
+        { "name": "glzDictionaryWindowSize", "type": "int32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcInputsKeyDown",
+      "direction": "clientInputs",
+      "messageID": 101,
+      "fields": [{ "name": "code", "type": "uint32" }]
+    },
+    {
+      "name": "SpiceMsgcInputsKeyUp",
+      "direction": "clientInputs",
+      "messageID": 102,
+      "fields": [{ "name": "code", "type": "uint32" }]
+    },
+    {
+      "name": "SpiceMsgcInputsKeyModifiers",
+      "direction": "clientInputs",
+      "messageID": 103,
+      "fields": [{ "name": "modifiers", "type": "uint16" }]
+    },
+    {
+      "name": "SpiceMsgcInputsMouseMotion",
+      "direction": "clientInputs",
+      "messageID": 111,
+      "fields": [
+        { "name": "dx", "type": "int32" },
+        { "name": "dy", "type": "int32" },
+        { "name": "buttonsState", "type": "uint16" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcInputsMousePosition",
+      "direction": "clientInputs",
+      "messageID": 112,
+      "fields": [
+        { "name": "x", "type": "uint32" },
+        { "name": "y", "type": "uint32" },
+        { "name": "buttonsState", "type": "uint16" },
+        { "name": "displayID", "type": "uint8" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcInputsMousePress",
+      "direction": "clientInputs",
+      "messageID": 113,
+      "fields": [
+        { "name": "button", "type": "uint8" },
+        { "name": "buttonsState", "type": "uint16" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcInputsMouseRelease",
+      "direction": "clientInputs",
+      "messageID": 114,
+      "fields": [
+        { "name": "button", "type": "uint8" },
+        { "name": "buttonsState", "type": "uint16" }
+      ]
+    },
+    {
+      "name": "SpiceMsgInputsInit",
+      "direction": "serverInputs",
+      "messageID": 101,
+      "fields": [{ "name": "keyboardModifiers", "type": "uint16" }]
+    },
+    {
+      "name": "SpiceMsgInputsKeyModifiers",
+      "direction": "serverInputs",
+      "messageID": 102,
+      "fields": [{ "name": "modifiers", "type": "uint16" }]
+    },
+    {
+      "name": "SpiceMsgInputsMouseMotionAck",
+      "direction": "serverInputs",
+      "messageID": 111,
+      "fields": []
+    }
+  ]
+}

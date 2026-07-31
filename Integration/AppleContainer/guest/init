@@ -1,0 +1,38 @@
+#!/bin/sh
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+echo "SwiftSpice local closure guest is running" > /dev/tty0
+echo "SwiftSpice local closure guest is running"
+
+(
+    while true; do
+        for device in /dev/input/event*; do
+            test -e "$device" || continue
+            device_name="$(basename "$device")"
+            marker="/tmp/monitor-${device_name}"
+            test -e "$marker" && continue
+            touch "$marker"
+            (
+                echo "monitoring $device"
+                event_file="/tmp/${device_name}.event"
+                while true; do
+                    if dd if="$device" of="$event_file" bs=24 count=1 2>/dev/null; then
+                        echo "INPUT_EVENT $device"
+                        od -An -tx1 "$event_file"
+                    fi
+                done
+            ) &
+        done
+        sleep 1
+    done
+) &
+
+counter=0
+while true; do
+    echo "SwiftSpice framebuffer tick $counter" > /dev/tty0
+    counter=$((counter + 1))
+    sleep 1
+done

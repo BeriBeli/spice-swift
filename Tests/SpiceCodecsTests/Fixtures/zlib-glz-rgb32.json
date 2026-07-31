@@ -1,0 +1,5 @@
+{
+  "generator": "spice-gtk 0.42.3 zlib decoder over spice-common GLZ RGB32 literal fixture",
+  "compressedBase64": "eJxTUIjyYWBkYJRgYGBgAmJGIOZgQAKMjEzMLKxsACbTASI=",
+  "expectedGLZBase64": "ICBaTAABAAEYAAAAAgAAAAEAAAAIAAAAAAAAAAAAAAAAAQECAwQFBg=="
+}
