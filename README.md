@@ -279,9 +279,14 @@ device.
 - `jpeg-turbo` with `pkg-config` metadata (`brew install jpeg-turbo`)
 - `usbredir` with `pkg-config` metadata (`brew install usbredir`)
 
-The current SwiftPM development build dynamically links Homebrew's
-`libturbojpeg.0.dylib`. Release app packaging must bundle/sign the dylib or use
-a vetted static build.
+Raw SwiftPM development products dynamically link the Homebrew codec and USB
+backends used at build time. `./script/build_and_run.sh --stage` creates the
+distributable app layout by recursively copying non-system dylibs into
+`SpiceViewer.app/Contents/Frameworks`, rewriting every reference to `@rpath`,
+and ad-hoc signing the local bundle. CI rejects absolute non-system dylib load
+commands. Distribution builds must replace the ad-hoc signature with a real
+Developer ID signature before notarization and include the licenses/notices
+required by the bundled third-party libraries.
 
 ## Verification
 
@@ -289,6 +294,7 @@ a vetted static build.
 swift build
 swift test
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
+./script/build_and_run.sh --stage
 ```
 
 ## Main Channel integration probe
@@ -339,3 +345,7 @@ swift package --allow-writing-to-package-directory generate-spice-protocol
 See [`docs/PLANS.md`](docs/PLANS.md) for the complete architecture and staged
 roadmap, and [`docs/CURRENT_MILESTONE.md`](docs/CURRENT_MILESTONE.md) for the
 validated/pending boundary.
+
+## License
+
+SwiftSpice is available under the [MIT License](LICENSE).

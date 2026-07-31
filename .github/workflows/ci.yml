@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swiftpm:
+    name: SwiftPM
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: brew install jpeg-turbo pkgconf spice-gtk usbredir zlib
+
+      - name: Configure pkg-config
+        run: |
+          echo "PKG_CONFIG_PATH=$(brew --prefix jpeg-turbo)/lib/pkgconfig:$(brew --prefix spice-gtk)/lib/pkgconfig:$(brew --prefix usbredir)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Report toolchain
+        run: swift --version
+
+      - name: Verify generated protocol sources
+        run: swift package --allow-writing-to-package-directory generate-spice-protocol --check
+
+      - name: Build
+        run: swift build -Xswiftc -warnings-as-errors
+
+      - name: Test
+        run: swift test -Xswiftc -warnings-as-errors
+
+      - name: Stage relocatable app
+        run: ./script/build_and_run.sh --stage
+
+      - name: Reject absolute non-system dylib links
+        run: |
+          ./Scripts/verify-relocatable-macho.sh dist/SpiceViewer.app
+          codesign --verify --deep --strict --verbose=2 dist/SpiceViewer.app
