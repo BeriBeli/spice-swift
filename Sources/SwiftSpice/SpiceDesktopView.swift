@@ -12,6 +12,39 @@ public enum SpicePointerMode: Sendable, Equatable {
     }
 }
 
+package enum SpiceCursorLayer: Sendable, Equatable {
+    case native
+    case overlay
+}
+
+package enum SpiceDesktopPresentationPolicy {
+    package static func cursorLayer(for pointerMode: SpicePointerMode) -> SpiceCursorLayer {
+        switch pointerMode {
+        case .absolute: .native
+        case .relative: .overlay
+        }
+    }
+
+    package static func drawableSize(
+        for viewSize: CGSize,
+        backingScaleFactor: CGFloat
+    ) -> CGSize {
+        guard viewSize.width.isFinite,
+              viewSize.height.isFinite,
+              backingScaleFactor.isFinite,
+              viewSize.width > 0,
+              viewSize.height > 0,
+              backingScaleFactor > 0
+        else {
+            return .zero
+        }
+        return CGSize(
+            width: (viewSize.width * backingScaleFactor).rounded(),
+            height: (viewSize.height * backingScaleFactor).rounded()
+        )
+    }
+}
+
 /// A narrow SwiftUI-to-AppKit bridge for framebuffer drawing and physical
 /// input capture. SwiftUI owns the frame and cursor values; the wrapped NSView
 /// owns only transient responder and tracking state.
@@ -87,7 +120,7 @@ private final class SpiceFramebufferView: NSView {
         }
         addSubview(cursorOverlay)
         isUsingMetal = metalView?.present(frame) ?? false
-        cursorOverlay.update(frame: frame, cursorState: cursorState)
+        updateCursorPresentation()
     }
 
     @available(*, unavailable)
@@ -106,7 +139,7 @@ private final class SpiceFramebufferView: NSView {
         self.pointerMode = pointerMode
         self.onInput = onInput
         isUsingMetal = metalView?.present(frame) ?? false
-        cursorOverlay.update(frame: frame, cursorState: cursorState)
+        updateCursorPresentation()
         needsLayout = true
         needsDisplay = true
     }
@@ -122,7 +155,25 @@ private final class SpiceFramebufferView: NSView {
             frameWidth: frame.width,
             frameHeight: frame.height
         )
+        updateCursorPresentation()
         cursorOverlay.needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        let cursor: NSCursor
+        switch SpiceDesktopPresentationPolicy.cursorLayer(for: pointerMode) {
+        case .native:
+            cursor = SpiceFrameDrawing.makeNativeCursor(
+                cursorState,
+                in: desktopFrame.map {
+                    contentRectangle(frameWidth: $0.width, frameHeight: $0.height)
+                } ?? .zero,
+                frame: desktopFrame
+            )
+        case .overlay:
+            cursor = SpiceFrameDrawing.transparentCursor
+        }
+        addCursorRect(bounds, cursor: cursor)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -281,6 +332,16 @@ private final class SpiceFramebufferView: NSView {
         )
     }
 
+    private func updateCursorPresentation() {
+        let usesOverlay = SpiceDesktopPresentationPolicy.cursorLayer(for: pointerMode) == .overlay
+        cursorOverlay.isHidden = !usesOverlay
+        cursorOverlay.update(
+            frame: desktopFrame,
+            cursorState: usesOverlay ? cursorState : nil
+        )
+        window?.invalidateCursorRects(for: self)
+    }
+
     private func clampedInt32(_ value: CGFloat) -> Int32 {
         guard value.isFinite else {
             return 0
@@ -333,6 +394,11 @@ private final class SpiceCursorOverlayView: NSView {
 
 @MainActor
 private enum SpiceFrameDrawing {
+    static let transparentCursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 1, height: 1))
+        return NSCursor(image: image, hotSpot: .zero)
+    }()
+
     static func contentRectangle(
         in bounds: NSRect,
         frameWidth: Int,
@@ -383,6 +449,62 @@ private enum SpiceFrameDrawing {
             decode: nil,
             shouldInterpolate: false,
             intent: .defaultIntent
+        )
+    }
+
+    static func makeNativeCursor(
+        _ cursorState: SpiceCursorState?,
+        in destination: NSRect,
+        frame: SpiceFrame?
+    ) -> NSCursor {
+        guard let cursorState else {
+            return .arrow
+        }
+        guard cursorState.isVisible else {
+            return transparentCursor
+        }
+        guard let frame,
+              frame.width > 0,
+              frame.height > 0,
+              destination.width > 0,
+              destination.height > 0,
+              let cursor = cursorState.image,
+              cursor.format == .alpha,
+              cursor.width > 0,
+              cursor.height > 0
+        else {
+            return .arrow
+        }
+        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(by: cursor.height)
+        let (byteCount, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard !pixelOverflow, !byteOverflow, cursor.data.count == byteCount else {
+            return .arrow
+        }
+        let cursorFrame = SpiceFrame(
+            surfaceID: 0,
+            width: cursor.width,
+            height: cursor.height,
+            bytesPerRow: cursor.width * 4,
+            pixels: cursor.data
+        )
+        guard let image = makeImage(cursorFrame) else {
+            return .arrow
+        }
+        let scaleX = destination.width / CGFloat(frame.width)
+        let scaleY = destination.height / CGFloat(frame.height)
+        let size = NSSize(
+            width: CGFloat(cursor.width) * scaleX,
+            height: CGFloat(cursor.height) * scaleY
+        )
+        guard size.width > 0, size.height > 0 else {
+            return .arrow
+        }
+        return NSCursor(
+            image: NSImage(cgImage: image, size: size),
+            hotSpot: NSPoint(
+                x: CGFloat(cursor.hotSpotX) * scaleX,
+                y: CGFloat(cursor.hotSpotY) * scaleY
+            )
         )
     }
 
