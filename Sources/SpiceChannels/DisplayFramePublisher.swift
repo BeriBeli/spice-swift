@@ -52,8 +52,10 @@ package actor DisplayFramePublisher {
     private var pending: [UInt32: Request] = [:]
     private var order: [UInt32] = []
     private var invalidationGenerations: [UInt32: UInt64] = [:]
+    private var lastEmittedRevisions: [UInt32: SurfaceRevision] = [:]
     private var flushTask: Task<Void, Never>?
     private var isFlushing = false
+    private var isCancelled = false
     private var lastFlushStart: ContinuousClock.Instant?
     private var generation: UInt64 = 0
     private var submissions: UInt64 = 0
@@ -76,7 +78,13 @@ package actor DisplayFramePublisher {
 
     package func submit(_ surfaceRevision: SurfaceRevision) {
         submissions &+= 1
+        guard !isCancelled else { return }
         let surfaceID = surfaceRevision.surfaceID
+        if let lastEmitted = lastEmittedRevisions[surfaceID],
+           !isNewer(surfaceRevision, than: lastEmitted)
+        {
+            return
+        }
         let invalidationGeneration = invalidationGenerations[surfaceID] ?? 0
         if let existing = pending[surfaceID],
            existing.invalidationGeneration == invalidationGeneration,
@@ -102,7 +110,13 @@ package actor DisplayFramePublisher {
     }
 
     private func scheduleFlushIfNeeded() {
-        guard !pending.isEmpty, flushTask == nil, !isFlushing else { return }
+        guard !isCancelled,
+              !pending.isEmpty,
+              flushTask == nil,
+              !isFlushing
+        else {
+            return
+        }
         let now = clock.now
         let deadline = lastFlushStart?.advanced(by: interval) ?? now.advanced(by: interval)
         let delay = now < deadline ? now.duration(to: deadline) : .zero
@@ -121,6 +135,7 @@ package actor DisplayFramePublisher {
 
     package func remove(surfaceID: UInt32) {
         invalidationGenerations[surfaceID, default: 0] &+= 1
+        lastEmittedRevisions.removeValue(forKey: surfaceID)
         pending.removeValue(forKey: surfaceID)
         order.removeAll { $0 == surfaceID }
     }
@@ -128,11 +143,12 @@ package actor DisplayFramePublisher {
     package func flushNow() async {
         flushTask?.cancel()
         flushTask = nil
-        guard !isFlushing else { return }
+        guard !isCancelled, !isFlushing else { return }
         await flush()
     }
 
     package func cancel() {
+        isCancelled = true
         generation &+= 1
         flushTask?.cancel()
         flushTask = nil
@@ -140,6 +156,7 @@ package actor DisplayFramePublisher {
         lastFlushStart = nil
         pending.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
+        lastEmittedRevisions.removeAll(keepingCapacity: false)
     }
 
     package func metrics() -> DisplayFramePublisherMetrics {
@@ -154,7 +171,7 @@ package actor DisplayFramePublisher {
     }
 
     private func flush() async {
-        guard !isFlushing else { return }
+        guard !isCancelled, !isFlushing else { return }
         let flushGeneration = generation
         isFlushing = true
         lastFlushStart = clock.now
@@ -170,20 +187,47 @@ package actor DisplayFramePublisher {
                 continue
             }
             guard generation == flushGeneration else { return }
-            guard isCurrent(request), frame.surfaceRevision == request.surfaceRevision else {
+            guard isCurrent(request), frameCovers(frame, request: request) else {
                 staleSnapshots &+= 1
                 continue
             }
-            if let replacement = pending[request.surfaceRevision.surfaceID] {
-                guard replacement == request else {
+            let replacement = pending[request.surfaceRevision.surfaceID]
+            if let replacement {
+                let replacementLifecycle = replacement.surfaceRevision.lifecycleGeneration
+                guard replacement.invalidationGeneration == request.invalidationGeneration,
+                      replacementLifecycle == request.surfaceRevision.lifecycleGeneration
+                else {
                     staleSnapshots &+= 1
                     continue
                 }
-                pending.removeValue(forKey: request.surfaceRevision.surfaceID)
-                order.removeAll { $0 == request.surfaceRevision.surfaceID }
+            }
+            guard frameMatchesSubmittedRevision(
+                frame,
+                request: request,
+                replacement: replacement
+            ) else {
+                // The surface advanced beyond every revision this publisher
+                // observed. Wait for its commit event instead of publishing a
+                // possible intermediate state from a multi-rectangle command.
+                continue
+            }
+            if replacement != nil {
+                removePendingCovered(
+                    by: frame,
+                    invalidationGeneration: request.invalidationGeneration
+                )
+                // A different revision from this lifecycle that is not covered
+                // remains pending; it does not invalidate the immutable snapshot.
             }
             await emit(frame)
             guard generation == flushGeneration else { return }
+            if isCurrent(request) {
+                lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
+                removePendingCovered(
+                    by: frame,
+                    invalidationGeneration: request.invalidationGeneration
+                )
+            }
             emittedFrames &+= 1
         }
         guard generation == flushGeneration else { return }
@@ -194,6 +238,38 @@ package actor DisplayFramePublisher {
     private func isCurrent(_ request: Request) -> Bool {
         (invalidationGenerations[request.surfaceRevision.surfaceID] ?? 0)
             == request.invalidationGeneration
+    }
+
+    private func frameCovers(_ frame: FrameSnapshot, request: Request) -> Bool {
+        frame.surfaceID == request.surfaceRevision.surfaceID
+            && frame.lifecycleGeneration == request.surfaceRevision.lifecycleGeneration
+            && frame.revision >= request.surfaceRevision.revision
+    }
+
+    private func frameMatchesSubmittedRevision(
+        _ frame: FrameSnapshot,
+        request: Request,
+        replacement: Request?
+    ) -> Bool {
+        if frame.surfaceRevision == request.surfaceRevision {
+            return true
+        }
+        return frame.surfaceRevision == replacement?.surfaceRevision
+    }
+
+    private func removePendingCovered(
+        by frame: FrameSnapshot,
+        invalidationGeneration: UInt64
+    ) {
+        guard let replacement = pending[frame.surfaceID],
+              replacement.invalidationGeneration == invalidationGeneration,
+              replacement.surfaceRevision.lifecycleGeneration == frame.lifecycleGeneration,
+              frame.revision >= replacement.surfaceRevision.revision
+        else {
+            return
+        }
+        pending.removeValue(forKey: frame.surfaceID)
+        order.removeAll { $0 == frame.surfaceID }
     }
 
     private func isNewer(_ lhs: SurfaceRevision, than rhs: SurfaceRevision) -> Bool {

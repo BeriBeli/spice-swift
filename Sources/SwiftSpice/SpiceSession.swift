@@ -39,6 +39,11 @@ public enum SpiceVideoCodecPolicy: Sendable, Equatable {
 
 public enum TLSTrustPolicy: Sendable, Equatable {
     case system
+    /// Trust only the supplied CA certificates. Values may be DER or PEM data;
+    /// escaped PEM from a virt-viewer `ca=` field is accepted directly.
+    /// `serverName` overrides hostname verification when the connection address
+    /// differs from the name in the server certificate.
+    case customCertificateAuthority(certificates: [Data], serverName: String? = nil)
     case insecureForTestingOnly
 }
 
@@ -1944,6 +1949,15 @@ public actor SpiceSession {
                 host: endpoint.host,
                 port: endpoint.port,
                 tlsPolicy: .system
+            )
+        case let .customCertificateAuthority(certificates, serverName):
+            NetworkSpiceTransport(
+                host: endpoint.host,
+                port: endpoint.port,
+                tlsPolicy: .customCertificateAuthority(
+                    certificates: certificates,
+                    serverName: serverName
+                )
             )
         case .insecureForTestingOnly:
             NetworkSpiceTransport(

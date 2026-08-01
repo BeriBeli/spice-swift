@@ -9,7 +9,7 @@ import SpiceWire
 package enum DisplayEvent: Sendable, Equatable {
     case surfaceCreated(UInt32)
     case surfaceDestroyed(UInt32)
-    case frameChanged(UInt32)
+    case frameChanged(SurfaceRevision)
     case monitorsConfigured(SpiceDisplayMonitorsConfiguration)
     case ignored(UInt16)
 }
@@ -136,7 +136,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         let framePublisher = DisplayFramePublisher(
             interval: framePublicationInterval,
             snapshot: { [surfaces] surfaceRevision in
-                await surfaces.snapshot(matching: surfaceRevision)
+                await surfaces.snapshot(atLeast: surfaceRevision)
             },
             emit: { frame in
                 await emit(.frame(frame))
@@ -151,10 +151,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                 case let .surfaceDestroyed(surfaceID):
                     await framePublisher.remove(surfaceID: surfaceID)
                     await emit(.surfaceDestroyed(surfaceID))
-                case let .frameChanged(surfaceID):
-                    if let descriptor = try? await surfaces.descriptor(surfaceID: surfaceID) {
-                        await framePublisher.submit(descriptor.surfaceRevision)
-                    }
+                case let .frameChanged(surfaceRevision):
+                    await framePublisher.submit(surfaceRevision)
                 case let .monitorsConfigured(configuration):
                     await emit(.displayMonitors(
                         channelID: connection.key.id,
@@ -250,23 +248,23 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamData(data):
-            let surfaceID = try await renderStreamFrame(
+            let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
                 sizing: nil,
                 data: data.data
             )
             try await acknowledgeIfNeeded()
-            return surfaceID.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
         case let .displayStreamDataSized(data):
-            let surfaceID = try await renderStreamFrame(
+            let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
                 sizing: (data.width, data.height, data.destination),
                 data: data.data
             )
             try await acknowledgeIfNeeded()
-            return surfaceID.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
         case let .displayStreamClip(clip):
             try updateStreamClip(clip)
             try await acknowledgeIfNeeded()
@@ -293,17 +291,17 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
             return .monitorsConfigured(configuration)
         case let .displayCopyBits(command):
-            try await execute(command)
+            let surfaceRevision = try await execute(command)
             try await acknowledgeIfNeeded()
-            return .frameChanged(command.base.surfaceID)
+            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
         case let .displayDrawFill(command):
-            try await execute(command)
+            let surfaceRevision = try await execute(command)
             try await acknowledgeIfNeeded()
-            return .frameChanged(command.base.surfaceID)
+            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
         case let .displayDrawCopy(command):
-            try await execute(command)
+            let surfaceRevision = try await execute(command)
             try await acknowledgeIfNeeded()
-            return .frameChanged(command.base.surfaceID)
+            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
         case let .setAck(setAck):
             ackController.configure(generation: setAck.generation, window: setAck.window)
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
@@ -480,7 +478,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         multimediaTime: UInt32,
         sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
         data: Data
-    ) async throws(ChannelError) -> UInt32? {
+    ) async throws(ChannelError) -> SurfaceRevision? {
         guard var stream = streams[streamID] else {
             throw .protocolViolation("data for unknown stream \(streamID)")
         }
@@ -590,9 +588,10 @@ package actor DisplayChannel: SpiceManagedChannel {
             height: sourceHeight
         )
         var usedNativeVideoPath = false
+        var surfaceRevision: SurfaceRevision?
         if stream.codec != .mjpeg, !stream.metalCompositorDisabled {
             do {
-                try await surfaces.drawNativeVideoFrame(
+                surfaceRevision = try await surfaces.drawNativeVideoFrame(
                     surfaceID: stream.surfaceID,
                     destination: destination,
                     frame: decodedFrame,
@@ -600,7 +599,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                     topDown: stream.topDown,
                     clippedDestinations: clipped
                 )
-                usedNativeVideoPath = true
+                usedNativeVideoPath = surfaceRevision != nil
             } catch {
                 switch error {
                 case .staleSurface:
@@ -644,7 +643,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                 pixels: decoded.pixelsBGRA
             )
             do {
-                try await surfaces.drawScaledCopy(
+                surfaceRevision = try await surfaces.drawScaledCopy(
                     surfaceID: stream.surfaceID,
                     destination: destination,
                     bitmap: bitmap,
@@ -662,7 +661,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         committed.lastPresentedSequence = frameSequence
         committed.lastMultimediaTime = multimediaTime
         streams[streamID] = committed
-        return stream.surfaceID
+        return surfaceRevision
     }
 
     private func retireAdvancedDecoder(
@@ -681,7 +680,9 @@ package actor DisplayChannel: SpiceManagedChannel {
         completedPublisherMetrics.accumulate(metrics)
     }
 
-    private func execute(_ command: SpiceDisplayDrawFill) async throws(ChannelError) {
+    private func execute(
+        _ command: SpiceDisplayDrawFill
+    ) async throws(ChannelError) -> SurfaceRevision? {
         guard command.ropDescriptor == 0x08 else {
             throw .protocolViolation("unsupported DRAW_FILL ROP \(command.ropDescriptor)")
         }
@@ -691,9 +692,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard case let .solid(color) = command.brush else {
             throw .protocolViolation("only solid DRAW_FILL brushes are implemented")
         }
+        var surfaceRevision: SurfaceRevision?
         for rectangle in try clippedRectangles(command.base) {
             do {
-                try await surfaces.fill(
+                surfaceRevision = try await surfaces.fill(
                     surfaceID: command.base.surfaceID,
                     rectangle: rectangle,
                     colorARGB: color
@@ -702,15 +704,19 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation(String(describing: error))
             }
         }
+        return surfaceRevision
     }
 
-    private func execute(_ command: SpiceDisplayCopyBits) async throws(ChannelError) {
+    private func execute(
+        _ command: SpiceDisplayCopyBits
+    ) async throws(ChannelError) -> SurfaceRevision? {
         let base = try pixelRect(command.base.box)
+        var surfaceRevision: SurfaceRevision?
         for destination in try clippedRectangles(command.base) {
             let sourceX = Int(command.sourcePosition.x) + destination.x - base.x
             let sourceY = Int(command.sourcePosition.y) + destination.y - base.y
             do {
-                try await surfaces.copyBits(
+                surfaceRevision = try await surfaces.copyBits(
                     surfaceID: command.base.surfaceID,
                     destination: destination,
                     sourceX: sourceX,
@@ -720,9 +726,12 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation(String(describing: error))
             }
         }
+        return surfaceRevision
     }
 
-    private func execute(_ command: SpiceDisplayDrawCopy) async throws(ChannelError) {
+    private func execute(
+        _ command: SpiceDisplayDrawCopy
+    ) async throws(ChannelError) -> SurfaceRevision? {
         guard command.ropDescriptor == 0x08 else {
             throw .protocolViolation("unsupported DRAW_COPY ROP \(command.ropDescriptor)")
         }
@@ -750,6 +759,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
         }
 
+        var surfaceRevision: SurfaceRevision?
         for destination in try clippedRectangles(command.base) {
             let source = PixelRect(
                 x: sourceArea.x + destination.x - base.x,
@@ -760,14 +770,14 @@ package actor DisplayChannel: SpiceManagedChannel {
             do {
                 switch resolvedSource {
                 case let .bitmap(bitmap):
-                    try await surfaces.drawCopy(
+                    surfaceRevision = try await surfaces.drawCopy(
                         surfaceID: command.base.surfaceID,
                         destination: destination,
                         bitmap: bitmap,
                         source: source
                     )
                 case let .surface(sourceSurfaceID):
-                    try await surfaces.drawCopy(
+                    surfaceRevision = try await surfaces.drawCopy(
                         surfaceID: command.base.surfaceID,
                         destination: destination,
                         sourceSurfaceID: sourceSurfaceID,
@@ -782,6 +792,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             palettes[paletteToCache.uniqueID] = paletteToCache
         }
         commit(cacheMutation)
+        return surfaceRevision
     }
 
     private func resolveSource(

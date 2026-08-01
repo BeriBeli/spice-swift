@@ -265,13 +265,14 @@ struct SurfaceStoreTests {
             topDown: true,
             pixels: Data([1, 2, 3, 4])
         )
-        try await store.drawScaledCopy(
+        let noOpRevision = try await store.drawScaledCopy(
             surfaceID: 17,
             destination: PixelRect(x: 0, y: 0, width: 2, height: 2),
             bitmap: bitmap,
             source: PixelRect(x: 0, y: 0, width: 1, height: 1),
             clippedDestinations: []
         )
+        #expect(noOpRevision == nil)
         #expect(try await store.descriptor(surfaceID: 17).revision == 0)
 
         try await store.fill(
@@ -396,12 +397,13 @@ struct SurfaceStoreTests {
         #expect(created.revision == 0)
         #expect(await store.metrics().snapshots == 0)
 
-        try await store.fill(
+        let fillRevision = try await store.fill(
             surfaceID: 5,
             rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
             colorARGB: 0x0011_2233
         )
         let drawn = try await store.descriptor(surfaceID: 5)
+        #expect(fillRevision == drawn.surfaceRevision)
         #expect(drawn.lifecycleGeneration == created.lifecycleGeneration)
         #expect(drawn.revision == 1)
 
@@ -415,12 +417,13 @@ struct SurfaceStoreTests {
         #expect(try await store.descriptor(surfaceID: 5).revision == 1)
 
         let onePixel = PixelRect(x: 0, y: 0, width: 1, height: 1)
-        try await store.copyBits(
+        let copiedRevision = try await store.copyBits(
             surfaceID: 5,
             destination: onePixel,
             sourceX: 0,
             sourceY: 0
         )
+        #expect(copiedRevision.revision == 2)
         #expect(try await store.descriptor(surfaceID: 5).revision == 2)
         let bitmap = RawBitmap(
             format: .xRGB8888,
@@ -430,23 +433,30 @@ struct SurfaceStoreTests {
             topDown: true,
             pixels: Data([1, 2, 3, 4])
         )
-        try await store.drawCopy(surfaceID: 5, destination: onePixel, bitmap: bitmap)
+        let bitmapRevision = try await store.drawCopy(
+            surfaceID: 5,
+            destination: onePixel,
+            bitmap: bitmap
+        )
+        #expect(bitmapRevision.revision == 3)
         #expect(try await store.descriptor(surfaceID: 5).revision == 3)
         try await store.create(id: 15, width: 1, height: 1, format: 32)
-        try await store.drawCopy(
+        let surfaceRevision = try await store.drawCopy(
             surfaceID: 5,
             destination: onePixel,
             sourceSurfaceID: 15,
             source: onePixel
         )
+        #expect(surfaceRevision.revision == 4)
         #expect(try await store.descriptor(surfaceID: 5).revision == 4)
-        try await store.drawScaledCopy(
+        let scaledRevision = try #require(await store.drawScaledCopy(
             surfaceID: 5,
             destination: onePixel,
             bitmap: bitmap,
             source: onePixel,
             clippedDestinations: [onePixel]
-        )
+        ))
+        #expect(scaledRevision.revision == 5)
         #expect(try await store.descriptor(surfaceID: 5).revision == 5)
 
         try await store.destroy(id: 5)
@@ -471,10 +481,19 @@ struct SurfaceStoreTests {
         #expect(await store.snapshot(matching: created.surfaceRevision) == nil)
         let updated = try await store.descriptor(surfaceID: 6)
         #expect(await store.snapshot(matching: updated.surfaceRevision) != nil)
+        let covering = try #require(await store.snapshot(atLeast: created.surfaceRevision))
+        #expect(covering.surfaceRevision == updated.surfaceRevision)
+        let future = SurfaceRevision(
+            surfaceID: updated.surfaceID,
+            lifecycleGeneration: updated.lifecycleGeneration,
+            revision: updated.revision + 1
+        )
+        #expect(await store.snapshot(atLeast: future) == nil)
 
         try await store.destroy(id: 6)
         try await store.create(id: 6, width: 1, height: 1, format: 32)
         #expect(await store.snapshot(matching: updated.surfaceRevision) == nil)
+        #expect(await store.snapshot(atLeast: updated.surfaceRevision) == nil)
     }
 
     @Test func cachesIOSurfaceCPUReadbackAndReportsAggregateMetrics() async throws {
@@ -1135,14 +1154,27 @@ struct SurfaceStoreTests {
             expectedHeight: 2,
             maximumDecodedBytes: 16
         )
-        try await store.drawNativeVideoFrame(
+        let beforeNoOp = try await store.descriptor(surfaceID: 22)
+        let noOpRevision = try await store.drawNativeVideoFrame(
+            surfaceID: 22,
+            destination: PixelRect(x: 1, y: 1, width: 2, height: 2),
+            frame: nativeFrame,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 2),
+            topDown: true,
+            clippedDestinations: []
+        )
+        #expect(noOpRevision == nil)
+        #expect(try await store.descriptor(surfaceID: 22) == beforeNoOp)
+
+        let nativeRevision = try #require(await store.drawNativeVideoFrame(
             surfaceID: 22,
             destination: PixelRect(x: 1, y: 1, width: 2, height: 2),
             frame: nativeFrame,
             source: PixelRect(x: 0, y: 0, width: 2, height: 2),
             topDown: true,
             clippedDestinations: [PixelRect(x: 1, y: 1, width: 2, height: 2)]
-        )
+        ))
+        #expect(nativeRevision.revision == 2)
         let gpuSnapshot = try await store.snapshot(surfaceID: 22)
         #expect(gpuSnapshot.ioSurfaceFrame != nil)
         #expect(await store.metrics().cpuMaterializations == 0)

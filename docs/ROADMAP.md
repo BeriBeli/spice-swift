@@ -24,8 +24,10 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - Close audible Playback and physical microphone Record behavior.
 - Validate real Smartcard and redirected USB devices.
 - Exercise live semi-seamless and seamless migration.
-- Optimize the corrected five-second performance smoke until fps, p95, and CPU
-  per frame pass. Only then run ten paired 30-second bootstrap measurements.
+- Reduce the corrected five-second CPU-per-frame ratio from the current
+  1.203073 to at most 1.10 while preserving the passing fps, ready-frame, p95,
+  RSS, and zero-stale Publisher results. Only then run ten paired 30-second
+  bootstrap measurements.
 - Complete Developer ID signing, notarization, Gatekeeper acceptance, and launch
   on a clean Apple Silicon macOS 26 host.
 - Restore the custom KVM kernel and local QEMU image before rerunning the current

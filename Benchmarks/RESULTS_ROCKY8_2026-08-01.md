@@ -5,6 +5,62 @@ Test date: 2026-08-01 (Asia/Singapore)
 This report keeps the latest measurements first. The later sections preserve
 the original failing baseline and the evidence that led to subsequent fixes.
 
+## Post-publisher revision-race smoke (16:20)
+
+The current dirty working tree was rebuilt as an arm64 Release `spice-probe`
+after repairing publisher revision races and removing the per-frame Surface
+descriptor lookup. One preregistered five-second pair then ran against a fresh
+instance of the same 1280x720 Rocky animation workload. The reference collector
+and analyzer were unchanged.
+
+| Metric | SwiftSpice | spice-client-glib2 | Swift / GLib | Threshold | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Published frame rate | 52.0 fps | 49.2 fps | 1.056911 | >= 0.95 | PASS |
+| First frame ready | 333.273166 ms | 431.340 ms | 0.772646 | <= 1.10 | PASS |
+| Frame interval p95 | 24.313750 ms | 36.079 ms | 0.673903 | <= 1.10 | PASS |
+| Observation-window CPU | 0.377439 s | 0.296836 s | 1.271541 | Diagnostic | Recorded |
+| CPU per published frame | 1.451688 ms | 1.206650 ms | 1.203073 | <= 1.10 | **FAIL** |
+| Maximum RSS | 83,804,160 B | 127,303,680 B | 0.658301 | <= 1.15 | PASS |
+
+SwiftSpice completed 260 frames and the reference client completed 246. Both
+passed the activity guard. Frame rate, startup, p95, and RSS passed, but CPU per
+published frame remained 20.3% above the reference and exceeded the 1.10 gate.
+The overall smoke therefore remained **FAIL**, and the preregistered rule
+prevented the ten paired 30-second batch from starting.
+
+The publisher received 14,075 submissions, attempted 265 snapshots, emitted
+260 frames, recorded zero stale snapshots and zero pending eviction, and ended
+with one surface pending at the observation cutoff. The stale ratio was
+therefore **0/265 (0%)**, compared with **48/261 (18.39%)** in the 14:34 sample
+below. Five successful snapshot candidates were not emitted; the current
+telemetry does not separately count submitted-revision deferrals, so that
+difference must not be attributed more precisely from these counters alone.
+
+SwiftSpice reported 14,076 damage operations and 265 Surface snapshots, with
+`full_frame_copy_bytes=376,012,800`,
+`partial_frame_copy_bytes=14,997,888`, and `gpu_copy_bytes=0`. CPU
+materialization, pool exhaustion, GPU error, and pending eviction counters were
+all zero.
+
+The CPU-per-frame ratio improved from 1.31379 in the corrected 10:11 smoke to
+1.203073 here. This is a cross-run diagnostic, not a confidence interval:
+SwiftSpice changed from 1.474 ms to 1.452 ms per frame while the reference also
+changed from 1.122 ms to 1.207 ms. A causal or non-inferiority claim still
+requires a passing smoke followed by ten complete 30-second pairs.
+
+Local raw output is stored at
+`/private/tmp/swiftspice-perf-revision-fix-smoke-20260801T1620`. Remote workload
+and round evidence is stored at
+`/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260801T081943Z`.
+The base commit was `83efeef1fdbea2013fc3d929f9d157bc8b0861de`; because the
+tested fixes were uncommitted, that hash does not identify the complete tested
+source. The Release probe SHA-256 was
+`911839b9e521f1ab998d9cf6660c02b3372c623e65904f2c65d84218812fa3c8`.
+
+The server logs confirmed two `PERF_LOAD state=animation reset_frame=0`
+markers. After capture, the local SSH tunnel and disposable remote QEMU/SPICE
+endpoint were stopped, and the temporary ticket was removed.
+
 ## Final-tree revisioned IOSurface smoke (14:34)
 
 The final tree was rebuilt as a fresh arm64 release in an independent scratch

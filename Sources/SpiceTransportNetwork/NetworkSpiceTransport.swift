@@ -1,9 +1,14 @@
 import Foundation
 import Network
+import Security
 import SpiceTransport
 
 public enum NetworkTLSPolicy: Sendable {
     case system
+    /// Trust only the supplied CA certificates. Each value may contain a DER
+    /// certificate or one or more PEM certificates, including the escaped PEM
+    /// representation carried by a virt-viewer `ca=` field.
+    case customCertificateAuthority(certificates: [Data], serverName: String? = nil)
     case insecureForTestingOnly
 }
 
@@ -325,9 +330,80 @@ public actor NetworkSpiceTransport: SpiceTransport {
         switch policy {
         case .system:
             return tls
+        case let .customCertificateAuthority(certificates, serverName):
+            return tls.certificateValidator { _, protocolTrust in
+                let trust = sec_trust_copy_ref(protocolTrust).takeRetainedValue()
+                return Self.evaluateCustomCertificateAuthority(
+                    trust: trust,
+                    certificates: certificates,
+                    serverName: serverName
+                )
+            }
         case .insecureForTestingOnly:
             return tls.certificateValidator { _, _ in true }
         }
+    }
+
+    package nonisolated static func evaluateCustomCertificateAuthority(
+        trust: SecTrust,
+        certificates: [Data],
+        serverName: String?
+    ) -> Bool {
+        guard let anchors = decodeCertificates(certificates), !anchors.isEmpty else {
+            return false
+        }
+        guard SecTrustSetAnchorCertificates(trust, anchors as CFArray) == errSecSuccess,
+              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess
+        else {
+            return false
+        }
+        if let serverName {
+            let policy = SecPolicyCreateSSL(true, serverName as CFString)
+            guard SecTrustSetPolicies(trust, policy) == errSecSuccess else {
+                return false
+            }
+        }
+        return SecTrustEvaluateWithError(trust, nil)
+    }
+
+    private nonisolated static func decodeCertificates(
+        _ representations: [Data]
+    ) -> [SecCertificate]? {
+        var certificates: [SecCertificate] = []
+        for representation in representations {
+            if let certificate = SecCertificateCreateWithData(nil, representation as CFData) {
+                certificates.append(certificate)
+                continue
+            }
+            guard var pem = String(data: representation, encoding: .utf8) else {
+                return nil
+            }
+            pem = pem.replacingOccurrences(of: "\\n", with: "\n")
+            let beginMarker = "-----BEGIN CERTIFICATE-----"
+            let endMarker = "-----END CERTIFICATE-----"
+            var remainder = pem[...]
+            var decodedAny = false
+            while let begin = remainder.range(of: beginMarker) {
+                let afterBegin = remainder[begin.upperBound...]
+                guard let end = afterBegin.range(of: endMarker) else {
+                    return nil
+                }
+                let body = afterBegin[..<end.lowerBound]
+                guard
+                    let der = Data(base64Encoded: String(body), options: .ignoreUnknownCharacters),
+                    let certificate = SecCertificateCreateWithData(nil, der as CFData)
+                else {
+                    return nil
+                }
+                certificates.append(certificate)
+                decodedAny = true
+                remainder = afterBegin[end.upperBound...]
+            }
+            guard decodedAny else {
+                return nil
+            }
+        }
+        return certificates
     }
 
     private func mapNetworkError(_ error: any Error) -> TransportError {

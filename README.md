@@ -144,9 +144,12 @@ SPICE_PASSWORD='...' swift run spice-probe HOST TLS_PORT --tls
 Advanced video remains explicit: pass exactly one of `--enable-h264` or
 `--enable-h265`; omitting both keeps the `.mjpegOnly` capability policy.
 
-TLS uses normal system certificate validation. The
-`--tls-insecure-for-testing-only` option is available only for self-signed local
-test servers.
+TLS uses normal system certificate validation. Applications connecting from a
+virt-viewer file can instead pass its `ca=` value to
+`TLSTrustPolicy.customCertificateAuthority`; escaped PEM is accepted directly,
+and `serverName` can preserve certificate-name verification when the connection
+address is different. The `--tls-insecure-for-testing-only` option is available
+only for self-signed local test servers.
 
 For the nested QEMU live-validation harness, see the
 [Apple/container guide](Integration/AppleContainer/APPLE_CONTAINER.md).

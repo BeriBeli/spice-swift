@@ -499,11 +499,12 @@ package actor SurfaceStore {
         }
     }
 
+    @discardableResult
     package func fill(
         surfaceID: UInt32,
         rectangle: PixelRect,
         colorARGB: UInt32
-    ) async throws(RenderError) {
+    ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
@@ -538,17 +539,19 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(rectangle)
+        return surfaceRevision(of: surface)
     }
 
+    @discardableResult
     package func copyBits(
         surfaceID: UInt32,
         destination: PixelRect,
         sourceX: Int,
         sourceY: Int
-    ) async throws(RenderError) {
+    ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
-        try copyBitsUnlocked(
+        return try copyBitsUnlocked(
             surfaceID: surfaceID,
             destination: destination,
             sourceX: sourceX,
@@ -561,7 +564,7 @@ package actor SurfaceStore {
         destination: PixelRect,
         sourceX: Int,
         sourceY: Int
-    ) throws(RenderError) {
+    ) throws(RenderError) -> SurfaceRevision {
         var surface = try surface(id: surfaceID)
         try validate(destination, in: surface)
         let source = PixelRect(
@@ -593,14 +596,16 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(destination)
+        return surfaceRevision(of: surface)
     }
 
+    @discardableResult
     package func drawCopy(
         surfaceID: UInt32,
         destination: PixelRect,
         bitmap: RawBitmap,
         source sourceRectangle: PixelRect? = nil
-    ) async throws(RenderError) {
+    ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
@@ -687,14 +692,16 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(destination)
+        return surfaceRevision(of: surface)
     }
 
+    @discardableResult
     package func drawCopy(
         surfaceID: UInt32,
         destination: PixelRect,
         sourceSurfaceID: UInt32,
         source sourceRectangle: PixelRect
-    ) async throws(RenderError) {
+    ) async throws(RenderError) -> SurfaceRevision {
         if sourceSurfaceID == surfaceID {
             try await acquireSurfaceOperation(surfaceID: surfaceID)
             defer { releaseSurfaceOperation(surfaceID: surfaceID) }
@@ -703,13 +710,12 @@ package actor SurfaceStore {
             else {
                 throw .invalidRectangle
             }
-            try copyBitsUnlocked(
+            return try copyBitsUnlocked(
                 surfaceID: surfaceID,
                 destination: destination,
                 sourceX: sourceRectangle.x,
                 sourceY: sourceRectangle.y
             )
-            return
         }
         let operationSurfaceIDs = [surfaceID, sourceSurfaceID].sorted()
         var acquiredSurfaceIDs: [UInt32] = []
@@ -767,15 +773,17 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = destinationSurface
         recordDamage(destination)
+        return surfaceRevision(of: destinationSurface)
     }
 
+    @discardableResult
     package func drawScaledCopy(
         surfaceID: UInt32,
         destination: PixelRect,
         bitmap: RawBitmap,
         source: PixelRect,
         clippedDestinations: [PixelRect]
-    ) async throws(RenderError) {
+    ) async throws(RenderError) -> SurfaceRevision? {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
@@ -820,7 +828,7 @@ package actor SurfaceStore {
             }
         }
         guard !clippedDestinations.isEmpty else {
-            return
+            return nil
         }
 
         let nextRevision = try advancedRevision(surface.revision)
@@ -867,11 +875,13 @@ package actor SurfaceStore {
         }
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
+        return surfaceRevision(of: surface)
     }
 
     /// Transactionally composites an opaque decoder frame into a writable
     /// IOSurface candidate. The candidate becomes canonical only after every
     /// Metal command has completed successfully.
+    @discardableResult
     package func drawNativeVideoFrame(
         surfaceID: UInt32,
         destination: PixelRect,
@@ -879,7 +889,7 @@ package actor SurfaceStore {
         source: PixelRect,
         topDown: Bool,
         clippedDestinations: [PixelRect]
-    ) async throws(SurfaceVideoCompositionError) {
+    ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
         guard let compositor = metalCompositor else {
             throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
         }
@@ -928,7 +938,7 @@ package actor SurfaceStore {
             throw .render(.invalidRectangle)
         }
         guard !clippedDestinations.isEmpty else {
-            return
+            return nil
         }
         guard let unified = surface.storage.unifiedBacking else {
             throw videoFallback(.unsupportedDevice)
@@ -1065,6 +1075,7 @@ package actor SurfaceStore {
             recordDamage(clipped)
         }
         nativeVideoFrames &+= 1
+        return surfaceRevision(of: liveSurface)
     }
 
     package func snapshot(surfaceID: UInt32) async throws(RenderError) -> FrameSnapshot {
@@ -1083,9 +1094,9 @@ package actor SurfaceStore {
     }
 
     /// Returns a frame only when the requested lifecycle and content revision
-    /// are still current. This is the publication commit check which prevents
-    /// an asynchronous snapshot from escaping after destroy/recreate or a
-    /// newer draw.
+    /// are still current. Use this when the caller requires exact identity;
+    /// display publication uses `snapshot(atLeast:)` so a newer immutable frame
+    /// can safely satisfy an older request.
     package func snapshot(matching requested: SurfaceRevision) async -> FrameSnapshot? {
         guard !rejectsNewOperations,
               let surface = surfaces[requested.surfaceID],
@@ -1095,6 +1106,37 @@ package actor SurfaceStore {
             return nil
         }
         return await makeSnapshot(from: surface, matching: requested)
+    }
+
+    /// Returns a frame from the requested lifecycle whose content includes at
+    /// least the requested revision. The per-surface operation reservation is
+    /// held while selecting and constructing the candidate, so concurrent
+    /// draws cannot make the snapshot chase a moving exact revision.
+    package func snapshot(atLeast requested: SurfaceRevision) async -> FrameSnapshot? {
+        guard !rejectsNewOperations,
+              let eligible = surfaces[requested.surfaceID],
+              eligible.lifecycleGeneration == requested.lifecycleGeneration,
+              eligible.revision >= requested.revision
+        else {
+            return nil
+        }
+        do {
+            try await acquireSurfaceOperation(surfaceID: requested.surfaceID)
+        } catch {
+            return nil
+        }
+        defer { releaseSurfaceOperation(surfaceID: requested.surfaceID) }
+        guard let surface = surfaces[requested.surfaceID],
+              surface.lifecycleGeneration == requested.lifecycleGeneration,
+              surface.revision >= requested.revision
+        else {
+            return nil
+        }
+        return await makeSnapshot(
+            from: surface,
+            matching: surfaceRevision(of: surface),
+            surfaceOperationAlreadyAcquired: true
+        )
     }
 
     package func descriptor(surfaceID: UInt32) throws(RenderError) -> SurfaceDescriptor {
@@ -1144,7 +1186,8 @@ package actor SurfaceStore {
 
     private func makeSnapshot(
         from surface: Surface,
-        matching requested: SurfaceRevision
+        matching requested: SurfaceRevision,
+        surfaceOperationAlreadyAcquired: Bool = false
     ) async -> FrameSnapshot? {
         guard let unified = surface.storage.unifiedBacking else {
             guard isCurrent(requested) else {
@@ -1165,12 +1208,20 @@ package actor SurfaceStore {
             return snapshot
         }
 
-        do {
-            try await acquireSurfaceOperation(surfaceID: surface.id)
-        } catch {
-            return nil
+        var acquiredSurfaceOperation = false
+        if !surfaceOperationAlreadyAcquired {
+            do {
+                try await acquireSurfaceOperation(surfaceID: surface.id)
+                acquiredSurfaceOperation = true
+            } catch {
+                return nil
+            }
         }
-        defer { releaseSurfaceOperation(surfaceID: surface.id) }
+        defer {
+            if acquiredSurfaceOperation {
+                releaseSurfaceOperation(surfaceID: surface.id)
+            }
+        }
         guard let operationSurface = surfaces[surface.id],
               operationSurface.lifecycleGeneration == requested.lifecycleGeneration,
               operationSurface.revision == requested.revision,

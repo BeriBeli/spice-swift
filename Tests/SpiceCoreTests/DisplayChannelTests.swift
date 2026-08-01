@@ -203,10 +203,10 @@ struct DisplayChannelTests {
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
         #expect(try await channel.processNext() == .ignored(124))
-        #expect(try await channel.processNext() == .frameChanged(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 3))
 
         let snapshot = try await channel.snapshot(surfaceID: 1)
         #expect(pixel(snapshot, x: 0, y: 0) == [10, 0, 0, 255])
@@ -308,7 +308,7 @@ struct DisplayChannelTests {
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
         #expect(try await channel.snapshot(surfaceID: 1).pixels == Data([
             1, 2, 3, 255, 4, 5, 6, 255,
             7, 8, 9, 255, 10, 11, 12, 255,
@@ -384,11 +384,11 @@ struct DisplayChannelTests {
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))
         #expect(try await channel.processNext() == .ignored(125))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 3))
 
         let diagnostics = await channel.diagnosticsSnapshot()
         #expect(diagnostics.advancedCPUFallbackFrames == 3)
@@ -504,8 +504,8 @@ struct DisplayChannelTests {
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))
         let beforeLateFrame = try await channel.snapshot(surfaceID: 1)
         #expect(try await channel.processNext() == .ignored(123))
 
@@ -635,7 +635,7 @@ struct DisplayChannelTests {
             try await channel.processNext()
         }
         #expect(try await channel.snapshot(surfaceID: 1) == before)
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
         let committed = try await channel.snapshot(surfaceID: 1)
         await #expect(throws: ChannelError.self) {
             try await channel.processNext()
@@ -643,7 +643,7 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1) == committed)
         #expect(try await channel.processNext() == .ignored(126))
         #expect(try await channel.processNext() == .ignored(122))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))
     }
 
     @Test func presentsBottomUpMJPEGRelativeToAdvertisedSourceHeight() async throws {
@@ -1585,7 +1585,7 @@ struct DisplayChannelTests {
         )
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
         let snapshot = try await channel.snapshot(surfaceID: 1)
         #expect(snapshot.pixels == Data([1, 2, 3, 255, 4, 5, 6, 255]))
     }
@@ -1683,9 +1683,9 @@ struct DisplayChannelTests {
         let channel = DisplayChannel(connection: connection)
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
-        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 3))
 
         let snapshot = try await channel.snapshot(surfaceID: 1)
         #expect(pixel(snapshot, x: 0, y: 0) == [0, 0, 255, 255])
@@ -1698,6 +1698,60 @@ struct DisplayChannelTests {
         #expect(pixel(snapshot, x: 3, y: 1) == [10, 11, 12, 255])
 
         #expect(try await channel.processNext() == .surfaceDestroyed(1))
+    }
+
+    @Test func fullyClippedCommandsDoNotPublishButStillCacheAndAcknowledge() async throws {
+        let imageID: UInt64 = 0x4455
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 4,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(SpiceMsgSetAck(generation: 7, window: 1)),
+            encodeMini(id: 302, body: drawFillBody(clipRectangles: [])),
+            encodeMini(id: 104, body: copyBitsBody(clipRectangles: [])),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01,
+                clipRectangles: []
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: imageID
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+
+        #expect(try await channel.processNext() == .surfaceCreated(1))
+        #expect(try await channel.processNext() == .ignored(3))
+        #expect(try await channel.processNext() == .ignored(302))
+        #expect(try await channel.processNext() == .ignored(104))
+        #expect(try await channel.processNext() == .ignored(304))
+        #expect(try await store.descriptor(surfaceID: 1).revision == 0)
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
+        #expect(try await channel.snapshot(surfaceID: 1).pixels.prefix(8) == Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+        ]))
+
+        let outbound = await transport.outbound
+        #expect(try outbound.map(miniMessageID) == [1, 2, 2, 2, 2])
     }
 
     @Test func rejectsImagePointerIntoFixedMessageBody() throws {
@@ -1767,13 +1821,17 @@ struct DisplayChannelTests {
         }
     }
 
-    private func drawFillBody() -> Data {
+    private func drawFillBody(
+        clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)] = [
+            (top: 0, left: 0, bottom: 2, right: 2),
+        ]
+    ) -> Data {
         var writer = ByteWriter()
         writeBase(
             to: &writer,
             surfaceID: 1,
             box: (top: 0, left: 0, bottom: 2, right: 4),
-            clipRectangles: [(top: 0, left: 0, bottom: 2, right: 2)]
+            clipRectangles: clipRectangles
         )
         writer.writeUInt8(1) // SPICE_BRUSH_TYPE_SOLID
         writer.writeUInt32LE(0x00ff_0000)
@@ -2021,7 +2079,8 @@ struct DisplayChannelTests {
         width: UInt32 = 2,
         height: UInt32 = 1,
         descriptorID: UInt64 = 88,
-        descriptorFlags: UInt8 = 0
+        descriptorFlags: UInt8 = 0,
+        clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)]? = nil
     ) -> Data {
         var writer = ByteWriter()
         writeBase(
@@ -2033,7 +2092,7 @@ struct DisplayChannelTests {
                 bottom: Int32(height),
                 right: Int32(width)
             ),
-            clipRectangles: nil
+            clipRectangles: clipRectangles
         )
         let imageOffset = UInt32(writer.data.count + 36)
         writer.writeUInt32LE(imageOffset)
@@ -2117,13 +2176,15 @@ struct DisplayChannelTests {
         )
     }
 
-    private func copyBitsBody() -> Data {
+    private func copyBitsBody(
+        clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)]? = nil
+    ) -> Data {
         var writer = ByteWriter()
         writeBase(
             to: &writer,
             surfaceID: 1,
             box: (top: 1, left: 0, bottom: 2, right: 2),
-            clipRectangles: nil
+            clipRectangles: clipRectangles
         )
         writer.writeInt32LE(2)
         writer.writeInt32LE(0)
@@ -2194,9 +2255,22 @@ struct DisplayChannelTests {
         return writer.data
     }
 
+    private func miniMessageID(_ framed: Data) throws -> UInt16 {
+        var reader = try ByteReader(framed)
+        return try reader.readUInt16LE()
+    }
+
     private func pixel(_ snapshot: FrameSnapshot, x: Int, y: Int) -> [UInt8] {
         let offset = y * snapshot.bytesPerRow + x * 4
         return Array(snapshot.pixels[offset..<(offset + 4)])
+    }
+
+    private func frameChanged(surfaceID: UInt32, revision: UInt64) -> DisplayEvent {
+        .frameChanged(SurfaceRevision(
+            surfaceID: surfaceID,
+            lifecycleGeneration: 1,
+            revision: revision
+        ))
     }
 }
 

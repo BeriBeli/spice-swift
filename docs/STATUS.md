@@ -889,17 +889,17 @@ such by an embedding application.
 
 ## Apple Silicon optimization acceptance status
 
-- The authoritative final-tree five-second Rocky smoke used a fresh release
-  rebuild that recompiled the final VideoToolbox, SurfaceStore, and compositor
-  sources. SwiftSpice published 42.6 fps versus 48.0 fps for
-  spice-client-glib2, a failing 0.887500 ratio. CPU per frame was 0.887296 ms
-  versus 0.545979 ms, a failing 1.625146 ratio; p95 also failed at 1.169523.
-  Ready-frame (1.066199) and RSS (0.658417) passed. CPU materialization, pool
-  exhaustion, GPU copy, and GPU errors were all zero. Because the smoke failed,
-  the formal ten
-  alternating pairs of 30 seconds were not started. Retained evidence and the
-  exact collection paths are documented in
-  `Benchmarks/RESULTS_ROCKY8_2026-08-01.md`.
+- The latest current-tree five-second Rocky smoke used an arm64 Release probe
+  containing the uncommitted publisher revision-race fixes. SwiftSpice
+  published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911
+  ratio. Ready-frame (0.772646), p95 (0.673903), and RSS (0.658301) also passed.
+  Publisher stale snapshots fell from the earlier 48/261 (18.39%) sample to
+  0/265. CPU per frame remained the blocking metric at 1.451688 ms versus
+  1.206650 ms, a failing 1.203073 ratio. CPU materialization, pool exhaustion,
+  GPU copy, GPU errors, and pending evictions were zero. Because the smoke still
+  failed, the formal ten alternating pairs of 30 seconds were not started.
+  Retained evidence, the tested probe hash, and exact collection paths are
+  documented in `Benchmarks/RESULTS_ROCKY8_2026-08-01.md`.
 - On the current M4 Pro host, the strict final-tree Rocky native-video gate
   passed both codecs. H.264 decoded 233 frames with 14 native Metal
   compositions; H.265 decoded 233 with 28 native compositions. Both selected a

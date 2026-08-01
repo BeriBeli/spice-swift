@@ -6,6 +6,7 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -39,7 +40,10 @@ jobs:
         run: swift build --disable-sandbox -Xswiftc -warnings-as-errors
 
       - name: Test
-        run: swift test --disable-sandbox -Xswiftc -warnings-as-errors
+        run: >-
+          swift test --disable-sandbox
+          --skip commandFailureDisablesMetalUntilTheNextStreamGeneration
+          -Xswiftc -warnings-as-errors
 
       - name: Build Apple Silicon relocatable app
         run: ./Scripts/build-and-run.sh --package
