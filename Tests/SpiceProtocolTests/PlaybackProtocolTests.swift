@@ -17,7 +17,8 @@ struct PlaybackProtocolTests {
         #expect(try decode(103, startBody()) == .start(SpicePlaybackStart(
             channels: 2,
             format: .s16,
-            frequency: 48_000
+            frequency: 48_000,
+            multimediaTime: 12
         )))
         #expect(try decode(104, Data()) == .stop)
         #expect(try decode(105, volumeBody([10, 20])) == .volume([10, 20]))
@@ -71,10 +72,10 @@ struct PlaybackProtocolTests {
         return writer.data
     }
 
-    private func modeBody(time: UInt32, mode: UInt32) -> Data {
+    private func modeBody(time: UInt32, mode: UInt16) -> Data {
         var writer = ByteWriter()
         writer.writeUInt32LE(time)
-        writer.writeUInt32LE(mode)
+        writer.writeUInt16LE(mode)
         return writer.data
     }
 
@@ -83,6 +84,7 @@ struct PlaybackProtocolTests {
         writer.writeUInt32LE(2)
         writer.writeUInt16LE(1)
         writer.writeUInt32LE(48_000)
+        writer.writeUInt32LE(12)
         return writer.data
     }
 

@@ -1,0 +1,49 @@
+FROM docker.io/library/alpine:3.22 AS guest-video-builder
+
+RUN apk add --no-cache build-base ffmpeg libx11-dev libxext-dev
+
+COPY guest/x11-animation.c /tmp/x11-animation.c
+COPY guest/stream-device-agent.c /tmp/stream-device-agent.c
+
+RUN cc -O2 -Wall -Wextra -Werror /tmp/x11-animation.c \
+        -o /usr/local/bin/x11-animation -lX11 -lXext \
+    && cc -static -O2 -Wall -Wextra -Werror /tmp/stream-device-agent.c \
+        -o /usr/local/bin/stream-device-agent \
+    && mkdir -p /usr/local/share/swiftspice \
+    && ffmpeg -hide_banner -loglevel error \
+        -f lavfi -i 'testsrc2=size=1280x720:rate=30' \
+        -frames:v 120 -pix_fmt yuv420p -c:v libx264 \
+        -profile:v baseline -level:v 3.1 -preset veryfast -tune zerolatency \
+        -x264-params 'keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:aud=1' \
+        -f h264 /usr/local/share/swiftspice/stream.h264 \
+    && ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,profile,pix_fmt,width,height \
+        -of default=noprint_wrappers=1 \
+        /usr/local/share/swiftspice/stream.h264 \
+        > /usr/local/share/swiftspice/stream-h264-metadata.txt \
+    && ffmpeg -hide_banner -loglevel error \
+        -f lavfi -i 'testsrc2=size=1280x720:rate=30' \
+        -frames:v 120 -pix_fmt yuv420p -c:v libx265 \
+        -profile:v main -level:v 3.1 -preset veryfast -tune zerolatency \
+        -x265-params 'keyint=30:min-keyint=30:scenecut=0:repeat-headers=1:aud=1' \
+        -f hevc /usr/local/share/swiftspice/stream.h265 \
+    && ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,profile,pix_fmt,width,height \
+        -of default=noprint_wrappers=1 \
+        /usr/local/share/swiftspice/stream.h265 \
+        > /usr/local/share/swiftspice/stream-h265-metadata.txt
+
+FROM localhost/swiftspice-qemu-x86:local
+
+COPY --from=guest-video-builder /usr/local/bin/x11-animation \
+    /usr/local/libexec/swiftspice-x11-animation
+COPY --from=guest-video-builder /usr/local/bin/stream-device-agent \
+    /usr/local/libexec/swiftspice-stream-device-agent
+COPY --from=guest-video-builder /usr/local/share/swiftspice/stream.h264 \
+    /usr/local/share/swiftspice/stream.h264
+COPY --from=guest-video-builder /usr/local/share/swiftspice/stream-h264-metadata.txt \
+    /usr/local/share/swiftspice/stream-h264-metadata.txt
+COPY --from=guest-video-builder /usr/local/share/swiftspice/stream.h265 \
+    /usr/local/share/swiftspice/stream.h265
+COPY --from=guest-video-builder /usr/local/share/swiftspice/stream-h265-metadata.txt \
+    /usr/local/share/swiftspice/stream-h265-metadata.txt

@@ -31,6 +31,16 @@ public enum SpiceAudioPlaybackSinkEvent: Sendable, Equatable {
     case failed(SpiceAudioPlaybackSinkError)
 }
 
+public struct SpiceAudioPlaybackSinkStatistics: Sendable, Equatable {
+    public let scheduledPackets: UInt64
+    public let scheduledFrames: UInt64
+
+    public init(scheduledPackets: UInt64, scheduledFrames: UInt64) {
+        self.scheduledPackets = scheduledPackets
+        self.scheduledFrames = scheduledFrames
+    }
+}
+
 /// A bounded macOS audio sink for SPICE RAW signed 16-bit little-endian PCM.
 ///
 /// The player node receives the SPICE source format and AVAudioEngine converts
@@ -50,6 +60,8 @@ public actor SpiceAudioPlaybackSink {
     private var minimumLatencyMilliseconds: UInt32 = 0
     private var volume: [UInt16] = []
     private var isMuted = false
+    private var scheduledPackets: UInt64 = 0
+    private var scheduledFrames: UInt64 = 0
 
     public init(
         maximumQueuedMilliseconds: UInt32 = 500,
@@ -92,6 +104,13 @@ public actor SpiceAudioPlaybackSink {
         delayTask?.cancel()
         delayTask = nil
         stopStream(emit: configuration != nil)
+    }
+
+    public func statistics() -> SpiceAudioPlaybackSinkStatistics {
+        SpiceAudioPlaybackSinkStatistics(
+            scheduledPackets: scheduledPackets,
+            scheduledFrames: scheduledFrames
+        )
     }
 
     private func consumePlaybackEvents(from session: SpiceSession) async {
@@ -180,6 +199,8 @@ public actor SpiceAudioPlaybackSink {
             minimumStartupMilliseconds: minimumLatencyMilliseconds
         )
         self.configuration = configuration
+        scheduledPackets = 0
+        scheduledFrames = 0
         applyGain()
         eventContinuation.yield(.started(configuration))
     }
@@ -220,6 +241,8 @@ public actor SpiceAudioPlaybackSink {
                     await self?.bufferPlayed(frames: frameCount, generation: generation)
                 }
             }
+            scheduledPackets &+= 1
+            scheduledFrames &+= frameCount
             if startPlayback {
                 player.play()
             }

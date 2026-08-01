@@ -43,6 +43,12 @@ let package = Package(
             name: "SpiceIOSurface"
         ),
         .target(
+            name: "SpiceMetalCompositor",
+            dependencies: ["SpiceCodecs", "SpiceIOSurface", "SpiceVideoToolbox"],
+            exclude: ["Shaders"],
+            plugins: ["CompileMetalShaders"]
+        ),
+        .target(
             name: "SpiceCodecInterop",
             dependencies: ["CTurboJPEG", "CSpiceQUIC", "CZlib"]
         ),
@@ -87,7 +93,13 @@ let package = Package(
         ),
         .target(
             name: "SpiceRenderer",
-            dependencies: ["SpiceIOSurface", "SpiceProtocol", "SpiceWire"]
+            dependencies: [
+                "SpiceCodecs",
+                "SpiceIOSurface",
+                "SpiceMetalCompositor",
+                "SpiceProtocol",
+                "SpiceWire",
+            ]
         ),
         .target(
             name: "SpiceTestSupport",
@@ -135,6 +147,11 @@ let package = Package(
             ),
             dependencies: ["SpiceProtocolGenerator"]
         ),
+        .plugin(
+            name: "CompileMetalShaders",
+            capability: .buildTool(),
+            exclude: ["compile-metal.sh"]
+        ),
         .testTarget(
             name: "SpiceWireTests",
             dependencies: ["SpiceWire"]
@@ -154,7 +171,11 @@ let package = Package(
         ),
         .testTarget(
             name: "SpiceVideoToolboxTests",
-            dependencies: ["SpiceCodecs", "SpiceVideoToolbox"],
+            dependencies: [
+                "SpiceCodecs",
+                "SpiceMetalCompositor",
+                "SpiceVideoToolbox",
+            ],
             resources: [.process("Fixtures")]
         ),
         .testTarget(
@@ -164,6 +185,7 @@ let package = Package(
                 "SpiceCore",
                 "SpiceChannels",
                 "SpiceCryptoSecurity",
+                "SpiceMetalCompositor",
                 "SpiceProtocol",
                 "SpiceRenderer",
                 "SpiceTestSupport",
@@ -174,7 +196,16 @@ let package = Package(
         ),
         .testTarget(
             name: "SpiceRendererTests",
-            dependencies: ["SpiceIOSurface", "SpiceRenderer"]
+            dependencies: [
+                "SpiceCodecs",
+                "SpiceIOSurface",
+                "SpiceRenderer",
+                "SpiceVideoToolbox",
+            ]
+        ),
+        .testTarget(
+            name: "SpiceMetalCompositorTests",
+            dependencies: ["SpiceCodecs", "SpiceMetalCompositor"]
         ),
         .testTarget(
             name: "SwiftSpiceTests",

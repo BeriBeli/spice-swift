@@ -1,9 +1,12 @@
+import CoreVideo
 import Foundation
+import IOSurface
 import Testing
 @testable import SpiceCodecs
+@testable import SpiceMetalCompositor
 @testable import SpiceVideoToolbox
 
-@Suite("VideoToolbox advanced-video corpus")
+@Suite("VideoToolbox advanced-video corpus", .serialized)
 struct AdvancedVideoCorpusTests {
     @Test func decodesIndependentH264AndH265Goldens() async throws {
         for fixture in try loadFixtures() {
@@ -15,16 +18,82 @@ struct AdvancedVideoCorpusTests {
                 height: fixture.height
             )
 
-            let decoded = try #require(try await decoder.decode(
+            let frame = try #require(try await decoder.decodeVideoFrame(
                 payload: encoded,
                 multimediaTime: 1
             ))
+            #expect(frame is SpiceVideoToolboxFrame)
+            let nativeDiagnostics = await decoder.diagnosticsSnapshot()
+            #expect(nativeDiagnostics.sessionCreationCount == 1)
+            #expect(nativeDiagnostics.decodedFrameCount == 1)
+            #expect(nativeDiagnostics.cpuMaterializationCount == 0)
+            #expect(
+                nativeDiagnostics.hardwareSessionCount +
+                    nativeDiagnostics.softwareSessionCount +
+                    nativeDiagnostics.hardwareQueryFailureCount == 1
+            )
+
+            if let compositor = try makeCompositorIfSupported() {
+                let destination = try makeBGRAIOSurface(
+                    width: fixture.width,
+                    height: fixture.height
+                )
+                do {
+                    try await compositor.composite(
+                        frame: frame,
+                        orientation: .topDown,
+                        into: destination,
+                        destinationRect: .init(
+                            x: 0,
+                            y: 0,
+                            width: fixture.width,
+                            height: fixture.height
+                        ),
+                        clip: .init(
+                            x: 0,
+                            y: 0,
+                            width: fixture.width,
+                            height: fixture.height
+                        )
+                    )
+                    try expectBGRA(
+                        copyPixels(
+                            from: destination,
+                            width: fixture.width,
+                            height: fixture.height
+                        ),
+                        matches: expected,
+                        maximumColorDelta: 4
+                    )
+                } catch let error as SpiceMetalCompositorError {
+                    if case .unknown = frame.colorMatrix {
+                        // Metadata-free corpus frames must stay on CPU fallback.
+                    } else {
+                        Issue.record("known matrix unexpectedly rejected by Metal")
+                    }
+                    #expect(error == .unsupportedColorMatrix)
+                    #expect(error.fallback == .frame)
+                }
+            }
+
+            let decoded = try frame.copyBGRA()
+            #expect(try frame.copyBGRA() == decoded)
+            let materializedDiagnostics = await decoder.diagnosticsSnapshot()
+            #expect(materializedDiagnostics.cpuMaterializationCount == 1)
             await decoder.close()
 
             #expect(decoded.width == fixture.width, Comment(rawValue: fixture.generator))
             #expect(decoded.height == fixture.height, Comment(rawValue: fixture.generator))
             #expect(decoded.bytesPerRow == fixture.width * 4)
             try expectBGRA(decoded.pixelsBGRA, matches: expected, maximumColorDelta: 4)
+        }
+    }
+
+    private func makeCompositorIfSupported() throws -> SpiceMetalCompositor? {
+        do {
+            return try SpiceMetalCompositor()
+        } catch let error where error == .unsupportedDevice {
+            return nil
         }
     }
 
@@ -52,6 +121,45 @@ struct AdvancedVideoCorpusTests {
         )
         try expectBGRA(
             second.pixelsBGRA,
+            matches: try #require(Data(base64Encoded: baseline.expectedBGRABase64)),
+            maximumColorDelta: 4
+        )
+    }
+
+    @Test func retriesTheSameParameterSetAfterSessionCreationFailure() async throws {
+        let high = try loadFixture(named: "h264-high-128x128")
+        let baseline = try loadFixture(named: "h264-baseline-128x128")
+        let highPayload = try #require(Data(base64Encoded: high.annexBBase64))
+        let baselinePayload = try #require(Data(base64Encoded: baseline.annexBBase64))
+        let decoder = try SpiceVideoToolboxDecoder(
+            codec: .h264,
+            width: 128,
+            height: 128,
+            sessionCreationFailureForAttempt: { attempt in
+                attempt == 2 ? OSStatus(-1) : nil
+            }
+        )
+
+        _ = try #require(try await decoder.decode(
+            payload: highPayload,
+            multimediaTime: 10
+        ))
+        await #expect(throws: SpiceCodecError.self) {
+            _ = try await decoder.decode(
+                payload: baselinePayload,
+                multimediaTime: 20
+            )
+        }
+        let recovered = try #require(try await decoder.decode(
+            payload: baselinePayload,
+            multimediaTime: 30
+        ))
+        let diagnostics = await decoder.diagnosticsSnapshot()
+        await decoder.close()
+
+        #expect(diagnostics.sessionCreationCount == 2)
+        try expectBGRA(
+            recovered.pixelsBGRA,
             matches: try #require(Data(base64Encoded: baseline.expectedBGRABase64)),
             maximumColorDelta: 4
         )
@@ -91,6 +199,48 @@ struct AdvancedVideoCorpusTests {
         }
         #expect(largestDelta <= maximumColorDelta, "largest RGB delta was \(largestDelta)")
     }
+
+    private func makeBGRAIOSurface(width: Int, height: Int) throws -> IOSurfaceRef {
+        let properties: [CFString: Any] = [
+            kIOSurfaceWidth: width,
+            kIOSurfaceHeight: height,
+            kIOSurfaceBytesPerElement: 4,
+            kIOSurfacePixelFormat: kCVPixelFormatType_32BGRA,
+        ]
+        return try #require(IOSurfaceCreate(properties as CFDictionary))
+    }
+
+    private func copyPixels(
+        from surface: IOSurfaceRef,
+        width: Int,
+        height: Int
+    ) throws -> Data {
+        var seed: UInt32 = 0
+        guard IOSurfaceLock(surface, .readOnly, &seed) == 0 else {
+            throw CorpusError.ioSurfaceLock
+        }
+        defer { IOSurfaceUnlock(surface, .readOnly, &seed) }
+        let rowBytes = width * 4
+        let sourceStride = IOSurfaceGetBytesPerRow(surface)
+        let source = IOSurfaceGetBaseAddress(surface)
+        var pixels = Data(count: rowBytes * height)
+        pixels.withUnsafeMutableBytes { bytes in
+            guard let destination = bytes.baseAddress else {
+                return
+            }
+            for row in 0..<height {
+                destination.advanced(by: row * rowBytes).copyMemory(
+                    from: source.advanced(by: row * sourceStride),
+                    byteCount: rowBytes
+                )
+            }
+        }
+        return pixels
+    }
+}
+
+private enum CorpusError: Error {
+    case ioSurfaceLock
 }
 
 private struct AdvancedVideoFixture: Decodable {

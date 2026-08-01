@@ -35,7 +35,7 @@ struct RecordChannelTests {
 
         let outbound = await transport.outbound
         #expect(try outbound.map(messageID) == [102, 103, 101])
-        #expect(try messageBody(outbound[0]) == uint32(10) + uint32(1))
+        #expect(try messageBody(outbound[0]) == uint32(10) + uint16(1))
         #expect(try messageBody(outbound[1]) == uint32(10))
         #expect(try messageBody(outbound[2]) == uint32(11) + Data([1, 2, 3, 4]))
     }
@@ -145,6 +145,12 @@ struct RecordChannelTests {
     private func uint32(_ value: UInt32) -> Data {
         var writer = ByteWriter()
         writer.writeUInt32LE(value)
+        return writer.data
+    }
+
+    private func uint16(_ value: UInt16) -> Data {
+        var writer = ByteWriter()
+        writer.writeUInt16LE(value)
         return writer.data
     }
 }

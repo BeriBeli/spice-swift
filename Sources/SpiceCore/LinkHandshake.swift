@@ -43,7 +43,12 @@ package struct LinkRequest: Sendable, Equatable {
         return request
     }
 
-    package static func channel(connectionID: UInt32, key: ChannelKey) -> Self {
+    package static func channel(
+        connectionID: UInt32,
+        key: ChannelKey,
+        advertisesH264: Bool = false,
+        advertisesH265: Bool = false
+    ) -> Self {
         var common = CapabilitySet<CommonCapability>()
         common.insert(.protocolAuthSelection)
         common.insert(.authSpice)
@@ -61,6 +66,12 @@ package struct LinkRequest: Sendable, Equatable {
             display.insert(.monitorsConfig)
             display.insert(.multiCodec)
             display.insert(.codecMJPEG)
+            if advertisesH264 {
+                display.insert(.codecH264)
+            }
+            if advertisesH265 {
+                display.insert(.codecH265)
+            }
             channelCapabilities = display.wireWords
         } else if key.type == 5 {
             var playback = CapabilitySet<PlaybackCapability>()

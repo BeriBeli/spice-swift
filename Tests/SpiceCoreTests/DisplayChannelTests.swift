@@ -4,6 +4,7 @@ import SpiceTestSupport
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
+@testable import SpiceMetalCompositor
 @testable import SpiceProtocol
 @testable import SpiceRenderer
 @testable import SpiceWire
@@ -223,6 +224,42 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1) == snapshot)
     }
 
+    @Test func streamCreationUsesSurfaceMetadataWithoutSnapshottingPixels() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 4,
+                height: 4,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 4, right: 4),
+                clipRectangles: nil
+            )),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+
+        #expect(try await channel.processNext() == .surfaceCreated(1))
+        #expect(try await channel.processNext() == .ignored(122))
+        #expect(await store.metrics().snapshots == 0)
+    }
+
     @Test func routesH264ThroughInjectedDecoderWithoutAdvertisingCapability() async throws {
         let decoder = StubAdvancedVideoDecoder(image: SpiceDecodedImage(
             width: 2,
@@ -279,6 +316,91 @@ struct DisplayChannelTests {
         #expect(await decoder.receivedPayloads == [Data([0, 0, 1, 0x65])])
         #expect(try await channel.processNext() == .ignored(125))
         #expect(await decoder.closeCount == 1)
+        let diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.advancedVideo.decodedFrameCount == 1)
+        #expect(diagnostics.advancedCPUFallbackFrames == 1)
+        #expect(diagnostics.surfaces.nativeVideoFallbacks == 1)
+    }
+
+    @Test func commandFailureDisablesMetalUntilTheNextStreamGeneration() async throws {
+        let decoder = StubAdvancedVideoDecoder(image: SpiceDecodedImage(
+            width: 2,
+            height: 2,
+            bytesPerRow: 8,
+            pixelsBGRA: Data(repeating: 0x7f, count: 16)
+        ))
+        let streamCreate = encodeMini(id: 122, body: streamCreateBody(
+            streamID: 9,
+            codec: 3,
+            streamWidth: 2,
+            streamHeight: 2,
+            sourceWidth: 2,
+            sourceHeight: 2,
+            destination: (top: 0, left: 0, bottom: 2, right: 2),
+            clipRectangles: nil
+        ))
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            streamCreate,
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 9,
+                multimediaTime: 42,
+                data: Data([1])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 9,
+                multimediaTime: 43,
+                data: Data([2])
+            )),
+            encodeMini(id: 125, body: streamDestroyBody(streamID: 9)),
+            streamCreate,
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 9,
+                multimediaTime: 44,
+                data: Data([3])
+            )),
+            encodeMini(id: 125, body: streamDestroyBody(streamID: 9)),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let store = SurfaceStore(compositorFailureForAttempt: { attempt in
+            attempt == 1 ? .commandExecutionFailed("injected command failure") : nil
+        })
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store,
+            advancedVideoDecoderFactory: StubAdvancedVideoDecoderFactory(decoder: decoder)
+        )
+
+        #expect(try await channel.processNext() == .surfaceCreated(1))
+        #expect(try await channel.processNext() == .ignored(122))
+        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == .frameChanged(1))
+        #expect(try await channel.processNext() == .ignored(125))
+        #expect(try await channel.processNext() == .ignored(122))
+        #expect(try await channel.processNext() == .frameChanged(1))
+
+        let diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.advancedCPUFallbackFrames == 3)
+        #expect(diagnostics.metalGenerationDisableCount == 1)
+        #expect(
+            diagnostics.firstMetalGenerationDisableReason?
+                .contains("injected command failure") == true
+        )
+        #expect(diagnostics.surfaces.nativeVideoFallbacks == 2)
+        #expect(diagnostics.surfaces.compositorErrors == 1)
+        #expect(await decoder.receivedPayloads == [Data([1]), Data([2]), Data([3])])
+        #expect(try await channel.processNext() == .ignored(125))
     }
 
     @Test func submitsLateInterFrameVideoWithoutCommittingDecodedPixels() async throws {
@@ -2124,6 +2246,12 @@ private actor StubAdvancedVideoDecoder: SpiceAdvancedVideoDecoder {
 
     func close() async {
         closeCount += 1
+    }
+
+    func diagnosticsSnapshot() async -> SpiceAdvancedVideoDecoderDiagnostics {
+        SpiceAdvancedVideoDecoderDiagnostics(
+            decodedFrameCount: UInt64(receivedPayloads.count)
+        )
     }
 }
 

@@ -394,21 +394,42 @@ public actor SpiceWebDAVServer {
     }
 
     private func propertyResponse(_ url: URL) throws -> String {
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        let resolvedURL = url.standardizedFileURL.resolvingSymlinksInPath()
+        guard contains(resolvedURL) else {
+            throw SpiceWebDAVServerError.pathEscapesRoot
+        }
+        let attributes = try fileManager.attributesOfItem(atPath: resolvedURL.path)
         let directory = attributes[.type] as? FileAttributeType == .typeDirectory
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        let relative = url.path == root.path
+        let modificationDate = attributes[.modificationDate] as? Date
+            ?? Date(timeIntervalSince1970: 0)
+        let modificationSeconds = Int64(modificationDate.timeIntervalSince1970)
+        let etag = "\"\(String(size, radix: 16))-\(String(modificationSeconds, radix: 16))\""
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        let lastModified = dateFormatter.string(from: modificationDate)
+        let relative = resolvedURL.path == root.path
             ? "/"
-            : "/" + url.path.dropFirst(root.path.count + 1)
-        let href = xmlEscape(String(relative).addingPercentEncoding(
+            : "/" + resolvedURL.path.dropFirst(root.path.count + 1)
+        var href = String(relative).addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
-        ) ?? String(relative)) + (directory ? "/" : "")
-        let displayName = xmlEscape(url == root ? root.lastPathComponent : url.lastPathComponent)
+        ) ?? String(relative)
+        if directory, href != "/", !href.hasSuffix("/") {
+            href += "/"
+        }
+        href = xmlEscape(href)
+        let displayName = xmlEscape(
+            resolvedURL.path == root.path ? "/" : resolvedURL.lastPathComponent
+        )
         let resourceType = directory ? "<D:collection/>" : ""
         return "<D:response><D:href>\(href)</D:href><D:propstat><D:prop>" +
             "<D:displayname>\(displayName)</D:displayname>" +
             "<D:resourcetype>\(resourceType)</D:resourcetype>" +
             "<D:getcontentlength>\(size)</D:getcontentlength>" +
+            "<D:getetag>\(xmlEscape(etag))</D:getetag>" +
+            "<D:getlastmodified>\(xmlEscape(lastModified))</D:getlastmodified>" +
             "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
     }
 

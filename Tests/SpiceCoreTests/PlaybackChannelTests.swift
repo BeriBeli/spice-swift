@@ -37,7 +37,8 @@ struct PlaybackChannelTests {
         #expect(try await channel.processNext() == .started(SpicePlaybackStart(
             channels: 2,
             format: .s16,
-            frequency: 48_000
+            frequency: 48_000,
+            multimediaTime: 100
         )))
         #expect(try await channel.processNext() == .packet(SpicePlaybackPacket(
             multimediaTime: 120,
@@ -140,10 +141,10 @@ struct PlaybackChannelTests {
         return writer.data
     }
 
-    private func modeBody(time: UInt32, mode: UInt32) -> Data {
+    private func modeBody(time: UInt32, mode: UInt16) -> Data {
         var writer = ByteWriter()
         writer.writeUInt32LE(time)
-        writer.writeUInt32LE(mode)
+        writer.writeUInt16LE(mode)
         return writer.data
     }
 
@@ -152,6 +153,7 @@ struct PlaybackChannelTests {
         writer.writeUInt32LE(channels)
         writer.writeUInt16LE(format)
         writer.writeUInt32LE(frequency)
+        writer.writeUInt32LE(100)
         return writer.data
     }
 

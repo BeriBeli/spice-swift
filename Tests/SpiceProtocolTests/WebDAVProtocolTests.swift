@@ -9,8 +9,9 @@ struct WebDAVProtocolTests {
         var body = ByteWriter()
         let name = Data("org.spice-space.webdav.0\0".utf8)
         body.writeUInt32LE(UInt32(name.count))
-        body.writeBytes(name)
+        body.writeUInt32LE(9)
         body.writeUInt8(1)
+        body.writeBytes(name)
         #expect(try SpicePortWireCodec().decodeInitialization(body.data) ==
             SpicePortInitialization(name: "org.spice-space.webdav.0", opened: true))
         #expect(try SpicePortWireCodec().decodeEvent(Data([0])) == .opened)
@@ -19,8 +20,16 @@ struct WebDAVProtocolTests {
 
         #expect(throws: WireError.invalidEnum(type: "SpicePortOpened", value: 2)) {
             var invalid = body.data
-            invalid[invalid.count - 1] = 2
+            invalid[8] = 2
             _ = try SpicePortWireCodec().decodeInitialization(invalid)
+        }
+        #expect(throws: WireError.invalidOffset(8)) {
+            var invalid = body.data
+            invalid[4] = 8
+            _ = try SpicePortWireCodec().decodeInitialization(invalid)
+        }
+        #expect(throws: WireError.trailingBytes(1)) {
+            _ = try SpicePortWireCodec().decodeInitialization(body.data + Data([0]))
         }
         #expect(throws: WireError.trailingBytes(1)) {
             _ = try SpicePortWireCodec().decodeEvent(Data([0, 1]))

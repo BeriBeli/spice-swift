@@ -28,7 +28,7 @@ struct RecordProtocolTests {
 
     @Test func encodesRawModeStartMarkAndDataExactly() throws {
         let codec = SpiceRecordWireCodec()
-        #expect(try codec.encodeMode(timestamp: 10) == uint32(10) + uint32(1))
+        #expect(try codec.encodeMode(timestamp: 10) == uint32(10) + uint16(1))
         #expect(codec.encodeStartMark(timestamp: 11) == uint32(11))
         #expect(try codec.encodeData(
             timestamp: 12,
@@ -89,6 +89,12 @@ struct RecordProtocolTests {
     private func uint32(_ value: UInt32) -> Data {
         var writer = ByteWriter()
         writer.writeUInt32LE(value)
+        return writer.data
+    }
+
+    private func uint16(_ value: UInt16) -> Data {
+        var writer = ByteWriter()
+        writer.writeUInt16LE(value)
         return writer.data
     }
 }

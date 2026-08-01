@@ -8,7 +8,7 @@ import Testing
 @MainActor
 struct SpiceMetalPresenterTests {
     @Test func mapsAndBlitsIOSurfaceWithoutChangingPixels() async throws {
-        let store = SurfaceStore()
+        let store = SurfaceStore(backingPolicy: .dataOnly)
         try await store.create(id: 12, width: 2, height: 1, format: 32)
         try await store.fill(
             surfaceID: 12,

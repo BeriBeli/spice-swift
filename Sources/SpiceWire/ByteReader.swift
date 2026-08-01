@@ -23,8 +23,7 @@ package struct ByteReader: Sendable {
     }
 
     package mutating func readUInt16LE() throws(WireError) -> UInt16 {
-        let bytes = try readIntegerBytes(count: 2)
-        return UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
+        try readInteger(UInt16.self)
     }
 
     package mutating func readInt16LE() throws(WireError) -> Int16 {
@@ -32,11 +31,7 @@ package struct ByteReader: Sendable {
     }
 
     package mutating func readUInt32LE() throws(WireError) -> UInt32 {
-        let bytes = try readIntegerBytes(count: 4)
-        return UInt32(bytes[0])
-            | (UInt32(bytes[1]) << 8)
-            | (UInt32(bytes[2]) << 16)
-            | (UInt32(bytes[3]) << 24)
+        try readInteger(UInt32.self)
     }
 
     package mutating func readInt32LE() throws(WireError) -> Int32 {
@@ -44,12 +39,7 @@ package struct ByteReader: Sendable {
     }
 
     package mutating func readUInt64LE() throws(WireError) -> UInt64 {
-        let bytes = try readIntegerBytes(count: 8)
-        var value: UInt64 = 0
-        for (index, byte) in bytes.enumerated() {
-            value |= UInt64(byte) << UInt64(index * 8)
-        }
-        return value
+        try readInteger(UInt64.self)
     }
 
     package mutating func readBytes(count: Int) throws(WireError) -> Data {
@@ -76,11 +66,16 @@ package struct ByteReader: Sendable {
         }
     }
 
-    private mutating func readIntegerBytes(count: Int) throws(WireError) -> [UInt8] {
+    private mutating func readInteger<T: FixedWidthInteger>(
+        _ type: T.Type
+    ) throws(WireError) -> T {
+        let count = MemoryLayout<T>.size
         try require(count)
-        let start = offset
+        let value = data.withUnsafeBytes {
+            $0.loadUnaligned(fromByteOffset: offset, as: type)
+        }
         offset += count
-        return (0..<count).map { data[data.startIndex + start + $0] }
+        return T(littleEndian: value)
     }
 
     private func require(_ count: Int) throws(WireError) {

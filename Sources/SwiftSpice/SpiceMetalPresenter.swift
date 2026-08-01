@@ -2,18 +2,47 @@ import CoreVideo
 import Metal
 import MetalKit
 import OSLog
+import SpiceIOSurface
+import Synchronization
 
 private let spiceRenderingLogger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "org.swiftspice.SwiftSpice",
     category: "Rendering"
 )
 
+package struct SpiceMetalPresenterMetrics: Sendable, Equatable {
+    package let commandErrors: UInt64
+}
+
+private final class SpiceMetalPresenterCompletionMetrics: Sendable {
+    private struct State: Sendable {
+        var commandErrors: UInt64 = 0
+        var loggedFirstCommandError = false
+    }
+
+    private let state = Mutex(State())
+
+    func recordCommandError() -> Bool {
+        state.withLock { state in
+            state.commandErrors &+= 1
+            guard !state.loggedFirstCommandError else { return false }
+            state.loggedFirstCommandError = true
+            return true
+        }
+    }
+
+    func snapshot() -> SpiceMetalPresenterMetrics {
+        state.withLock { SpiceMetalPresenterMetrics(commandErrors: $0.commandErrors) }
+    }
+}
+
 @MainActor
 package final class SpiceMetalPresenter {
     package let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
+    private let completionMetrics = SpiceMetalPresenterCompletionMetrics()
 
-    package init?(device: (any MTLDevice)? = MTLCreateSystemDefaultDevice()) {
+    package init?(device: (any MTLDevice)? = SpiceMetalSystemDevice.shared.device) {
         guard let device, let commandQueue = device.makeCommandQueue() else {
             return nil
         }
@@ -40,6 +69,10 @@ package final class SpiceMetalPresenter {
         return ioSurface.backing.withIOSurface { surface in
             device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0)
         }
+    }
+
+    package nonisolated func metrics() -> SpiceMetalPresenterMetrics {
+        completionMetrics.snapshot()
     }
 
     /// The returned command buffer retains the frame lease until GPU completion,
@@ -70,8 +103,8 @@ package final class SpiceMetalPresenter {
             destinationOrigin: .init(x: 0, y: 0, z: 0)
         )
         blit.endEncoding()
-        commandBuffer.addCompletedHandler { commandBuffer in
-            if commandBuffer.status == .error {
+        commandBuffer.addCompletedHandler { [completionMetrics] commandBuffer in
+            if commandBuffer.status == .error, completionMetrics.recordCommandError() {
                 spiceRenderingLogger.error(
                     "Metal frame copy failed: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public)"
                 )

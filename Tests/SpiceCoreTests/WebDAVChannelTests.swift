@@ -71,8 +71,9 @@ struct WebDAVChannelTests {
         let name = Data("org.spice-space.webdav.0\0".utf8)
         var writer = ByteWriter()
         writer.writeUInt32LE(UInt32(name.count))
-        writer.writeBytes(name)
+        writer.writeUInt32LE(9)
         writer.writeUInt8(opened ? 1 : 0)
+        writer.writeBytes(name)
         return writer.data
     }
 

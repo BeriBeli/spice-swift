@@ -28,24 +28,33 @@ package struct SpicePortWireCodec: Sendable {
     package func decodeInitialization(_ body: Data) throws(WireError) -> SpicePortInitialization {
         var reader = try ByteReader(body)
         let rawSize = try reader.readUInt32LE()
+        let rawNameOffset = try reader.readUInt32LE()
+        let rawOpened = try reader.readUInt8()
+        let fixedEnd = reader.offset
         guard let size = Int(exactly: rawSize) else { throw .integerOverflow }
         guard size >= 2, size <= maximumNameBytes else {
             throw size > maximumNameBytes
                 ? .messageTooLarge(actual: size, maximum: maximumNameBytes)
                 : .invalidSize(size)
         }
-        let bytes = try reader.readBytes(count: size)
+        guard let nameOffset = Int(exactly: rawNameOffset) else {
+            throw .integerOverflow
+        }
+        guard nameOffset == fixedEnd else {
+            throw .invalidOffset(UInt64(rawNameOffset))
+        }
+        var nameReader = try ByteReader(body, offset: nameOffset)
+        let bytes = try nameReader.readBytes(count: size)
         guard bytes.last == 0,
               !bytes.dropLast().contains(0),
               let name = String(data: bytes.dropLast(), encoding: .utf8),
               !name.isEmpty else {
             throw .unsupportedFeature("invalid SPICE port name")
         }
-        let rawOpened = try reader.readUInt8()
         guard rawOpened <= 1 else {
             throw .invalidEnum(type: "SpicePortOpened", value: UInt64(rawOpened))
         }
-        try reader.requireFullyConsumed()
+        try nameReader.requireFullyConsumed()
         return SpicePortInitialization(name: name, opened: rawOpened == 1)
     }
 

@@ -38,53 +38,89 @@ private final class SurfaceEntry: @unchecked Sendable {
     let surface: IOSurfaceRef
     let bytesPerRow: Int
     let allocationSize: Int
+    private let allocationBudget: IOSurfaceAllocationBudget
 
-    init(key: FrameKey, surface: IOSurfaceRef) {
+    init(
+        key: FrameKey,
+        surface: IOSurfaceRef,
+        allocationBudget: IOSurfaceAllocationBudget
+    ) {
         self.key = key
         self.surface = surface
         self.bytesPerRow = IOSurfaceGetBytesPerRow(surface)
         self.allocationSize = IOSurfaceGetAllocSize(surface)
+        self.allocationBudget = allocationBudget
+    }
+
+    deinit {
+        allocationBudget.release(allocationSize)
     }
 }
 
 package final class IOSurfaceFrame: @unchecked Sendable {
-    private let entry: SurfaceEntry
-    private let pool: IOSurfaceFramePool
+    private let surface: IOSurfaceRef
+    private let frameWidth: Int
+    private let frameHeight: Int
+    private let frameBytesPerRow: Int
+    private let framePixelFormat: OSType
+    private let release: @Sendable () -> Void
 
-    package var id: UInt32 { IOSurfaceGetID(entry.surface) }
-    package var width: Int { entry.key.width }
-    package var height: Int { entry.key.height }
-    package var bytesPerRow: Int { entry.bytesPerRow }
-    package var pixelFormat: OSType { entry.key.pixelFormat }
+    package var id: UInt32 { IOSurfaceGetID(surface) }
+    package var width: Int { frameWidth }
+    package var height: Int { frameHeight }
+    package var bytesPerRow: Int { frameBytesPerRow }
+    package var pixelFormat: OSType { framePixelFormat }
 
     fileprivate init(entry: SurfaceEntry, pool: IOSurfaceFramePool) {
-        self.entry = entry
-        self.pool = pool
+        surface = entry.surface
+        frameWidth = entry.key.width
+        frameHeight = entry.key.height
+        frameBytesPerRow = entry.bytesPerRow
+        framePixelFormat = entry.key.pixelFormat
+        release = { [entry, weak pool] in
+            pool?.recycle(entry)
+        }
+    }
+
+    package init(
+        surface: IOSurfaceRef,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        pixelFormat: OSType,
+        release: @escaping @Sendable () -> Void
+    ) {
+        self.surface = surface
+        frameWidth = width
+        frameHeight = height
+        frameBytesPerRow = bytesPerRow
+        framePixelFormat = pixelFormat
+        self.release = release
     }
 
     deinit {
-        pool.recycle(entry)
+        release()
     }
 
     /// Copies the committed IOSurface contents for validation and CPU clients.
     /// Presentation code should consume the package-owned handle directly.
     package func copyPixels() -> Data? {
         var seed: UInt32 = 0
-        guard IOSurfaceLock(entry.surface, .readOnly, &seed) == 0 else {
+        guard IOSurfaceLock(surface, .readOnly, &seed) == 0 else {
             return nil
         }
-        defer { IOSurfaceUnlock(entry.surface, .readOnly, &seed) }
-        let baseAddress = IOSurfaceGetBaseAddress(entry.surface)
+        defer { IOSurfaceUnlock(surface, .readOnly, &seed) }
+        let baseAddress = IOSurfaceGetBaseAddress(surface)
 
-        let rowBytes = entry.key.width * 4
-        var pixels = Data(count: rowBytes * entry.key.height)
+        let rowBytes = frameWidth * 4
+        var pixels = Data(count: rowBytes * frameHeight)
         pixels.withUnsafeMutableBytes { destination in
             guard let destinationBase = destination.baseAddress else {
                 return
             }
-            for row in 0..<entry.key.height {
+            for row in 0..<frameHeight {
                 destinationBase.advanced(by: row * rowBytes).copyMemory(
-                    from: baseAddress.advanced(by: row * entry.bytesPerRow),
+                    from: baseAddress.advanced(by: row * frameBytesPerRow),
                     byteCount: rowBytes
                 )
             }
@@ -95,11 +131,16 @@ package final class IOSurfaceFrame: @unchecked Sendable {
     package func withIOSurface<Result, Failure: Error>(
         _ body: (IOSurfaceRef) throws(Failure) -> Result
     ) throws(Failure) -> Result {
-        try body(entry.surface)
+        try body(surface)
     }
 }
 
 package final class IOSurfaceFramePool: Sendable {
+    package static let shared = IOSurfaceFramePool(
+        limits: .init(),
+        allocationBudget: .shared
+    )
+
     private struct State {
         var available: [FrameKey: [SurfaceEntry]] = [:]
         var allocatedFrames = 0
@@ -108,10 +149,20 @@ package final class IOSurfaceFramePool: Sendable {
     }
 
     private let limits: IOSurfaceFramePoolLimits
+    private let allocationBudget: IOSurfaceAllocationBudget
     private let state = Mutex(State())
 
     package init(limits: IOSurfaceFramePoolLimits = .init()) {
         self.limits = limits
+        allocationBudget = IOSurfaceAllocationBudget(maximumBytes: limits.maximumBytes)
+    }
+
+    private init(
+        limits: IOSurfaceFramePoolLimits,
+        allocationBudget: IOSurfaceAllocationBudget
+    ) {
+        self.limits = limits
+        self.allocationBudget = allocationBudget
     }
 
     package func makeFrame(
@@ -167,6 +218,22 @@ package final class IOSurfaceFramePool: Sendable {
         }
     }
 
+    /// Releases cached fallback frames so the process-shared revisioned pool
+    /// can reclaim the common IOSurface budget under pressure. In-use leases
+    /// remain immutable and are never revoked.
+    package func purgeAvailable() {
+        var discarded: [SurfaceEntry] = state.withLock { state in
+            let entries = state.available.values.flatMap { $0 }
+            state.available.removeAll(keepingCapacity: false)
+            state.allocatedFrames -= entries.count
+            state.allocatedBytes -= entries.reduce(0) { $0 + $1.allocationSize }
+            return entries
+        }
+        // Drop entries after releasing the pool lock. Their deinitializers
+        // acquire the process-wide allocation-budget lock.
+        discarded.removeAll(keepingCapacity: false)
+    }
+
     private func checkout(key: FrameKey, minimumByteCount: Int) -> SurfaceEntry? {
         state.withLock { state in
             if var entries = state.available[key], let entry = entries.popLast() {
@@ -195,15 +262,22 @@ package final class IOSurfaceFramePool: Sendable {
             guard let surface = IOSurfaceCreate(properties as CFDictionary) else {
                 return nil
             }
-            let entry = SurfaceEntry(key: key, surface: surface)
-            let (coveredBytes, coveredBytesOverflow) = entry.bytesPerRow
+            let bytesPerRow = IOSurfaceGetBytesPerRow(surface)
+            let allocationSize = IOSurfaceGetAllocSize(surface)
+            let (coveredBytes, coveredBytesOverflow) = bytesPerRow
                 .multipliedReportingOverflow(by: key.height)
-            guard entry.bytesPerRow >= key.width * 4,
+            guard bytesPerRow >= key.width * 4,
                   !coveredBytesOverflow,
-                  coveredBytes <= entry.allocationSize
+                  coveredBytes <= allocationSize,
+                  allocationBudget.reserve(allocationSize)
             else {
                 return nil
             }
+            let entry = SurfaceEntry(
+                key: key,
+                surface: surface,
+                allocationBudget: allocationBudget
+            )
             while state.allocatedFrames >= limits.maximumFrames
                 || !fitsWithinByteLimit(
                     current: state.allocatedBytes,
@@ -251,16 +325,23 @@ package final class IOSurfaceFramePool: Sendable {
         defer { IOSurfaceUnlock(entry.surface, [], &seed) }
         let destination = IOSurfaceGetBaseAddress(entry.surface)
 
-        destination.initializeMemory(
-            as: UInt8.self,
-            repeating: 0,
-            count: entry.bytesPerRow * entry.key.height
-        )
         let rowBytes = entry.key.width * 4
         pixels.withUnsafeBytes { source in
             guard let sourceBase = source.baseAddress else {
                 return
             }
+            if sourceBytesPerRow == rowBytes, entry.bytesPerRow == rowBytes {
+                destination.copyMemory(
+                    from: sourceBase,
+                    byteCount: rowBytes * entry.key.height
+                )
+                return
+            }
+            destination.initializeMemory(
+                as: UInt8.self,
+                repeating: 0,
+                count: entry.bytesPerRow * entry.key.height
+            )
             for row in 0..<entry.key.height {
                 destination.advanced(by: row * entry.bytesPerRow).copyMemory(
                     from: sourceBase.advanced(by: row * sourceBytesPerRow),

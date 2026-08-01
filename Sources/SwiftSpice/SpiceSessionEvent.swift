@@ -36,15 +36,22 @@ public struct SpiceFrame: Sendable, Equatable {
     public let width: Int
     public let height: Int
     public let bytesPerRow: Int
-    public let pixels: Data
+    private let pixelStorage: FramePixelStorage
     public let ioSurface: SpiceIOSurfaceFrame?
+
+    /// Copies IOSurface-backed frames only when a CPU consumer requests pixels.
+    /// Metal presentation can retain and present the IOSurface without creating
+    /// a second full-frame Data snapshot.
+    public var pixels: Data {
+        pixelStorage.pixels()
+    }
 
     package init(_ snapshot: FrameSnapshot) {
         surfaceID = snapshot.surfaceID
         width = snapshot.width
         height = snapshot.height
         bytesPerRow = snapshot.bytesPerRow
-        pixels = snapshot.pixels
+        pixelStorage = snapshot.pixelStorage
         ioSurface = snapshot.ioSurfaceFrame.map(SpiceIOSurfaceFrame.init)
     }
 
@@ -59,7 +66,7 @@ public struct SpiceFrame: Sendable, Equatable {
         self.width = width
         self.height = height
         self.bytesPerRow = bytesPerRow
-        self.pixels = pixels
+        pixelStorage = FramePixelStorage(pixels: pixels, ioSurfaceFrame: nil)
         self.ioSurface = nil
     }
 

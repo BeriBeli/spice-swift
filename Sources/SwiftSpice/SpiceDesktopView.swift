@@ -359,11 +359,12 @@ private enum SpiceFrameDrawing {
         let (expectedBytes, sizeOverflow) = frame.bytesPerRow.multipliedReportingOverflow(
             by: frame.height
         )
+        let pixels = frame.pixels
         guard frame.width > 0, frame.height > 0,
               !rowOverflow, !sizeOverflow,
               frame.bytesPerRow >= minimumBytesPerRow,
-              frame.pixels.count == expectedBytes,
-              let provider = CGDataProvider(data: frame.pixels as CFData)
+              pixels.count == expectedBytes,
+              let provider = CGDataProvider(data: pixels as CFData)
         else {
             return nil
         }

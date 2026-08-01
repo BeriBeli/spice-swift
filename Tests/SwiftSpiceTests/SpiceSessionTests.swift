@@ -37,8 +37,9 @@ struct SpiceSessionTests {
         let portName = Data("org.spice-space.webdav.0\0".utf8)
         var initialization = ByteWriter()
         initialization.writeUInt32LE(UInt32(portName.count))
-        initialization.writeBytes(portName)
+        initialization.writeUInt32LE(9)
         initialization.writeUInt8(1)
+        initialization.writeBytes(portName)
         await webDAV.enqueue(encodeMini(id: 201, body: initialization.data))
         let request = Data("GET /file.txt HTTP/1.1\r\nHost: fixture.invalid\r\n\r\n".utf8)
         await webDAV.enqueue(encodeMini(
@@ -77,8 +78,9 @@ struct SpiceSessionTests {
         let portName = Data("org.spice-space.webdav.0\0".utf8)
         var initialization = ByteWriter()
         initialization.writeUInt32LE(UInt32(portName.count))
-        initialization.writeBytes(portName)
+        initialization.writeUInt32LE(9)
         initialization.writeUInt8(1)
+        initialization.writeBytes(portName)
         await webDAV.enqueue(encodeMini(id: 201, body: initialization.data))
         #expect(await events.next() == .initialized(
             name: "org.spice-space.webdav.0",
@@ -253,7 +255,8 @@ struct SpiceSessionTests {
         #expect(SpiceSession.playbackEvent(.started(SpiceProtocol.SpicePlaybackStart(
             channels: 2,
             format: .s16,
-            frequency: 48_000
+            frequency: 48_000,
+            multimediaTime: 10
         ))) == .started(SpicePlaybackConfiguration(
             channels: 2,
             format: .signed16LittleEndian,
@@ -1035,12 +1038,14 @@ struct SpiceSessionTests {
             current: SpiceEndpoint(
                 host: "source",
                 port: 5_901,
-                tlsPolicy: .insecureForTestingOnly
+                tlsPolicy: .insecureForTestingOnly,
+                videoCodecPolicy: .h264AndMJPEG
             )
         ) == SpiceEndpoint(
             host: "target.example",
             port: 5_901,
-            tlsPolicy: .insecureForTestingOnly
+            tlsPolicy: .insecureForTestingOnly,
+            videoCodecPolicy: .h264AndMJPEG
         ))
 
         #expect(try SpiceSession.selectMigrationEndpoint(

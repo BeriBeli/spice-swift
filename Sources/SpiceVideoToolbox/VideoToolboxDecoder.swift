@@ -4,16 +4,219 @@ import Foundation
 import SpiceCodecs
 import VideoToolbox
 
+package enum SpiceVideoToolboxHardwareDecoderState: Sendable, Equatable {
+    case notCreated
+    case hardware
+    case software
+    case queryFailed(OSStatus)
+}
+
+package struct SpiceVideoToolboxDiagnostics: Sendable, Equatable {
+    package let sessionCreationCount: UInt64
+    package let hardwareSessionCount: UInt64
+    package let softwareSessionCount: UInt64
+    package let hardwareQueryFailureCount: UInt64
+    package let decodedFrameCount: UInt64
+    package let droppedFrameCount: UInt64
+    package let cpuMaterializationCount: UInt64
+    package let currentHardwareDecoderState: SpiceVideoToolboxHardwareDecoderState
+}
+
+private final class VideoToolboxDiagnosticsCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessionCreationCount: UInt64 = 0
+    private var hardwareSessionCount: UInt64 = 0
+    private var softwareSessionCount: UInt64 = 0
+    private var hardwareQueryFailureCount: UInt64 = 0
+    private var decodedFrameCount: UInt64 = 0
+    private var droppedFrameCount: UInt64 = 0
+    private var cpuMaterializationCount: UInt64 = 0
+    private var currentHardwareDecoderState: SpiceVideoToolboxHardwareDecoderState = .notCreated
+
+    func recordSession(state: SpiceVideoToolboxHardwareDecoderState) {
+        lock.lock()
+        defer { lock.unlock() }
+        sessionCreationCount &+= 1
+        currentHardwareDecoderState = state
+        switch state {
+        case .hardware:
+            hardwareSessionCount &+= 1
+        case .software:
+            softwareSessionCount &+= 1
+        case .queryFailed:
+            hardwareQueryFailureCount &+= 1
+        case .notCreated:
+            break
+        }
+    }
+
+    func recordDecodedFrame() {
+        lock.lock()
+        decodedFrameCount &+= 1
+        lock.unlock()
+    }
+
+    func recordDroppedFrame() {
+        lock.lock()
+        droppedFrameCount &+= 1
+        lock.unlock()
+    }
+
+    func recordCPUMaterialization() {
+        lock.lock()
+        cpuMaterializationCount &+= 1
+        lock.unlock()
+    }
+
+    func snapshot() -> SpiceVideoToolboxDiagnostics {
+        lock.lock()
+        defer { lock.unlock() }
+        return SpiceVideoToolboxDiagnostics(
+            sessionCreationCount: sessionCreationCount,
+            hardwareSessionCount: hardwareSessionCount,
+            softwareSessionCount: softwareSessionCount,
+            hardwareQueryFailureCount: hardwareQueryFailureCount,
+            decodedFrameCount: decodedFrameCount,
+            droppedFrameCount: droppedFrameCount,
+            cpuMaterializationCount: cpuMaterializationCount,
+            currentHardwareDecoderState: currentHardwareDecoderState
+        )
+    }
+}
+
+/// VideoToolbox's immutable decoded image. The CoreVideo handle is package-only
+/// and is retained until all consumers (including Metal command buffers) finish.
+package final class SpiceVideoToolboxFrame: SpiceDecodedVideoFrame, @unchecked Sendable {
+    package let width: Int
+    package let height: Int
+    package let pixelFormat: SpiceDecodedVideoPixelFormat
+    package let colorMatrix: SpiceVideoColorMatrix
+    package let colorRange: SpiceVideoColorRange
+    package let pixelBuffer: CVPixelBuffer
+
+    private let maximumDecodedBytes: Int
+    private let diagnostics: VideoToolboxDiagnosticsCounter?
+    private let materializationLock = NSLock()
+    private var materializedBGRA: Result<SpiceDecodedImage, SpiceCodecError>?
+
+    package convenience init(
+        pixelBuffer: CVPixelBuffer,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        maximumDecodedBytes: Int
+    ) throws(SpiceCodecError) {
+        try self.init(
+            pixelBuffer: pixelBuffer,
+            expectedWidth: expectedWidth,
+            expectedHeight: expectedHeight,
+            maximumDecodedBytes: maximumDecodedBytes,
+            diagnostics: nil
+        )
+    }
+
+    fileprivate init(
+        pixelBuffer: CVPixelBuffer,
+        expectedWidth: Int,
+        expectedHeight: Int,
+        maximumDecodedBytes: Int,
+        diagnostics: VideoToolboxDiagnosticsCounter?
+    ) throws(SpiceCodecError) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width == expectedWidth, height == expectedHeight else {
+            throw .dimensionMismatch(
+                expectedWidth: expectedWidth,
+                expectedHeight: expectedHeight,
+                actualWidth: width,
+                actualHeight: height
+            )
+        }
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (decodedBytes, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        guard !pixelOverflow, !byteOverflow else {
+            throw .integerOverflow
+        }
+        guard decodedBytes <= maximumDecodedBytes else {
+            throw .decodedImageTooLarge(actual: decodedBytes, maximum: maximumDecodedBytes)
+        }
+
+        let cvPixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        switch cvPixelFormat {
+        case kCVPixelFormatType_32BGRA:
+            self.pixelFormat = .bgra8
+            self.colorRange = .full
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            self.pixelFormat = .nv12
+            self.colorRange = .video
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            self.pixelFormat = .nv12
+            self.colorRange = .full
+        default:
+            self.pixelFormat = .unsupported(cvPixelFormat)
+            self.colorRange = .unknown
+        }
+
+        self.width = width
+        self.height = height
+        self.colorMatrix = Self.readColorMatrix(from: pixelBuffer)
+        self.pixelBuffer = pixelBuffer
+        self.maximumDecodedBytes = maximumDecodedBytes
+        self.diagnostics = diagnostics
+    }
+
+    package func copyBGRA() throws(SpiceCodecError) -> SpiceDecodedImage {
+        materializationLock.lock()
+        defer { materializationLock.unlock() }
+        if let materializedBGRA {
+            return try materializedBGRA.get()
+        }
+
+        diagnostics?.recordCPUMaterialization()
+        let result = SpiceVideoToolboxDecoder.copyDecodedPixels(
+            from: pixelBuffer,
+            expectedWidth: width,
+            expectedHeight: height,
+            maximumDecodedBytes: maximumDecodedBytes
+        )
+        materializedBGRA = result
+        return try result.get()
+    }
+
+    private static func readColorMatrix(from pixelBuffer: CVPixelBuffer) -> SpiceVideoColorMatrix {
+        guard let attachment = CVBufferCopyAttachment(
+            pixelBuffer,
+            kCVImageBufferYCbCrMatrixKey,
+            nil
+        ) else {
+            return .unknown(nil)
+        }
+        if CFEqual(attachment, kCVImageBufferYCbCrMatrix_ITU_R_601_4) {
+            return .bt601
+        }
+        if CFEqual(attachment, kCVImageBufferYCbCrMatrix_ITU_R_709_2) {
+            return .bt709
+        }
+        return .unknown((attachment as? String) ?? String(describing: attachment))
+    }
+}
+
 private final class SynchronousDecodeOutput {
     let expectedWidth: Int
     let expectedHeight: Int
     let maximumDecodedBytes: Int
-    var result: Result<SpiceDecodedImage?, SpiceCodecError>?
+    let diagnostics: VideoToolboxDiagnosticsCounter
+    var result: Result<SpiceVideoToolboxFrame?, SpiceCodecError>?
 
-    init(expectedWidth: Int, expectedHeight: Int, maximumDecodedBytes: Int) {
+    init(
+        expectedWidth: Int,
+        expectedHeight: Int,
+        maximumDecodedBytes: Int,
+        diagnostics: VideoToolboxDiagnosticsCounter
+    ) {
         self.expectedWidth = expectedWidth
         self.expectedHeight = expectedHeight
         self.maximumDecodedBytes = maximumDecodedBytes
+        self.diagnostics = diagnostics
     }
 }
 
@@ -28,14 +231,24 @@ private let synchronousDecodeCallback: VTDecompressionOutputCallback = {
     if status != noErr {
         output.result = .failure(.backendFailure("VideoToolbox decode status \(status)"))
     } else if flags.contains(.frameDropped) || imageBuffer == nil {
+        output.diagnostics.recordDroppedFrame()
         output.result = .success(nil)
     } else {
-        output.result = SpiceVideoToolboxDecoder.copyDecodedPixels(
-            from: imageBuffer!,
-            expectedWidth: output.expectedWidth,
-            expectedHeight: output.expectedHeight,
-            maximumDecodedBytes: output.maximumDecodedBytes
-        )
+        do {
+            let frame = try SpiceVideoToolboxFrame(
+                pixelBuffer: imageBuffer!,
+                expectedWidth: output.expectedWidth,
+                expectedHeight: output.expectedHeight,
+                maximumDecodedBytes: output.maximumDecodedBytes,
+                diagnostics: output.diagnostics
+            )
+            output.diagnostics.recordDecodedFrame()
+            output.result = .success(frame)
+        } catch let error as SpiceCodecError {
+            output.result = .failure(error)
+        } catch {
+            output.result = .failure(.backendFailure(String(describing: error)))
+        }
     }
 }
 
@@ -69,12 +282,17 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
     private var parameterSets: [UInt8: Data] = [:]
     private var formatDescription: CMVideoFormatDescription?
     private var session: VTDecompressionSession?
+    private var sessionRebuildRequired = false
+    private let sessionCreationFailureForAttempt: @Sendable (Int) -> OSStatus?
+    private var sessionCreationAttempt = 0
+    private let diagnosticsCounter = VideoToolboxDiagnosticsCounter()
 
     package init(
         codec: SpiceAdvancedVideoCodec,
         width: Int,
         height: Int,
-        limits: SpiceAdvancedVideoDecodeLimits = .init()
+        limits: SpiceAdvancedVideoDecodeLimits = .init(),
+        sessionCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = { _ in nil }
     ) throws(SpiceCodecError) {
         guard width > 0, height > 0,
               width <= limits.maximumDimension,
@@ -98,12 +316,26 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         self.expectedHeight = height
         self.limits = limits
         self.parser = SpiceAnnexBParser(limits: limits)
+        self.sessionCreationFailureForAttempt = sessionCreationFailureForAttempt
     }
 
     package func decode(
         payload: Data,
         multimediaTime: UInt32
     ) async throws(SpiceCodecError) -> SpiceDecodedImage? {
+        guard let frame = try await decodeVideoFrame(
+            payload: payload,
+            multimediaTime: multimediaTime
+        ) else {
+            return nil
+        }
+        return try frame.copyBGRA()
+    }
+
+    package func decodeVideoFrame(
+        payload: Data,
+        multimediaTime: UInt32
+    ) async throws(SpiceCodecError) -> (any SpiceDecodedVideoFrame)? {
         let accessUnit = try parser.parse(codec: codec, payload: payload)
         var changed = false
         for parameterSet in accessUnit.parameterSets {
@@ -112,7 +344,10 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
                 changed = true
             }
         }
-        if changed || formatDescription == nil {
+        if changed {
+            sessionRebuildRequired = true
+        }
+        if sessionRebuildRequired || formatDescription == nil {
             try rebuildSessionIfReady()
         }
         guard accessUnit.containsPicture else {
@@ -133,7 +368,8 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         let output = SynchronousDecodeOutput(
             expectedWidth: expectedWidth,
             expectedHeight: expectedHeight,
-            maximumDecodedBytes: limits.maximumDecodedBytes
+            maximumDecodedBytes: limits.maximumDecodedBytes,
+            diagnostics: diagnosticsCounter
         )
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
@@ -152,12 +388,30 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         return try result.get()
     }
 
+    package func diagnosticsSnapshot() async -> SpiceAdvancedVideoDecoderDiagnostics {
+        let diagnostics = diagnosticsCounter.snapshot()
+        return SpiceAdvancedVideoDecoderDiagnostics(
+            sessionCreationCount: diagnostics.sessionCreationCount,
+            hardwareSessionCount: diagnostics.hardwareSessionCount,
+            softwareSessionCount: diagnostics.softwareSessionCount,
+            hardwareQueryFailureCount: diagnostics.hardwareQueryFailureCount,
+            decodedFrameCount: diagnostics.decodedFrameCount,
+            droppedFrameCount: diagnostics.droppedFrameCount,
+            cpuMaterializationCount: diagnostics.cpuMaterializationCount
+        )
+    }
+
+    package func videoToolboxDiagnosticsSnapshot() -> SpiceVideoToolboxDiagnostics {
+        diagnosticsCounter.snapshot()
+    }
+
     package func close() async {
         if let session {
             VTDecompressionSessionInvalidate(session)
         }
         session = nil
         formatDescription = nil
+        sessionRebuildRequired = false
         parameterSets.removeAll(keepingCapacity: false)
     }
 
@@ -208,22 +462,31 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             throw .backendFailure("CoreMedia format description status \(status)")
         }
 
-        if let session {
-            VTDecompressionSessionInvalidate(session)
-        }
         var newSession: VTDecompressionSession?
         var callback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: synchronousDecodeCallback,
             decompressionOutputRefCon: nil
         )
+        let decoderSpecification = [
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true,
+        ] as CFDictionary
+        let imageBufferAttributes = [
+            kCVPixelBufferPixelFormatTypeKey:
+                NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        ] as CFDictionary
+        sessionCreationAttempt &+= 1
+        if let injectedStatus = sessionCreationFailureForAttempt(sessionCreationAttempt) {
+            throw .backendFailure(
+                "VideoToolbox session creation status \(injectedStatus) (injected)"
+            )
+        }
         let sessionStatus = VTDecompressionSessionCreate(
             allocator: nil,
             formatDescription: description,
-            decoderSpecification: nil,
-            imageBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey:
-                    NSNumber(value: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-            ] as CFDictionary,
+            decoderSpecification: decoderSpecification,
+            imageBufferAttributes: imageBufferAttributes,
             outputCallback: &callback,
             decompressionSessionOut: &newSession
         )
@@ -235,8 +498,35 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
                 "for subtype \(subtype), dimensions \(dimensions.width)x\(dimensions.height)"
             )
         }
+        diagnosticsCounter.recordSession(state: Self.hardwareDecoderState(for: newSession))
+        let previousSession = self.session
         self.formatDescription = description
         self.session = newSession
+        sessionRebuildRequired = false
+        if let previousSession {
+            VTDecompressionSessionInvalidate(previousSession)
+        }
+    }
+
+    private nonisolated static func hardwareDecoderState(
+        for session: VTDecompressionSession
+    ) -> SpiceVideoToolboxHardwareDecoderState {
+        var value: CFTypeRef?
+        let status = withUnsafeMutablePointer(to: &value) { valueOut in
+            VTSessionCopyProperty(
+                session,
+                key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                allocator: nil,
+                valueOut: valueOut
+            )
+        }
+        guard status == noErr else {
+            return .queryFailed(status)
+        }
+        guard let number = value as? NSNumber else {
+            return .queryFailed(kVTPropertyNotSupportedErr)
+        }
+        return number.boolValue ? .hardware : .software
     }
 
     private func makeSampleBuffer(
@@ -300,7 +590,7 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         expectedWidth: Int,
         expectedHeight: Int,
         maximumDecodedBytes: Int
-    ) -> Result<SpiceDecodedImage?, SpiceCodecError> {
+    ) -> Result<SpiceDecodedImage, SpiceCodecError> {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width == expectedWidth, height == expectedHeight else {
@@ -363,7 +653,7 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         height: Int,
         bytesPerRow: Int,
         byteCount: Int
-    ) -> Result<SpiceDecodedImage?, SpiceCodecError> {
+    ) -> Result<SpiceDecodedImage, SpiceCodecError> {
         let lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         guard lockStatus == kCVReturnSuccess else {
             return .failure(.backendFailure("CVPixelBuffer lock status \(lockStatus)"))
@@ -395,7 +685,7 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         bytesPerRow: Int,
         byteCount: Int,
         fullRange: Bool
-    ) -> Result<SpiceDecodedImage?, SpiceCodecError> {
+    ) -> Result<SpiceDecodedImage, SpiceCodecError> {
         guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2 else {
             return .failure(.backendFailure("NV12 pixel buffer does not have two planes"))
         }

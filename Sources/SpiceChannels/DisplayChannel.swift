@@ -14,6 +14,15 @@ package enum DisplayEvent: Sendable, Equatable {
     case ignored(UInt16)
 }
 
+package struct DisplayChannelDiagnostics: Sendable, Equatable {
+    package let surfaces: SurfaceStoreMetrics
+    package let publisher: DisplayFramePublisherMetrics
+    package let advancedVideo: SpiceAdvancedVideoDecoderDiagnostics
+    package let advancedCPUFallbackFrames: UInt64
+    package let metalGenerationDisableCount: UInt64
+    package let firstMetalGenerationDisableReason: String?
+}
+
 package actor DisplayChannel: SpiceManagedChannel {
     private static let pixmapCachePixels: UInt64 = 16 * 1_024 * 1_024
     private static let glzDictionaryWindowPixels: Int32 = 8 * 1_024 * 1_024
@@ -50,6 +59,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         var nextFrameSequence: UInt64
         var lastPresentedSequence: UInt64
         var lastMultimediaTime: UInt32?
+        var metalCompositorDisabled: Bool
     }
 
     private var connection: ChannelConnection
@@ -66,12 +76,19 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let maximumCachedImages: Int
     private let maximumCachedImageBytes: Int
     private let maximumStreams: Int
+    private let framePublicationInterval: Duration
     private var palettes: [UInt64: SpiceLZPalette] = [:]
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
     private var streams: [UInt32: VideoStream] = [:]
     private var nextStreamGeneration: UInt64 = 1
     private var ackController = AckController()
+    private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
+    private var completedPublisherMetrics = DisplayFramePublisherMetrics()
+    private var retiredAdvancedVideoDiagnostics = SpiceAdvancedVideoDecoderDiagnostics()
+    private var advancedCPUFallbackFrames: UInt64 = 0
+    private var metalGenerationDisableCount: UInt64 = 0
+    private var firstMetalGenerationDisableReason: String?
 
     package init(
         connection: ChannelConnection,
@@ -87,7 +104,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         maximumCachedPalettes: Int = 256,
         maximumCachedImages: Int = 256,
         maximumCachedImageBytes: Int = 256 * 1_024 * 1_024,
-        maximumStreams: Int = 64
+        maximumStreams: Int = 64,
+        framePublicationInterval: Duration = .milliseconds(16)
     ) {
         self.connection = connection
         self.surfaces = surfaces
@@ -103,6 +121,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         self.maximumCachedImages = max(1, maximumCachedImages)
         self.maximumCachedImageBytes = max(1, maximumCachedImageBytes)
         self.maximumStreams = min(64, max(1, maximumStreams))
+        self.framePublicationInterval = framePublicationInterval
     }
 
     package func run(
@@ -114,23 +133,42 @@ package actor DisplayChannel: SpiceManagedChannel {
             glzDictionaryID: 1,
             glzDictionaryWindowSize: Self.glzDictionaryWindowPixels
         ))
-        while !Task.isCancelled {
-            switch try await processNext() {
-            case let .surfaceCreated(surfaceID):
-                await emit(.surfaceCreated(surfaceID))
-            case let .surfaceDestroyed(surfaceID):
-                await emit(.surfaceDestroyed(surfaceID))
-            case let .frameChanged(surfaceID):
-                await emit(.frame(try await snapshot(surfaceID: surfaceID)))
-            case let .monitorsConfigured(configuration):
-                await emit(.displayMonitors(
-                    channelID: connection.key.id,
-                    configuration
-                ))
-            case .ignored:
-                break
+        let framePublisher = DisplayFramePublisher(
+            interval: framePublicationInterval,
+            snapshot: { [surfaces] surfaceRevision in
+                await surfaces.snapshot(matching: surfaceRevision)
+            },
+            emit: { frame in
+                await emit(.frame(frame))
             }
+        )
+        framePublishers[ObjectIdentifier(framePublisher)] = framePublisher
+        do {
+            while !Task.isCancelled {
+                switch try await processNext() {
+                case let .surfaceCreated(surfaceID):
+                    await emit(.surfaceCreated(surfaceID))
+                case let .surfaceDestroyed(surfaceID):
+                    await framePublisher.remove(surfaceID: surfaceID)
+                    await emit(.surfaceDestroyed(surfaceID))
+                case let .frameChanged(surfaceID):
+                    if let descriptor = try? await surfaces.descriptor(surfaceID: surfaceID) {
+                        await framePublisher.submit(descriptor.surfaceRevision)
+                    }
+                case let .monitorsConfigured(configuration):
+                    await emit(.displayMonitors(
+                        channelID: connection.key.id,
+                        configuration
+                    ))
+                case .ignored:
+                    break
+                }
+            }
+        } catch {
+            await retireFramePublisher(framePublisher)
+            throw error
         }
+        await retireFramePublisher(framePublisher)
     }
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
@@ -169,7 +207,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
-                await stream.advancedDecoder?.close()
+                await retireAdvancedDecoder(stream.advancedDecoder)
             }
             try await acknowledgeIfNeeded()
             return .surfaceDestroyed(destroy.surfaceID)
@@ -178,7 +216,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
-                await stream.advancedDecoder?.close()
+                await retireAdvancedDecoder(stream.advancedDecoder)
             }
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
@@ -237,14 +275,14 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard let removed = streams.removeValue(forKey: streamID) else {
                 throw .protocolViolation("destroy of unknown stream \(streamID)")
             }
-            await removed.advancedDecoder?.close()
+            await retireAdvancedDecoder(removed.advancedDecoder)
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case .displayStreamDestroyAll:
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
-                await stream.advancedDecoder?.close()
+                await retireAdvancedDecoder(stream.advancedDecoder)
             }
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
@@ -308,12 +346,38 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func close() async {
+        await connection.close()
+        let publishers = Array(framePublishers.values)
+        for publisher in publishers {
+            await retireFramePublisher(publisher)
+        }
         let removedStreams = Array(streams.values)
         streams.removeAll(keepingCapacity: false)
         for stream in removedStreams {
-            await stream.advancedDecoder?.close()
+            await retireAdvancedDecoder(stream.advancedDecoder)
         }
-        await connection.close()
+        await surfaces.close()
+    }
+
+    package func diagnosticsSnapshot() async -> DisplayChannelDiagnostics {
+        var advancedVideo = retiredAdvancedVideoDiagnostics
+        let activeDecoders = streams.values.compactMap(\.advancedDecoder)
+        for decoder in activeDecoders {
+            advancedVideo.accumulate(await decoder.diagnosticsSnapshot())
+        }
+        var publisherMetrics = completedPublisherMetrics
+        let activePublishers = Array(framePublishers.values)
+        for publisher in activePublishers {
+            publisherMetrics.accumulate(await publisher.metrics())
+        }
+        return DisplayChannelDiagnostics(
+            surfaces: await surfaces.metrics(),
+            publisher: publisherMetrics,
+            advancedVideo: advancedVideo,
+            advancedCPUFallbackFrames: advancedCPUFallbackFrames,
+            metalGenerationDisableCount: metalGenerationDisableCount,
+            firstMetalGenerationDisableReason: firstMetalGenerationDisableReason
+        )
     }
 
     package func replaceConnection(
@@ -345,13 +409,13 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation("invalid stream dimensions")
         }
         let destination = try pixelRect(create.destination)
-        let snapshot: FrameSnapshot
+        let descriptor: SurfaceDescriptor
         do {
-            snapshot = try await surfaces.snapshot(surfaceID: create.surfaceID)
+            descriptor = try await surfaces.descriptor(surfaceID: create.surfaceID)
         } catch {
             throw .protocolViolation(String(describing: error))
         }
-        try validateStreamDestination(destination, in: snapshot)
+        try validateStreamDestination(destination, in: descriptor)
         _ = try clippedRectangles(destination: create.destination, clip: create.clip)
 
         let advancedDecoder: (any SpiceAdvancedVideoDecoder)?
@@ -397,7 +461,8 @@ package actor DisplayChannel: SpiceManagedChannel {
             clip: create.clip,
             nextFrameSequence: 0,
             lastPresentedSequence: 0,
-            lastMultimediaTime: nil
+            lastMultimediaTime: nil,
+            metalCompositorDisabled: false
         )
     }
 
@@ -460,10 +525,10 @@ package actor DisplayChannel: SpiceManagedChannel {
             destinationRect = stream.destination
         }
 
-        let decoded: SpiceDecodedImage
+        let decodedFrame: any SpiceDecodedVideoFrame
         do {
             if stream.codec == .mjpeg {
-                decoded = try await jpegDecoder.decode(
+                decodedFrame = try await jpegDecoder.decode(
                     descriptor: SpiceCodecImageDescriptor(width: frameWidth, height: frameHeight),
                     payload: data
                 )
@@ -471,13 +536,13 @@ package actor DisplayChannel: SpiceManagedChannel {
                 guard let decoder = stream.advancedDecoder else {
                     throw SpiceCodecError.backendFailure("advanced stream has no decoder")
                 }
-                guard let advanced = try await decoder.decode(
+                guard let advanced = try await decoder.decodeVideoFrame(
                     payload: data,
                     multimediaTime: multimediaTime
                 ) else {
                     return nil
                 }
-                decoded = advanced
+                decodedFrame = advanced
             }
         } catch {
             throw .protocolViolation("video decode failed: \(String(describing: error))")
@@ -518,29 +583,77 @@ package actor DisplayChannel: SpiceManagedChannel {
             streams[streamID] = committed
             return nil
         }
-        let bitmap = RawBitmap(
-            format: .xRGB8888,
-            width: decoded.width,
-            height: decoded.height,
-            stride: decoded.bytesPerRow,
-            topDown: stream.topDown,
-            pixels: decoded.pixelsBGRA
+        let source = PixelRect(
+            x: 0,
+            y: stream.topDown ? 0 : frameHeight - sourceHeight,
+            width: sourceWidth,
+            height: sourceHeight
         )
-        do {
-            try await surfaces.drawScaledCopy(
-                surfaceID: stream.surfaceID,
-                destination: destination,
-                bitmap: bitmap,
-                source: PixelRect(
-                    x: 0,
-                    y: stream.topDown ? 0 : frameHeight - sourceHeight,
-                    width: sourceWidth,
-                    height: sourceHeight
-                ),
-                clippedDestinations: clipped
+        var usedNativeVideoPath = false
+        if stream.codec != .mjpeg, !stream.metalCompositorDisabled {
+            do {
+                try await surfaces.drawNativeVideoFrame(
+                    surfaceID: stream.surfaceID,
+                    destination: destination,
+                    frame: decodedFrame,
+                    source: source,
+                    topDown: stream.topDown,
+                    clippedDestinations: clipped
+                )
+                usedNativeVideoPath = true
+            } catch {
+                switch error {
+                case .staleSurface:
+                    return nil
+                case let .render(renderError):
+                    throw .protocolViolation(String(describing: renderError))
+                case let .compositor(compositorError):
+                    if error.disablesStreamGeneration,
+                       var currentStream = streams[streamID],
+                       currentStream.generation == stream.generation
+                    {
+                        currentStream.metalCompositorDisabled = true
+                        streams[streamID] = currentStream
+                        stream.metalCompositorDisabled = true
+                        metalGenerationDisableCount &+= 1
+                        if firstMetalGenerationDisableReason == nil {
+                            firstMetalGenerationDisableReason = compositorError.description
+                        }
+                    }
+                }
+            }
+        }
+        if !usedNativeVideoPath {
+            if stream.codec != .mjpeg {
+                advancedCPUFallbackFrames &+= 1
+            }
+            let decoded: SpiceDecodedImage
+            do {
+                decoded = try decodedFrame.copyBGRA()
+            } catch {
+                throw .protocolViolation(
+                    "video BGRA fallback failed: \(String(describing: error))"
+                )
+            }
+            let bitmap = RawBitmap(
+                format: .xRGB8888,
+                width: decoded.width,
+                height: decoded.height,
+                stride: decoded.bytesPerRow,
+                topDown: stream.topDown,
+                pixels: decoded.pixelsBGRA
             )
-        } catch {
-            throw .protocolViolation(String(describing: error))
+            do {
+                try await surfaces.drawScaledCopy(
+                    surfaceID: stream.surfaceID,
+                    destination: destination,
+                    bitmap: bitmap,
+                    source: source,
+                    clippedDestinations: clipped
+                )
+            } catch {
+                throw .protocolViolation(String(describing: error))
+            }
         }
 
         guard var committed = streams[streamID], committed.generation == stream.generation else {
@@ -550,6 +663,22 @@ package actor DisplayChannel: SpiceManagedChannel {
         committed.lastMultimediaTime = multimediaTime
         streams[streamID] = committed
         return stream.surfaceID
+    }
+
+    private func retireAdvancedDecoder(
+        _ decoder: (any SpiceAdvancedVideoDecoder)?
+    ) async {
+        guard let decoder else { return }
+        retiredAdvancedVideoDiagnostics.accumulate(await decoder.diagnosticsSnapshot())
+        await decoder.close()
+    }
+
+    private func retireFramePublisher(_ publisher: DisplayFramePublisher) async {
+        await publisher.cancel()
+        let metrics = await publisher.metrics()
+        let identifier = ObjectIdentifier(publisher)
+        guard framePublishers.removeValue(forKey: identifier) != nil else { return }
+        completedPublisherMetrics.accumulate(metrics)
     }
 
     private func execute(_ command: SpiceDisplayDrawFill) async throws(ChannelError) {
@@ -957,13 +1086,13 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     private func validateStreamDestination(
         _ destination: PixelRect,
-        in snapshot: FrameSnapshot
+        in descriptor: SurfaceDescriptor
     ) throws(ChannelError) {
         let (right, rightOverflow) = destination.x.addingReportingOverflow(destination.width)
         let (bottom, bottomOverflow) = destination.y.addingReportingOverflow(destination.height)
         guard destination.x >= 0, destination.y >= 0,
               !rightOverflow, !bottomOverflow,
-              right <= snapshot.width, bottom <= snapshot.height
+              right <= descriptor.width, bottom <= descriptor.height
         else {
             throw .protocolViolation("stream destination exceeds Surface")
         }

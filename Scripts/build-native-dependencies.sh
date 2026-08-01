@@ -78,7 +78,6 @@ write_module_map() {
 
 require_tool curl
 require_tool cmake
-require_tool lipo
 require_tool xcodebuild
 
 fetch_verified "$JPEG_URL" "$JPEG_ARCHIVE" "$JPEG_SHA256"
@@ -92,7 +91,7 @@ tar -xf "$WORK_DIR/downloads/$SPICE_GTK_ARCHIVE" -C "$WORK_DIR/src"
 tar -xf "$WORK_DIR/downloads/$USBREDIR_ARCHIVE" -C "$WORK_DIR/src"
 tar -xf "$WORK_DIR/downloads/$LIBUSB_ARCHIVE" -C "$WORK_DIR/src"
 
-for arch in arm64 x86_64; do
+readonly arch="arm64"
     arch_dir="$WORK_DIR/build/$arch"
     prefix="$arch_dir/prefix"
     mkdir -p "$arch_dir" "$prefix"
@@ -238,26 +237,25 @@ for arch in arm64 x86_64; do
         "$usbredir_build/libusbredir.a" "$prefix/libusb/lib/libusb-1.0.a"
     cp "$prefix/jpeg/lib/libturbojpeg.a" "$arch_dir/libCTurboJPEG.a"
     cp "$quic_build/libspicequic.a" "$arch_dir/libCSpiceQUIC.a"
-done
 
 artifact_stage="$WORK_DIR/artifacts"
 mkdir -p "$artifact_stage/CTurboJPEG/Headers" \
     "$artifact_stage/CSpiceQUIC/Headers" \
     "$artifact_stage/CUSBRedir/Headers"
 
-lipo -create "$WORK_DIR/build/arm64/libCTurboJPEG.a" "$WORK_DIR/build/x86_64/libCTurboJPEG.a" \
-    -output "$artifact_stage/CTurboJPEG/libCTurboJPEG.a"
+cp "$WORK_DIR/build/arm64/libCTurboJPEG.a" \
+    "$artifact_stage/CTurboJPEG/libCTurboJPEG.a"
 cp "$ROOT_DIR/Sources/CTurboJPEG/shim.h" "$artifact_stage/CTurboJPEG/Headers/"
 cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/src/turbojpeg.h" "$artifact_stage/CTurboJPEG/Headers/"
 write_module_map "$artifact_stage/CTurboJPEG/Headers" CTurboJPEG shim.h
 
-lipo -create "$WORK_DIR/build/arm64/libCSpiceQUIC.a" "$WORK_DIR/build/x86_64/libCSpiceQUIC.a" \
-    -output "$artifact_stage/CSpiceQUIC/libCSpiceQUIC.a"
+cp "$WORK_DIR/build/arm64/libCSpiceQUIC.a" \
+    "$artifact_stage/CSpiceQUIC/libCSpiceQUIC.a"
 cp "$ROOT_DIR/Sources/CSpiceQUIC/shim.h" "$artifact_stage/CSpiceQUIC/Headers/"
 write_module_map "$artifact_stage/CSpiceQUIC/Headers" CSpiceQUIC shim.h
 
-lipo -create "$WORK_DIR/build/arm64/libCUSBRedir.a" "$WORK_DIR/build/x86_64/libCUSBRedir.a" \
-    -output "$artifact_stage/CUSBRedir/libCUSBRedir.a"
+cp "$WORK_DIR/build/arm64/libCUSBRedir.a" \
+    "$artifact_stage/CUSBRedir/libCUSBRedir.a"
 cp "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/usbredirhost/usbredirhost.h" \
     "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/usbredirparser/usbredirfilter.h" \
     "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/usbredirparser/usbredirparser.h" \

@@ -25,6 +25,18 @@ struct LinkHandshakeTests {
             key: ChannelKey(type: 2, id: 0)
         )
         #expect(display.channelCapabilities == [0x303])
+        let h264Display = LinkRequest.channel(
+            connectionID: 9,
+            key: ChannelKey(type: 2, id: 0),
+            advertisesH264: true
+        )
+        #expect(h264Display.channelCapabilities == [0xb03])
+        let h265Display = LinkRequest.channel(
+            connectionID: 9,
+            key: ChannelKey(type: 2, id: 0),
+            advertisesH265: true
+        )
+        #expect(h265Display.channelCapabilities == [0x4303])
 
         let inputs = LinkRequest.channel(
             connectionID: 9,

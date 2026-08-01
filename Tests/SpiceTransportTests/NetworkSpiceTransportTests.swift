@@ -24,6 +24,27 @@ struct NetworkSpiceTransportTests {
         }
     }
 
+    @Test func closeStopsPendingEstablishmentAndAllowsRetry() async throws {
+        let transport = NetworkSpiceTransport(host: "192.0.2.1", port: 5900)
+
+        for _ in 0 ..< 25 {
+            let task = Task {
+                try await transport.connect()
+            }
+            try await Task.sleep(for: .milliseconds(5))
+            await transport.close()
+
+            do {
+                try await task.value
+                Issue.record("closed connection unexpectedly succeeded")
+            } catch TransportError.cancelled {
+                // Expected: close invalidates this generation and wakes connect().
+            } catch {
+                Issue.record("expected cancellation after close, got \(error)")
+            }
+        }
+    }
+
     @Test func exchangesBytesWithLocalTCPListener() async throws {
         let listener = try NWListener(using: .tcp, on: .any)
         let queue = DispatchQueue(label: "swiftspice.network-test")

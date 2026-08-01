@@ -1,5 +1,9 @@
 #include "CUSBRedirShim.h"
 
+#if !defined(__arm64__)
+#error "SwiftSpice supports Apple Silicon (arm64) only."
+#endif
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>

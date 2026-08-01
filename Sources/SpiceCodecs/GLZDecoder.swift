@@ -12,7 +12,7 @@ package struct SpiceGLZDecodeLimits: Sendable, Equatable {
         maximumDimension: Int = 16_384,
         maximumEncodedBytes: Int = 64 * 1_024 * 1_024,
         maximumDecodedBytes: Int = 256 * 1_024 * 1_024,
-        maximumDictionaryImages: Int = 1_024,
+        maximumDictionaryImages: Int = 256 * 1_024,
         maximumDictionaryBytes: Int = 256 * 1_024 * 1_024,
         maximumPendingDictionaryWaits: Int = 64
     ) {
@@ -46,6 +46,7 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
     private var dictionary: [UInt64: DictionaryImage] = [:]
     private var oldestImageID: UInt64 = 0
     private var tailGap: UInt64 = 0
+    private var dictionaryByteCount = 0
     private var dictionaryWaiters: [UUID: DictionaryWaiter] = [:]
     private var pendingDictionaryWaitBytes = 0
 
@@ -57,6 +58,7 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         dictionary.removeAll(keepingCapacity: true)
         oldestImageID = 0
         tailGap = 0
+        dictionaryByteCount = 0
         let waiters = dictionaryWaiters.values
         dictionaryWaiters.removeAll(keepingCapacity: false)
         for waiter in waiters {
@@ -134,19 +136,19 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
             throw .invalidHeader("GLZ window head precedes image zero")
         }
 
-        var output = [UInt8](repeating: 0, count: outputByteCount)
-        (reader, output) = try await decodePlane(
+        var output = Data(count: outputByteCount)
+        try await decodePlane(
             imageType.colorPlane,
-            reader: reader,
-            output: output,
+            reader: &reader,
+            output: &output,
             pixelCount: pixelCount,
             imageID: imageID
         )
         if imageType.hasAlpha {
-            (reader, output) = try await decodePlane(
+            try await decodePlane(
                 .alpha,
-                reader: reader,
-                output: output,
+                reader: &reader,
+                output: &output,
                 pixelCount: pixelCount,
                 imageID: imageID
             )
@@ -155,7 +157,7 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
             throw .malformedPayload("trailing compressed bytes")
         }
 
-        let pixels = Data(output)
+        let pixels = output
         try commit(
             imageID: imageID,
             image: DictionaryImage(
@@ -176,13 +178,11 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
 
     private func decodePlane(
         _ plane: GLZPlane,
-        reader initialReader: GLZReader,
-        output initialOutput: [UInt8],
+        reader: inout GLZReader,
+        output: inout Data,
         pixelCount: Int,
         imageID: UInt64
-    ) async throws(SpiceCodecError) -> (GLZReader, [UInt8]) {
-        var reader = initialReader
-        var output = initialOutput
+    ) async throws(SpiceCodecError) {
         var outputPixel = 0
         while outputPixel < pixelCount {
             let control = Int(try reader.readByte())
@@ -191,15 +191,14 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
                 guard literalCount <= pixelCount - outputPixel else {
                     throw .malformedPayload("GLZ literal exceeds output")
                 }
-                for _ in 0..<literalCount {
-                    try decodeLiteral(
-                        plane,
-                        reader: &reader,
-                        output: &output,
-                        pixel: outputPixel
-                    )
-                    outputPixel += 1
-                }
+                try decodeLiterals(
+                    plane,
+                    reader: &reader,
+                    output: &output,
+                    startPixel: outputPixel,
+                    count: literalCount
+                )
+                outputPixel += literalCount
                 continue
             }
 
@@ -245,18 +244,14 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
                 guard pixelOffset <= outputPixel else {
                     throw .malformedPayload("GLZ reference precedes current image")
                 }
-                var referencePixel = outputPixel - pixelOffset
-                for _ in 0..<length {
-                    copyPixel(
-                        plane,
-                        source: output,
-                        sourcePixel: referencePixel,
-                        destination: &output,
-                        destinationPixel: outputPixel
-                    )
-                    referencePixel += 1
-                    outputPixel += 1
-                }
+                copyPixelsWithinOutput(
+                    plane,
+                    output: &output,
+                    sourcePixel: outputPixel - pixelOffset,
+                    destinationPixel: outputPixel,
+                    count: length
+                )
+                outputPixel += length
             } else {
                 guard let distance = UInt64(exactly: imageDistance), distance <= imageID else {
                     throw .malformedPayload("invalid GLZ image distance")
@@ -271,19 +266,17 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
                 else {
                     throw .malformedPayload("GLZ dictionary reference exceeds image")
                 }
-                for referencePixel in pixelOffset..<(pixelOffset + length) {
-                    copyPixel(
-                        plane,
-                        source: referenceImage.pixels,
-                        sourcePixel: referencePixel,
-                        destination: &output,
-                        destinationPixel: outputPixel
-                    )
-                    outputPixel += 1
-                }
+                copyPixels(
+                    plane,
+                    source: referenceImage.pixels,
+                    sourcePixel: pixelOffset,
+                    destination: &output,
+                    destinationPixel: outputPixel,
+                    count: length
+                )
+                outputPixel += length
             }
         }
-        return (reader, output)
     }
 
     private func dictionaryImage(
@@ -342,48 +335,119 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         )
     }
 
-    private func decodeLiteral(
+    private func decodeLiterals(
         _ plane: GLZPlane,
         reader: inout GLZReader,
-        output: inout [UInt8],
-        pixel: Int
+        output: inout Data,
+        startPixel: Int,
+        count: Int
     ) throws(SpiceCodecError) {
-        let offset = pixel * 4
-        switch plane {
-        case .rgb16:
-            let redBits = try reader.readByte()
-            let blueBits = try reader.readByte()
-            var green = ((redBits << 6) | (blueBits >> 2)) & ~UInt8(0x07)
-            green |= green >> 5
-            output[offset] = (blueBits << 3) | ((blueBits >> 2) & 0x07)
-            output[offset + 1] = green
-            output[offset + 2] = ((redBits << 1) & ~UInt8(0x07))
-                | ((redBits >> 4) & 0x07)
-        case .color:
-            output[offset] = try reader.readByte()
-            output[offset + 1] = try reader.readByte()
-            output[offset + 2] = try reader.readByte()
-        case .alpha:
-            output[offset + 3] = try reader.readByte()
+        var decodingError: SpiceCodecError?
+        output.withUnsafeMutableBytes { bytes in
+            guard bytes.baseAddress != nil else { return }
+            do {
+                for pixel in startPixel..<(startPixel + count) {
+                    let offset = pixel * 4
+                    switch plane {
+                    case .rgb16:
+                        let redBits = try reader.readByte()
+                        let blueBits = try reader.readByte()
+                        var green = ((redBits << 6) | (blueBits >> 2)) & ~UInt8(0x07)
+                        green |= green >> 5
+                        bytes[offset] = (blueBits << 3) | ((blueBits >> 2) & 0x07)
+                        bytes[offset + 1] = green
+                        bytes[offset + 2] = ((redBits << 1) & ~UInt8(0x07))
+                            | ((redBits >> 4) & 0x07)
+                    case .color:
+                        bytes[offset] = try reader.readByte()
+                        bytes[offset + 1] = try reader.readByte()
+                        bytes[offset + 2] = try reader.readByte()
+                    case .alpha:
+                        bytes[offset + 3] = try reader.readByte()
+                    }
+                }
+            } catch let error as SpiceCodecError {
+                decodingError = error
+            } catch {
+                preconditionFailure("GLZReader emitted an unexpected error type: \(error)")
+            }
+        }
+        if let decodingError {
+            throw decodingError
         }
     }
 
-    private func copyPixel(
+    private func copyPixelsWithinOutput(
         _ plane: GLZPlane,
-        source: some Collection<UInt8>,
+        output: inout Data,
         sourcePixel: Int,
-        destination: inout [UInt8],
-        destinationPixel: Int
+        destinationPixel: Int,
+        count: Int
     ) {
-        let sourceOffset = source.index(source.startIndex, offsetBy: sourcePixel * 4)
-        let destinationOffset = destinationPixel * 4
-        if plane == .alpha {
-            destination[destinationOffset + 3] = source[source.index(sourceOffset, offsetBy: 3)]
-        } else {
-            destination[destinationOffset] = source[sourceOffset]
-            destination[destinationOffset + 1] = source[source.index(sourceOffset, offsetBy: 1)]
-            destination[destinationOffset + 2] = source[source.index(sourceOffset, offsetBy: 2)]
-            destination[destinationOffset + 3] = source[source.index(sourceOffset, offsetBy: 3)]
+        output.withUnsafeMutableBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            if plane != .alpha {
+                let source = base.advanced(by: sourcePixel * 4)
+                let destination = base.advanced(by: destinationPixel * 4)
+                let distance = destinationPixel - sourcePixel
+                let initialPixels = min(distance, count)
+                memmove(destination, source, initialPixels * 4)
+
+                // GLZ references may overlap their destination. Once the first
+                // period is copied, double the initialized prefix instead of
+                // copying the repeated pattern one pixel at a time.
+                var copiedPixels = initialPixels
+                while copiedPixels < count {
+                    let chunkPixels = min(copiedPixels, count - copiedPixels)
+                    memmove(
+                        destination.advanced(by: copiedPixels * 4),
+                        destination,
+                        chunkPixels * 4
+                    )
+                    copiedPixels += chunkPixels
+                }
+                return
+            }
+            for index in 0..<count {
+                let sourceOffset = (sourcePixel + index) * 4
+                let destinationOffset = (destinationPixel + index) * 4
+                bytes[destinationOffset + 3] = bytes[sourceOffset + 3]
+            }
+        }
+    }
+
+    private func copyPixels(
+        _ plane: GLZPlane,
+        source: Data,
+        sourcePixel: Int,
+        destination: inout Data,
+        destinationPixel: Int,
+        count: Int
+    ) {
+        source.withUnsafeBytes { sourceBytes in
+            destination.withUnsafeMutableBytes { destinationBytes in
+                guard let sourceBase = sourceBytes.baseAddress,
+                      let destinationBase = destinationBytes.baseAddress
+                else {
+                    return
+                }
+                if plane != .alpha {
+                    memmove(
+                        destinationBase.advanced(by: destinationPixel * 4),
+                        sourceBase.advanced(by: sourcePixel * 4),
+                        count * 4
+                    )
+                    return
+                }
+                for index in 0..<count {
+                    let sourceOffset = (sourcePixel + index) * 4
+                    let destinationOffset = (destinationPixel + index) * 4
+                    destinationBytes[destinationOffset + 3] = sourceBase.load(
+                        fromByteOffset: sourceOffset + 3,
+                        as: UInt8.self
+                    )
+                }
+            }
         }
     }
 
@@ -394,10 +458,8 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         guard dictionary[imageID] == nil else {
             throw .malformedPayload("duplicate GLZ image id")
         }
-        var candidate = dictionary
-        candidate[imageID] = image
         var candidateTailGap = tailGap
-        while candidate[candidateTailGap] != nil {
+        while candidateTailGap == imageID || dictionary[candidateTailGap] != nil {
             let (next, overflow) = candidateTailGap.addingReportingOverflow(1)
             guard !overflow else {
                 throw .malformedPayload("GLZ image id overflow")
@@ -406,35 +468,58 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         }
         var candidateOldest = oldestImageID
         if candidateTailGap > 0,
-           let newestContiguous = candidate[candidateTailGap - 1]
+           let newestContiguous = candidateTailGap - 1 == imageID
+               ? image
+               : dictionary[candidateTailGap - 1]
         {
             let head = candidateTailGap - 1 - UInt64(newestContiguous.windowHeadDistance)
-            while candidateOldest < head {
-                candidate.removeValue(forKey: candidateOldest)
-                candidateOldest += 1
-            }
+            candidateOldest = max(candidateOldest, head)
         }
-        guard candidate.count <= limits.maximumDictionaryImages else {
+
+        var removedImageCount = 0
+        var removedByteCount = 0
+        var evictedID = oldestImageID
+        while evictedID < candidateOldest {
+            if let evicted = dictionary[evictedID] {
+                removedImageCount += 1
+                let (next, overflow) = removedByteCount.addingReportingOverflow(
+                    evicted.pixels.count
+                )
+                guard !overflow else { throw .integerOverflow }
+                removedByteCount = next
+            }
+            evictedID += 1
+        }
+        let candidateImageCount = dictionary.count + 1 - removedImageCount
+        guard candidateImageCount <= limits.maximumDictionaryImages else {
             throw .decodedImageTooLarge(
-                actual: candidate.count,
+                actual: candidateImageCount,
                 maximum: limits.maximumDictionaryImages
             )
         }
-        var byteCount = 0
-        for entry in candidate.values {
-            let (next, overflow) = byteCount.addingReportingOverflow(entry.pixels.count)
-            guard !overflow else { throw .integerOverflow }
-            byteCount = next
+        let (bytesWithImage, byteOverflow) = dictionaryByteCount.addingReportingOverflow(
+            image.pixels.count
+        )
+        guard !byteOverflow, bytesWithImage >= removedByteCount else {
+            throw .integerOverflow
         }
-        guard byteCount <= limits.maximumDictionaryBytes else {
+        let candidateByteCount = bytesWithImage - removedByteCount
+        guard candidateByteCount <= limits.maximumDictionaryBytes else {
             throw .decodedImageTooLarge(
-                actual: byteCount,
+                actual: candidateByteCount,
                 maximum: limits.maximumDictionaryBytes
             )
         }
-        dictionary = candidate
+
+        evictedID = oldestImageID
+        while evictedID < candidateOldest {
+            dictionary.removeValue(forKey: evictedID)
+            evictedID += 1
+        }
+        dictionary[imageID] = image
         tailGap = candidateTailGap
         oldestImageID = candidateOldest
+        dictionaryByteCount = candidateByteCount
         let ready = dictionaryWaiters.compactMap { id, waiter in
             waiter.imageID == imageID ? id : nil
         }

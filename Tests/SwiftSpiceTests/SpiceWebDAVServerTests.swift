@@ -22,7 +22,13 @@ struct SpiceWebDAVServerTests {
             data: request("PROPFIND", "/", headers: ["Depth": "1"])
         ).first)
         #expect(status(propfind) == 207)
-        #expect(String(decoding: propfind, as: UTF8.self).contains("hello.txt"))
+        let propfindText = String(decoding: propfind, as: UTF8.self)
+        #expect(propfindText.contains("<D:href>/</D:href>"))
+        #expect(propfindText.contains("<D:href>/hello.txt</D:href>"))
+        #expect(!propfindText.contains("<D:href>//</D:href>"))
+        #expect(!propfindText.contains(root.lastPathComponent))
+        #expect(propfindText.contains("<D:getetag>"))
+        #expect(propfindText.contains("<D:getlastmodified>"))
 
         let put = try #require(await server.receive(
             clientID: 1,

@@ -8,15 +8,21 @@ package struct ChannelFactory: Sendable {
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let serialBarrier: ChannelSerialBarrier
+    private let advertisesH264: Bool
+    private let advertisesH265: Bool
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
-        serialBarrier: ChannelSerialBarrier = ChannelSerialBarrier()
+        serialBarrier: ChannelSerialBarrier = ChannelSerialBarrier(),
+        advertisesH264: Bool = false,
+        advertisesH265: Bool = false
     ) {
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         self.serialBarrier = serialBarrier
+        self.advertisesH264 = advertisesH264
+        self.advertisesH265 = advertisesH265
     }
 
     package func connect(
@@ -29,7 +35,12 @@ package struct ChannelFactory: Sendable {
             try await transport.connect()
             let handshake = try await LinkHandshake().perform(
                 transport: transport,
-                request: .channel(connectionID: connectionID, key: key),
+                request: .channel(
+                    connectionID: connectionID,
+                    key: key,
+                    advertisesH264: advertisesH264,
+                    advertisesH265: advertisesH265
+                ),
                 password: password,
                 ticketEncryptor: ticketEncryptor
             )

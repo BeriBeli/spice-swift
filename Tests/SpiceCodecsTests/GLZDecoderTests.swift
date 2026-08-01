@@ -71,6 +71,27 @@ struct GLZDecoderTests {
             9, 8, 7, 0, 9, 8, 7, 0,
             9, 8, 7, 0, 9, 8, 7, 0,
         ]))
+
+        let alternating = try await SpiceGLZDecoder().decode(
+            descriptor: .init(width: 7, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 7,
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: [
+                    1, 1, 2, 3, 4, 5, 6,
+                    0xa1, 0, 0,
+                ]
+            )
+        )
+        #expect(alternating.pixelsBGRA == Data([
+            1, 2, 3, 0, 4, 5, 6, 0,
+            1, 2, 3, 0, 4, 5, 6, 0,
+            1, 2, 3, 0, 4, 5, 6, 0,
+            1, 2, 3, 0,
+        ]))
     }
 
     @Test func decodesRGB16AndRGBAPlanes() async throws {
@@ -484,6 +505,23 @@ struct GLZDecoderTests {
                     imageID: 22,
                     windowHeadDistance: 4,
                     compressed: [0x20, 0, 5]
+                )
+            )
+        }
+    }
+
+    @Test func retainsAdvertisedWindowBeyondLegacyImageCount() async throws {
+        let decoder = SpiceGLZDecoder()
+        for imageID: UInt64 in 0...1_024 {
+            _ = try await decoder.decode(
+                descriptor: .init(width: 1, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 1,
+                    height: 1,
+                    imageID: imageID,
+                    windowHeadDistance: UInt32(imageID),
+                    compressed: [0, UInt8(truncatingIfNeeded: imageID), 2, 3]
                 )
             )
         }

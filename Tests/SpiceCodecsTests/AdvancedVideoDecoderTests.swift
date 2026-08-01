@@ -4,6 +4,23 @@ import Testing
 
 @Suite("Advanced video access-unit parser")
 struct AdvancedVideoDecoderTests {
+    @Test func packedImageProvidesTheNativeVideoFallbackContract() throws {
+        let image = SpiceDecodedImage(
+            width: 2,
+            height: 1,
+            bytesPerRow: 8,
+            pixelsBGRA: Data([1, 2, 3, 255, 4, 5, 6, 255])
+        )
+        let frame: any SpiceDecodedVideoFrame = image
+
+        #expect(frame.width == 2)
+        #expect(frame.height == 1)
+        #expect(frame.pixelFormat == .bgra8)
+        #expect(frame.colorMatrix == .unknown(nil))
+        #expect(frame.colorRange == .full)
+        #expect(try frame.copyBGRA() == image)
+    }
+
     @Test func convertsMixedH264AnnexBStartCodesToLengthPrefixedSample() throws {
         let payload = Data([
             0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e,

@@ -3,7 +3,9 @@ import SpiceChannels
 import SpiceCodecs
 import SpiceCore
 import SpiceCryptoSecurity
+import SpiceIOSurface
 import SpiceProtocol
+import SpiceRenderer
 import SpiceTransport
 import SpiceTransportNetwork
 import Synchronization
@@ -12,16 +14,27 @@ public struct SpiceEndpoint: Sendable, Equatable {
     public var host: String
     public var port: UInt16
     public var tlsPolicy: TLSTrustPolicy?
+    public var videoCodecPolicy: SpiceVideoCodecPolicy
 
     public init(
         host: String,
         port: UInt16,
-        tlsPolicy: TLSTrustPolicy? = nil
+        tlsPolicy: TLSTrustPolicy? = nil,
+        videoCodecPolicy: SpiceVideoCodecPolicy = .mjpegOnly
     ) {
         self.host = host
         self.port = port
         self.tlsPolicy = tlsPolicy
+        self.videoCodecPolicy = videoCodecPolicy
     }
+}
+
+/// Controls codecs advertised to the SPICE Display peer. H.264 is opt-in
+/// because some host encoders emit 4:4:4 profiles unsupported by VideoToolbox.
+public enum SpiceVideoCodecPolicy: Sendable, Equatable {
+    case mjpegOnly
+    case h264AndMJPEG
+    case h265AndMJPEG
 }
 
 public enum TLSTrustPolicy: Sendable, Equatable {
@@ -105,8 +118,9 @@ public actor SpiceSession {
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
+    private let surfaceMemoryBudget = SurfaceMemoryBudget()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
-    private let eventContinuation: AsyncStream<SpiceSessionEvent>.Continuation
+    private let eventMailbox: SpiceSessionEventMailbox
     public nonisolated let playbackEvents: AsyncStream<SpicePlaybackEvent>
     private let playbackEventContinuation: AsyncStream<SpicePlaybackEvent>.Continuation
     public nonisolated let recordEvents: AsyncStream<SpiceRecordEvent>
@@ -120,10 +134,10 @@ public actor SpiceSession {
         AsyncStream<SpiceUSBRedirectionPacket>.Continuation
     public nonisolated let webDAVEvents: AsyncStream<SpiceWebDAVEvent>
     private let webDAVEventContinuation: AsyncStream<SpiceWebDAVEvent>.Continuation
-    private let frameCoalescer: FrameCoalescer
     private var mainChannel: MainChannel?
     private var channels: [ChannelKey: any SpiceManagedChannel] = [:]
     private var connections: [ChannelKey: ChannelConnection] = [:]
+    private var retiredDisplayDiagnostics = SpiceSessionDiagnostics()
     private var receiveTasks: [Task<Void, Never>] = []
     private var supervisionGeneration: UInt64 = 0
     private var credentialStorage: SpiceCredentialStorage?
@@ -164,12 +178,9 @@ public actor SpiceSession {
     }
 
     public init() {
-        let eventPipe = AsyncStream.makeStream(
-            of: SpiceSessionEvent.self,
-            bufferingPolicy: .bufferingNewest(64)
-        )
-        events = eventPipe.stream
-        eventContinuation = eventPipe.continuation
+        let eventMailbox = SpiceSessionEventMailbox()
+        self.eventMailbox = eventMailbox
+        events = AsyncStream(unfolding: { await eventMailbox.next() })
         let playbackPipe = AsyncStream.makeStream(
             of: SpicePlaybackEvent.self,
             bufferingPolicy: .bufferingNewest(32)
@@ -206,9 +217,6 @@ public actor SpiceSession {
         )
         webDAVEvents = webDAVPipe.stream
         webDAVEventContinuation = webDAVPipe.continuation
-        frameCoalescer = FrameCoalescer { frame in
-            eventPipe.continuation.yield(.frame(frame))
-        }
         transportFactory = Self.makeNetworkTransport
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
@@ -219,12 +227,9 @@ public actor SpiceSession {
         ticketEncryptor: any TicketEncrypting,
         migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
     ) {
-        let eventPipe = AsyncStream.makeStream(
-            of: SpiceSessionEvent.self,
-            bufferingPolicy: .bufferingNewest(64)
-        )
-        events = eventPipe.stream
-        eventContinuation = eventPipe.continuation
+        let eventMailbox = SpiceSessionEventMailbox()
+        self.eventMailbox = eventMailbox
+        events = AsyncStream(unfolding: { await eventMailbox.next() })
         let playbackPipe = AsyncStream.makeStream(
             of: SpicePlaybackEvent.self,
             bufferingPolicy: .bufferingNewest(32)
@@ -261,12 +266,13 @@ public actor SpiceSession {
         )
         webDAVEvents = webDAVPipe.stream
         webDAVEventContinuation = webDAVPipe.continuation
-        frameCoalescer = FrameCoalescer { frame in
-            eventPipe.continuation.yield(.frame(frame))
-        }
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
+    }
+
+    deinit {
+        eventMailbox.finish()
     }
 
     public func connect(
@@ -276,6 +282,7 @@ public actor SpiceSession {
         guard mainChannel == nil, !isConnecting else {
             throw .alreadyConnected
         }
+        retiredDisplayDiagnostics = SpiceSessionDiagnostics()
         isConnecting = true
         defer { isConnecting = false }
 
@@ -321,7 +328,9 @@ public actor SpiceSession {
             let channelFactory = ChannelFactory(
                 transportFactory: { _ in transportFactory(endpoint) },
                 ticketEncryptor: ticketEncryptor,
-                serialBarrier: serialBarrier
+                serialBarrier: serialBarrier,
+                advertisesH264: endpoint.videoCodecPolicy == .h264AndMJPEG,
+                advertisesH265: endpoint.videoCodecPolicy == .h265AndMJPEG
             )
             for descriptor in bootstrap.channels {
                 try Task.checkCancellation()
@@ -342,7 +351,8 @@ public actor SpiceSession {
                     key: key,
                     connection: connected,
                     glzDecoder: glzDecoder,
-                    multimediaClock: multimediaClock
+                    multimediaClock: multimediaClock,
+                    surfaceMemoryBudget: surfaceMemoryBudget
                 )
             }
             try Task.checkCancellation()
@@ -406,11 +416,10 @@ public actor SpiceSession {
         }
         await closeChannels()
         connections.removeAll(keepingCapacity: false)
-        await frameCoalescer.cancel()
         credentialStorage = nil
         currentEndpoint = nil
         currentBootstrap = nil
-        eventContinuation.yield(.disconnected)
+        eventMailbox.send(.disconnected)
     }
 
     package func currentAgentConnectionState() -> Bool {
@@ -419,6 +428,25 @@ public actor SpiceSession {
 
     package func isChannelMigrationFlushing() -> Bool {
         !seamlessMigrationPayloads.isEmpty
+    }
+
+    package func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
+        var result = retiredDisplayDiagnostics
+
+        let orderedKeys = channels.keys.sorted {
+            ($0.type, $0.id) < ($1.type, $1.id)
+        }
+        for key in orderedKeys {
+            guard let channel = channels[key] else { continue }
+            guard let display = channel as? DisplayChannel else { continue }
+            result.accumulate(await display.diagnosticsSnapshot())
+        }
+
+        result.totalIOSurfaceAllocatedBytes = IOSurfaceAllocationBudget.shared.allocatedBytes
+        let surfaceBudget = surfaceMemoryBudget.metrics()
+        result.surfaceAllocatedBytes = surfaceBudget.allocatedBytes
+        result.maximumSurfaceBytes = surfaceBudget.maximumBytes
+        return result
     }
 
     public func send(_ input: SpiceClientInput) async throws(SpiceError) {
@@ -752,10 +780,17 @@ public actor SpiceSession {
     }
 
     private func closeChannels() async {
-        let openChannels = channels.values
+        let openChannels = channels.keys.sorted(by: Self.channelKeySort).compactMap { channels[$0] }
         channels.removeAll(keepingCapacity: false)
         for channel in openChannels {
-            await channel.close()
+            await closeAndArchive(channel)
+        }
+    }
+
+    private func closeAndArchive(_ channel: any SpiceManagedChannel) async {
+        await channel.close()
+        if let display = channel as? DisplayChannel {
+            retiredDisplayDiagnostics.accumulate(await display.diagnosticsSnapshot())
         }
     }
 
@@ -865,18 +900,23 @@ public actor SpiceSession {
     private func startSupervision(mainChannel: MainChannel) {
         supervisionGeneration &+= 1
         let generation = supervisionGeneration
-        appendSupervisionTask(for: mainChannel, generation: generation)
-        for channel in channels.values {
-            appendSupervisionTask(for: channel, generation: generation)
+        appendSupervisionTask(
+            for: mainChannel,
+            key: ChannelKey(type: 1, id: 0),
+            generation: generation
+        )
+        for (key, channel) in channels {
+            appendSupervisionTask(for: channel, key: key, generation: generation)
         }
     }
 
     private func appendSupervisionTask(
         for channel: any SpiceManagedChannel,
+        key: ChannelKey,
         generation: UInt64
     ) {
         let emit: @Sendable (SpiceChannelEvent) async -> Void = { [weak self] event in
-            await self?.received(event, generation: generation)
+            await self?.received(event, from: key, generation: generation)
         }
         receiveTasks.append(Task { [weak self] in
             do {
@@ -989,35 +1029,39 @@ public actor SpiceSession {
         }
     }
 
-    private func received(_ event: SpiceChannelEvent, generation: UInt64) async {
+    private func received(
+        _ event: SpiceChannelEvent,
+        from key: ChannelKey,
+        generation: UInt64
+    ) async {
         guard generation == supervisionGeneration else {
             return
         }
         switch event {
         case let .frame(snapshot):
-            await frameCoalescer.submit(SpiceFrame(snapshot))
+            eventMailbox.send(.frame(SpiceFrame(snapshot)), displayChannelID: key.id)
         case let .surfaceDestroyed(surfaceID):
-            eventContinuation.yield(.surfaceDestroyed(surfaceID))
+            eventMailbox.send(.surfaceDestroyed(surfaceID), displayChannelID: key.id)
         case let .cursor(cursorEvent):
             switch cursorEvent {
             case let .initialized(snapshot), let .updated(snapshot), let .reset(snapshot):
-                eventContinuation.yield(.cursor(SpiceCursorState(snapshot)))
+                eventMailbox.send(.cursor(SpiceCursorState(snapshot)))
             case .cacheInvalidated, .ignored:
                 break
             }
         case let .inputs(inputsEvent):
             switch inputsEvent {
             case let .initialized(modifiers), let .keyboardModifiersChanged(modifiers):
-                eventContinuation.yield(.keyboardModifiers(modifiers))
+                eventMailbox.send(.keyboardModifiers(modifiers))
             case .mouseMotionAcknowledged:
-                eventContinuation.yield(.mouseMotionAcknowledged)
+                eventMailbox.send(.mouseMotionAcknowledged)
             case .ignored:
                 break
             }
         case let .main(mainEvent):
             switch mainEvent {
             case let .mouseMode(supported, current):
-                eventContinuation.yield(.mouseMode(supported: supported, current: current))
+                eventMailbox.send(.mouseMode(supported: supported, current: current))
             case let .migration(command):
                 let actions = migrationCoordinator.receive(command)
                 await processMigrationActions(actions, generation: generation)
@@ -1144,7 +1188,7 @@ public actor SpiceSession {
                 }
             }
         case let .displayMonitors(channelID, configuration):
-            eventContinuation.yield(.displayConfiguration(.init(
+            eventMailbox.send(.displayConfiguration(.init(
                 channelID: channelID,
                 maximumAllowed: configuration.maximumAllowed == 0
                     ? nil
@@ -1194,7 +1238,7 @@ public actor SpiceSession {
             guard generation == supervisionGeneration else { return }
             switch action {
             case let .emit(event):
-                eventContinuation.yield(.migration(event))
+                eventMailbox.send(.migration(event))
             case let .send(reply):
                 guard let mainChannel else { return }
                 do {
@@ -1421,7 +1465,9 @@ public actor SpiceSession {
             let channelFactory = ChannelFactory(
                 transportFactory: { _ in transportFactory(endpoint) },
                 ticketEncryptor: ticketEncryptor,
-                serialBarrier: serialBarrier
+                serialBarrier: serialBarrier,
+                advertisesH264: endpoint.videoCodecPolicy == .h264AndMJPEG,
+                advertisesH265: endpoint.videoCodecPolicy == .h265AndMJPEG
             )
             for descriptor in sourceBootstrap.channels {
                 try Task.checkCancellation()
@@ -1442,7 +1488,8 @@ public actor SpiceSession {
                     key: key,
                     connection: connected,
                     glzDecoder: glzDecoder,
-                    multimediaClock: multimediaClock
+                    multimediaClock: multimediaClock,
+                    surfaceMemoryBudget: surfaceMemoryBudget
                 )
             }
             try Task.checkCancellation()
@@ -1596,7 +1643,6 @@ public actor SpiceSession {
         _ prepared: PreparedSession,
         credentials: SpiceCredentialStorage
     ) async throws {
-        await frameCoalescer.cancel()
         try Task.checkCancellation()
 
         supervisionGeneration &+= 1
@@ -1624,7 +1670,11 @@ public actor SpiceSession {
             agentEventContinuation.yield(.connected)
         }
         if let oldMain { await oldMain.close() }
-        for channel in oldChannels.values { await channel.close() }
+        for key in oldChannels.keys.sorted(by: Self.channelKeySort) {
+            if let channel = oldChannels[key] {
+                await closeAndArchive(channel)
+            }
+        }
     }
 
     private nonisolated static func channelKeySort(
@@ -1650,9 +1700,9 @@ public actor SpiceSession {
         for key in partialPayloads.keys {
             await connections[key]?.resumeAfterMigrationCancellation()
             if key == ChannelKey(type: 1, id: 0), let mainChannel {
-                appendSupervisionTask(for: mainChannel, generation: generation)
+                appendSupervisionTask(for: mainChannel, key: key, generation: generation)
             } else if let channel = channels[key] {
-                appendSupervisionTask(for: channel, generation: generation)
+                appendSupervisionTask(for: channel, key: key, generation: generation)
             }
         }
     }
@@ -1680,17 +1730,23 @@ public actor SpiceSession {
             return SpiceEndpoint(
                 host: destination.host,
                 port: securePort,
-                tlsPolicy: tlsPolicy
+                tlsPolicy: tlsPolicy,
+                videoCodecPolicy: current?.videoCodecPolicy ?? .mjpegOnly
             )
         }
         if let port = destination.port {
-            return SpiceEndpoint(host: destination.host, port: port)
+            return SpiceEndpoint(
+                host: destination.host,
+                port: port,
+                videoCodecPolicy: current?.videoCodecPolicy ?? .mjpegOnly
+            )
         }
         if let securePort = destination.securePort {
             return SpiceEndpoint(
                 host: destination.host,
                 port: securePort,
-                tlsPolicy: .system
+                tlsPolicy: .system,
+                videoCodecPolicy: current?.videoCodecPolicy ?? .mjpegOnly
             )
         }
         throw SpiceError.protocolError("migration target has no usable port")
@@ -1717,11 +1773,10 @@ public actor SpiceSession {
         }
         await closeChannels()
         connections.removeAll(keepingCapacity: false)
-        await frameCoalescer.cancel()
         credentialStorage = nil
         currentEndpoint = nil
         currentBootstrap = nil
-        eventContinuation.yield(.failed(Self.map(channelError: error)))
+        eventMailbox.send(.failed(Self.map(channelError: error)))
     }
 
     private nonisolated static func channelInput(_ input: SpiceClientInput) -> SpiceInputEvent {
@@ -1750,7 +1805,7 @@ public actor SpiceSession {
         case let .modeChanged(multimediaTime, mode):
             .modeChanged(
                 multimediaTime: multimediaTime,
-                mode: SpicePlaybackDataMode(rawValue: mode.rawValue) ?? .raw
+                mode: SpicePlaybackDataMode(rawValue: UInt32(mode.rawValue)) ?? .raw
             )
         case let .started(start):
             .started(SpicePlaybackConfiguration(
@@ -1848,12 +1903,14 @@ public actor SpiceSession {
         key: ChannelKey,
         connection: ChannelConnection,
         glzDecoder: SpiceGLZDecoder,
-        multimediaClock: any MultimediaClockScheduling
+        multimediaClock: any MultimediaClockScheduling,
+        surfaceMemoryBudget: SurfaceMemoryBudget
     ) -> any SpiceManagedChannel {
         switch SpiceChannelKind(rawValue: key.type) {
         case .display:
             DisplayChannel(
                 connection: connection,
+                surfaces: SurfaceStore(memoryBudget: surfaceMemoryBudget),
                 glzDecoder: glzDecoder,
                 multimediaClock: multimediaClock
             )

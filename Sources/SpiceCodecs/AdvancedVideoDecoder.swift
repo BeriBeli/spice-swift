@@ -5,6 +5,50 @@ package enum SpiceAdvancedVideoCodec: Sendable, Equatable {
     case h265
 }
 
+/// The storage format retained by an advanced-video decoder.
+///
+/// This is package-only so platform-native storage can remain an implementation
+/// detail while display code can still avoid an unnecessary BGRA materialization.
+package enum SpiceDecodedVideoPixelFormat: Sendable, Equatable {
+    case bgra8
+    case nv12
+    case unsupported(UInt32)
+}
+
+package enum SpiceVideoColorMatrix: Sendable, Equatable {
+    case bt601
+    case bt709
+    case unknown(String?)
+}
+
+package enum SpiceVideoColorRange: Sendable, Equatable {
+    case video
+    case full
+    case unknown
+}
+
+/// An immutable decoded video frame whose packed-BGRA representation is an
+/// explicit fallback rather than the required canonical storage.
+package protocol SpiceDecodedVideoFrame: Sendable {
+    var width: Int { get }
+    var height: Int { get }
+    var pixelFormat: SpiceDecodedVideoPixelFormat { get }
+    var colorMatrix: SpiceVideoColorMatrix { get }
+    var colorRange: SpiceVideoColorRange { get }
+
+    func copyBGRA() throws(SpiceCodecError) -> SpiceDecodedImage
+}
+
+extension SpiceDecodedImage: SpiceDecodedVideoFrame {
+    package var pixelFormat: SpiceDecodedVideoPixelFormat { .bgra8 }
+    package var colorMatrix: SpiceVideoColorMatrix { .unknown(nil) }
+    package var colorRange: SpiceVideoColorRange { .full }
+
+    package func copyBGRA() throws(SpiceCodecError) -> SpiceDecodedImage {
+        self
+    }
+}
+
 package struct SpiceAdvancedVideoDecodeLimits: Sendable, Equatable {
     package var maximumEncodedBytes: Int
     package var maximumNALUnits: Int
@@ -24,6 +68,46 @@ package struct SpiceAdvancedVideoDecodeLimits: Sendable, Equatable {
         self.maximumNALUnitBytes = maximumNALUnitBytes
         self.maximumDimension = maximumDimension
         self.maximumDecodedBytes = maximumDecodedBytes
+    }
+}
+
+/// Backend-neutral aggregate state. Platform decoder handles and CoreVideo
+/// objects remain inside their implementation target.
+package struct SpiceAdvancedVideoDecoderDiagnostics: Sendable, Equatable {
+    package var sessionCreationCount: UInt64
+    package var hardwareSessionCount: UInt64
+    package var softwareSessionCount: UInt64
+    package var hardwareQueryFailureCount: UInt64
+    package var decodedFrameCount: UInt64
+    package var droppedFrameCount: UInt64
+    package var cpuMaterializationCount: UInt64
+
+    package init(
+        sessionCreationCount: UInt64 = 0,
+        hardwareSessionCount: UInt64 = 0,
+        softwareSessionCount: UInt64 = 0,
+        hardwareQueryFailureCount: UInt64 = 0,
+        decodedFrameCount: UInt64 = 0,
+        droppedFrameCount: UInt64 = 0,
+        cpuMaterializationCount: UInt64 = 0
+    ) {
+        self.sessionCreationCount = sessionCreationCount
+        self.hardwareSessionCount = hardwareSessionCount
+        self.softwareSessionCount = softwareSessionCount
+        self.hardwareQueryFailureCount = hardwareQueryFailureCount
+        self.decodedFrameCount = decodedFrameCount
+        self.droppedFrameCount = droppedFrameCount
+        self.cpuMaterializationCount = cpuMaterializationCount
+    }
+
+    package mutating func accumulate(_ other: Self) {
+        sessionCreationCount &+= other.sessionCreationCount
+        hardwareSessionCount &+= other.hardwareSessionCount
+        softwareSessionCount &+= other.softwareSessionCount
+        hardwareQueryFailureCount &+= other.hardwareQueryFailureCount
+        decodedFrameCount &+= other.decodedFrameCount
+        droppedFrameCount &+= other.droppedFrameCount
+        cpuMaterializationCount &+= other.cpuMaterializationCount
     }
 }
 
@@ -222,13 +306,35 @@ package struct SpiceAnnexBParser: Sendable {
     }
 }
 
-package protocol SpiceAdvancedVideoDecoder: Sendable {
+package protocol SpiceAdvancedVideoDecoder: AnyObject, Sendable {
     func decode(
         payload: Data,
         multimediaTime: UInt32
     ) async throws(SpiceCodecError) -> SpiceDecodedImage?
 
+    /// Returns the decoder's immutable native frame when it has one. Callers
+    /// that cannot consume it can use `copyBGRA()` or the compatibility
+    /// `decode(payload:multimediaTime:)` entry point.
+    func decodeVideoFrame(
+        payload: Data,
+        multimediaTime: UInt32
+    ) async throws(SpiceCodecError) -> (any SpiceDecodedVideoFrame)?
+
+    func diagnosticsSnapshot() async -> SpiceAdvancedVideoDecoderDiagnostics
     func close() async
+}
+
+package extension SpiceAdvancedVideoDecoder {
+    func decodeVideoFrame(
+        payload: Data,
+        multimediaTime: UInt32
+    ) async throws(SpiceCodecError) -> (any SpiceDecodedVideoFrame)? {
+        try await decode(payload: payload, multimediaTime: multimediaTime)
+    }
+
+    func diagnosticsSnapshot() async -> SpiceAdvancedVideoDecoderDiagnostics {
+        .init()
+    }
 }
 
 package protocol SpiceAdvancedVideoDecoderFactory: Sendable {

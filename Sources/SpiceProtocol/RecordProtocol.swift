@@ -91,9 +91,9 @@ package struct SpiceRecordWireCodec: Sendable {
         guard data.count <= limits.maximumModeDataBytes else {
             throw .messageTooLarge(actual: data.count, maximum: limits.maximumModeDataBytes)
         }
-        var writer = ByteWriter(capacity: 8 + data.count)
+        var writer = ByteWriter(capacity: 6 + data.count)
         writer.writeUInt32LE(timestamp)
-        writer.writeUInt32LE(mode.rawValue)
+        writer.writeUInt16LE(mode.rawValue)
         writer.writeBytes(data)
         return writer.data
     }

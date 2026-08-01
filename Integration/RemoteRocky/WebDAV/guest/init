@@ -1,0 +1,84 @@
+#!/bin/sh
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export HOME=/root
+
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mkdir -p /dev/pts /dev/shm /dev/virtio-ports /run/dbus /run/avahi-daemon /mnt/webdav
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+ip link set lo up
+
+modprobe virtio_console
+modprobe fuse
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+
+dbus-uuidgen --ensure=/etc/machine-id
+dbus-daemon --system --fork --nopidfile
+avahi-daemon --daemonize --no-chroot
+
+attempt=0
+while ! test -e /dev/virtio-ports/org.spice-space.webdav.0; do
+    mdev -s
+    attempt=$((attempt + 1))
+    if test "${attempt}" -ge 30; then
+        echo "WEBDAV_ERROR virtio port unavailable"
+        exec sh
+    fi
+    sleep 1
+done
+
+spice-webdavd --port 9843 &
+echo "WEBDAV_GUEST_READY port=9843"
+
+printf 'use_locks 0\n' >> /etc/davfs2/davfs2.conf
+printf 'http://127.0.0.1:9843/ "" ""\n' > /etc/davfs2/secrets
+chmod 0600 /etc/davfs2/secrets
+printf 'SwiftSpice WebDAV live fixture\n' > /tmp/expected-webdav.txt
+syslogd
+
+attempt=0
+while true; do
+    if timeout 5 wget -O /tmp/webdav-get.txt \
+        http://127.0.0.1:9843/swiftspice-webdav-live.txt 2>/tmp/wget-error.log \
+        && cmp -s /tmp/expected-webdav.txt /tmp/webdav-get.txt; then
+        echo "WEBDAV_GET_COMPLETE name=swiftspice-webdav-live.txt"
+        break
+    fi
+    attempt=$((attempt + 1))
+    if test "${attempt}" -ge 30; then
+        echo "WEBDAV_ERROR GET failed"
+        cat /tmp/wget-error.log
+        exec sh
+    fi
+    sleep 1
+done
+
+attempt=0
+while true; do
+    umount /mnt/webdav 2>/dev/null || true
+    if timeout 5 mount -t davfs http://127.0.0.1:9843/ /mnt/webdav -o ro </dev/null 2>/tmp/davfs-error.log \
+        && cat /mnt/webdav/swiftspice-webdav-live.txt > /tmp/observed-webdav.txt \
+        && cmp -s /tmp/expected-webdav.txt /tmp/observed-webdav.txt; then
+        bytes="$(wc -c < /tmp/observed-webdav.txt | tr -d ' ')"
+        sha256="$(sha256sum /tmp/observed-webdav.txt | cut -d ' ' -f 1)"
+        echo "WEBDAV_MOUNT_COMPLETE name=swiftspice-webdav-live.txt bytes=${bytes} sha256=${sha256}"
+        break
+    fi
+    attempt=$((attempt + 1))
+    if test "${attempt}" -ge 30; then
+        echo "WEBDAV_ERROR mount or read failed"
+        cat /tmp/davfs-error.log
+        exec sh
+    fi
+    sleep 1
+done
+
+while true; do
+    sleep 60
+done

@@ -24,11 +24,18 @@ public actor NetworkSpiceTransport: SpiceTransport {
         case cancelled
     }
 
+    private struct PendingEstablishment: Sendable {
+        let generation: UInt64
+        let continuation: AsyncStream<EstablishmentState>.Continuation
+    }
+
     private let host: String
     private let port: UInt16
     private let configuration: Configuration
     private let establishmentTimeout: Duration
     private var connection: Connection?
+    private var connectionGeneration: UInt64 = 0
+    private var pendingEstablishment: PendingEstablishment?
 
     public init(host: String, port: UInt16) {
         self.host = host
@@ -84,31 +91,36 @@ public actor NetworkSpiceTransport: SpiceTransport {
                 tls
             }))
         }
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
         connection = newConnection
 
         do {
             switch newConnection {
             case let .tcp(connection):
-                try await startAndWaitUntilReady(connection)
+                try await startAndWaitUntilReady(connection, generation: generation)
             case let .tls(connection):
-                try await startAndWaitUntilReady(connection)
+                try await startAndWaitUntilReady(connection, generation: generation)
+            }
+            guard connectionGeneration == generation, connection != nil else {
+                throw CancellationError()
             }
         } catch is CancellationError {
-            // Dropping the unestablished channel is deliberate. An async
-            // end-of-stream send can itself wait for establishment and would
-            // make cancellation non-terminating.
-            connection = nil
+            clearConnection(generation: generation)
             throw .cancelled
         } catch let error as TransportError {
-            connection = nil
+            clearConnection(generation: generation)
             throw error
         } catch {
-            connection = nil
+            clearConnection(generation: generation)
             throw .connectionFailed(String(describing: error))
         }
     }
 
-    private func startAndWaitUntilReady(_ connection: NetworkConnection<TCP>) async throws {
+    private func startAndWaitUntilReady(
+        _ connection: NetworkConnection<TCP>,
+        generation: UInt64
+    ) async throws {
         let states = AsyncStream.makeStream(
             of: EstablishmentState.self,
             bufferingPolicy: .bufferingNewest(1)
@@ -132,11 +144,16 @@ public actor NetworkSpiceTransport: SpiceTransport {
                 break
             }
         }
+        registerPendingEstablishment(states.continuation, generation: generation)
+        defer { clearPendingEstablishment(generation: generation) }
         connection.sendIdempotent(Data())
         try await waitForEstablishment(states)
     }
 
-    private func startAndWaitUntilReady(_ connection: NetworkConnection<TLS>) async throws {
+    private func startAndWaitUntilReady(
+        _ connection: NetworkConnection<TLS>,
+        generation: UInt64
+    ) async throws {
         let states = AsyncStream.makeStream(
             of: EstablishmentState.self,
             bufferingPolicy: .bufferingNewest(1)
@@ -160,6 +177,8 @@ public actor NetworkSpiceTransport: SpiceTransport {
                 break
             }
         }
+        registerPendingEstablishment(states.continuation, generation: generation)
+        defer { clearPendingEstablishment(generation: generation) }
         connection.sendIdempotent(Data())
         try await waitForEstablishment(states)
     }
@@ -259,11 +278,44 @@ public actor NetworkSpiceTransport: SpiceTransport {
     }
 
     public func close() async {
-        guard let connection else {
+        if let pendingEstablishment {
+            pendingEstablishment.continuation.yield(.cancelled)
+            pendingEstablishment.continuation.finish()
+        }
+        pendingEstablishment = nil
+        connectionGeneration &+= 1
+        connection = nil
+
+        // NetworkConnection starts lazily on the first operation. Sending an
+        // end-of-stream message while setup is being cancelled can enter the
+        // framework with no initialized nw_connection and trap. Releasing the
+        // final reference closes both established and in-flight connections
+        // without issuing another operation against that invalid state.
+    }
+
+    private func registerPendingEstablishment(
+        _ continuation: AsyncStream<EstablishmentState>.Continuation,
+        generation: UInt64
+    ) {
+        pendingEstablishment = PendingEstablishment(
+            generation: generation,
+            continuation: continuation
+        )
+    }
+
+    private func clearPendingEstablishment(generation: UInt64) {
+        guard pendingEstablishment?.generation == generation else {
             return
         }
-        self.connection = nil
-        await closeConnection(connection)
+        pendingEstablishment = nil
+    }
+
+    private func clearConnection(generation: UInt64) {
+        clearPendingEstablishment(generation: generation)
+        guard connectionGeneration == generation else {
+            return
+        }
+        connection = nil
     }
 
     private func makeTLS(policy: NetworkTLSPolicy) -> TLS {
@@ -275,15 +327,6 @@ public actor NetworkSpiceTransport: SpiceTransport {
             return tls
         case .insecureForTestingOnly:
             return tls.certificateValidator { _, _ in true }
-        }
-    }
-
-    private func closeConnection(_ connection: Connection) async {
-        switch connection {
-        case let .tcp(connection):
-            try? await connection.send(Data(), endOfStream: true)
-        case let .tls(connection):
-            try? await connection.send(Data(), endOfStream: true)
         }
     }
 

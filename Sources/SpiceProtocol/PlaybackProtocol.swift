@@ -1,7 +1,7 @@
 import Foundation
 import SpiceWire
 
-package enum SpiceAudioDataMode: UInt32, Sendable, Equatable {
+package enum SpiceAudioDataMode: UInt16, Sendable, Equatable {
     case raw = 1
     case celt051 = 2
     case opus = 3
@@ -26,6 +26,7 @@ package struct SpicePlaybackStart: Sendable, Equatable {
     package let channels: UInt32
     package let format: SpiceAudioFormat
     package let frequency: UInt32
+    package let multimediaTime: UInt32
 }
 
 package enum SpicePlaybackCommand: Sendable, Equatable {
@@ -78,7 +79,7 @@ package struct SpicePlaybackWireDecoder: Sendable {
             ))
         case 102:
             let multimediaTime = try reader.readUInt32LE()
-            let rawMode = try reader.readUInt32LE()
+            let rawMode = try reader.readUInt16LE()
             guard let mode = SpiceAudioDataMode(rawValue: rawMode) else {
                 throw .invalidEnum(type: "SpiceAudioDataMode", value: UInt64(rawMode))
             }
@@ -100,11 +101,13 @@ package struct SpicePlaybackWireDecoder: Sendable {
                 throw .invalidEnum(type: "SpiceAudioFormat", value: UInt64(rawFormat))
             }
             let frequency = try reader.readUInt32LE()
+            let multimediaTime = try reader.readUInt32LE()
             try reader.requireFullyConsumed()
             command = .start(SpicePlaybackStart(
                 channels: channels,
                 format: format,
-                frequency: frequency
+                frequency: frequency,
+                multimediaTime: multimediaTime
             ))
         case 104:
             try reader.requireFullyConsumed()

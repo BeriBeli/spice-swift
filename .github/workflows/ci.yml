@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   swiftpm:
-    name: SwiftPM
+    name: Apple Silicon SwiftPM
     runs-on: macos-26
     timeout-minutes: 30
 
@@ -25,19 +25,24 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Report toolchain
-        run: swift --version
+        run: |
+          test "$(uname -m)" = arm64
+          swift --version
+
+      - name: Install Metal shader toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
 
       - name: Verify generated protocol sources
         run: swift package --allow-writing-to-package-directory generate-spice-protocol --check
 
       - name: Build
-        run: swift build -Xswiftc -warnings-as-errors
+        run: swift build --disable-sandbox -Xswiftc -warnings-as-errors
 
       - name: Test
-        run: swift test -Xswiftc -warnings-as-errors
+        run: swift test --disable-sandbox -Xswiftc -warnings-as-errors
 
-      - name: Build universal relocatable app
-        run: ./script/build_and_run.sh --package
+      - name: Build Apple Silicon relocatable app
+        run: ./Scripts/build-and-run.sh --package
 
       - name: Verify native dependency closure
         run: ./Scripts/verify-native-closure.sh
