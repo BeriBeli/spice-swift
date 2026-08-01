@@ -50,7 +50,9 @@ package final class SpiceMetalPresenter {
         }
         self.device = device
         self.commandQueue = commandQueue
-        self.scaler = MPSImageLanczosScale(device: device)
+        let scaler = MPSImageLanczosScale(device: device)
+        scaler.edgeMode = .clamp
+        self.scaler = scaler
     }
 
     package func makeTexture(for frame: SpiceFrame) -> (any MTLTexture)? {

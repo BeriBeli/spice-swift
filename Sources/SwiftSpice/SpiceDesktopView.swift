@@ -17,6 +17,12 @@ package enum SpiceCursorLayer: Sendable, Equatable {
     case overlay
 }
 
+package enum SpiceSystemCursorDescriptor: Equatable {
+    case arrow
+    case transparent
+    case image(cursor: SpiceCursorImage, scaleX: CGFloat, scaleY: CGFloat)
+}
+
 package enum SpiceDesktopPresentationPolicy {
     package static func cursorLayer(for pointerMode: SpicePointerMode) -> SpiceCursorLayer {
         switch pointerMode {
@@ -41,6 +47,49 @@ package enum SpiceDesktopPresentationPolicy {
         return CGSize(
             width: (viewSize.width * backingScaleFactor).rounded(),
             height: (viewSize.height * backingScaleFactor).rounded()
+        )
+    }
+
+    package static func systemCursorDescriptor(
+        for pointerMode: SpicePointerMode,
+        cursorState: SpiceCursorState?,
+        frameSize: CGSize?,
+        destinationSize: CGSize
+    ) -> SpiceSystemCursorDescriptor {
+        guard pointerMode == .absolute else {
+            return .transparent
+        }
+        guard let cursorState else {
+            return .arrow
+        }
+        guard cursorState.isVisible else {
+            return .transparent
+        }
+        guard let frameSize,
+              frameSize.width.isFinite,
+              frameSize.height.isFinite,
+              destinationSize.width.isFinite,
+              destinationSize.height.isFinite,
+              frameSize.width > 0,
+              frameSize.height > 0,
+              destinationSize.width > 0,
+              destinationSize.height > 0,
+              let cursor = cursorState.image,
+              cursor.format == .alpha,
+              cursor.width > 0,
+              cursor.height > 0
+        else {
+            return .arrow
+        }
+        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(by: cursor.height)
+        let (byteCount, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard !pixelOverflow, !byteOverflow, cursor.data.count == byteCount else {
+            return .arrow
+        }
+        return .image(
+            cursor: cursor,
+            scaleX: destinationSize.width / frameSize.width,
+            scaleY: destinationSize.height / frameSize.height
         )
     }
 }
@@ -99,6 +148,8 @@ private final class SpiceFramebufferView: NSView {
     private let metalView: SpiceMetalFrameView?
     private let cursorOverlay = SpiceCursorOverlayView()
     private var isUsingMetal = false
+    private var systemCursorDescriptor: SpiceSystemCursorDescriptor?
+    private var systemCursor: NSCursor = .arrow
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -160,20 +211,7 @@ private final class SpiceFramebufferView: NSView {
     }
 
     override func resetCursorRects() {
-        let cursor: NSCursor
-        switch SpiceDesktopPresentationPolicy.cursorLayer(for: pointerMode) {
-        case .native:
-            cursor = SpiceFrameDrawing.makeNativeCursor(
-                cursorState,
-                in: desktopFrame.map {
-                    contentRectangle(frameWidth: $0.width, frameHeight: $0.height)
-                } ?? .zero,
-                frame: desktopFrame
-            )
-        case .overlay:
-            cursor = SpiceFrameDrawing.transparentCursor
-        }
-        addCursorRect(bounds, cursor: cursor)
+        addCursorRect(bounds, cursor: systemCursor)
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -339,6 +377,22 @@ private final class SpiceFramebufferView: NSView {
             frame: desktopFrame,
             cursorState: usesOverlay ? cursorState : nil
         )
+        let destinationSize = desktopFrame.map {
+            contentRectangle(frameWidth: $0.width, frameHeight: $0.height).size
+        } ?? .zero
+        let descriptor = SpiceDesktopPresentationPolicy.systemCursorDescriptor(
+            for: pointerMode,
+            cursorState: cursorState,
+            frameSize: desktopFrame.map {
+                CGSize(width: $0.width, height: $0.height)
+            },
+            destinationSize: destinationSize
+        )
+        guard descriptor != systemCursorDescriptor else {
+            return
+        }
+        systemCursorDescriptor = descriptor
+        systemCursor = SpiceFrameDrawing.makeSystemCursor(descriptor)
         window?.invalidateCursorRects(for: self)
     }
 
@@ -452,34 +506,22 @@ private enum SpiceFrameDrawing {
         )
     }
 
-    static func makeNativeCursor(
-        _ cursorState: SpiceCursorState?,
-        in destination: NSRect,
-        frame: SpiceFrame?
-    ) -> NSCursor {
-        guard let cursorState else {
+    static func makeSystemCursor(_ descriptor: SpiceSystemCursorDescriptor) -> NSCursor {
+        switch descriptor {
+        case .arrow:
             return .arrow
-        }
-        guard cursorState.isVisible else {
+        case .transparent:
             return transparentCursor
+        case let .image(cursor, scaleX, scaleY):
+            return makeSystemCursorImage(cursor, scaleX: scaleX, scaleY: scaleY)
         }
-        guard let frame,
-              frame.width > 0,
-              frame.height > 0,
-              destination.width > 0,
-              destination.height > 0,
-              let cursor = cursorState.image,
-              cursor.format == .alpha,
-              cursor.width > 0,
-              cursor.height > 0
-        else {
-            return .arrow
-        }
-        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(by: cursor.height)
-        let (byteCount, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
-        guard !pixelOverflow, !byteOverflow, cursor.data.count == byteCount else {
-            return .arrow
-        }
+    }
+
+    private static func makeSystemCursorImage(
+        _ cursor: SpiceCursorImage,
+        scaleX: CGFloat,
+        scaleY: CGFloat
+    ) -> NSCursor {
         let cursorFrame = SpiceFrame(
             surfaceID: 0,
             width: cursor.width,
@@ -490,8 +532,6 @@ private enum SpiceFrameDrawing {
         guard let image = makeImage(cursorFrame) else {
             return .arrow
         }
-        let scaleX = destination.width / CGFloat(frame.width)
-        let scaleY = destination.height / CGFloat(frame.height)
         let size = NSSize(
             width: CGFloat(cursor.width) * scaleX,
             height: CGFloat(cursor.height) * scaleY

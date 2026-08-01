@@ -108,5 +108,18 @@ struct SpiceMetalPresenterTests {
         #expect(commandBuffer.status == .completed)
         #expect(commandBuffer.error == nil)
         #expect(presenter.metrics().commandErrors == 0)
+
+        var pixels = Data(count: 32)
+        pixels.withUnsafeMutableBytes { bytes in
+            destination.getBytes(
+                bytes.baseAddress!,
+                bytesPerRow: 16,
+                from: MTLRegionMake2D(0, 0, 4, 2),
+                mipmapLevel: 0
+            )
+        }
+        let expectedPixel: [UInt8] = [0x33, 0x22, 0x11, 0xff]
+        let expectedPixels = Data((0..<8).flatMap { _ in expectedPixel })
+        #expect(pixels == expectedPixels)
     }
 }
