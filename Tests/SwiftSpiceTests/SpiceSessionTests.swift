@@ -1048,6 +1048,28 @@ struct SpiceSessionTests {
             videoCodecPolicy: .h264AndMJPEG
         ))
 
+        let virtViewerPolicy = TLSTrustPolicy.virtViewerCertificateAuthority(
+            certificates: [Data([1, 2, 3])],
+            expectedSubject: "C=SG,O=SwiftSpice,CN=target.example"
+        )
+        #expect(try SpiceSession.selectMigrationEndpoint(
+            destination: .init(
+                host: "target.example",
+                port: 5_900,
+                securePort: 5_901,
+                certificateSubject: nil
+            ),
+            current: SpiceEndpoint(
+                host: "source",
+                port: 5_901,
+                tlsPolicy: virtViewerPolicy
+            )
+        ) == SpiceEndpoint(
+            host: "target.example",
+            port: 5_901,
+            tlsPolicy: virtViewerPolicy
+        ))
+
         #expect(try SpiceSession.selectMigrationEndpoint(
             destination: .init(
                 host: "secure.example",

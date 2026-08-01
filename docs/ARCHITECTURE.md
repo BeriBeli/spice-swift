@@ -225,8 +225,10 @@ actors. This preserves render caches, Agent state, input state, audio state, and
 the multimedia clock. Cancellation or failure closes the prepared target
 without disturbing the source session.
 
-TLS sessions must not migrate to plaintext. Certificate-subject validation is
-still unsupported and remains an explicit gate.
+TLS sessions must not migrate to plaintext. Connect-time virt-viewer
+`host-subject` validation is supported, but a migration offer that supplies a
+new destination certificate subject is still unsupported and remains an
+explicit gate.
 
 ## Host-resource boundaries
 

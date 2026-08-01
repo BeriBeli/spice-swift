@@ -25,6 +25,11 @@ Agent behavior, including system-trusted TLS.
 - Swift 6 actor-based TCP and TLS transport using Network.framework.
 - System certificate validation by default and an explicitly named insecure
   policy reserved for tests.
+- Caller-anchored private PKI supports both modern hostname/SAN/EKU validation
+  and an explicit virt-viewer-compatible full `host-subject` policy for legacy
+  certificates. Fixed-date local fixtures cover chain, subject, and validity
+  failures; the reported real Ravada endpoint remains an external acceptance
+  gate.
 - SPICE Link handshake, Full/Mini header negotiation, and ticket authentication.
 - RSA-OAEP-SHA1 ticket encryption with the reference trailing NUL convention.
 - Main Init, Attach Channels, Channel List, Ping/Pong, and ACK flow control.
@@ -48,9 +53,10 @@ Agent behavior, including system-trusted TLS.
 - A self-signed container TLS listener completed the same handshake with the
   explicitly test-only insecure trust policy. No certificate was installed in
   the macOS system or user trust store.
-- A system-trust connection to that untrusted certificate now fails with the
-  transport's bounded 10-second establishment timeout instead of hanging past
-  60 seconds. The same timeout path has a local listener regression test.
+- A system-trust connection to that untrusted certificate now surfaces its
+  terminal TLS trust error instead of hiding it behind the 10-second
+  establishment timeout. A silent peer that never completes TLS still follows
+  the bounded timeout path; both state paths have local regression coverage.
 - After explicit authorization, a one-day local CA was temporarily installed as
   a trust root in the login keychain. macOS SSL evaluation accepted its
   IP-address leaf for `127.0.0.1`, and the normal `--tls` probe authenticated
@@ -107,8 +113,9 @@ Agent behavior, including system-trusted TLS.
 
 - Both trust directions are now closed: a temporarily system-trusted local chain
   completes normal `--tls` Main and child-channel attachment, while the same
-  self-managed chain fails after trust removal. The bounded negative timeout and
-  propagation path remains covered by its local listener regression test.
+  self-managed chain fails after trust removal. Terminal certificate/trust
+  `.waiting` errors propagate as TLS failures, while a genuinely stalled
+  handshake remains covered by the bounded negative-timeout listener test.
 
 ## Stage C delivered so far
 

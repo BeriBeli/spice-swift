@@ -44,6 +44,12 @@ public enum TLSTrustPolicy: Sendable, Equatable {
     /// `serverName` overrides hostname verification when the connection address
     /// differs from the name in the server certificate.
     case customCertificateAuthority(certificates: [Data], serverName: String? = nil)
+    /// Trust only the supplied CA certificates and require the complete leaf
+    /// subject to match a virt-viewer `host-subject` value. Use this explicit
+    /// compatibility policy for legacy SPICE certificates without SAN or a
+    /// Server Authentication EKU; modern hostname validation remains available
+    /// through `customCertificateAuthority`.
+    case virtViewerCertificateAuthority(certificates: [Data], expectedSubject: String)
     case insecureForTestingOnly
 }
 
@@ -1957,6 +1963,15 @@ public actor SpiceSession {
                 tlsPolicy: .customCertificateAuthority(
                     certificates: certificates,
                     serverName: serverName
+                )
+            )
+        case let .virtViewerCertificateAuthority(certificates, expectedSubject):
+            NetworkSpiceTransport(
+                host: endpoint.host,
+                port: endpoint.port,
+                tlsPolicy: .virtViewerCertificateAuthority(
+                    certificates: certificates,
+                    expectedSubject: expectedSubject
                 )
             )
         case .insecureForTestingOnly:

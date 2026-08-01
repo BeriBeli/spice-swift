@@ -9,6 +9,10 @@ public enum NetworkTLSPolicy: Sendable {
     /// certificate or one or more PEM certificates, including the escaped PEM
     /// representation carried by a virt-viewer `ca=` field.
     case customCertificateAuthority(certificates: [Data], serverName: String? = nil)
+    /// Trust only the supplied CA certificates, then compare the complete leaf
+    /// subject with a virt-viewer `host-subject` value. This intentionally uses
+    /// basic X.509 validation instead of modern TLS hostname and EKU checks.
+    case virtViewerCertificateAuthority(certificates: [Data], expectedSubject: String)
     case insecureForTestingOnly
 }
 
@@ -176,7 +180,12 @@ public actor NetworkSpiceTransport: SpiceTransport {
             case .cancelled:
                 states.continuation.yield(.cancelled)
                 states.continuation.finish()
-            case .setup, .waiting, .preparing:
+            case let .waiting(error):
+                if let failure = Self.terminalTLSWaitingFailure(error) {
+                    states.continuation.yield(.failed(failure))
+                    states.continuation.finish()
+                }
+            case .setup, .preparing:
                 break
             @unknown default:
                 break
@@ -339,6 +348,15 @@ public actor NetworkSpiceTransport: SpiceTransport {
                     serverName: serverName
                 )
             }
+        case let .virtViewerCertificateAuthority(certificates, expectedSubject):
+            return tls.certificateValidator { _, protocolTrust in
+                let trust = sec_trust_copy_ref(protocolTrust).takeRetainedValue()
+                return Self.evaluateVirtViewerCertificateAuthority(
+                    trust: trust,
+                    certificates: certificates,
+                    expectedSubject: expectedSubject
+                )
+            }
         case .insecureForTestingOnly:
             return tls.certificateValidator { _, _ in true }
         }
@@ -364,6 +382,57 @@ public actor NetworkSpiceTransport: SpiceTransport {
             }
         }
         return SecTrustEvaluateWithError(trust, nil)
+    }
+
+    package nonisolated static func evaluateVirtViewerCertificateAuthority(
+        trust: SecTrust,
+        certificates: [Data],
+        expectedSubject: String
+    ) -> Bool {
+        guard let anchors = decodeCertificates(certificates), !anchors.isEmpty else {
+            return false
+        }
+        guard SecTrustSetAnchorCertificates(trust, anchors as CFArray) == errSecSuccess,
+              SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess,
+              SecTrustSetPolicies(trust, SecPolicyCreateBasicX509()) == errSecSuccess,
+              SecTrustEvaluateWithError(trust, nil),
+              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              let leaf = chain.first
+        else {
+            return false
+        }
+        return VirtViewerCertificateSubject.matches(expectedSubject, certificate: leaf)
+    }
+
+    package nonisolated static func terminalTLSWaitingFailure(
+        _ error: NWError
+    ) -> TransportError? {
+        guard case let .tls(status) = error else {
+            return nil
+        }
+        switch status {
+        case errSSLXCertChainInvalid,
+             errSSLBadCert,
+             errSSLUnknownRootCert,
+             errSSLNoRootCert,
+             errSSLCertExpired,
+             errSSLCertNotYetValid,
+             errSSLPeerBadCert,
+             errSSLPeerUnsupportedCert,
+             errSSLPeerCertRevoked,
+             errSSLPeerCertExpired,
+             errSSLPeerCertUnknown,
+             errSSLPeerUnknownCA,
+             errSSLHostNameMismatch,
+             errSSLBadCertificateStatusResponse,
+             errSSLCertificateRequired,
+             errSSLATSLeafCertificateHashAlgorithmViolation,
+             errSSLATSCertificateHashAlgorithmViolation,
+             errSSLATSCertificateTrustViolation:
+            return .tlsFailure(String(describing: error))
+        default:
+            return nil
+        }
     }
 
     private nonisolated static func decodeCertificates(
