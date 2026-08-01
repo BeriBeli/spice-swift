@@ -1,6 +1,7 @@
 import CoreVideo
 import Metal
 import MetalKit
+import MetalPerformanceShaders
 import OSLog
 import SpiceIOSurface
 import Synchronization
@@ -40,6 +41,7 @@ private final class SpiceMetalPresenterCompletionMetrics: Sendable {
 package final class SpiceMetalPresenter {
     package let device: any MTLDevice
     private let commandQueue: any MTLCommandQueue
+    private let scaler: MPSImageLanczosScale
     private let completionMetrics = SpiceMetalPresenterCompletionMetrics()
 
     package init?(device: (any MTLDevice)? = SpiceMetalSystemDevice.shared.device) {
@@ -48,6 +50,9 @@ package final class SpiceMetalPresenter {
         }
         self.device = device
         self.commandQueue = commandQueue
+        let scaler = MPSImageLanczosScale(device: device)
+        scaler.edgeMode = .clamp
+        self.scaler = scaler
     }
 
     package func makeTexture(for frame: SpiceFrame) -> (any MTLTexture)? {
@@ -113,6 +118,49 @@ package final class SpiceMetalPresenter {
         }
         return commandBuffer
     }
+
+    /// Builds a presentation command that preserves exact pixels at 1:1 and
+    /// performs one high-quality GPU scale when the drawable uses backing pixels.
+    package func makePresentationCommand(
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        retaining frame: SpiceFrame
+    ) -> (any MTLCommandBuffer)? {
+        guard source.pixelFormat == .bgra8Unorm,
+              destination.pixelFormat == .bgra8Unorm
+        else {
+            return nil
+        }
+        if source.width == destination.width, source.height == destination.height {
+            return makeCopyCommand(
+                source: source,
+                destination: destination,
+                retaining: frame
+            )
+        }
+        guard source.width > 0,
+              source.height > 0,
+              destination.width > 0,
+              destination.height > 0,
+              let commandBuffer = commandQueue.makeCommandBuffer()
+        else {
+            return nil
+        }
+        scaler.encode(
+            commandBuffer: commandBuffer,
+            sourceTexture: source,
+            destinationTexture: destination
+        )
+        commandBuffer.addCompletedHandler { [completionMetrics] commandBuffer in
+            if commandBuffer.status == .error, completionMetrics.recordCommandError() {
+                spiceRenderingLogger.error(
+                    "Metal frame scale failed: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public)"
+                )
+            }
+            withExtendedLifetime(frame) {}
+        }
+        return commandBuffer
+    }
 }
 
 @MainActor
@@ -132,7 +180,7 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
         super.init(frame: .zero, device: presenter.device)
         colorPixelFormat = .bgra8Unorm
         framebufferOnly = false
-        autoResizeDrawable = false
+        autoResizeDrawable = true
         enableSetNeedsDisplay = true
         isPaused = true
         clearColor = MTLClearColorMake(0, 0, 0, 1)
@@ -161,17 +209,26 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
             spiceRenderingLogger.info("Presentation path changed to Metal IOSurface")
         }
         wasUsingMetal = true
-        drawableSize = CGSize(width: frame.width, height: frame.height)
         isHidden = false
         needsDisplay = true
         return true
+    }
+
+    override func layout() {
+        super.layout()
+        updateDrawableSize()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateDrawableSize()
     }
 
     func draw(in view: MTKView) {
         guard let frame = presentedFrame,
               let sourceTexture,
               let drawable = currentDrawable,
-              let commandBuffer = presenter.makeCopyCommand(
+              let commandBuffer = presenter.makePresentationCommand(
                   source: sourceTexture,
                   destination: drawable.texture,
                   retaining: frame
@@ -184,4 +241,15 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    private func updateDrawableSize() {
+        let backingScaleFactor = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 1
+        drawableSize = SpiceDesktopPresentationPolicy.drawableSize(
+            for: bounds.size,
+            backingScaleFactor: backingScaleFactor
+        )
+        needsDisplay = true
+    }
 }
