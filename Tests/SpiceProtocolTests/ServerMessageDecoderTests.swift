@@ -48,6 +48,22 @@ struct ServerMessageDecoderTests {
         #expect(decoded == .mainMouseMode(expected))
     }
 
+    @Test func decodesFourByteMainMouseModeWireBody() throws {
+        let body = Data([
+            0x03, 0x00, // supported_modes: SERVER | CLIENT (flags16)
+            0x02, 0x00, // current_mode: CLIENT (flags16)
+        ])
+
+        #expect(try SpiceServerMessageDecoder.decode(
+            id: 105,
+            body: body,
+            channel: .main
+        ) == .mainMouseMode(SpiceMsgMainMouseMode(
+            supportedModes: 3,
+            currentMode: 2
+        )))
+    }
+
     @Test func decodesMainMultimediaClockReset() throws {
         let expected = SpiceMsgMainMultimediaTime(multimediaTime: UInt32.max - 7)
         var writer = ByteWriter()

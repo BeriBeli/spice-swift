@@ -156,8 +156,8 @@
       "direction": "serverMain",
       "messageID": 105,
       "fields": [
-        { "name": "supportedModes", "type": "uint32" },
-        { "name": "currentMode", "type": "uint32" }
+        { "name": "supportedModes", "type": "uint16" },
+        { "name": "currentMode", "type": "uint16" }
       ]
     },
     {
@@ -179,7 +179,7 @@
       "direction": "clientMain",
       "messageID": 105,
       "fields": [
-        { "name": "mode", "type": "uint32" }
+        { "name": "mode", "type": "uint16" }
       ]
     },
     {

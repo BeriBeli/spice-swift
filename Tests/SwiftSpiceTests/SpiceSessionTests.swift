@@ -11,6 +11,42 @@ import Testing
 
 @Suite("SpiceSession bootstrap")
 struct SpiceSessionTests {
+    @Test func requestsClientMouseModeAndPublishesServerDecisions() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            supportedMouseModes: 3,
+            currentMouseMode: 1
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+
+        let info = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        #expect(info.supportedMouseModes == 3)
+        #expect(info.currentMouseMode == 1)
+        await transport.waitForOutboundCount(5)
+        let outbound = await transport.outbound
+        #expect(try decodeMiniMessageID(outbound[3]) == 105)
+        #expect(try decodeMiniBody(outbound[3]) == Data([0x02, 0x00]))
+        #expect(try decodeMiniMessageID(outbound[4]) == 104)
+
+        var events = session.events.makeAsyncIterator()
+        await transport.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 2)
+        ))
+        #expect(await events.next() == .mouseMode(supported: 3, current: 2))
+
+        await transport.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
+        ))
+        #expect(await events.next() == .mouseMode(supported: 3, current: 1))
+        await session.disconnect()
+    }
+
     @Test func supervisesExplicitNativeWebDAVServer() async throws {
         let source = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [SpiceChannelID(type: 11, id: 0)]
@@ -1268,13 +1304,15 @@ struct SpiceSessionTests {
         channels channelOverride: [SpiceChannelID]? = nil,
         agentConnected: UInt32 = 0,
         agentTokens: UInt32 = 0,
+        supportedMouseModes: UInt32 = 3,
+        currentMouseMode: UInt32 = 2,
         trailing: [Data] = []
     ) throws -> [Data] {
         let mainInit = SpiceMsgMainInit(
             sessionID: 77,
             displayChannelsHint: 1,
-            supportedMouseModes: 3,
-            currentMouseMode: 2,
+            supportedMouseModes: supportedMouseModes,
+            currentMouseMode: currentMouseMode,
             agentConnected: agentConnected,
             agentTokens: agentTokens,
             multimediaTime: 0,

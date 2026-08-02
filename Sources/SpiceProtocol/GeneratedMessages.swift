@@ -621,14 +621,14 @@ package struct SpiceMsgMainChannelsList: SpiceGeneratedMessage {
 package struct SpiceMsgMainMouseMode: SpiceGeneratedMessage {
     package static let direction: SpiceMessageDirection = .serverMain
     package static let messageID: UInt16? = 105
-    package static let minimumWireSize = 8
+    package static let minimumWireSize = 4
 
-    package let supportedModes: UInt32
-    package let currentMode: UInt32
+    package let supportedModes: UInt16
+    package let currentMode: UInt16
 
     package init(
-        supportedModes: UInt32,
-        currentMode: UInt32
+        supportedModes: UInt16,
+        currentMode: UInt16
     ) {
         self.supportedModes = supportedModes
         self.currentMode = currentMode
@@ -638,16 +638,16 @@ package struct SpiceMsgMainMouseMode: SpiceGeneratedMessage {
         from reader: inout ByteReader
     ) throws(WireError) -> Self {
         return Self(
-            supportedModes: try reader.readUInt32LE(),
-            currentMode: try reader.readUInt32LE()
+            supportedModes: try reader.readUInt16LE(),
+            currentMode: try reader.readUInt16LE()
         )
     }
 
     package func encode(
         to writer: inout ByteWriter
     ) throws(WireError) {
-        writer.writeUInt32LE(supportedModes)
-        writer.writeUInt32LE(currentMode)
+        writer.writeUInt16LE(supportedModes)
+        writer.writeUInt16LE(currentMode)
     }
 }
 
@@ -702,12 +702,12 @@ package struct SpiceMsgcMainAttachChannels: SpiceGeneratedMessage {
 package struct SpiceMsgcMainMouseModeRequest: SpiceGeneratedMessage {
     package static let direction: SpiceMessageDirection = .clientMain
     package static let messageID: UInt16? = 105
-    package static let minimumWireSize = 4
+    package static let minimumWireSize = 2
 
-    package let mode: UInt32
+    package let mode: UInt16
 
     package init(
-        mode: UInt32
+        mode: UInt16
     ) {
         self.mode = mode
     }
@@ -716,14 +716,14 @@ package struct SpiceMsgcMainMouseModeRequest: SpiceGeneratedMessage {
         from reader: inout ByteReader
     ) throws(WireError) -> Self {
         return Self(
-            mode: try reader.readUInt32LE()
+            mode: try reader.readUInt16LE()
         )
     }
 
     package func encode(
         to writer: inout ByteWriter
     ) throws(WireError) {
-        writer.writeUInt32LE(mode)
+        writer.writeUInt16LE(mode)
     }
 }
 

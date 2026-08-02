@@ -8,6 +8,101 @@ import Testing
 
 @Suite("Main Channel bootstrap")
 struct MainChannelTests {
+    @Test func requestsSupportedClientMouseModeWithoutAssumingAcceptance() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 1,
+                agentConnected: 0,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+
+        let bootstrap = try await channel.bootstrap()
+
+        #expect(bootstrap.supportedMouseModes == 3)
+        #expect(bootstrap.currentMouseMode == 1)
+        let outbound = await transport.outbound
+        #expect(try outbound.map(decodeMiniMessageID) == [105, 104])
+        #expect(try decodeMiniBody(outbound[0]) == Data([0x02, 0x00]))
+    }
+
+    @Test func preservesServerModeWhenClientMouseModeIsUnsupported() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 1,
+                currentMouseMode: 1,
+                agentConnected: 0,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+
+        let bootstrap = try await channel.bootstrap()
+
+        #expect(bootstrap.supportedMouseModes == 1)
+        #expect(bootstrap.currentMouseMode == 1)
+        #expect(try (await transport.outbound).map(decodeMiniMessageID) == [104])
+    }
+
+    @Test func appliesMouseModeConfirmationReceivedDuringBootstrap() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 1,
+                agentConnected: 0,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainMouseMode(
+                supportedModes: 3,
+                currentMode: 2
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+
+        let bootstrap = try await channel.bootstrap()
+
+        #expect(bootstrap.supportedMouseModes == 3)
+        #expect(bootstrap.currentMouseMode == 2)
+        let outbound = await transport.outbound
+        #expect(try outbound.map(decodeMiniMessageID) == [105, 104])
+        #expect(try decodeMiniBody(outbound[0]) == Data([0x02, 0x00]))
+    }
+
     @Test func discoversChannelsAndHandlesPingAndAckWindow() async throws {
         let mainInit = SpiceMsgMainInit(
             sessionID: 42,
