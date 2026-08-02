@@ -38,8 +38,17 @@ Remote lifecycle commands:
 ```
 
 `control.sh stop` stops only the animated workload and returns to the static
-desktop. `remote/stop.sh` stops QEMU. Start/reset always begins the same
-30-frame-per-second animation at frame zero.
+desktop. `remote/stop.sh` stops QEMU. Start creates the deterministic xterm;
+reset signals its existing generator to return to frame zero, avoiding X-client
+churn while preserving the same 30-frame-per-second starting phase.
+
+After changing the guest image or reset path, exercise at least ten alternating
+five-second pairs and require every client sample to pass the activity-span,
+time-bucket, and last-frame-age gates before starting a formal 10x30-second
+comparison. The 2026-08-02 signal-reset image produced 20/20 valid 720p stress
+samples and 19/20 at 4K, so 4K remains below this prerequisite. See
+[`Benchmarks/RESULTS_ROCKY8_2026-08-02.md`](../../Benchmarks/RESULTS_ROCKY8_2026-08-02.md)
+for the evidence and exact rerun boundary.
 
 Archive a server-log slice around each client capture:
 

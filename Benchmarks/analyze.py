@@ -17,6 +17,9 @@ METRICS = {
     "observe_cpu_seconds_per_frame": ("lower", 1.10),
     "maximum_rss_bytes": ("lower", 1.15),
 }
+EXPECTED_ACTIVITY_BUCKETS = 10
+MINIMUM_ACTIVITY_FRACTION = 0.8
+MAXIMUM_LAST_FRAME_AGE_MS = 1_000.0
 
 
 def parse_time(path: Path) -> dict[str, float]:
@@ -34,9 +37,58 @@ def parse_time(path: Path) -> dict[str, float]:
 def load_client(directory: Path, run: int, client: str) -> dict[str, float]:
     prefix = directory / f"run-{run:02d}-{client}"
     report = json.loads(prefix.with_suffix(".json").read_text())
-    if int(report.get("frames", 0)) < 2:
-        raise ValueError(f"inactive benchmark workload in {prefix.with_suffix('.json')}")
+    metadata_path = prefix.with_suffix(".meta.json")
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("client") != client or int(metadata.get("run", -1)) != run:
+        raise ValueError(f"sample identity mismatch in {metadata_path}")
+    if int(metadata.get("exit_code", -1)) != 0:
+        raise ValueError(f"client exited unsuccessfully in {metadata_path}")
+    boot_epoch = metadata.get("boot_epoch")
+    if not isinstance(boot_epoch, str) or not boot_epoch:
+        raise ValueError(f"missing boot epoch in {metadata_path}")
+    observe_seconds = int(report.get("observe_seconds", 0))
+    if observe_seconds < 1 or observe_seconds != int(
+        metadata.get("observe_seconds", -1)
+    ):
+        raise ValueError(f"observation duration mismatch in {metadata_path}")
+    activity_requirements = {
+        "frames": int(report.get("frames", 0)) >= 2,
+        "expected_time_buckets": int(report.get("expected_time_buckets", 0))
+        == EXPECTED_ACTIVITY_BUCKETS,
+        "active_time_buckets": int(report.get("active_time_buckets", 0))
+        >= int(EXPECTED_ACTIVITY_BUCKETS * MINIMUM_ACTIVITY_FRACTION),
+        "active_span_ms": float(report.get("active_span_ms", -1))
+        >= observe_seconds * 1_000 * MINIMUM_ACTIVITY_FRACTION,
+        "last_frame_age_ms": 0 <= float(report.get("last_frame_age_ms", -1))
+        <= MAXIMUM_LAST_FRAME_AGE_MS,
+    }
+    invalid_activity = [
+        name for name, passed in activity_requirements.items() if not passed
+    ]
+    if invalid_activity:
+        raise ValueError(
+            f"incomplete benchmark activity in {prefix.with_suffix('.json')}: "
+            + ", ".join(invalid_activity)
+        )
+    if client == "swiftspice" and report.get("renderer") == "metal":
+        metal_requirements = {
+            "metal_2d_command_buffers": lambda value: int(value) > 0,
+            "metal_2d_commands": lambda value: int(value) > 0,
+            "cpu_materializations": lambda value: int(value) == 0,
+            "gpu_errors": lambda value: int(value) == 0,
+        }
+        invalid = [
+            name
+            for name, predicate in metal_requirements.items()
+            if name not in report or not predicate(report[name])
+        ]
+        if invalid:
+            raise ValueError(
+                "invalid Metal 2D benchmark evidence in "
+                f"{prefix.with_suffix('.json')}: {', '.join(invalid)}"
+            )
     report.update(parse_time(prefix.with_suffix(".time.txt")))
+    report["boot_epoch"] = boot_epoch
     if "cpu_seconds" in report:
         report["cpu_seconds_per_frame"] = (
             float(report["cpu_seconds"]) / float(report["frames"])
@@ -87,6 +139,12 @@ def analyze(directory: Path, expected_pairs: int | None = None) -> dict[str, obj
         )
         for run in run_numbers
     ]
+    for run, (swift, reference) in zip(run_numbers, pairs, strict=True):
+        if swift["boot_epoch"] != reference["boot_epoch"]:
+            raise ValueError(
+                f"boot epoch changed within pair {run}: "
+                f"{swift['boot_epoch']} != {reference['boot_epoch']}"
+            )
     metrics: dict[str, object] = {}
     overall_pass = True
     for name, (direction, threshold) in METRICS.items():

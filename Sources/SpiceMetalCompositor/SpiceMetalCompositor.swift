@@ -186,7 +186,7 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         self.textureCache = cache
     }
 
-    private static func bundledShaderLibraryURL() -> URL? {
+    package static func bundledShaderLibraryURL() -> URL? {
         // Locate by relative bundle structure in packaged apps and SwiftPM test
         // runs. Deliberately avoid Bundle.module here: its generated fallback
         // embeds an absolute build-machine path in clients of a static library.

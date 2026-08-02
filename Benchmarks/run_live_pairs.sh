@@ -14,6 +14,10 @@ readonly OUTPUT_DIRECTORY="$5"
 readonly RESET_SCRIPT="${SWIFTSPICE_BENCH_RESET_SCRIPT:-}"
 readonly HOOK_SCRIPT="${SWIFTSPICE_BENCH_HOOK_SCRIPT:-}"
 readonly VIDEO_CODEC="${SWIFTSPICE_BENCH_VIDEO_CODEC:-mjpeg}"
+readonly RENDERER="${SWIFTSPICE_BENCH_RENDERER:-metal}"
+readonly BOOT_EPOCH="${SWIFTSPICE_BENCH_BOOT_EPOCH:-}"
+readonly BOOT_EPOCH_SCRIPT="${SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT:-}"
+readonly CONTINUE_ON_FAILURE="${SWIFTSPICE_BENCH_CONTINUE_ON_FAILURE:-0}"
 
 if [[ -z "${SPICE_PASSWORD+x}" ]]; then
     echo "SPICE_PASSWORD must be set (an empty ticket is allowed)" >&2
@@ -39,6 +43,22 @@ if [[ -n "$HOOK_SCRIPT" && ! -x "$HOOK_SCRIPT" ]]; then
     echo "SWIFTSPICE_BENCH_HOOK_SCRIPT is not executable: $HOOK_SCRIPT" >&2
     exit 2
 fi
+if [[ -n "$BOOT_EPOCH_SCRIPT" && ! -x "$BOOT_EPOCH_SCRIPT" ]]; then
+    echo "SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT is not executable: $BOOT_EPOCH_SCRIPT" >&2
+    exit 2
+fi
+if [[ -n "$BOOT_EPOCH" && -n "$BOOT_EPOCH_SCRIPT" ]]; then
+    echo "set only one of SWIFTSPICE_BENCH_BOOT_EPOCH or SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT" >&2
+    exit 2
+fi
+if [[ -z "$BOOT_EPOCH" && -z "$BOOT_EPOCH_SCRIPT" ]]; then
+    echo "a guest boot epoch value or script is required" >&2
+    exit 2
+fi
+if [[ "$CONTINUE_ON_FAILURE" != 0 && "$CONTINUE_ON_FAILURE" != 1 ]]; then
+    echo "SWIFTSPICE_BENCH_CONTINUE_ON_FAILURE must be 0 or 1" >&2
+    exit 2
+fi
 if [[ -e "$OUTPUT_DIRECTORY" ]]; then
     echo "output directory already exists: $OUTPUT_DIRECTORY" >&2
     exit 2
@@ -56,6 +76,14 @@ case "$VIDEO_CODEC" in
         ;;
     *)
         echo "SWIFTSPICE_BENCH_VIDEO_CODEC must be mjpeg, h264, or h265" >&2
+        exit 2
+        ;;
+esac
+case "$RENDERER" in
+    automatic|cpu|metal)
+        ;;
+    *)
+        echo "SWIFTSPICE_BENCH_RENDERER must be automatic, cpu, or metal" >&2
         exit 2
         ;;
 esac
@@ -91,6 +119,14 @@ run_client() {
     if [[ -n "$HOOK_SCRIPT" ]]; then
         "$HOOK_SCRIPT" before "$run_number" "$client"
     fi
+    local sample_boot_epoch="$BOOT_EPOCH"
+    if [[ -n "$BOOT_EPOCH_SCRIPT" ]]; then
+        sample_boot_epoch="$($BOOT_EPOCH_SCRIPT "$run_number" "$client")"
+    fi
+    if [[ -z "$sample_boot_epoch" || "$sample_boot_epoch" == *$'\n'* ]]; then
+        echo "boot epoch must be one non-empty line" >&2
+        return 1
+    fi
 
     local result=0
     set +e
@@ -99,6 +135,7 @@ run_client() {
             /usr/bin/time -lp -o "$prefix.time.txt" \
                 "$SWIFT_PROBE" "$HOST" "$PORT" \
                 --observe-seconds "$OBSERVE_SECONDS" --benchmark-json \
+                --renderer "$RENDERER" \
                 ${SWIFT_VIDEO_FLAGS[@]+"${SWIFT_VIDEO_FLAGS[@]}"} \
                 >"$prefix.json"
             ;;
@@ -114,30 +151,92 @@ run_client() {
     esac
     result=$?
     set -e
+    jq -n \
+        --arg boot_epoch "$sample_boot_epoch" \
+        --arg client "$client" \
+        --arg renderer "$RENDERER" \
+        --arg video_codec "$VIDEO_CODEC" \
+        --argjson exit_code "$result" \
+        --argjson observe_seconds "$OBSERVE_SECONDS" \
+        --argjson run "$run_number" \
+        '{
+            boot_epoch: $boot_epoch,
+            client: $client,
+            exit_code: $exit_code,
+            observe_seconds: $observe_seconds,
+            renderer: $renderer,
+            run: $run,
+            video_codec: $video_codec
+        }' >"$prefix.meta.json"
     if [[ -n "$HOOK_SCRIPT" ]]; then
         "$HOOK_SCRIPT" after "$run_number" "$client"
     fi
+    local sample_failed=0
     if ((result != 0)); then
-        return "$result"
+        if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
+            return "$result"
+        fi
+        printf '%02d\t%s\texit_code=%d\n' "$run_number" "$client" "$result" \
+            >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
+        sample_failed=1
     fi
-    jq -e '.frames >= 2' "$prefix.json" >/dev/null || {
-        echo "inactive benchmark workload in $prefix.json" >&2
-        return 1
-    }
-    if [[ "$client" == "swiftspice" && "$VIDEO_CODEC" != "mjpeg" ]]; then
-        jq -e '
+    if ((result == 0)) && ! jq -e --argjson observe_seconds "$OBSERVE_SECONDS" '
+        .frames >= 2
+        and .observe_seconds == $observe_seconds
+        and .expected_time_buckets == 10
+        and .active_time_buckets * 5 >= .expected_time_buckets * 4
+        and .active_span_ms >= ($observe_seconds * 800)
+        and .last_frame_age_ms >= 0
+        and .last_frame_age_ms <= 1000
+    ' "$prefix.json" >/dev/null; then
+        echo "incomplete benchmark activity window in $prefix.json" >&2
+        if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
+            return 1
+        fi
+        printf '%02d\t%s\tincomplete_activity\n' "$run_number" "$client" \
+            >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
+        sample_failed=1
+    fi
+    if ((result == 0)) && [[ "$client" == "swiftspice" && "$RENDERER" == "metal" ]]; then
+        if ! jq -e '
+            .metal_2d_renderer_enabled == true
+            and .metal_2d_command_buffers >= 1
+            and .metal_2d_commands >= 1
+            and .cpu_materializations == 0
+            and .gpu_errors == 0
+        ' "$prefix.json" >/dev/null; then
+            echo "Metal 2D evidence gate failed in $prefix.json" >&2
+            if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
+                return 1
+            fi
+            printf '%02d\t%s\tmetal_2d_evidence\n' "$run_number" "$client" \
+                >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
+            sample_failed=1
+        fi
+    fi
+    if ((result == 0)) && [[ "$client" == "swiftspice" && "$VIDEO_CODEC" != "mjpeg" ]]; then
+        if ! jq -e '
             .native_video_frames >= 1
             and .vt_decoded_frames >= 1
             and .vt_cpu_materializations == 0
             and .advanced_cpu_fallback_frames == 0
             and .gpu_errors == 0
             and .metal_generation_disables == 0
-        ' "$prefix.json" >/dev/null || {
+        ' "$prefix.json" >/dev/null; then
             echo "native-video evidence gate failed in $prefix.json" >&2
-            return 1
-        }
+            if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
+                return 1
+            fi
+            printf '%02d\t%s\tnative_video_evidence\n' "$run_number" "$client" \
+                >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
+            sample_failed=1
+        fi
     fi
-    printf 'run=%02d client=%s state=completed\n' "$run_number" "$client"
+    if ((sample_failed == 1)); then
+        printf 'run=%02d client=%s state=completed-integrity-failed\n' "$run_number" "$client"
+    else
+        printf 'run=%02d client=%s state=completed\n' "$run_number" "$client"
+    fi
 }
 
 for ((run_number = 1; run_number <= RUNS; run_number++)); do

@@ -67,3 +67,77 @@ kernel void spice_nv12_to_bgra(
 
     destination.write(float4(rgb, 1.0f), destinationPosition);
 }
+
+struct SpiceFillUniforms {
+    uint4 rectangle;
+    float4 colorRGBA;
+};
+
+kernel void spice_fill_rect(
+    texture2d<float, access::write> destination [[texture(0)]],
+    constant SpiceFillUniforms &uniforms [[buffer(0)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    if (any(position >= uniforms.rectangle.zw)) {
+        return;
+    }
+    destination.write(uniforms.colorRGBA, uniforms.rectangle.xy + position);
+}
+
+struct SpiceBitmapUniforms {
+    // x/y: bitmap dimensions, z: source stride in bytes.
+    uint4 sourceGeometry;
+    uint4 sourceRectangle;
+    uint4 destinationRectangle;
+    // x: top-down, y: preserve alpha.
+    uint4 flags;
+};
+
+kernel void spice_bitmap_copy(
+    device const uchar *sourceBytes [[buffer(0)]],
+    constant SpiceBitmapUniforms &uniforms [[buffer(1)]],
+    texture2d<float, access::write> destination [[texture(0)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    if (any(position >= uniforms.destinationRectangle.zw)) {
+        return;
+    }
+    const uint2 sourcePosition = uniforms.sourceRectangle.xy + uint2(
+        position.x * uniforms.sourceRectangle.z / uniforms.destinationRectangle.z,
+        position.y * uniforms.sourceRectangle.w / uniforms.destinationRectangle.w
+    );
+    const uint sourceY = uniforms.flags.x != 0
+        ? sourcePosition.y
+        : uniforms.sourceGeometry.y - 1u - sourcePosition.y;
+    const uint offset = sourceY * uniforms.sourceGeometry.z + sourcePosition.x * 4u;
+    const float4 rgba = float4(
+        float(sourceBytes[offset + 2u]),
+        float(sourceBytes[offset + 1u]),
+        float(sourceBytes[offset]),
+        uniforms.flags.y != 0 ? float(sourceBytes[offset + 3u]) : 255.0f
+    ) / 255.0f;
+    destination.write(rgba, uniforms.destinationRectangle.xy + position);
+}
+
+struct SpiceSurfaceCopyUniforms {
+    uint4 sourceRectangle;
+    uint4 destinationRectangle;
+    // x: preserve alpha.
+    uint4 flags;
+};
+
+kernel void spice_surface_copy(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    constant SpiceSurfaceCopyUniforms &uniforms [[buffer(0)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    if (any(position >= uniforms.destinationRectangle.zw)) {
+        return;
+    }
+    float4 rgba = source.read(uniforms.sourceRectangle.xy + position);
+    if (uniforms.flags.x == 0) {
+        rgba.a = 1.0f;
+    }
+    destination.write(rgba, uniforms.destinationRectangle.xy + position);
+}

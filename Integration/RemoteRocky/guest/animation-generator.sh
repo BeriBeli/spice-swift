@@ -2,9 +2,18 @@
 
 set -eu
 
+parent_pid="${PPID}"
+reset_requested=0
+trap 'reset_requested=1' USR1
+
 frame=0
 printf '\033[2J'
-while true; do
+while kill -0 "${parent_pid}" 2>/dev/null; do
+    if test "${reset_requested}" -eq 1; then
+        frame=0
+        reset_requested=0
+        printf '\033[2J'
+    fi
     printf '\033[HSwiftSpice deterministic animation | 1280x720 | frame=%06d\n' "${frame}"
     row=0
     while test "${row}" -lt 32; do
@@ -27,5 +36,5 @@ while true; do
         row=$((row + 1))
     done
     frame=$(((frame + 1) % 1000000))
-    sleep 0.033333
+    sleep 0.033333 || true
 done

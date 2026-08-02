@@ -61,7 +61,7 @@ stop_process() {
     pid_file="$1"
     if test -f "${pid_file}"; then
         pid="$(cat "${pid_file}")"
-        kill "${pid}" 2>/dev/null || true
+        kill -TERM -- "-${pid}" 2>/dev/null || kill "${pid}" 2>/dev/null || true
         wait "${pid}" 2>/dev/null || true
         rm -f "${pid_file}"
     fi
@@ -69,6 +69,7 @@ stop_process() {
 
 start_static() {
     stop_process /run/perf-animation.pid
+    rm -f /run/perf-animation-generator.pid
     stop_process /run/perf-static.pid
     xsetroot -solid '#17212b'
     /usr/local/bin/static-desktop.sh &
@@ -78,10 +79,22 @@ start_static() {
 
 start_animation() {
     stop_process /run/perf-animation.pid
+    rm -f /run/perf-animation-generator.pid
     stop_process /run/perf-static.pid
     /usr/local/bin/animation-load.sh &
     echo "$!" > /run/perf-animation.pid
     echo "PERF_LOAD state=animation reset_frame=0"
+}
+
+reset_animation() {
+    if test -f /run/perf-animation.pid \
+        && kill -0 "$(cat /run/perf-animation.pid)" 2>/dev/null \
+        && test -f /run/perf-animation-generator.pid \
+        && kill -USR1 "$(cat /run/perf-animation-generator.pid)" 2>/dev/null; then
+        echo "PERF_LOAD state=animation reset_frame=0 method=signal"
+    else
+        start_animation
+    fi
 }
 
 start_static
@@ -90,8 +103,11 @@ echo "PERF_READY resolution=1280x720"
 while true; do
     while IFS= read -r command; do
         case "${command}" in
-            start|reset)
+            start)
                 start_animation
+                ;;
+            reset)
+                reset_animation
                 ;;
             stop)
                 start_static
