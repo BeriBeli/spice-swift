@@ -25,9 +25,14 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - Validate real Smartcard and redirected USB devices.
 - Exercise live semi-seamless and seamless migration.
 - Make the signal-reset guest fixture activity-valid for 20/20 short 4K stress
-  samples, then rerun fresh ten-pair, 30-second CPU and Metal batches at both
-  1280x720 and 3840x2160. The 2026-08-02 formal collection was rejected because
-  the old fixture became static in late pairs.
+  samples, then rerun fresh ten-pair, 30-second `cpu`, `cpu-iosurface`, and
+  `metal` batches at both 1280x720 and 3840x2160. Pair `cpu-iosurface` directly
+  with `metal` before making a Metal benefit claim. The 2026-08-02 formal
+  collection was rejected because the old fixture became static in late pairs.
+- Before production-enabling Metal 2D, eliminate the per-publication full-frame
+  seed and serial seed/draw completion waits, preserve partial damage history,
+  avoid scratch for non-overlapping COPY_BITS, deduplicate clipped bitmap
+  uploads, and bound resident upload/scratch pools.
 - Reduce CPU per published frame to at most 1.10x spice-client-glib2 while
   preserving fps, ready-frame, p95, lifecycle, and GPU-evidence gates. The
   current valid eight-pair diagnostic ratios range from 1.375421 to 1.944140;

@@ -449,7 +449,7 @@ package actor SurfaceStore {
         framePool: IOSurfaceFramePool = .shared,
         memoryBudget: SurfaceMemoryBudget? = nil,
         backingPolicy: SurfaceBackingPolicy = .automatic,
-        enableMetal2DRenderer: Bool = true,
+        enableMetal2DRenderer: Bool = false,
         compositorFailureForAttempt: @escaping @Sendable (Int) -> SpiceMetalCompositorError? = {
             _ in nil
         },
@@ -1581,15 +1581,18 @@ package actor SurfaceStore {
             return pending
         }
         guard let renderer = metal2DRenderer,
-              var unified = surface.storage.unifiedBacking,
-              let writable = unified.pool.checkoutWritable(
-                  namespace: unified.namespace,
-                  surfaceID: surface.id,
-                  width: surface.width,
-                  height: surface.height,
-                  source: unified.current
-              )
+              var unified = surface.storage.unifiedBacking
         else {
+            return nil
+        }
+        guard let writable = unified.pool.checkoutWritable(
+            namespace: unified.namespace,
+            surfaceID: surface.id,
+            width: surface.width,
+            height: surface.height,
+            source: unified.current
+        ) else {
+            poolExhaustions &+= 1
             return nil
         }
 

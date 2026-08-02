@@ -530,8 +530,17 @@ struct SpiceProbe {
         if let sessionFailure = summary.sessionFailure {
             throw ProbeError.sessionFailed(sessionFailure)
         }
-        if rendererBackend == .metal, !diagnostics.metal2DRendererEnabled {
-            throw ProbeError.missingObservation("Metal 2D renderer")
+        if rendererBackend.requiresRevisionedBacking,
+           !diagnostics.revisionedBackingEnabled {
+            throw ProbeError.missingObservation("revisioned IOSurface backing")
+        }
+        if !rendererBackend.usesRevisionedIOSurfaceBacking,
+           diagnostics.revisionedBackingEnabled {
+            throw ProbeError.missingObservation("data-only backing")
+        }
+        if diagnostics.metal2DRendererEnabled
+            != rendererBackend.enablesMetal2DRenderer {
+            throw ProbeError.missingObservation("requested 2D renderer")
         }
         if benchmarkJSON {
             let report = ProbeBenchmarkReport(
@@ -1398,7 +1407,8 @@ private enum ProbeError: Error, CustomStringConvertible {
                 + "[--exercise-monitor-config] [--exercise-webdav] "
                 + "[--exercise-playback|--exercise-record-synthetic] "
                 + "[--benchmark-json] [--enable-h264|--enable-h265] "
-                + "[--require-native-video] [--renderer automatic|cpu|metal]; "
+                + "[--require-native-video] "
+                + "[--renderer automatic|cpu|cpu-iosurface|metal]; "
                 + "password is read from SPICE_PASSWORD"
         case let .missingObservation(name):
             "missing required live observation: \(name)"

@@ -896,11 +896,14 @@ such by an embedding application.
 
 ## Apple Silicon optimization acceptance status
 
-- Ordinary SPICE 2D commands now use an IOSurface-canonical Metal batch on
-  supported Apple Silicon. Fill, decoded bitmap copy, overlap-safe COPY_BITS,
-  and cross-Surface copy share one command buffer until snapshot or the bounded
-  512-command/16-MiB threshold. Canonical output becomes visible only after GPU
-  completion; an injected failure replays the complete batch on the CPU.
+- The production `.automatic` backend keeps ordinary SPICE 2D commands on the
+  CPU while using revisioned IOSurface publication when supported. The
+  IOSurface-canonical Metal 2D batch is retained only behind the explicit
+  experimental `.metal` backend. Fill, decoded bitmap copy, overlap-safe
+  COPY_BITS, and cross-Surface copy share one command buffer until snapshot or
+  the bounded 512-command/16-MiB threshold. Canonical output becomes visible
+  only after GPU completion; an injected failure replays the complete batch on
+  the CPU.
 - Focused M4 tests prove a four-command batch uses one command buffer and
   matches the CPU renderer byte-for-byte, preserves ARGB cross-Surface copy
   without CPU readback, and recovers from an injected GPU failure. Probe JSON
@@ -913,14 +916,18 @@ such by an embedding application.
 - CPU-only rendering bypasses Metal enqueue and empty-flush calls. Probe
   diagnostics now split CPU opcode counts/timing, revision GPU clones, batch
   seed CPU/GPU copies, snapshot catch-up copies, per-Metal-opcode counts, and
-  upload-buffer allocation/reuse. Bitmap uploads use a bounded-by-peak,
-  power-of-two persistent MTLBuffer pool across completed batches.
+  upload-buffer allocation/reuse. Bitmap uploads use a power-of-two persistent
+  MTLBuffer pool across completed batches; a hard resident-byte/class cap and
+  memory-pressure purge remain required before production enablement.
 - In-place mutation of the current IOSurface was not enabled: it would break
   the batch's rollback guarantee when GPU execution fails. Snapshot-driven
   commits also remain at the 16-ms publication boundary; reducing them would
   trade benchmark CPU for visible frame latency and needs a separate policy.
-- `spice-probe --renderer automatic|cpu|metal` provides an explicit A/B switch;
-  `metal` rejects observations without revisioned IOSurface backing. The live
+- `spice-probe --renderer automatic|cpu|cpu-iosurface|metal` provides explicit
+  engine/backing configurations. `automatic` and `cpu-iosurface` use CPU 2D
+  with automatic and required revisioned backing respectively; `cpu` is the
+  historical Data-backed mode; `metal` is experimental and requires revisioned
+  backing. The live
   runner now requires full-window activity evidence, successful process exit,
   and a stable guest boot epoch within each pair. A 2026-08-02 alternating
   10x30-second CPU/Metal collection covered 1280x720 and 3840x2160, but its
@@ -931,6 +938,11 @@ such by an embedding application.
   limit. The 4K Metal RSS ratio was also 1.256189, above 1.15. These failures
   identify current optimization work; they are not a substitute for a valid
   ten-pair confidence interval.
+- Those retained CPU and Metal prefixes are not a direct Swift CPU-versus-Metal
+  A/B: `cpu` used Data backing while `metal` used revisioned IOSurface backing,
+  and the variants came from different batches. Future Metal benefit claims
+  must pair `cpu-iosurface` against `metal` while also retaining `cpu` as the
+  historical Swift-versus-GLib configuration.
 - All 20 Metal processes in that collection exited zero, recorded zero GPU
   errors and zero CPU materializations in valid samples, and avoided the former
   encoder-lifecycle abort. Median 4K Metal diagnostics nevertheless recorded
@@ -941,7 +953,8 @@ such by an embedding application.
   instead of repeatedly creating xterm clients. A fixed-fixture 10x5-second
   stress produced 20/20 activity-valid 720p samples and 19/20 at 4K; one 4K
   GLib sample still became static. Therefore the next formal run is gated on a
-  20/20 4K stress pass followed by fresh CPU/Metal 10x30-second batches. Full
+  20/20 4K stress pass followed by fresh `cpu`, `cpu-iosurface`, and `metal`
+  10x30-second batches. Full
   ratios, absolute medians, and retained paths are in
   `Benchmarks/RESULTS_ROCKY8_2026-08-02.md`.
 - The previous 2026-08-01 current-tree five-second Rocky smoke used an arm64
@@ -980,7 +993,7 @@ such by an embedding application.
   still needs its custom KVM kernel and local QEMU image restored before rerun.
 
 The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate passes 347 tests in 68 suites. The current Rocky
+warnings-as-errors gate passes 354 tests in 69 suites. The current Rocky
 yuv420p H.264/H.265 native composition gate is closed; broader codec profiles,
 resolutions, and display behavior remain part of the real-host gate. Smartcard
 hardware, a redirected USB device, human-audible Playback/device route
@@ -1006,7 +1019,7 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 347 tests in 68 suites, `swift build`,
+The current warnings-as-errors gate passes 354 tests in 69 suites, `swift build`,
 the generated-protocol consistency check, and exact-arm64 app packaging with
 recursive native-closure verification.
 

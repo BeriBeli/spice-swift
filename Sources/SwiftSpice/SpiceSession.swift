@@ -126,7 +126,35 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
 package enum SpiceRenderingBackend: String, Sendable {
     case automatic
     case cpu
+    case cpuIOSurface = "cpu-iosurface"
     case metal
+
+    package var usesRevisionedIOSurfaceBacking: Bool {
+        switch self {
+        case .automatic, .cpuIOSurface, .metal:
+            true
+        case .cpu:
+            false
+        }
+    }
+
+    package var enablesMetal2DRenderer: Bool {
+        switch self {
+        case .metal:
+            true
+        case .automatic, .cpu, .cpuIOSurface:
+            false
+        }
+    }
+
+    package var requiresRevisionedBacking: Bool {
+        switch self {
+        case .cpuIOSurface, .metal:
+            true
+        case .automatic, .cpu:
+            false
+        }
+    }
 }
 
 public actor SpiceSession {
@@ -1940,7 +1968,10 @@ public actor SpiceSession {
                 connection: connection,
                 surfaces: SurfaceStore(
                     memoryBudget: surfaceMemoryBudget,
-                    backingPolicy: renderingBackend == .cpu ? .dataOnly : .automatic
+                    backingPolicy: renderingBackend.usesRevisionedIOSurfaceBacking
+                        ? .automatic
+                        : .dataOnly,
+                    enableMetal2DRenderer: renderingBackend.enablesMetal2DRenderer
                 ),
                 glzDecoder: glzDecoder,
                 multimediaClock: multimediaClock

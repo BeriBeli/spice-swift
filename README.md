@@ -17,7 +17,7 @@ advertised on the wire after their interoperability requirements are met.
 | Display, Cursor, physical keyboard and pointer input | Implemented and exercised against live QEMU/SPICE |
 | RAW, JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, and MJPEG display data | Covered by bounded decoders and offline golden fixtures |
 | H.264 and H.265 | VideoToolbox decode and deterministic Rocky yuv420p interoperability are closed behind explicit opt-in; `.mjpegOnly` remains the default |
-| Apple Silicon display path | Revisioned IOSurface backing, batched Metal fill/bitmap/COPY_BITS/surface-copy, and native NV12 composition are implemented; byte-exact CPU/GPU differential tests pass locally, but current headless 720p/4K diagnostics fail CPU/frame parity and the formal 10-pair verdict remains open pending a fully reliable guest activity fixture plus M1 and real-window validation |
+| Apple Silicon display path | The default uses CPU 2D drawing with revisioned IOSurface publication; transactional Metal fill/bitmap/COPY_BITS/surface-copy is retained behind an explicit experimental backend, while native NV12 composition remains enabled. Byte-exact differential tests pass locally, but current headless 720p/4K diagnostics fail CPU/frame parity and do not establish Metal performance non-inferiority |
 | UTF-8 clipboard, file transfer, and monitor configuration | Implemented and exercised with the richer Agent guest |
 | Playback and Record | Implemented locally; audible playback and microphone capture remain external hardware gates |
 | Smartcard and USB redirection | Implemented locally; real devices remain external gates |

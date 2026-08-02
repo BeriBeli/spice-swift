@@ -1017,7 +1017,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
         try await store.create(id: 45, width: 2, height: 2, format: 32)
         try await store.fill(
             surfaceID: 45,
@@ -1037,7 +1040,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
         try await store.create(id: 46, width: 2, height: 2, format: 32)
         try await store.fill(
             surfaceID: 46,
@@ -1334,7 +1340,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let gpu = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let gpu = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
         let cpu = SurfaceStore(backingPolicy: .dataOnly)
         for store in [gpu, cpu] {
             try await store.create(id: 30, width: 4, height: 2, format: 32)
@@ -1397,7 +1406,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
         try await store.create(id: 34, width: 2, height: 1, format: 96)
         let rectangle = PixelRect(x: 0, y: 0, width: 2, height: 1)
         for seed in [UInt8(1), UInt8(9)] {
@@ -1426,6 +1438,39 @@ struct SurfaceStoreTests {
         #expect(metrics.revisionGPUCopyBytes == 8)
     }
 
+    @Test func metal2DPoolExhaustionReportsCPUFallback() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 1, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 35, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 35,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        _ = try await store.snapshot(surfaceID: 35)
+
+        try await store.fill(
+            surfaceID: 35,
+            rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
+            colorARGB: 0x00aa_bbcc
+        )
+        let frame = try await store.snapshot(surfaceID: 35)
+        #expect(pixel(frame, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
+
+        let metrics = await store.metrics()
+        #expect(metrics.metal2DCommandBuffers == 1)
+        #expect(metrics.metal2DCommands == 1)
+        #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.poolExhaustions == 1)
+    }
+
     @Test func failedMetal2DBatchReplaysAtomicallyOnCPU() async throws {
         guard let pool = RevisionedIOSurfacePool.makeIfSupported(
             limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
@@ -1434,6 +1479,7 @@ struct SurfaceStoreTests {
         }
         let store = SurfaceStore(
             backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true,
             metal2DBatchFailureForAttempt: { attempt in
                 attempt == 1 ? .commandExecutionFailed("injected 2D batch failure") : nil
             }
@@ -1468,7 +1514,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
         try await store.create(id: 32, width: 2, height: 1, format: 96)
         try await store.create(id: 33, width: 2, height: 1, format: 96)
         try await store.fill(

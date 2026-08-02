@@ -24,7 +24,8 @@ after the fixture is made fully reliable.
 - Clients: current-tree arm64 Release `spice-probe` and
   `spice-client-glib-2.0` 0.42, connected separately to the same loopback-only
   endpoint through an SSH tunnel.
-- Variants: CPU and required-Metal rendering at 1280x720 and 3840x2160.
+- Variants: Data-backed CPU and required-revisioned Metal rendering at 1280x720
+  and 3840x2160.
 - Formal shape: ten alternating paired runs, 30 seconds per client.
 - Evidence gates: process exit zero, stable guest boot epoch within each pair,
   at least 80% active-span coverage, at least 8 of 10 active time buckets, and a
@@ -36,6 +37,21 @@ after the fixture is made fully reliable.
 
 The runner's collect-on-failure mode retained all requested samples where
 needed, but did not waive any evidence failure.
+
+### Configuration limitation
+
+This retained collection does not isolate the draw engine. Its `cpu` variant
+used CPU drawing with Data backing, while `metal` used Metal 2D with revisioned
+IOSurface backing. The variants also ran as separate batches rather than as a
+direct paired Swift CPU-versus-Metal comparison. Consequently, the absolute
+medians below are warning signals about each complete configuration, not a
+causal measurement of Metal 2D overhead.
+
+The benchmark now also exposes `cpu-iosurface`: CPU drawing with required
+revisioned IOSurface backing and Metal 2D disabled. Future Metal benefit claims
+must compare that configuration directly with `metal` under the same guest
+epoch, reset sequence, resolution, and order schedule. The Data-backed `cpu`
+configuration remains useful for the historical Swift-versus-GLib gate.
 
 ## Formal evidence disposition
 
@@ -144,7 +160,8 @@ run IDs `20260802T021211Z`, `20260802T023733Z`, `20260802T024924Z`,
 
 1. Make the repaired 4K fixture pass all 20 samples in a ten-pair, five-second
    activity stress run.
-2. Start a fresh guest epoch and collect all four ten-pair, 30-second variants.
+2. Start a fresh guest epoch and collect `cpu`, `cpu-iosurface`, and `metal` at
+   both resolutions using ten paired 30-second runs per configuration.
 3. Reject the entire affected batch on any process, epoch, activity, or Metal
    evidence failure.
 4. Treat CPU/frame <= 1.10 and 4K Metal RSS <= 1.15 as unresolved performance

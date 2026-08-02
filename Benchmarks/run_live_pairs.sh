@@ -80,10 +80,10 @@ case "$VIDEO_CODEC" in
         ;;
 esac
 case "$RENDERER" in
-    automatic|cpu|metal)
+    automatic|cpu|cpu-iosurface|metal)
         ;;
     *)
-        echo "SWIFTSPICE_BENCH_RENDERER must be automatic, cpu, or metal" >&2
+        echo "SWIFTSPICE_BENCH_RENDERER must be automatic, cpu, cpu-iosurface, or metal" >&2
         exit 2
         ;;
 esac
@@ -197,19 +197,65 @@ run_client() {
             >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
         sample_failed=1
     fi
-    if ((result == 0)) && [[ "$client" == "swiftspice" && "$RENDERER" == "metal" ]]; then
-        if ! jq -e '
-            .metal_2d_renderer_enabled == true
-            and .metal_2d_command_buffers >= 1
-            and .metal_2d_commands >= 1
-            and .cpu_materializations == 0
-            and .gpu_errors == 0
-        ' "$prefix.json" >/dev/null; then
-            echo "Metal 2D evidence gate failed in $prefix.json" >&2
+    if ((result == 0)) && [[ "$client" == "swiftspice" ]]; then
+        local renderer_evidence='false'
+        case "$RENDERER" in
+            automatic)
+                renderer_evidence='
+                    .metal_2d_renderer_enabled == false
+                    and .metal_2d_command_buffers == 0
+                    and .metal_2d_commands == 0'
+                ;;
+            cpu)
+                renderer_evidence='
+                    .revisioned_backing_enabled == false
+                    and .metal_2d_renderer_enabled == false
+                    and .metal_2d_command_buffers == 0
+                    and .metal_2d_commands == 0
+                    and .pool_exhaustions == 0
+                    and .gpu_errors == 0
+                    and ((
+                        .cpu_fill_operations
+                        + .cpu_copy_bits_operations
+                        + .cpu_bitmap_copy_operations
+                        + .cpu_surface_copy_operations
+                        + .cpu_scaled_copy_operations
+                    ) >= 1)'
+                ;;
+            cpu-iosurface)
+                renderer_evidence='
+                    .revisioned_backing_enabled == true
+                    and .revisioned_allocated_frames >= 1
+                    and .metal_2d_renderer_enabled == false
+                    and .metal_2d_command_buffers == 0
+                    and .metal_2d_commands == 0
+                    and .pool_exhaustions == 0
+                    and .gpu_errors == 0
+                    and ((
+                        .cpu_fill_operations
+                        + .cpu_copy_bits_operations
+                        + .cpu_bitmap_copy_operations
+                        + .cpu_surface_copy_operations
+                        + .cpu_scaled_copy_operations
+                    ) >= 1)'
+                ;;
+            metal)
+                renderer_evidence='
+                    .revisioned_backing_enabled == true
+                    and .metal_2d_renderer_enabled == true
+                    and .metal_2d_command_buffers >= 1
+                    and .metal_2d_commands >= 1
+                    and .cpu_materializations == 0
+                    and .gpu_errors == 0
+                    and .pool_exhaustions == 0'
+                ;;
+        esac
+        if ! jq -e "$renderer_evidence" "$prefix.json" >/dev/null; then
+            echo "$RENDERER renderer evidence gate failed in $prefix.json" >&2
             if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
                 return 1
             fi
-            printf '%02d\t%s\tmetal_2d_evidence\n' "$run_number" "$client" \
+            printf '%02d\t%s\trenderer_evidence\n' "$run_number" "$client" \
                 >>"$OUTPUT_DIRECTORY/integrity-failures.tsv"
             sample_failed=1
         fi

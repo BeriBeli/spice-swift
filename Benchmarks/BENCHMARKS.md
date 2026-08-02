@@ -77,9 +77,19 @@ and zero permanent stream-generation disables. Hardware decoding itself is
 reported as hardware/software/query counters but is not required: VideoToolbox
 may legitimately select its software decoder.
 
-`SWIFTSPICE_BENCH_RENDERER` selects `metal` (the runner default), `cpu`, or
-`automatic`. A required Metal run fails if Display cannot create revisioned
-IOSurface backing. The JSON report includes 2D command-buffer and command
+`SWIFTSPICE_BENCH_RENDERER` selects one complete rendering configuration:
+
+| Value | Ordinary 2D engine | Surface backing | Intended use |
+| --- | --- | --- | --- |
+| `automatic` | CPU | Automatic; revisioned IOSurface when supported | Production default |
+| `cpu` | CPU | Data | Historical reference-compatible benchmark |
+| `cpu-iosurface` | CPU | Required revisioned IOSurface | Fair baseline for Metal 2D |
+| `metal` | Experimental Metal 2D | Required revisioned IOSurface | Explicit GPU experiment; runner default |
+
+Both the runner and analyzer reject a sample whose observed backing or Metal
+2D state does not match the requested configuration. A required revisioned run
+fails rather than silently falling back to Data. The JSON report includes 2D
+command-buffer and command
 counts, shared-buffer upload bytes, scratch/copy blit bytes, completed GPU time,
 CPU materializations, and GPU errors. Frames count only after Metal completion;
 a valid Metal sample must execute at least one 2D command buffer and command,
@@ -88,6 +98,13 @@ the analyzer reject samples that fail this evidence gate. The report separates
 revision GPU clones, Metal-batch CPU/GPU seed copies, snapshot catch-up copies,
 2D opcodes, and upload-buffer allocations/reuses. CPU fallback opcodes include
 aggregate nanosecond timings.
+
+The current paired analyzer compares the selected Swift configuration with
+spice-client-glib2. A claim that Metal 2D improves SwiftSpice must additionally
+compare `cpu-iosurface` and `metal` under the same guest epoch, reset sequence,
+resolution, and client-order schedule. The historical `cpu` versus `metal`
+absolute medians changed both the draw engine and backing policy and therefore
+do not isolate the effect of Metal 2D.
 
 The runner requires a guest boot epoch. Set `SWIFTSPICE_BENCH_BOOT_EPOCH` when
 the complete batch is guaranteed to remain in one epoch, or provide an
@@ -100,7 +117,9 @@ By default, the runner stops at the first process or evidence failure. Set
 `SWIFTSPICE_BENCH_CONTINUE_ON_FAILURE=1` only when the test contract requires
 collecting the entire batch despite failures. Such failures are recorded in
 `integrity-failures.tsv`; the final analyzer still rejects the batch, so this
-mode cannot turn incomplete evidence into a passing result.
+mode cannot turn incomplete evidence into a passing result. The analyzer also
+rejects mixed renderer or codec configurations and requires every metric to be
+present and usable in every requested pair.
 
 ```sh
 SPICE_PASSWORD='...' \
