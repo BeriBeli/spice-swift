@@ -55,19 +55,22 @@ ran on the macOS host rather than in a filesystem sandbox.
 The `cpu` configuration uses CPU drawing with Data backing. The `metal`
 configuration uses Metal 2D with revisioned IOSurface backing. They were
 collected in separate batches and therefore do not isolate the Metal draw
-engine. A Metal benefit claim still requires a direct paired runner comparing
-`cpu-iosurface` with `metal` under the same boot epoch, reset sequence,
+engine. A Metal benefit claim still requires a valid direct paired result
+comparing `cpu-iosurface` with `metal` under the same boot epoch, reset sequence,
 resolution, and order schedule.
 
 The PR now includes a dedicated
 [`run_renderer_pairs.sh`](run_renderer_pairs.sh) collection runner and
 [`analyze_renderer_pairs.py`](analyze_renderer_pairs.py) analyzer for that
-comparison. They were added after this collection and have not been used for a
-host run, so they provide no direct `cpu-iosurface` versus `metal` result yet.
-For future formal evidence the direct runner requires matching guest boot IDs
-before and after every sample, rejects any Metal scaled-copy CPU work and any
-cpu-iosurface materialization, and then requires one boot epoch, codec, and
-resolution across the complete alternating batch.
+comparison. They were added after this historical collection and were not used
+to produce any measurement in this report. A later `bb3b176` host run did
+exercise them, but its complete batches were invalid and its diagnostic
+prefixes failed performance gates; see the
+[direct follow-up](RESULTS_DIRECT_ROCKY8_2026-08-03.md). For formal evidence
+the direct runner requires matching guest boot IDs before and after every
+sample, rejects any Metal scaled-copy CPU work and any cpu-iosurface
+materialization, and then requires one boot epoch, codec, and resolution across
+the complete alternating batch.
 
 ## Formal evidence disposition
 
@@ -240,8 +243,10 @@ frames, but these samples observed two. `metal_current_allocated_bytes` is a
 device-wide diagnostic that can overlap IOSurface-backed resources and must not
 be added to RSS or IOSurface bytes. These counters support backing-policy and
 Metal-resource overhead as important contributors, but they cannot isolate the
-Metal 2D renderer. A direct `cpu-iosurface` versus `metal` comparison remains
-required.
+Metal 2D renderer. A valid direct `cpu-iosurface` versus `metal` comparison
+remains required; the later
+[matched-backing follow-up](RESULTS_DIRECT_ROCKY8_2026-08-03.md) was collected
+but remained invalid.
 
 ## Guest activity evidence gap
 
@@ -263,10 +268,16 @@ specifically, to the guest rather than a downstream server, transport, or
 client path.
 
 The formal blocker is an unlocalized activity-evidence failure. A guest-side
-generation/frame heartbeat has been added for future collection, but those
-counters were not present in these results and have not yet been exercised by a
-replacement formal batch. Replacing the xterm workload with a persistent native
-X11 generator remains a recommended fixture improvement.
+generation/frame heartbeat was added after this collection, so those counters
+are not present in these results. Replacing the xterm workload with a persistent
+native X11 generator remains a recommended fixture improvement.
+
+The later [direct follow-up](RESULTS_DIRECT_ROCKY8_2026-08-03.md) did exercise
+the heartbeat: generator progress continued through every failed client
+sample, localizing that run's stall downstream of the generator. It still lacks
+X11 Present/Damage evidence, so the exact xterm, Xorg, spice-server, transport,
+or client component remains unproven. That later evidence does not alter the
+historical disposition of this report.
 
 ## Retained evidence and cleanup
 
@@ -307,15 +318,16 @@ clean before this documentation update.
 
 ## Next formal gate
 
-1. Replace or repair the guest renderer and require 20/20 activity-valid
-   samples in both short stress and full-duration preflight coverage, using the
-   new guest generation/frame heartbeat to localize any stall.
+1. Replace or repair the downstream guest display/server fixture path and
+   require 20/20 activity-valid samples in both short stress and full-duration
+   preflight coverage, retaining generator heartbeat and adding X11
+   Present/Damage evidence to localize any stall.
 2. Re-run the historical `cpu` versus GLib 10x30-second reference at both
    resolutions under a fresh boot epoch.
-3. Run the newly added direct Swift renderer-pair runner/analyzer and compare
-   `cpu-iosurface` with `metal` under the same guest epoch, resolution, reset
-   sequence, and alternating order. The tooling exists, but no such collection
-   has run yet.
+3. Repeat the direct Swift renderer-pair collection after fixture repair,
+   comparing `cpu-iosurface` with `metal` under the same guest epoch,
+   resolution, reset sequence, and alternating order. The first direct
+   follow-up was collected but did not yield a valid formal batch.
 4. Preserve the existing four-opcode Metal evidence gates and reject the entire
    batch on any process, epoch, activity, backing, fallback, or GPU failure.
 5. Treat CPU/frame <= 1.10 and 4K Metal RSS <= 1.15 as unresolved requirements.

@@ -9,7 +9,7 @@ reference collector coalesces `display-invalidate` signals on a 16 ms cadence,
 matching SwiftSpice's default frame-coalescing interval. Each process prints one
 JSON object after the observation interval; frame-by-frame logging is disabled.
 
-## Latest retained result
+## Latest retained results
 
 The 2026-08-03 Rocky rerun exercised CPU and Metal at 1280x720 and 3840x2160
 from PR #4 head `d68a8ec`. All requested ten-by-30-second batches were collected,
@@ -26,6 +26,19 @@ The sanitized [evidence archive](Results/2026-08-03/) retains all formal raw
 samples, the activity-valid diagnostic selections, the 4K preflight, analyzer
 outputs, exact tested tools, and checksums so reviewers do not depend on
 ephemeral `/private/tmp` paths.
+
+A direct matched-backing follow-up at PR #4 head `bb3b176` then paired
+`cpu-iosurface` with `metal` on the same guest boot at both resolutions. All
+20 samples were collected at each resolution, but the formal 720p batch had
+nine incomplete-activity samples and the 4K batch had eight. The contiguous
+activity-valid prefixes (pairs 1-5 at 720p and 1-6 at 4K) are diagnostic only
+and both fail the performance analyzer: Metal/CPU-IOSurface CPU per frame was
+1.730965 at 720p and 1.754194 at 4K; 4K RSS was 1.340859. Guest heartbeats
+continued throughout every failed sample, which places the stall downstream
+of the generator without identifying xterm, Xorg, spice-server, transport, or
+the client as the exact cause. See
+[RESULTS_DIRECT_ROCKY8_2026-08-03.md](RESULTS_DIRECT_ROCKY8_2026-08-03.md) and
+the direct evidence archive in [Results/2026-08-03](Results/2026-08-03/).
 
 The earlier [2026-08-02 result](RESULTS_ROCKY8_2026-08-02.md) remains available
 as historical evidence; it must not be combined with the new batches to create
@@ -95,7 +108,7 @@ may legitimately select its software decoder.
 | --- | --- | --- | --- |
 | `automatic` | CPU | Automatic; revisioned IOSurface when supported | Production default |
 | `cpu` | CPU | Data | Historical reference-compatible benchmark |
-| `cpu-iosurface` | CPU | Required revisioned IOSurface | Matched-backing Metal candidate; current runner still pairs it with GLib |
+| `cpu-iosurface` | CPU | Required revisioned IOSurface | Matched-backing reference for the direct Metal A/B |
 | `metal` | Experimental Metal 2D | Required revisioned IOSurface | Explicit GPU experiment; runner default |
 
 Both the runner and analyzer reject a sample whose observed backing or Metal
@@ -141,20 +154,44 @@ assume the `rocky8` SSH alias and the deployed remote fixture:
 
 ```sh
 SPICE_PASSWORD='...' \
+SWIFTSPICE_BENCH_REMOTE_ROCKY_DIRECTORY=/home/beribeli/swiftspice-remote-closure/direct-bb3b176-20260803-v1-4k/remote \
+SWIFTSPICE_BENCH_ROUND_EVIDENCE_DIRECTORY=/private/tmp/swiftspice-renderer-pairs-4k/remote-rounds \
 SWIFTSPICE_BENCH_HOOK_SCRIPT=Benchmarks/remote_rocky_hook.sh \
 SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT=Benchmarks/remote_rocky_boot_epoch.sh \
 SWIFTSPICE_BENCH_RESOLUTION=3840x2160 \
-Benchmarks/run_renderer_pairs.sh 127.0.0.1 15930 10 30 \
+Benchmarks/run_renderer_pairs.sh 127.0.0.1 15935 10 30 \
   /private/tmp/swiftspice-renderer-pairs-4k
 
 uv run Benchmarks/analyze_renderer_pairs.py \
   /private/tmp/swiftspice-renderer-pairs-4k --expected-pairs 10
+
+uv run Benchmarks/analyze_guest_telemetry.py \
+  /private/tmp/swiftspice-renderer-pairs-4k \
+  /private/tmp/swiftspice-renderer-pairs-4k/remote-rounds \
+  --expected-pairs 10 --observe-seconds 30
 ```
 
-The runner exists on this PR but has not yet produced a formal result. Two
-separate Swift-versus-GLib result directories still do not satisfy this paired
-contract. Historical `cpu` versus `metal` absolute medians changed both the
-draw engine and backing policy and therefore do not isolate Metal 2D.
+The guest analyzer also requires the runner's alternating sample order, one
+batch-wide boot epoch and generator PID, exactly one generation advance per
+reset, non-overlapping monotonic-uptime windows, and no heartbeat gap above five
+seconds. It is an independent fixture gate; it does not replace renderer/client
+activity validation.
+
+`SWIFTSPICE_BENCH_REMOTE_ROCKY_DIRECTORY` routes both Rocky wrappers to an
+isolated fixture whose path ends in `/remote`.
+`SWIFTSPICE_BENCH_ROUND_EVIDENCE_DIRECTORY` downloads the exact server log,
+guest telemetry, configuration, and version files named by each completed
+round. The resolution variable declares and validates the expected frame-byte
+footprint; it does not resize or reconfigure the guest. A real 4K run therefore
+requires a fixture whose guest X server and QEMU configuration already use
+3840x2160.
+
+The direct runner was exercised at `bb3b176`, but both complete ten-pair
+batches were invalid because activity failed late in the persistent fixture;
+their valid prefixes also failed the performance analyzer. This provides no
+formal Metal-benefit result. Two separate Swift-versus-GLib result directories
+still do not satisfy the paired contract, and historical `cpu` versus `metal`
+absolute medians changed both the draw engine and backing policy.
 
 The selected-renderer-versus-GLib runner accepts `SWIFTSPICE_BENCH_BOOT_EPOCH`
 when the complete batch is independently guaranteed to remain in one epoch, or
@@ -198,6 +235,17 @@ per-file SHA-256 checksums:
 ```sh
 Benchmarks/archive_results.sh /private/tmp/evidence.tar.gz TESTED_GIT_REF \
   /private/tmp/raw-results /private/tmp/diagnostic-results
+```
+
+Use `archive_renderer_results.sh` for direct renderer evidence. It archives
+each direct result set, the exact runner and analyzers, guest telemetry and
+round configuration/version files, analyzer outputs and exit codes, a
+manifest, and per-file checksums while rejecting credentials and unsafe input
+layouts:
+
+```sh
+Benchmarks/archive_renderer_results.sh /private/tmp/direct-evidence.tar.gz \
+  TESTED_GIT_REF /private/tmp/direct-raw /private/tmp/direct-valid-prefix
 ```
 
 This headless gate covers connection, wire processing, codec execution, Surface

@@ -8,7 +8,8 @@ The endpoint is deliberately bound only to remote loopback:
 
 - SPICE: `127.0.0.1:5935`
 - guest load control: `127.0.0.1:5936`
-- fixed guest display: `1280x720`
+- default guest display: `1280x720`; isolated fixtures may carry a separately
+  built `3840x2160` guest/QEMU configuration
 
 Connect one client at a time through an SSH tunnel:
 
@@ -36,6 +37,25 @@ Remote lifecycle commands:
 ~/swiftspice-remote-closure/perf-ab/remote/status.sh
 ~/swiftspice-remote-closure/perf-ab/remote/stop.sh
 ```
+
+The host wrappers can target an isolated fixture without changing the default
+deployment. The path must be absolute and end in `/remote`; the optional round
+evidence directory receives the exact completed round's server log, generator
+telemetry, configuration, and version files:
+
+```sh
+SWIFTSPICE_BENCH_REMOTE_ROCKY_DIRECTORY=/home/beribeli/swiftspice-remote-closure/direct-bb3b176-20260803-v1-4k/remote \
+SWIFTSPICE_BENCH_ROUND_EVIDENCE_DIRECTORY=/private/tmp/swiftspice-renderer-pairs-4k/remote-rounds \
+SWIFTSPICE_BENCH_HOOK_SCRIPT=Benchmarks/remote_rocky_hook.sh \
+SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT=Benchmarks/remote_rocky_boot_epoch.sh \
+SWIFTSPICE_BENCH_RESOLUTION=3840x2160 \
+Benchmarks/run_renderer_pairs.sh 127.0.0.1 15935 10 30 \
+  /private/tmp/swiftspice-renderer-pairs-4k
+```
+
+`SWIFTSPICE_BENCH_RESOLUTION` only declares and validates the expected
+frame-byte footprint. It does not resize Xorg or QEMU, so a real 4K run must
+use a fixture already built and verified at 3840x2160.
 
 `control.sh stop` stops only the animated workload and returns to the static
 desktop. `remote/stop.sh` stops QEMU. Start creates the deterministic xterm;
@@ -65,14 +85,17 @@ independent log cross-check.
 After changing the guest image or reset path, exercise at least ten alternating
 five-second pairs and require every client sample to pass the activity-span,
 time-bucket, and last-frame-age gates before starting a formal 10x30-second
-comparison. Also run a full-duration preflight: the 2026-08-03 image passed a
-20/20 4K five-second stress but still became static during longer CPU and Metal
-collections, and `control.sh start` did not recover sustained activity after
-degradation. The xterm-based workload must be replaced or repaired before a
-formal verdict. See
-[`Benchmarks/RESULTS_ROCKY8_2026-08-03.md`](../../Benchmarks/RESULTS_ROCKY8_2026-08-03.md)
-for the evidence and exact rerun boundary. The historical 2026-08-02 report is
-retained separately.
+comparison. Also run a full-duration preflight. At `bb3b176`, both direct
+`cpu-iosurface`/`metal` batches collected all 20 samples, but the 720p batch had
+nine incomplete-activity samples and the 4K batch had eight. Guest generator
+heartbeats continued through every failed client sample, so the failure is
+downstream of the generator; the retained records cannot yet distinguish
+xterm, Xorg, spice-server, transport, and client paths. Replace or repair that
+path and add X11 Present/Damage evidence before a formal verdict. See the
+[direct report](../../Benchmarks/RESULTS_DIRECT_ROCKY8_2026-08-03.md) for this
+follow-up. The earlier
+[selected-Swift-versus-GLib report](../../Benchmarks/RESULTS_ROCKY8_2026-08-03.md)
+and the 2026-08-02 report remain historical evidence.
 
 Archive a server-log slice around each client capture:
 
@@ -93,3 +116,16 @@ records, a frame counter that stops advancing, or an unexpected generation/PID
 transition after that boundary invalidate the fixture evidence and should be
 compared with the client's published-frame activity before assigning the stall
 to the guest or client pipeline.
+
+Validate the copied generator evidence separately from the renderer analyzer:
+
+```sh
+uv run Benchmarks/analyze_guest_telemetry.py \
+  /private/tmp/swiftspice-renderer-pairs-4k \
+  /private/tmp/swiftspice-renderer-pairs-4k/remote-rounds \
+  --expected-pairs 10 --observe-seconds 30
+```
+
+Both analyzers are required: client activity can fail while the generator
+telemetry remains healthy, which is exactly what the `bb3b176` direct run
+observed.
