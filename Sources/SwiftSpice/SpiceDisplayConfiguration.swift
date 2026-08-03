@@ -113,12 +113,25 @@ package struct DisplayConfigurationCoordinator: Sendable {
         inFlight == nil ? desired : nil
     }
 
-    package mutating func didSend(_ configuration: SpiceDisplayConfiguration) {
+    @discardableResult
+    package mutating func beginSend(_ configuration: SpiceDisplayConfiguration) -> Bool {
         guard nextToSend == configuration else {
-            return
+            return false
         }
         desired = nil
         inFlight = configuration
+        return true
+    }
+
+    package mutating func didFailSend(
+        _ configuration: SpiceDisplayConfiguration,
+        requeue: Bool
+    ) {
+        guard inFlight == configuration else { return }
+        inFlight = nil
+        if requeue, desired == nil {
+            desired = configuration
+        }
     }
 
     package mutating func didReceiveReply() -> SpiceDisplayConfiguration? {

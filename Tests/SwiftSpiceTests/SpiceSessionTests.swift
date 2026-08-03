@@ -525,6 +525,98 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func clipboardDriverReentrancyDoesNotDuplicateInFlightAnnouncement() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.announceCapabilities.rawValue,
+        ])
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        let start = Task {
+            try await manager.start(session: session)
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+
+        await manager.synchronizePasteboard()
+        await manager.synchronizePasteboard()
+        #expect(await transport.blockedAgentWriteCount == 1)
+
+        await transport.releaseBlockedAgentWrites()
+        try await start.value
+        await manager.stop()
+        let messages = try decodedAgentMessages(await transport.outbound)
+        #expect(messages.filter {
+            $0.type == VDAgentMessageType.announceCapabilities.rawValue
+        }.count == 1)
+        await session.disconnect()
+    }
+
+    @Test func monitorReplyAndNewQueueDuringSendKeepOneOwnerPerConfiguration() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.monitorsConfig.rawValue,
+        ])
+        var events = manager.displayConfigurationEvents.makeAsyncIterator()
+        let first = SpiceDisplayConfiguration(width: 800, height: 600)
+        let latest = SpiceDisplayConfiguration(width: 1_024, height: 768)
+
+        let firstSend = Task {
+            try await manager.requestDisplayConfiguration(first)
+        }
+        #expect(await events.next() == .queued(first))
+        await transport.waitForBlockedAgentWriteCount(1)
+        try await manager.requestDisplayConfiguration(latest)
+        #expect(await events.next() == .queued(latest))
+
+        let reply = VDAgentMessage(
+            type: VDAgentMessageType.reply.rawValue,
+            data: uint32(VDAgentMessageType.monitorsConfig.rawValue) + uint32(1)
+        )
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: reply).first)
+        ))
+        #expect(await events.next() == .acknowledged(first))
+        #expect(await transport.blockedAgentWriteCount == 1)
+
+        let outboundBeforeRelease = await transport.outbound.count
+        await transport.releaseBlockedAgentWrites()
+        try await firstSend.value
+        await transport.waitForOutboundCount(outboundBeforeRelease + 2)
+        let messages = try decodedAgentMessages(await transport.outbound)
+        #expect(messages.filter {
+            $0.type == VDAgentMessageType.monitorsConfig.rawValue
+        }.count == 2)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
     @Test func agentManagerEncodesSparsePositionedMonitorLayout() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
@@ -727,6 +819,91 @@ struct SpiceSessionTests {
         let successPacket = try #require(VDAgentWireEncoder.fragments(for: success).first)
         await transport.enqueue(encodeMini(id: 109, body: successPacket))
         #expect(await events.next() == .completed(id: id))
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func fileStatusAndCancelDuringSendingDataDoNotDuplicateWireOwner() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        let bytes = Data([1, 2, 3, 4, 5])
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "spice-swift-inflight-cancel-\(UUID().uuidString).bin"
+        )
+        try bytes.write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+        var events = manager.fileTransferEvents.makeAsyncIterator()
+        let id = try await manager.sendFile(at: source, name: "fixture.bin")
+        #expect(await events.next() == .queued(
+            id: id,
+            name: "fixture.bin",
+            totalBytes: UInt64(bytes.count)
+        ))
+        #expect(await events.next() == .awaitingGuestApproval(id: id))
+
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.fileTransferData.rawValue,
+        ])
+        let codec = VDAgentFileTransferCodec()
+        let canSend = codec.encodeStatus(id: id.rawValue, result: .canSendData)
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: canSend).first)
+        ))
+        await transport.waitForBlockedAgentWriteCount(1)
+
+        await manager.cancelFileTransfer(id)
+        let cancelled = codec.encodeStatus(id: id.rawValue, result: .cancelled)
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: cancelled).first)
+        ))
+        #expect(await transport.blockedAgentWriteCount == 1)
+        await transport.releaseBlockedAgentWrites()
+
+        #expect(await events.next() == .progress(
+            id: id,
+            sentBytes: UInt64(bytes.count),
+            totalBytes: UInt64(bytes.count)
+        ))
+        #expect(await events.next() == .cancelled(id: id))
+        let commands = try decodedAgentMessages(await transport.outbound).compactMap {
+            try codec.decode($0)
+        }
+        #expect(commands.filter {
+            guard case let .data(commandID, data) = $0 else { return false }
+            return commandID == id.rawValue && data == bytes
+        }.count == 1)
+        #expect(commands.filter { $0 == .status(VDAgentFileTransferStatus(
+            id: id.rawValue,
+            result: .cancelled,
+            detail: nil
+        )) }.count == 1)
 
         await manager.stop()
         await session.disconnect()
@@ -973,6 +1150,86 @@ struct SpiceSessionTests {
         await session.disconnect()
         #expect(!(await target.isConnected))
         #expect(!(await targetInputs.isConnected))
+    }
+
+    @Test func midInventoryMigrationFailureRollsBackAndRestartsSourceSupervision() async throws {
+        let sourceChannels = [
+            SpiceChannelID(type: 2, id: 0),
+            SpiceChannelID(type: 3, id: 0),
+        ]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: sourceChannels
+        ))
+        let sourceDisplay = StreamingSessionTransport(initial: try makeLinkResponses())
+        let sourceInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let targetDisplay = StreamingSessionTransport(initial: try makeLinkResponses())
+        let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            source,
+            sourceDisplay,
+            sourceInputs,
+            target,
+            targetDisplay,
+            targetInputs,
+        ])
+        let failingKey = ChannelKey(type: 3, id: 0)
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationRebindFault: { key in key == failingKey ? .invalidState : nil }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+
+        await source.enqueue(encodeMini(id: 1, body: uint32(1)))
+        await sourceDisplay.enqueue(encodeMini(id: 1, body: uint32(1)))
+        await sourceInputs.enqueue(encodeMini(id: 1, body: uint32(1)))
+        #expect(await events.next() == .migration(.committing(offer)))
+
+        let failure = await events.next()
+        if case let .migration(.failed(failedOffer, reason)) = failure {
+            #expect(failedOffer == offer)
+            #expect(!reason.isEmpty)
+        } else {
+            Issue.record("expected migration failure after rollback, got \(String(describing: failure))")
+        }
+        while true {
+            let targetMainConnected = await target.isConnected
+            let targetDisplayConnected = await targetDisplay.isConnected
+            let targetInputsConnected = await targetInputs.isConnected
+            guard targetMainConnected || targetDisplayConnected || targetInputsConnected else {
+                break
+            }
+            await Task.yield()
+        }
+        #expect(await source.isConnected)
+        #expect(await sourceDisplay.isConnected)
+        #expect(await sourceInputs.isConnected)
+
+        await source.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 7, currentMode: 2)
+        ))
+        #expect(await events.next() == .mouseMode(supported: 7, current: 2))
+        let sourceInputCount = await sourceInputs.outbound.count
+        try await session.send(.keyDown(scanCode: 0x1e))
+        await sourceInputs.waitForOutboundCount(sourceInputCount + 1)
+        #expect(await sourceInputs.outbound.count == sourceInputCount + 1)
+
+        await session.disconnect()
     }
 
     @Test func seamlessTargetNegotiatesBeforeReportingReady() async throws {
@@ -1396,6 +1653,17 @@ struct SpiceSessionTests {
         ]
     }
 
+    private func decodedAgentMessages(_ outbound: [Data]) throws -> [VDAgentMessage] {
+        let packets = try outbound.compactMap { packet -> Data? in
+            guard packet.count >= 6, try decodeMiniMessageID(packet) == 107 else {
+                return nil
+            }
+            return try decodeMiniBody(packet)
+        }
+        var decoder = VDAgentStreamDecoder()
+        return try packets.flatMap { try decoder.append(packet: $0) }
+    }
+
     private func encodeMini<Message: SpiceGeneratedMessage>(_ message: Message) throws -> Data {
         let id = try #require(Message.messageID)
         var bodyWriter = ByteWriter()
@@ -1512,6 +1780,9 @@ private actor StreamingSessionTransport: SpiceTransport {
     private let writeContinuation: AsyncStream<Void>.Continuation
     private(set) var outbound: [Data] = []
     private(set) var isConnected = false
+    private var blockedAgentMessageTypes: Set<UInt32> = []
+    private var blockedAgentWriteWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var blockedAgentWriteCount = 0
 
     init(initial: [Data]) {
         let inboundPipe = AsyncStream.makeStream(of: Data.self)
@@ -1546,6 +1817,14 @@ private actor StreamingSessionTransport: SpiceTransport {
         guard isConnected else {
             throw .connectionClosed
         }
+        if let messageType = Self.agentMessageType(in: data),
+           blockedAgentMessageTypes.contains(messageType) {
+            blockedAgentWriteCount += 1
+            await withCheckedContinuation { continuation in
+                blockedAgentWriteWaiters.append(continuation)
+            }
+            guard isConnected else { throw .connectionClosed }
+        }
         outbound.append(data)
         writeContinuation.yield(())
     }
@@ -1565,10 +1844,42 @@ private actor StreamingSessionTransport: SpiceTransport {
         }
     }
 
+    func blockAgentMessages(types: Set<UInt32>) {
+        blockedAgentMessageTypes = types
+    }
+
+    func waitForBlockedAgentWriteCount(_ count: Int) async {
+        while blockedAgentWriteCount < count {
+            await Task.yield()
+        }
+    }
+
+    func releaseBlockedAgentWrites() {
+        blockedAgentMessageTypes.removeAll(keepingCapacity: false)
+        let waiters = blockedAgentWriteWaiters
+        blockedAgentWriteWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+    }
+
     func close() async {
         isConnected = false
+        releaseBlockedAgentWrites()
         inboundContinuation.finish()
         writeContinuation.finish()
+    }
+
+    private nonisolated static func agentMessageType(in packet: Data) -> UInt32? {
+        guard packet.count >= 14,
+              packet[packet.startIndex] == UInt8(SpiceMainAgentWire.clientData & 0xff),
+              packet[packet.startIndex + 1]
+                == UInt8((SpiceMainAgentWire.clientData >> 8) & 0xff) else {
+            return nil
+        }
+        let start = packet.startIndex + 10
+        return UInt32(packet[start])
+            | (UInt32(packet[start + 1]) << 8)
+            | (UInt32(packet[start + 2]) << 16)
+            | (UInt32(packet[start + 3]) << 24)
     }
 }
 

@@ -3,6 +3,18 @@ import Testing
 
 @Suite("Dynamic resolution request coalescing")
 struct DisplayConfigurationCoordinatorTests {
+    @Test func managerMigrationPolicyRetriesOnlyBeforeFirstFragment() {
+        #expect(SpiceAgentManager.agentSendDisposition(
+            .agentMigrationRebind(partial: false)
+        ) == .retry)
+        #expect(SpiceAgentManager.agentSendDisposition(
+            .agentMigrationRebind(partial: true)
+        ) == .failed)
+        #expect(SpiceAgentManager.agentSendDisposition(
+            .agentCancelled(partial: true)
+        ) == .completed)
+    }
+
     @Test func keepsOnlyLatestResizeWhileWaitingForReply() throws {
         var coordinator = DisplayConfigurationCoordinator()
         let first = SpiceDisplayConfiguration(width: 1_024, height: 768)
@@ -11,7 +23,8 @@ struct DisplayConfigurationCoordinatorTests {
 
         coordinator.queue(first)
         #expect(coordinator.nextToSend == first)
-        coordinator.didSend(first)
+        let beganFirst = coordinator.beginSend(first)
+        #expect(beganFirst)
         coordinator.queue(intermediate)
         coordinator.queue(latest)
 
@@ -24,14 +37,16 @@ struct DisplayConfigurationCoordinatorTests {
         var firstCoordinator = DisplayConfigurationCoordinator()
         let first = SpiceDisplayConfiguration(width: 800, height: 600)
         firstCoordinator.queue(first)
-        firstCoordinator.didSend(first)
+        let beganFirst = firstCoordinator.beginSend(first)
+        #expect(beganFirst)
         firstCoordinator.disconnected()
         #expect(firstCoordinator.nextToSend == first)
 
         var latestCoordinator = DisplayConfigurationCoordinator()
         let latest = SpiceDisplayConfiguration(width: 1_920, height: 1_080)
         latestCoordinator.queue(first)
-        latestCoordinator.didSend(first)
+        let beganLatest = latestCoordinator.beginSend(first)
+        #expect(beganLatest)
         latestCoordinator.queue(latest)
         latestCoordinator.disconnected()
         #expect(latestCoordinator.nextToSend == latest)

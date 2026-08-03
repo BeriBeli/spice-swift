@@ -54,14 +54,18 @@ public enum SpiceFileTransferEvent: Sendable, Equatable {
 
 package enum FileTransferPhase: Sendable, Equatable {
     case queuedStart
+    case sendingStart
     case awaitingGuestApproval
     case readyToRead
     case reading
     case readyToSend(Data)
+    case sendingData(Data)
     case awaitingCompletion
     case queuedCancellation
+    case sendingCancellation
     case awaitingCancellation
     case queuedFailure(SpiceFileTransferError)
+    case sendingFailure(SpiceFileTransferError)
 }
 
 package struct FileTransferJob: Sendable, Equatable {
@@ -71,4 +75,24 @@ package struct FileTransferJob: Sendable, Equatable {
     package let totalBytes: UInt64
     package var sentBytes: UInt64
     package var phase: FileTransferPhase
+    package var cancellationRequested = false
+}
+
+package extension FileTransferPhase {
+    var isSending: Bool {
+        switch self {
+        case .sendingStart, .sendingData, .sendingCancellation, .sendingFailure:
+            true
+        case .queuedStart,
+             .awaitingGuestApproval,
+             .readyToRead,
+             .reading,
+             .readyToSend,
+             .awaitingCompletion,
+             .queuedCancellation,
+             .awaitingCancellation,
+             .queuedFailure:
+            false
+        }
+    }
 }
