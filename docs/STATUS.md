@@ -927,6 +927,21 @@ such by an embedding application.
   the batch's rollback guarantee when GPU execution fails. Snapshot-driven
   commits also remain at the 16-ms publication boundary; reducing them would
   trade benchmark CPU for visible frame latency and needs a separate policy.
+- A 2026-08-03 host rerun at PR #4 head `d68a8ec` collected all requested
+  10x30-second CPU/GLib and Metal/GLib samples at 1280x720 and 3840x2160. All
+  four formal batches remained invalid because the guest animation became
+  static in late samples. Activity-valid diagnostics failed CPU/frame in all
+  configurations: 1.313759 (720p CPU, 8 pairs), 2.174098 (720p Metal, 7 pairs),
+  1.107982 (4K CPU, 8 pairs), and 1.811612 (4K Metal, 8 pairs). The 4K Metal
+  RSS ratio was 1.255131. Every Metal process exited zero and recorded completed
+  commands with zero supported CPU opcode activity, dedicated fallback, CPU
+  materialization, GPU error, and pool exhaustion. Median Metal batch-seed GPU
+  copies were 5.65 GB at 720p and 53.91 GB at 4K; snapshot catch-up CPU copies
+  were 2.44 GB and 30.34 GB. The seed totals exactly match one full-surface
+  clone per command buffer, so canonical cloning, snapshot catch-up, and
+  publication-driven flush frequency remain higher-priority than shader tuning.
+  The full evidence disposition and retained paths are in
+  `Benchmarks/RESULTS_ROCKY8_2026-08-03.md`.
 - `spice-probe --renderer automatic|cpu|cpu-iosurface|metal` provides explicit
   engine/backing configurations. `automatic` and `cpu-iosurface` use CPU 2D
   with automatic and required revisioned backing respectively; `cpu` is the
@@ -956,15 +971,16 @@ such by an embedding application.
   53.25 GB of batch-seed GPU copies and 29.56 GB of snapshot catch-up CPU copies
   per 30-second sample, making copy and publication policy higher-priority
   performance targets than shader tuning.
-- The guest workload now resets the existing animation generator with `SIGUSR1`
-  instead of repeatedly creating xterm clients. A fixed-fixture 10x5-second
-  stress produced 20/20 activity-valid 720p samples and 19/20 at 4K; one 4K
-  GLib sample still became static. Therefore the next formal run is gated on a
-  20/20 4K stress pass, followed by a fresh `cpu` versus GLib 10x30-second
-  reference batch and, after adding the direct Swift renderer runner/analyzer,
-  a separate `cpu-iosurface` versus `metal` 10x30-second batch. Full
-  ratios, absolute medians, and retained paths are in
-  `Benchmarks/RESULTS_ROCKY8_2026-08-02.md`.
+- The guest workload resets the existing animation generator with `SIGUSR1`
+  instead of intentionally creating a new xterm per sample. The 2026-08-02
+  fixed-fixture 10x5-second stress produced 20/20 activity-valid 720p samples
+  and 19/20 at 4K. A fresh 2026-08-03 4K stress reached 20/20, but the longer
+  CPU and Metal batches still became static; even `control.sh start` did not
+  restore sustained activity after degradation. Short stress alone is
+  therefore insufficient. The next formal run is gated on replacing or
+  repairing the xterm-based renderer, full-duration activity preflight, and a
+  fresh `cpu` versus GLib reference. A separate direct `cpu-iosurface` versus
+  `metal` runner remains required for any Metal benefit claim.
 - The previous 2026-08-01 current-tree five-second Rocky smoke used an arm64
   Release probe containing the uncommitted publisher revision-race fixes.
   SwiftSpice published 52.0 fps versus 49.2 fps for spice-client-glib2, a

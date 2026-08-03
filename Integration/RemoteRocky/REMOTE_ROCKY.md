@@ -45,10 +45,14 @@ churn while preserving the same 30-frame-per-second starting phase.
 After changing the guest image or reset path, exercise at least ten alternating
 five-second pairs and require every client sample to pass the activity-span,
 time-bucket, and last-frame-age gates before starting a formal 10x30-second
-comparison. The 2026-08-02 signal-reset image produced 20/20 valid 720p stress
-samples and 19/20 at 4K, so 4K remains below this prerequisite. See
-[`Benchmarks/RESULTS_ROCKY8_2026-08-02.md`](../../Benchmarks/RESULTS_ROCKY8_2026-08-02.md)
-for the evidence and exact rerun boundary.
+comparison. Also run a full-duration preflight: the 2026-08-03 image passed a
+20/20 4K five-second stress but still became static during longer CPU and Metal
+collections, and `control.sh start` did not recover sustained activity after
+degradation. The xterm-based workload must be replaced or repaired before a
+formal verdict. See
+[`Benchmarks/RESULTS_ROCKY8_2026-08-03.md`](../../Benchmarks/RESULTS_ROCKY8_2026-08-03.md)
+for the evidence and exact rerun boundary. The historical 2026-08-02 report is
+retained separately.
 
 Archive a server-log slice around each client capture:
 

@@ -11,14 +11,21 @@ JSON object after the observation interval; frame-by-frame logging is disabled.
 
 ## Latest retained result
 
-The 2026-08-02 Rocky run exercised CPU and Metal at 1280x720 and 3840x2160.
-Every continuous eight-pair diagnostic prefix failed the CPU-per-frame gate;
-the 4K Metal prefix also failed RSS. The intended formal ten-pair verdict is
-**invalid**, not a performance pass or failure, because the old guest reset
-fixture stopped producing activity in the late pairs. Metal lifecycle evidence
-remained clean in all 20 measured Metal processes. See
-[RESULTS_ROCKY8_2026-08-02.md](RESULTS_ROCKY8_2026-08-02.md) for the complete
-ratios, evidence boundaries, fixture repair, and rerun criteria.
+The 2026-08-03 Rocky rerun exercised CPU and Metal at 1280x720 and 3840x2160
+from PR #4 head `d68a8ec`. All requested ten-by-30-second batches were collected,
+including samples after evidence failures, but the formal verdict remains
+**invalid**: the guest workload again stopped producing sustained activity in
+late samples. Activity-valid diagnostics failed CPU per published frame in all
+four configurations; 4K Metal also failed RSS. Metal renderer evidence remained
+pure and lifecycle-stable in all 20 Metal processes. The counters identify one
+full-surface canonical clone per command buffer plus large snapshot catch-up
+copies as the primary Metal data-movement costs. See
+[RESULTS_ROCKY8_2026-08-03.md](RESULTS_ROCKY8_2026-08-03.md) for the complete
+ratios, absolute medians, rejected samples, raw evidence paths, and next gate.
+
+The earlier [2026-08-02 result](RESULTS_ROCKY8_2026-08-02.md) remains available
+as historical evidence; it must not be combined with the new batches to create
+a synthetic formal result.
 
 Build the two collectors on macOS:
 
