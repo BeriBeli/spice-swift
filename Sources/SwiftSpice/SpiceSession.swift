@@ -105,6 +105,7 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
     case connectionFailed(String)
     case authenticationFailed(String)
     case protocolError(String)
+    case inputGenerationExpired
     case agentQueueFull
     case agentCancelled(partial: Bool)
     case agentDisconnected
@@ -123,6 +124,8 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
             "authentication failed: \(reason)"
         case let .protocolError(reason):
             "protocol error: \(reason)"
+        case .inputGenerationExpired:
+            "input generation expired"
         case .agentQueueFull:
             "guest Agent outbound queue is full"
         case let .agentCancelled(partial):
@@ -158,11 +161,13 @@ public actor SpiceSession {
     package typealias TransportFactory = @Sendable (SpiceEndpoint) -> any SpiceTransport
     package typealias MigrationReplacementHook =
         @Sendable (MigrationReplacementPhase, ChannelKey) async throws -> Void
+    package typealias MigrationTargetEndHook = @Sendable () async throws -> Void
 
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
     private let injectedMigrationReplacementHook: MigrationReplacementHook?
+    private let injectedMigrationTargetEndHook: MigrationTargetEndHook?
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
@@ -185,6 +190,13 @@ public actor SpiceSession {
     private var retiredDisplayDiagnostics = SpiceSessionDiagnostics()
     private var receiveTasks: [Task<Void, Never>] = []
     private var supervisionGeneration: UInt64 = 0
+    private nonisolated let inputSessionIdentity = UUID()
+    private var inputGenerationSequence: UInt64 = 0
+    private var activeInputGeneration: SpiceInputGeneration?
+    private var lifecycleGeneration: UInt64 = 0
+    private var isTearingDown = false
+    private var teardownWaiters: [CheckedContinuation<Void, Never>] = []
+    private var migrationAdoptionLifecycleGeneration: UInt64?
     private var credentialStorage: SpiceCredentialStorage?
     private var currentEndpoint: SpiceEndpoint?
     private var currentBootstrap: MainBootstrap?
@@ -222,9 +234,25 @@ public actor SpiceSession {
         }
     }
 
-    private enum MigrationAdoptionFailure: Error, Sendable {
-        case sourceResumed(ChannelError)
-        case rollbackIncomplete(ChannelError)
+    private struct MigrationAdoptionFailure: Error, Sendable {
+        let cause: ChannelError
+        let rollbackComplete: Bool
+        let lifecycleGeneration: UInt64
+        let supervisionGeneration: UInt64
+    }
+
+    private struct MigrationAdoptionCommit: Sendable {
+        let lifecycleGeneration: UInt64
+        let supervisionGeneration: UInt64
+    }
+
+    private enum MigrationAdoptionPolicy: Sendable {
+        /// Every source receive loop stopped at a channel MIGRATE boundary and
+        /// can be safely restarted after a complete reverse replacement.
+        case sourceResumable
+        /// The source has no proven restart boundary (for example after a
+        /// non-seamless END); any adoption failure must close the full session.
+        case failClosed
     }
 
     public init() {
@@ -271,13 +299,15 @@ public actor SpiceSession {
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
         injectedMigrationReplacementHook = nil
+        injectedMigrationTargetEndHook = nil
     }
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
         migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
-        migrationReplacementHook: MigrationReplacementHook? = nil
+        migrationReplacementHook: MigrationReplacementHook? = nil,
+        migrationTargetEndHook: MigrationTargetEndHook? = nil
     ) {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
@@ -322,6 +352,7 @@ public actor SpiceSession {
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
         injectedMigrationReplacementHook = migrationReplacementHook
+        injectedMigrationTargetEndHook = migrationTargetEndHook
     }
 
     deinit {
@@ -332,9 +363,13 @@ public actor SpiceSession {
         endpoint: SpiceEndpoint,
         credentials: consuming SpiceCredentials
     ) async throws(SpiceError) -> SpiceSessionInfo {
+        guard !isTearingDown else {
+            throw .cancelled
+        }
         guard mainChannel == nil, !isConnecting else {
             throw .alreadyConnected
         }
+        let admittedLifecycleGeneration = lifecycleGeneration
         retiredDisplayDiagnostics = SpiceSessionDiagnostics()
         isConnecting = true
         defer { isConnecting = false }
@@ -344,6 +379,12 @@ public actor SpiceSession {
             endpoint: endpoint,
             credentials: credentialStorage
         )
+        guard !isTearingDown,
+              admittedLifecycleGeneration == lifecycleGeneration,
+              mainChannel == nil else {
+            await Self.closePrepared(prepared)
+            throw .cancelled
+        }
         adopt(prepared, credentials: credentialStorage)
         return prepared.info
     }
@@ -446,13 +487,20 @@ public actor SpiceSession {
         credentialStorage = credentials
         isAgentConnected = prepared.bootstrap.agentConnected
         startSupervision(mainChannel: prepared.mainChannel)
+        activateInputGeneration()
         if prepared.bootstrap.agentConnected {
             agentEventContinuation.yield(.connected)
         }
     }
 
     public func disconnect() async {
+        guard beginTeardown() else {
+            await waitForTeardown()
+            return
+        }
+        defer { finishTeardown() }
         supervisionGeneration &+= 1
+        invalidateInputGeneration()
         await cancelMigrationHandoff()
         await stopUSBRedirectionHosts()
         await stopWebDAVServers()
@@ -502,17 +550,75 @@ public actor SpiceSession {
         return result
     }
 
-    public func send(_ input: SpiceClientInput) async throws(SpiceError) {
+    /// Returns a capability bound to the currently connected Inputs transport.
+    /// The sender expires on disconnect, failure, or migration rebind.
+    public func makeInputSender() throws(SpiceError) -> SpiceInputSender {
         try ensureClientSendsAllowed()
+        guard let generation = activeInputGeneration,
+              channels[ChannelKey(type: 3, id: 0)] is InputsChannel else {
+            throw .protocolError("Inputs Channel is not connected")
+        }
+        return SpiceInputSender(session: self, generation: generation)
+    }
+
+    /// Sends on whichever Inputs generation is current when this actor begins
+    /// the call. Recovery-aware callers should retain a ``SpiceInputSender``.
+    public func send(_ input: SpiceClientInput) async throws(SpiceError) {
+        let sender = try makeInputSender()
+        try await sender.send(input)
+    }
+
+    func validateInputGeneration(
+        _ generation: SpiceInputGeneration
+    ) throws(SpiceError) {
+        guard activeInputGeneration == generation,
+              mainChannel != nil,
+              channels[ChannelKey(type: 3, id: 0)] is InputsChannel else {
+            throw .inputGenerationExpired
+        }
+    }
+
+    func send(
+        _ input: SpiceClientInput,
+        generation: SpiceInputGeneration
+    ) async throws(SpiceError) {
+        try ensureClientSendsAllowed()
+        try validateInputGeneration(generation)
+        guard !Task.isCancelled else {
+            throw .cancelled
+        }
+
         let key = ChannelKey(type: 3, id: 0)
         guard let inputs = channels[key] as? InputsChannel else {
             throw .protocolError("Inputs Channel is not connected")
         }
+        let sessionGeneration = supervisionGeneration
         do {
             try await inputs.send(Self.channelInput(input))
-        } catch {
+        } catch let error {
+            guard activeInputGeneration == generation else {
+                throw .inputGenerationExpired
+            }
+            if case .transport = error {
+                await inputTransportFailed(
+                    error,
+                    inputGeneration: generation,
+                    sessionGeneration: sessionGeneration
+                )
+            }
             throw Self.map(channelError: error)
         }
+
+        if Task.isCancelled {
+            let error = ChannelError.transport(TransportError.cancelled)
+            await inputTransportFailed(
+                error,
+                inputGeneration: generation,
+                sessionGeneration: sessionGeneration
+            )
+            throw .cancelled
+        }
+        try validateInputGeneration(generation)
     }
 
     /// Reports the host audio sink's current queued playback delay. This is
@@ -840,6 +946,30 @@ public actor SpiceSession {
         }
     }
 
+    private func beginTeardown() -> Bool {
+        guard !isTearingDown else { return false }
+        isTearingDown = true
+        lifecycleGeneration &+= 1
+        migrationAdoptionLifecycleGeneration = nil
+        return true
+    }
+
+    private func waitForTeardown() async {
+        guard isTearingDown else { return }
+        await withCheckedContinuation { continuation in
+            teardownWaiters.append(continuation)
+        }
+    }
+
+    private func finishTeardown() {
+        isTearingDown = false
+        let waiters = teardownWaiters
+        teardownWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
     private func closeChannels() async {
         let openChannels = channels.keys.sorted(by: Self.channelKeySort).compactMap { channels[$0] }
         channels.removeAll(keepingCapacity: false)
@@ -1009,6 +1139,12 @@ public actor SpiceSession {
     }
 
     private func ensureClientSendsAllowed() throws(SpiceError) {
+        guard !isTearingDown else {
+            throw .cancelled
+        }
+        guard migrationAdoptionLifecycleGeneration == nil else {
+            throw .agentMigrationRebind(partial: false)
+        }
         guard seamlessMigrationPayloads.isEmpty else {
             throw .protocolError("channel migration is flushing client messages")
         }
@@ -1088,8 +1224,12 @@ public actor SpiceSession {
             // admission pause is the authoritative semantic-send gate; keeping
             // this bookkeeping entry would mask a premature Main resume.
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
-            try await adoptMigrationTarget(prepared, credentials: credentials)
-            await migrationHandoffCompleted(offerID: offer.id)
+            let commit = try await adoptMigrationTarget(
+                prepared,
+                credentials: credentials,
+                policy: .sourceResumable
+            )
+            await migrationHandoffCompleted(offerID: offer.id, commit: commit)
         } catch {
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
             if removedForAdoption {
@@ -1097,12 +1237,17 @@ public actor SpiceSession {
             } else if let owned = preparedMigrations.removeValue(forKey: offer.id) {
                 await Self.closePrepared(owned)
             }
-            if error is MigrationAdoptionFailure {
+            if let failure = error as? MigrationAdoptionFailure {
+                if !failure.rollbackComplete {
+                    await failMigrationAdoption(failure)
+                    return
+                }
                 await migrationOperationFailed(
                     offerID: offer.id,
                     operation: .commit,
-                    error: error,
-                    generation: generation
+                    reason: Self.map(channelError: failure.cause).description,
+                    generation: failure.supervisionGeneration,
+                    expectedLifecycleGeneration: failure.lifecycleGeneration
                 )
             } else {
                 await receiveFailed(Self.channelError(error), generation: generation)
@@ -1379,35 +1524,53 @@ public actor SpiceSession {
                         generation: generation
                     )
                 case .commit:
+                    let commit: MigrationAdoptionCommit?
                     if let executor {
                         try await executor.commit(offer)
+                        commit = nil
                     } else if let self {
-                        try await self.commitMigrationTarget(offer)
+                        commit = try await self.commitMigrationTarget(offer)
                     } else {
                         return
                     }
-                    guard !Task.isCancelled else { return }
-                    await self?.migrationHandoffCompleted(offerID: offer.id)
+                    await self?.migrationHandoffCompleted(
+                        offerID: offer.id,
+                        commit: commit
+                    )
                 case .switchHost:
+                    let commit: MigrationAdoptionCommit?
                     if let executor {
                         try await executor.switchHost(offer)
+                        commit = nil
                     } else if let self {
-                        try await self.switchMigrationTarget(offer)
+                        commit = try await self.switchMigrationTarget(offer)
                     } else {
                         return
                     }
-                    guard !Task.isCancelled else { return }
-                    await self?.migrationHandoffCompleted(offerID: offer.id)
+                    await self?.migrationHandoffCompleted(
+                        offerID: offer.id,
+                        commit: commit
+                    )
                 }
             } catch is CancellationError {
                 return
             } catch {
+                if let failure = error as? MigrationAdoptionFailure,
+                   !failure.rollbackComplete {
+                    await self?.failMigrationAdoption(failure)
+                    return
+                }
                 guard !Task.isCancelled else { return }
                 await self?.migrationOperationFailed(
                     offerID: offer.id,
                     operation: operation,
-                    error: error,
-                    generation: generation
+                    reason: (error as? MigrationAdoptionFailure).map {
+                        Self.map(channelError: $0.cause).description
+                    } ?? String(describing: error),
+                    generation: (error as? MigrationAdoptionFailure)?
+                        .supervisionGeneration ?? generation,
+                    expectedLifecycleGeneration: (error as? MigrationAdoptionFailure)?
+                        .lifecycleGeneration
                 )
             }
         }
@@ -1427,7 +1590,17 @@ public actor SpiceSession {
         await processMigrationActions(actions, generation: generation)
     }
 
-    private func migrationHandoffCompleted(offerID: UInt64) async {
+    private func migrationHandoffCompleted(
+        offerID: UInt64,
+        commit: MigrationAdoptionCommit? = nil
+    ) async {
+        if let commit {
+            guard commit.lifecycleGeneration == lifecycleGeneration,
+                  commit.supervisionGeneration == supervisionGeneration,
+                  !isTearingDown else {
+                return
+            }
+        }
         migrationTask = nil
         let actions = migrationCoordinator.handoffCompleted(offerID: offerID)
         await processMigrationActions(actions, generation: supervisionGeneration)
@@ -1436,25 +1609,14 @@ public actor SpiceSession {
     private func migrationOperationFailed(
         offerID: UInt64,
         operation: MigrationOperation,
-        error: any Error,
-        generation: UInt64
+        reason: String,
+        generation: UInt64,
+        expectedLifecycleGeneration: UInt64? = nil
     ) async {
-        let effectiveGeneration: UInt64
-        let reason: String
-        if let adoptionFailure = error as? MigrationAdoptionFailure {
-            switch adoptionFailure {
-            case let .sourceResumed(channelError):
-                effectiveGeneration = supervisionGeneration
-                reason = String(describing: channelError)
-            case let .rollbackIncomplete(channelError):
-                await receiveFailed(channelError, generation: supervisionGeneration)
-                return
-            }
-        } else {
-            effectiveGeneration = generation
-            reason = String(describing: error)
+        guard generation == supervisionGeneration, !isTearingDown else { return }
+        if let expectedLifecycleGeneration {
+            guard expectedLifecycleGeneration == lifecycleGeneration else { return }
         }
-        guard effectiveGeneration == supervisionGeneration else { return }
         migrationTask = nil
         let actions: [MigrationHandoffCoordinator.Action]
         switch operation {
@@ -1469,7 +1631,15 @@ public actor SpiceSession {
                 reason: reason
             )
         }
-        await processMigrationActions(actions, generation: effectiveGeneration)
+        await processMigrationActions(actions, generation: generation)
+    }
+
+    private func failMigrationAdoption(_ failure: MigrationAdoptionFailure) async {
+        guard failure.lifecycleGeneration == lifecycleGeneration else { return }
+        await receiveFailed(
+            failure.cause,
+            generation: failure.supervisionGeneration
+        )
     }
 
     private func cancelMigrationHandoff() async {
@@ -1627,31 +1797,62 @@ public actor SpiceSession {
         }
     }
 
-    private func commitMigrationTarget(_ offer: SpiceMigrationOffer) async throws {
+    private func commitMigrationTarget(
+        _ offer: SpiceMigrationOffer
+    ) async throws -> MigrationAdoptionCommit {
         guard let prepared = preparedMigrations[offer.id],
               let credentials = credentialStorage else {
             throw SpiceError.protocolError("migration target was not prepared")
         }
+        try Task.checkCancellation()
+        let adoptionLifecycleGeneration = try beginMigrationAdoptionGate()
         var removedForAdoption = false
         do {
+            // Non-seamless migration has no resumable source boundary.  Close
+            // session-level admission before the target END write so source
+            // Agent traffic cannot race this irreversible transition.
+            try await injectedMigrationTargetEndHook?()
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
             try await prepared.mainChannel.sendMigrationReply(.end)
-            try Task.checkCancellation()
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
+            guard migrationAdoptionLifecycleGeneration == adoptionLifecycleGeneration else {
+                throw CancellationError()
+            }
             guard preparedMigrations.removeValue(forKey: offer.id) != nil else {
                 throw CancellationError()
             }
             removedForAdoption = true
-            try await adoptMigrationTarget(prepared, credentials: credentials)
+            return try await adoptMigrationTarget(
+                prepared,
+                credentials: credentials,
+                policy: .failClosed,
+                heldGateGeneration: adoptionLifecycleGeneration
+            )
         } catch {
             if removedForAdoption {
                 await Self.closePrepared(prepared)
             } else if let owned = preparedMigrations.removeValue(forKey: offer.id) {
                 await Self.closePrepared(owned)
             }
-            throw error
+            if let failure = error as? MigrationAdoptionFailure {
+                throw failure
+            }
+            // Once the non-seamless commit operation owns the gate, every
+            // error (including task cancellation or END failure) is fail
+            // closed.  Leaving the gate installed blocks writes until
+            // failMigrationAdoption tears the session down.
+            throw MigrationAdoptionFailure(
+                cause: Self.migrationAdoptionChannelError(error),
+                rollbackComplete: false,
+                lifecycleGeneration: adoptionLifecycleGeneration,
+                supervisionGeneration: supervisionGeneration
+            )
         }
     }
 
-    private func switchMigrationTarget(_ offer: SpiceMigrationOffer) async throws {
+    private func switchMigrationTarget(
+        _ offer: SpiceMigrationOffer
+    ) async throws -> MigrationAdoptionCommit {
         guard let credentials = credentialStorage else {
             throw SpiceError.protocolError("migration started without active credentials")
         }
@@ -1662,7 +1863,7 @@ public actor SpiceSession {
             throw CancellationError()
         }
         do {
-            try await replaceSessionWithTarget(prepared, credentials: credentials)
+            return try await replaceSessionWithTarget(prepared, credentials: credentials)
         } catch {
             await Self.closePrepared(prepared)
             throw error
@@ -1671,9 +1872,21 @@ public actor SpiceSession {
 
     private func adoptMigrationTarget(
         _ prepared: PreparedSession,
-        credentials: SpiceCredentialStorage
-    ) async throws {
+        credentials: SpiceCredentialStorage,
+        policy: MigrationAdoptionPolicy,
+        heldGateGeneration: UInt64? = nil
+    ) async throws -> MigrationAdoptionCommit {
         try Task.checkCancellation()
+        let adoptionLifecycleGeneration: UInt64
+        if let heldGateGeneration {
+            try ensureMigrationLifecycle(heldGateGeneration)
+            guard migrationAdoptionLifecycleGeneration == heldGateGeneration else {
+                throw CancellationError()
+            }
+            adoptionLifecycleGeneration = heldGateGeneration
+        } else {
+            adoptionLifecycleGeneration = try beginMigrationAdoptionGate()
+        }
 
         let mainKey = ChannelKey(type: 1, id: 0)
         let activeKeys = Set(connections.keys)
@@ -1695,20 +1908,25 @@ public actor SpiceSession {
         let sourceBootstrap = currentBootstrap
         let sourceCredentials = credentialStorage
 
+        // Session-level admission remains closed across every actor hop. Main
+        // admission may open only at the final commit await, after which this
+        // actor synchronously installs supervision and clears this gate.
+        invalidateInputGeneration()
         supervisionGeneration &+= 1
         let oldTasks = receiveTasks
         receiveTasks.removeAll(keepingCapacity: false)
         for task in oldTasks { task.cancel() }
 
         var previousConnections: [ChannelKey: ChannelConnection] = [:]
-        var targetStateCommitted = false
-        var targetSupervisionStarted = false
         do {
             try await mainChannel.prepareAgentForMigrationRebind()
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
             try await injectedMigrationReplacementHook?(.applying, mainKey)
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
             previousConnections[mainKey] = try await mainChannel.replaceConnection(
                 with: targetMainConnection
             )
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
             for key in channels.keys.sorted(by: Self.channelKeySort) {
                 guard let channel = channels[key],
                       let replacement = prepared.connections[key] else {
@@ -1717,33 +1935,38 @@ public actor SpiceSession {
                     )
                 }
                 try await injectedMigrationReplacementHook?(.applying, key)
+                try ensureMigrationLifecycle(adoptionLifecycleGeneration)
                 previousConnections[key] = try await channel.replaceConnection(
                     with: replacement
                 )
+                try ensureMigrationLifecycle(adoptionLifecycleGeneration)
             }
 
-            // Publish the target inventory and metadata as one actor-isolated
-            // state transition while Main admission remains paused.  Only the
-            // explicit commit below may open semantic Agent writes.
             connections = prepared.connections
             currentEndpoint = prepared.endpoint
             currentBootstrap = prepared.bootstrap
             credentialStorage = credentials
-            targetStateCommitted = true
-            startSupervision(mainChannel: mainChannel)
-            targetSupervisionStarted = true
+            try ensureMigrationLifecycle(adoptionLifecycleGeneration)
+            if policy == .failClosed {
+                try Task.checkCancellation()
+            }
             try await mainChannel.commitAgentMigrationRebind()
         } catch {
-            let adoptionError = Self.channelError(error)
-            if targetSupervisionStarted {
-                invalidateSupervisionTasks()
+            let adoptionError = Self.migrationAdoptionChannelError(error)
+            let canResumeSource = policy == .sourceResumable
+                && lifecycleGeneration == adoptionLifecycleGeneration
+                && !isTearingDown
+            guard canResumeSource else {
+                invalidateInputGeneration()
+                closeConnectionsInBackground(Array(previousConnections.values))
+                throw MigrationAdoptionFailure(
+                    cause: adoptionError,
+                    rollbackComplete: false,
+                    lifecycleGeneration: adoptionLifecycleGeneration,
+                    supervisionGeneration: supervisionGeneration
+                )
             }
-            if targetStateCommitted {
-                connections = sourceConnections
-                currentEndpoint = sourceEndpoint
-                currentBootstrap = sourceBootstrap
-                credentialStorage = sourceCredentials
-            }
+
             var rollbackError: ChannelError?
             let replacedChannelKeys = previousConnections.keys
                 .filter { $0 != mainKey }
@@ -1756,63 +1979,115 @@ public actor SpiceSession {
                 }
                 do {
                     try await injectedMigrationReplacementHook?(.rollingBack, key)
+                    try ensureMigrationLifecycle(adoptionLifecycleGeneration)
                     _ = try await channel.replaceConnection(with: previous)
+                    try ensureMigrationLifecycle(adoptionLifecycleGeneration)
                 } catch {
-                    rollbackError = rollbackError ?? Self.channelError(error)
+                    rollbackError = rollbackError
+                        ?? Self.migrationAdoptionChannelError(error)
                 }
             }
             var mainRestored = previousConnections[mainKey] == nil
             if let previousMain = previousConnections[mainKey] {
                 do {
                     try await injectedMigrationReplacementHook?(.rollingBack, mainKey)
+                    try ensureMigrationLifecycle(adoptionLifecycleGeneration)
                     _ = try await mainChannel.replaceConnection(with: previousMain)
+                    try ensureMigrationLifecycle(adoptionLifecycleGeneration)
                     mainRestored = true
                 } catch {
-                    rollbackError = rollbackError ?? Self.channelError(error)
+                    rollbackError = rollbackError
+                        ?? Self.migrationAdoptionChannelError(error)
                 }
             }
 
-            guard rollbackError == nil, mainRestored else {
-                let rollbackError = rollbackError ?? .invalidState
-                throw MigrationAdoptionFailure.rollbackIncomplete(.protocolViolation(
+            var rollbackComplete = rollbackError == nil
+                && mainRestored
+                && lifecycleGeneration == adoptionLifecycleGeneration
+                && !isTearingDown
+            if rollbackComplete {
+                connections = sourceConnections
+                currentEndpoint = sourceEndpoint
+                currentBootstrap = sourceBootstrap
+                credentialStorage = sourceCredentials
+            }
+
+            if rollbackComplete {
+                for sourceConnection in sourceConnections.values {
+                    await sourceConnection.resumeAfterMigrationCancellation()
+                    guard lifecycleGeneration == adoptionLifecycleGeneration,
+                          !isTearingDown else {
+                        rollbackComplete = false
+                        break
+                    }
+                }
+            }
+
+            if rollbackComplete {
+                rollbackComplete = await mainChannel.abortAgentMigrationRebind()
+                    && lifecycleGeneration == adoptionLifecycleGeneration
+                    && !isTearingDown
+            }
+
+            if rollbackComplete {
+                startSupervision(mainChannel: mainChannel)
+                activateInputGeneration()
+                if migrationAdoptionLifecycleGeneration == adoptionLifecycleGeneration {
+                    migrationAdoptionLifecycleGeneration = nil
+                }
+            } else {
+                invalidateInputGeneration()
+                closeConnectionsInBackground(Array(previousConnections.values))
+            }
+            let cause: ChannelError
+            if let rollbackError, !rollbackComplete {
+                cause = .protocolViolation(
                     "migration adoption failed (\(adoptionError)); "
                         + "source rollback incomplete (\(rollbackError))"
-                ))
+                )
+            } else {
+                cause = adoptionError
             }
-
-            // Restore every source connection's migration gate before opening
-            // Main Agent admission again.
-            for sourceConnection in sourceConnections.values {
-                await sourceConnection.resumeAfterMigrationCancellation()
-            }
-            // Supervision must own the restored source before Main admission is
-            // reopened.  If reopening fails, discard this epoch before the
-            // rollback is reported incomplete/fail-closed.
-            startSupervision(mainChannel: mainChannel)
-            guard await mainChannel.abortAgentMigrationRebind() else {
-                invalidateSupervisionTasks()
-                throw MigrationAdoptionFailure.rollbackIncomplete(.protocolViolation(
-                    "migration adoption failed (\(adoptionError)); "
-                        + "source Agent admission could not be restored"
-                ))
-            }
-            throw MigrationAdoptionFailure.sourceResumed(adoptionError)
+            throw MigrationAdoptionFailure(
+                cause: cause,
+                rollbackComplete: rollbackComplete,
+                lifecycleGeneration: adoptionLifecycleGeneration,
+                supervisionGeneration: supervisionGeneration
+            )
         }
 
-        // Inventory, metadata, supervision, and Agent admission now all refer
-        // to the target generation; old transport cleanup cannot create an
-        // unsupervised admission window.
-        for connection in previousConnections.values {
-            await connection.close()
+        guard lifecycleGeneration == adoptionLifecycleGeneration,
+              !isTearingDown,
+              migrationAdoptionLifecycleGeneration == adoptionLifecycleGeneration else {
+            closeConnectionsInBackground(Array(previousConnections.values))
+            throw MigrationAdoptionFailure(
+                cause: .transport(.cancelled),
+                rollbackComplete: false,
+                lifecycleGeneration: adoptionLifecycleGeneration,
+                supervisionGeneration: supervisionGeneration
+            )
         }
+        // No suspension is permitted between target supervision installation,
+        // input capability activation, and reopening the session-level gate.
+        startSupervision(mainChannel: mainChannel)
+        activateInputGeneration()
+        migrationAdoptionLifecycleGeneration = nil
+        let commit = MigrationAdoptionCommit(
+            lifecycleGeneration: adoptionLifecycleGeneration,
+            supervisionGeneration: supervisionGeneration
+        )
+        closeConnectionsInBackground(Array(previousConnections.values))
+        return commit
     }
 
     private func replaceSessionWithTarget(
         _ prepared: PreparedSession,
         credentials: SpiceCredentialStorage
-    ) async throws {
+    ) async throws -> MigrationAdoptionCommit {
         try Task.checkCancellation()
+        let adoptionLifecycleGeneration = try beginMigrationAdoptionGate()
 
+        invalidateInputGeneration()
         supervisionGeneration &+= 1
         let oldTasks = receiveTasks
         receiveTasks.removeAll(keepingCapacity: false)
@@ -1829,7 +2104,16 @@ public actor SpiceSession {
         currentBootstrap = prepared.bootstrap
         credentialStorage = credentials
         isAgentConnected = prepared.bootstrap.agentConnected
+        // This switch contains no actor suspension after state publication.
+        // Supervision, the fresh input capability, and send admission become
+        // visible atomically to other session calls.
         startSupervision(mainChannel: prepared.mainChannel)
+        activateInputGeneration()
+        migrationAdoptionLifecycleGeneration = nil
+        let commit = MigrationAdoptionCommit(
+            lifecycleGeneration: adoptionLifecycleGeneration,
+            supervisionGeneration: supervisionGeneration
+        )
 
         if oldAgentConnected {
             agentEventContinuation.yield(.disconnected(errorCode: 0))
@@ -1837,10 +2121,39 @@ public actor SpiceSession {
         if prepared.bootstrap.agentConnected {
             agentEventContinuation.yield(.connected)
         }
-        if let oldMain { await oldMain.close() }
-        for key in oldChannels.keys.sorted(by: Self.channelKeySort) {
-            if let channel = oldChannels[key] {
-                await closeAndArchive(channel)
+        Self.closeChannelsInBackground(main: oldMain, channels: oldChannels)
+        return commit
+    }
+
+    private func beginMigrationAdoptionGate() throws -> UInt64 {
+        guard !isTearingDown,
+              migrationAdoptionLifecycleGeneration == nil else {
+            throw CancellationError()
+        }
+        let generation = lifecycleGeneration
+        migrationAdoptionLifecycleGeneration = generation
+        invalidateInputGeneration()
+        return generation
+    }
+
+    private func closeConnectionsInBackground(_ values: [ChannelConnection]) {
+        Task.detached {
+            for connection in values {
+                await connection.close()
+            }
+        }
+    }
+
+    private nonisolated static func closeChannelsInBackground(
+        main: MainChannel?,
+        channels: [ChannelKey: any SpiceManagedChannel]
+    ) {
+        Task {
+            if let main {
+                await main.close()
+            }
+            for key in channels.keys.sorted(by: Self.channelKeySort) {
+                await channels[key]?.close()
             }
         }
     }
@@ -1920,11 +2233,64 @@ public actor SpiceSession {
         throw SpiceError.protocolError("migration target has no usable port")
     }
 
+    private func activateInputGeneration() {
+        inputGenerationSequence &+= 1
+        guard mainChannel != nil,
+              channels[ChannelKey(type: 3, id: 0)] is InputsChannel else {
+            activeInputGeneration = nil
+            return
+        }
+        activeInputGeneration = SpiceInputGeneration(
+            sessionID: inputSessionIdentity,
+            sequence: inputGenerationSequence
+        )
+    }
+
+    private func invalidateInputGeneration() {
+        guard activeInputGeneration != nil else { return }
+        inputGenerationSequence &+= 1
+        activeInputGeneration = nil
+    }
+
+    private func ensureMigrationLifecycle(_ expectedGeneration: UInt64) throws {
+        guard lifecycleGeneration == expectedGeneration, !isTearingDown else {
+            throw CancellationError()
+        }
+    }
+
+    private nonisolated static func migrationAdoptionChannelError(
+        _ error: any Error
+    ) -> ChannelError {
+        if let channelError = error as? ChannelError {
+            return channelError
+        }
+        if error is CancellationError {
+            return .transport(.cancelled)
+        }
+        return .protocolViolation(String(describing: error))
+    }
+
+    private func inputTransportFailed(
+        _ error: ChannelError,
+        inputGeneration: SpiceInputGeneration,
+        sessionGeneration: UInt64
+    ) async {
+        guard activeInputGeneration == inputGeneration else { return }
+        invalidateInputGeneration()
+        await receiveFailed(error, generation: sessionGeneration)
+    }
+
     private func receiveFailed(_ error: ChannelError, generation: UInt64) async {
         guard generation == supervisionGeneration, mainChannel != nil else {
             return
         }
+        guard beginTeardown() else {
+            await waitForTeardown()
+            return
+        }
+        defer { finishTeardown() }
         supervisionGeneration &+= 1
+        invalidateInputGeneration()
         await cancelMigrationHandoff()
         await stopUSBRedirectionHosts()
         await stopWebDAVServers()
@@ -2163,6 +2529,8 @@ public actor SpiceSession {
             .protocolError(
                 "unexpected migration request on channel type=\(key.type) id=\(key.id)"
             )
+        case .cancelledBeforeWrite:
+            .cancelled
         case .agentQueueFull:
             .agentQueueFull
         case let .agentCancelled(partial):

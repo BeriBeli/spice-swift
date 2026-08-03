@@ -586,6 +586,7 @@ struct SpiceSessionTests {
         await transport.waitForBlockedAgentWriteCount(1)
 
         await manager.stop()
+        #expect(await manager.ownedAgentSendCountForTesting() == 0)
         await transport.releaseBlockedAgentWrites()
         await #expect(throws: SpiceClipboardError.transport(.cancelled)) {
             try await staleStart.value
@@ -596,6 +597,114 @@ struct SpiceSessionTests {
         try await manager.start(session: session)
         await manager.stop()
         #expect(await transport.agentWriteCount == 2)
+        await session.disconnect()
+    }
+
+    @Test func stopRemovesZeroTokenClipboardOwnerBeforeFreshLifecycle() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 1
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        let stalePayload = Data("stale-zero-token".utf8)
+        let staleSend = Task {
+            await manager.sendClipboardCommandForTesting(.data(
+                type: VDAgentClipboardType.utf8Text.rawValue,
+                data: stalePayload
+            ))
+        }
+        await waitForOwnedAgentSendCount(1, manager: manager)
+
+        await manager.stop()
+        #expect(await manager.ownedAgentSendCountForTesting() == 0)
+        await staleSend.value
+
+        let freshStart = Task { try await manager.start(session: session) }
+        await waitForOwnedAgentSendCount(1, manager: manager)
+        await transport.enqueue(encodeMini(id: 110, body: uint32(1)))
+        try await freshStart.value
+
+        let commands = try decodedAgentMessages(await transport.outbound).compactMap {
+            try VDAgentClipboardCodec.decode($0)
+        }
+        #expect(!commands.contains(.data(
+            type: VDAgentClipboardType.utf8Text.rawValue,
+            data: stalePayload
+        )))
+        #expect(commands.filter {
+            if case .announceCapabilities = $0 { return true }
+            return false
+        }.count == 2)
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func stopRemovesZeroTokenFileStartBeforeFreshLifecycle() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 1
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "spice-swift-zero-token-\(UUID().uuidString).bin"
+        )
+        try Data([1, 2, 3]).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let staleFile = Task {
+            try await manager.sendFile(at: source, name: "stale.bin")
+        }
+        await waitForOwnedAgentSendCount(1, manager: manager)
+
+        await manager.stop()
+        #expect(await manager.ownedAgentSendCountForTesting() == 0)
+        await #expect(throws: SpiceFileTransferError.agentUnavailable) {
+            _ = try await staleFile.value
+        }
+
+        let freshStart = Task { try await manager.start(session: session) }
+        await waitForOwnedAgentSendCount(1, manager: manager)
+        await transport.enqueue(encodeMini(id: 110, body: uint32(1)))
+        try await freshStart.value
+
+        let fileCommands = try decodedAgentMessages(await transport.outbound).compactMap {
+            try VDAgentFileTransferCodec().decode($0)
+        }
+        #expect(!fileCommands.contains(where: {
+            if case .start = $0 { return true }
+            return false
+        }))
+        await manager.stop()
         await session.disconnect()
     }
 
@@ -1338,6 +1447,143 @@ struct SpiceSessionTests {
         #expect(!(await targetInputs.isConnected))
     }
 
+    @Test func nonSeamlessEndGateRejectsConcurrentSourceAgentWrites() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let target = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([source, target])
+        let endGate = MigrationEndGate()
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationTargetEndHook: {
+                await endGate.intercept()
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+        await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
+            host: "target.example"
+        )))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: false)))
+
+        await source.enqueue(encodeMini(id: 112, body: Data()))
+        #expect(await events.next() == .migration(.committing(offer)))
+        await endGate.waitUntilBlocked()
+        let sourceAgentWrites = await source.agentWriteCount
+        await #expect(throws: SpiceError.agentMigrationRebind(partial: false)) {
+            try await session.sendAgentMessage(SpiceAgentMessage(
+                protocolID: 1,
+                type: VDAgentMessageType.clipboardRelease.rawValue,
+                opaque: 0,
+                data: Data()
+            ))
+        }
+        #expect(await source.agentWriteCount == sourceAgentWrites)
+        #expect(await target.agentWriteCount == 0)
+
+        await endGate.release()
+        #expect(await events.next() == .migration(.completed(offer)))
+        await session.disconnect()
+    }
+
+    @Test func nonSeamlessApplyFailureFailsClosedWithoutSourceRestart() async throws {
+        let inputChannel = [SpiceChannelID(type: 3, id: 0)]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: inputChannel
+        ))
+        let sourceInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let target = StreamingSessionTransport(initial: try makeLinkResponses())
+        let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([source, sourceInputs, target, targetInputs])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationReplacementHook: { phase, key in
+                if case .applying = phase, key.type == 3 {
+                    throw ChannelError.protocolViolation("fixture nonseamless apply failure")
+                }
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sourceSender = try await session.makeInputSender()
+        var events = session.events.makeAsyncIterator()
+        await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
+            host: "target.example"
+        )))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: false)))
+
+        await source.enqueue(encodeMini(id: 112, body: Data()))
+        #expect(await events.next() == .migration(.committing(offer)))
+        let failure = await events.next()
+        guard case let .failed(error) = failure else {
+            Issue.record("expected full-session failure, got \(String(describing: failure))")
+            return
+        }
+        #expect(error.description.contains("fixture nonseamless apply failure"))
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await sourceSender.send(.keyDown(scanCode: 0x1e))
+        }
+        #expect(await source.waitUntilDisconnected())
+        #expect(await sourceInputs.waitUntilDisconnected())
+        #expect(await target.waitUntilDisconnected())
+        #expect(await targetInputs.waitUntilDisconnected())
+    }
+
+    @Test func committedTargetImmediateFailureFailsClosedWithoutSourceRollback() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        // prepareMigrationConnection consumes only the link handshake.  The
+        // queued MainInit is invalid for the rebound, already-bootstrapped
+        // source Main actor and fails target supervision immediately after the
+        // atomic admission commit.
+        let target = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let transports = TransportPool([source, target])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+        await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
+            host: "target.example"
+        )))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: false)))
+
+        await source.enqueue(encodeMini(id: 112, body: Data()))
+        #expect(await events.next() == .migration(.committing(offer)))
+        let firstTerminal = await events.next()
+        switch firstTerminal {
+        case let .migration(.completed(completedOffer)):
+            #expect(completedOffer == offer)
+            guard case .failed = await events.next() else {
+                Issue.record("committed target failure must close the session")
+                return
+            }
+        case .failed:
+            break
+        default:
+            Issue.record("unexpected target failure event: \(String(describing: firstTerminal))")
+            return
+        }
+        #expect(await source.waitUntilDisconnected())
+        #expect(await target.waitUntilDisconnected())
+    }
+
     @Test func midInventoryMigrationFailureRollsBackAndRestartsSourceSupervision() async throws {
         let sourceChannels = [
             SpiceChannelID(type: 2, id: 0),
@@ -1390,15 +1636,7 @@ struct SpiceSessionTests {
         await sourceDisplay.enqueue(encodeMini(id: 1, body: uint32(1)))
         await sourceInputs.enqueue(encodeMini(id: 1, body: uint32(1)))
         #expect(await events.next() == .migration(.committing(offer)))
-        var replacementBlocked = false
-        for _ in 0..<10_000 {
-            if await replacementGate.isCurrentlyBlocked {
-                replacementBlocked = true
-                break
-            }
-            await Task.yield()
-        }
-        try #require(replacementBlocked)
+        await replacementGate.waitUntilBlocked()
         await #expect(throws: SpiceError.agentMigrationRebind(partial: false)) {
             try await session.sendAgentMessage(SpiceAgentMessage(
                 protocolID: 1,
@@ -1442,7 +1680,7 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
-    @Test func seamlessTargetNegotiatesBeforeReportingReady() async throws {
+    @Test func seamlessTargetRebindsInputGenerationAfterNegotiation() async throws {
         let inputChannel = [SpiceChannelID(type: 3, id: 0)]
         let source = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: inputChannel
@@ -1462,6 +1700,7 @@ struct SpiceSessionTests {
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
+        let sourceInputSender = try await session.makeInputSender()
         var events = session.events.makeAsyncIterator()
         await source.enqueue(encodeMini(
             id: 116,
@@ -1472,7 +1711,7 @@ struct SpiceSessionTests {
         #expect(offer.mode == .seamless(sourceVersion: 9))
         #expect(await events.next() == .migration(.ready(offer, seamless: true)))
 
-        try await session.send(.mousePress(.left))
+        try await sourceInputSender.send(.mousePress(.left))
         await sourceInputs.waitForOutboundCount(3)
 
         await target.waitForOutboundCount(4)
@@ -1506,13 +1745,21 @@ struct SpiceSessionTests {
         await targetInputs.waitForOutboundCount(4)
         #expect(try decodeMiniMessageID((await targetInputs.outbound).last ?? Data()) == 5)
         #expect(try decodeMiniBody((await targetInputs.outbound).last ?? Data()) == inputsState)
+        #expect(await source.waitUntilDisconnected())
+        #expect(await sourceInputs.waitUntilDisconnected())
         #expect(!(await source.isConnected))
         #expect(!(await sourceInputs.isConnected))
         #expect(await target.isConnected)
         #expect(await targetInputs.isConnected)
 
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await sourceInputSender.send(.mousePosition(x: 1, y: 2, displayID: 0))
+        }
+        let targetInputSender = try await session.makeInputSender()
+        #expect(targetInputSender.generation != sourceInputSender.generation)
+
         let targetInputCount = await targetInputs.outbound.count
-        try await session.send(.mousePosition(x: 40, y: 50, displayID: 0))
+        try await targetInputSender.send(.mousePosition(x: 40, y: 50, displayID: 0))
         await targetInputs.waitForOutboundCount(targetInputCount + 1)
         let reboundInput = try #require((await targetInputs.outbound).last)
         #expect(try decodeMiniMessageID(reboundInput) == 112)
@@ -1767,6 +2014,286 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func inputGenerationsAreScopedToTheirOwningSession() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let firstMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let firstInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let secondMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let secondInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let firstPool = TransportPool([firstMain, firstInputs])
+        let secondPool = TransportPool([secondMain, secondInputs])
+        let firstSession = SpiceSession(
+            transportFactory: { _ in firstPool.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let secondSession = SpiceSession(
+            transportFactory: { _ in secondPool.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+
+        _ = try await firstSession.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        _ = try await secondSession.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let firstSender = try await firstSession.makeInputSender()
+        let secondSender = try await secondSession.makeInputSender()
+
+        #expect(firstSender.generation != secondSender.generation)
+        await firstSession.disconnect()
+        await secondSession.disconnect()
+    }
+
+    @Test func fullSessionInputRecoveryRetainsFenceAcrossReplacementFailure() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let sourceMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let sourceInputs = FailingStreamingSessionTransport(
+            initial: try makeLinkResponses(),
+            failingWrites: [6]
+        )
+        let failedReplacementMain = StreamingSessionTransport(
+            initial: try makeServerTranscript(channels: channels)
+        )
+        let failedReplacementInputs = FailingStreamingSessionTransport(
+            initial: try makeLinkResponses(),
+            failingWrites: [4]
+        )
+        let finalMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let finalInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            sourceMain,
+            sourceInputs,
+            failedReplacementMain,
+            failedReplacementInputs,
+            finalMain,
+            finalInputs,
+        ])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let endpoint = SpiceEndpoint(host: "fixture.invalid", port: 5_900)
+
+        _ = try await session.connect(
+            endpoint: endpoint,
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sourceSender = try await session.makeInputSender()
+        try await sourceSender.send(.keyDown(scanCode: 0x1d))
+        try await sourceSender.send(.mousePress(.left))
+        await #expect(throws: SpiceError.self) {
+            try await sourceSender.send(.mouseMotion(dx: 8, dy: -3))
+        }
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await sourceSender.send(.keyUp(scanCode: 0x1d))
+        }
+
+        let snapshot = SpiceInputRecoverySnapshot(
+            possiblyPressedScanCodes: [0x1d],
+            possiblyPressedButtons: [.left]
+        )
+        _ = try await session.connect(
+            endpoint: endpoint,
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let failedReplacementSender = try await session.makeInputSender()
+        #expect(failedReplacementSender.generation != sourceSender.generation)
+        await #expect(throws: SpiceError.self) {
+            try await failedReplacementSender.sendRecoveryFence(snapshot)
+        }
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await failedReplacementSender.send(.keyUp(scanCode: 0x1d))
+        }
+
+        _ = try await session.connect(
+            endpoint: endpoint,
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let finalSender = try await session.makeInputSender()
+        #expect(finalSender.generation != failedReplacementSender.generation)
+        try await finalSender.sendRecoveryFence(snapshot)
+        try await finalSender.send(.keyDown(scanCode: 0x1d))
+
+        let recoveryMessages = Array((await finalInputs.outbound).dropFirst(3))
+        #expect(try recoveryMessages.map(decodeMiniMessageID) == [114, 102, 101])
+        await session.disconnect()
+    }
+
+    @Test func cancellationAfterInputWriteStartsInvalidatesItsGeneration() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let inputs = BlockingEventSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([main, inputs])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sender = try await session.makeInputSender()
+
+        let sendTask = Task {
+            try await sender.send(.keyDown(scanCode: 0x1d))
+        }
+        await inputs.waitUntilEventWriteStarts()
+        sendTask.cancel()
+        await inputs.completeEventWrite()
+
+        await #expect(throws: SpiceError.cancelled) {
+            try await sendTask.value
+        }
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await sender.send(.keyUp(scanCode: 0x1d))
+        }
+        #expect(await inputs.isClosed)
+    }
+
+    @Test func cancellationBeforeQueuedInputWriteKeepsGenerationUsable() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let inputs = BlockingEventSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([main, inputs])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sender = try await session.makeInputSender()
+
+        let active = Task { try await sender.send(.keyDown(scanCode: 0x1d)) }
+        await inputs.waitUntilEventWriteStarts()
+        let queued = Task { try await sender.send(.keyDown(scanCode: 0x2a)) }
+        await Task.yield()
+        queued.cancel()
+
+        await #expect(throws: SpiceError.cancelled) {
+            try await queued.value
+        }
+        #expect(!(await inputs.isClosed))
+        await inputs.completeEventWrite()
+        try await active.value
+
+        try await sender.send(.keyUp(scanCode: 0x1d))
+        #expect(!(await inputs.isClosed))
+        await session.disconnect()
+    }
+
+    @Test func disconnectExpiresActiveAndQueuedInputSends() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let inputs = BlockingEventSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([main, inputs])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sender = try await session.makeInputSender()
+
+        let active = Task { try await sender.send(.mousePress(.left)) }
+        await inputs.waitUntilEventWriteStarts()
+        let queued = Task { try await sender.send(.mousePress(.right)) }
+        await Task.yield()
+        let disconnect = Task { await session.disconnect() }
+
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await queued.value
+        }
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await active.value
+        }
+        await disconnect.value
+        #expect(await inputs.isClosed)
+    }
+
+    @Test func connectCannotAdoptWhilePreviousChannelsAreClosing() async throws {
+        let channels = [SpiceChannelID(type: 3, id: 0)]
+        let oldMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let oldInputs = BlockingCloseSessionTransport(initial: try makeLinkResponses())
+        let replacementMain = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: channels
+        ))
+        let replacementInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            oldMain,
+            oldInputs,
+            replacementMain,
+            replacementInputs,
+        ])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let endpoint = SpiceEndpoint(host: "fixture.invalid", port: 5_900)
+        _ = try await session.connect(
+            endpoint: endpoint,
+            credentials: SpiceCredentials(password: "secret")
+        )
+
+        let disconnect = Task { await session.disconnect() }
+        await oldInputs.waitUntilCloseStarts()
+        await #expect(throws: SpiceError.cancelled) {
+            _ = try await session.connect(
+                endpoint: endpoint,
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        #expect(!(await replacementMain.isConnected))
+        #expect(!(await replacementInputs.isConnected))
+
+        await oldInputs.completeClose()
+        await disconnect.value
+        _ = try await session.connect(
+            endpoint: endpoint,
+            credentials: SpiceCredentials(password: "secret")
+        )
+        _ = try await session.makeInputSender()
+        await session.disconnect()
+        #expect(!(await replacementMain.isConnected))
+        #expect(!(await replacementInputs.isConnected))
+    }
+
+    private func waitForOwnedAgentSendCount(
+        _ count: Int,
+        manager: SpiceAgentManager,
+        maximumYields: Int = 10_000
+    ) async {
+        for _ in 0..<maximumYields {
+            if await manager.ownedAgentSendCountForTesting() == count {
+                return
+            }
+            await Task.yield()
+        }
+        Issue.record("timed out waiting for \(count) owned Agent sends")
+    }
+
     private func makeServerTranscript(
         channels channelOverride: [SpiceChannelID]? = nil,
         agentConnected: UInt32 = 0,
@@ -1930,12 +2457,39 @@ private final class TransportPool: Sendable {
     }
 }
 
+private actor MigrationEndGate {
+    private var isBlocked = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func intercept() async {
+        isBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilBlocked() async {
+        guard !isBlocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor MigrationReplacementGate {
     private let failingKey: ChannelKey
     private var isBlocked = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
-
-    var isCurrentlyBlocked: Bool { isBlocked }
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(failingKey: ChannelKey) {
         self.failingKey = failingKey
@@ -1947,10 +2501,20 @@ private actor MigrationReplacementGate {
     ) async throws {
         guard case .applying = phase, key == failingKey else { return }
         isBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
         await withCheckedContinuation { continuation in
             releaseContinuation = continuation
         }
         throw ChannelError.invalidState
+    }
+
+    func waitUntilBlocked() async {
+        guard !isBlocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
     }
 
     func releaseWithFailure() {
@@ -2091,6 +2655,14 @@ private actor StreamingSessionTransport: SpiceTransport {
         }
     }
 
+    func waitUntilDisconnected(maximumYields: Int = 10_000) async -> Bool {
+        for _ in 0..<maximumYields {
+            if !isConnected { return true }
+            await Task.yield()
+        }
+        return !isConnected
+    }
+
     func blockAgentMessages(types: Set<UInt32>) {
         blockedAgentMessageTypes = types
     }
@@ -2139,6 +2711,187 @@ private actor StreamingSessionTransport: SpiceTransport {
         return packet[packet.startIndex] == UInt8(SpiceMainAgentWire.clientData & 0xff)
             && packet[packet.startIndex + 1]
                 == UInt8((SpiceMainAgentWire.clientData >> 8) & 0xff)
+    }
+}
+
+private actor BlockingCloseSessionTransport: SpiceTransport {
+    private let inbound: AsyncStream<Data>
+    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private var closeContinuation: CheckedContinuation<Void, Never>?
+    private var closeStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var isConnected = false
+    private var closeStarted = false
+
+    init(initial: [Data]) {
+        let inboundPipe = AsyncStream.makeStream(of: Data.self)
+        inbound = inboundPipe.stream
+        inboundContinuation = inboundPipe.continuation
+        for packet in initial {
+            inboundPipe.continuation.yield(packet)
+        }
+    }
+
+    func connect() async throws(TransportError) {
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected else { throw .connectionClosed }
+        for await packet in inbound {
+            guard packet.count <= maximum else {
+                throw .connectionFailed("fixture exceeds requested maximum")
+            }
+            return packet
+        }
+        throw Task.isCancelled ? .cancelled : .connectionClosed
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected else { throw .connectionClosed }
+    }
+
+    func waitUntilCloseStarts() async {
+        guard !closeStarted else { return }
+        await withCheckedContinuation { continuation in
+            closeStartWaiters.append(continuation)
+        }
+    }
+
+    func completeClose() {
+        closeContinuation?.resume()
+        closeContinuation = nil
+    }
+
+    func close() async {
+        guard !closeStarted else { return }
+        closeStarted = true
+        let waiters = closeStartWaiters
+        closeStartWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            closeContinuation = continuation
+        }
+        isConnected = false
+        inboundContinuation.finish()
+    }
+}
+
+private actor FailingStreamingSessionTransport: SpiceTransport {
+    private let inbound: AsyncStream<Data>
+    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private let failingWrites: Set<Int>
+    private(set) var outbound: [Data] = []
+    private var writeCount = 0
+    private var isConnected = false
+
+    init(initial: [Data], failingWrites: Set<Int>) {
+        let inboundPipe = AsyncStream.makeStream(of: Data.self)
+        inbound = inboundPipe.stream
+        inboundContinuation = inboundPipe.continuation
+        for packet in initial {
+            inboundPipe.continuation.yield(packet)
+        }
+        self.failingWrites = failingWrites
+    }
+
+    func connect() async throws(TransportError) {
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected else { throw .connectionClosed }
+        for await packet in inbound {
+            guard packet.count <= maximum else {
+                throw .connectionFailed("fixture exceeds requested maximum")
+            }
+            return packet
+        }
+        throw Task.isCancelled ? .cancelled : .connectionClosed
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected else { throw .connectionClosed }
+        writeCount += 1
+        if failingWrites.contains(writeCount) {
+            throw .connectionFailed("fixture write \(writeCount)")
+        }
+        outbound.append(data)
+    }
+
+    func close() async {
+        isConnected = false
+        inboundContinuation.finish()
+    }
+}
+
+private actor BlockingEventSessionTransport: SpiceTransport {
+    private let inbound: AsyncStream<Data>
+    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private var eventWriteCompletion: CheckedContinuation<Void, Never>?
+    private var eventWriteStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var outbound: [Data] = []
+    private var writeCount = 0
+    private var isConnected = false
+    private(set) var isClosed = false
+
+    init(initial: [Data]) {
+        let inboundPipe = AsyncStream.makeStream(of: Data.self)
+        inbound = inboundPipe.stream
+        inboundContinuation = inboundPipe.continuation
+        for packet in initial {
+            inboundPipe.continuation.yield(packet)
+        }
+    }
+
+    func connect() async throws(TransportError) {
+        guard !isClosed else { throw .connectionClosed }
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected else { throw .connectionClosed }
+        for await packet in inbound {
+            guard packet.count <= maximum else {
+                throw .connectionFailed("fixture exceeds requested maximum")
+            }
+            return packet
+        }
+        throw Task.isCancelled ? .cancelled : .connectionClosed
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected else { throw .connectionClosed }
+        writeCount += 1
+        if writeCount == 4 {
+            let waiters = eventWriteStartWaiters
+            eventWriteStartWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { continuation in
+                eventWriteCompletion = continuation
+            }
+        }
+        outbound.append(data)
+    }
+
+    func waitUntilEventWriteStarts() async {
+        guard writeCount < 4 else { return }
+        await withCheckedContinuation { continuation in
+            eventWriteStartWaiters.append(continuation)
+        }
+    }
+
+    func completeEventWrite() {
+        eventWriteCompletion?.resume()
+        eventWriteCompletion = nil
+    }
+
+    func close() async {
+        isClosed = true
+        isConnected = false
+        completeEventWrite()
+        for waiter in eventWriteStartWaiters { waiter.resume() }
+        eventWriteStartWaiters.removeAll(keepingCapacity: false)
+        inboundContinuation.finish()
     }
 }
 

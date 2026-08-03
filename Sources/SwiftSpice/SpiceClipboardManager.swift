@@ -38,6 +38,9 @@ public actor SpiceAgentManager {
     private var clipboardInFlight: ClipboardActionOwner?
     private var nextClipboardOwnerID: UInt64 = 1
     private var agentWorkGeneration: UInt64 = 1
+    private var agentWorkInvalidationGeneration: UInt64?
+    private var ownedAgentSends: [UInt64: OwnedAgentSend] = [:]
+    private var nextOwnedAgentSendID: UInt64 = 1
     private var displayCoordinator = DisplayConfigurationCoordinator()
     private var lastDisplayConfigurationSupport: SpiceDisplayConfigurationSupport?
     private let maximumConcurrentFileTransfers: Int
@@ -55,6 +58,17 @@ public actor SpiceAgentManager {
         let id: UInt64
         let generation: UInt64
         let action: ClipboardStateMachine.Action
+    }
+
+    private struct AgentWorkEpoch: Sendable, Equatable {
+        let lifecycleGeneration: UInt64
+        let agentWorkGeneration: UInt64
+        let sessionID: ObjectIdentifier
+    }
+
+    private struct OwnedAgentSend {
+        let epoch: AgentWorkEpoch
+        let task: Task<Result<Void, SpiceError>, Never>
     }
 
     public init(
@@ -108,6 +122,9 @@ public actor SpiceAgentManager {
     deinit {
         eventTask?.cancel()
         pollTask?.cancel()
+        for send in ownedAgentSends.values {
+            send.task.cancel()
+        }
         eventContinuation.finish()
         displayConfigurationContinuation.finish()
         displayConfigurationSupportContinuation.finish()
@@ -115,7 +132,10 @@ public actor SpiceAgentManager {
     }
 
     public func start(session: SpiceSession) async throws(SpiceClipboardError) {
-        guard eventTask == nil, startingGeneration == nil else {
+        guard eventTask == nil,
+              startingGeneration == nil,
+              agentWorkInvalidationGeneration == nil,
+              ownedAgentSends.isEmpty else {
             throw .alreadyRunning
         }
         lifecycleGeneration &+= 1
@@ -171,7 +191,7 @@ public actor SpiceAgentManager {
         startingGeneration = nil
     }
 
-    public func stop() {
+    public func stop() async {
         lifecycleGeneration &+= 1
         startingGeneration = nil
         eventTask?.cancel()
@@ -179,21 +199,26 @@ public actor SpiceAgentManager {
         pollTask?.cancel()
         pollTask = nil
         session = nil
-        invalidateAgentWork()
+        let invalidation = beginAgentWorkInvalidation()
         displayCoordinator.reset()
         cancelAllFileTransfers()
         emitActions(state.disconnected())
         emitDisplayConfigurationSupportIfChanged()
+        await finishAgentWorkInvalidation(invalidation)
     }
 
     /// Checks the current pasteboard immediately rather than waiting for the
     /// optional polling loop.
     public func synchronizePasteboard() async {
-        guard pasteboardSynchronizationEnabled, let session else {
+        guard pasteboardSynchronizationEnabled,
+              let session,
+              let epoch = currentAgentWorkEpoch(using: session) else {
             return
         }
         await execute(state.announcementIfNeeded(), using: session)
+        guard ownsAgentWork(epoch, using: session) else { return }
         let snapshot = await SpicePasteboardBridge.snapshot()
+        guard ownsAgentWork(epoch, using: session) else { return }
         await execute(state.localPasteboardChanged(
             changeCount: snapshot.changeCount,
             text: snapshot.text
@@ -205,6 +230,8 @@ public actor SpiceAgentManager {
     /// Publishes text locally and offers it to the guest without polling delay.
     public func publish(_ text: String) async {
         guard pasteboardSynchronizationEnabled else { return }
+        let admittedSession = session
+        let admittedEpoch = admittedSession.flatMap { currentAgentWorkEpoch(using: $0) }
         let snapshot: SpicePasteboardSnapshot
         do {
             snapshot = try await SpicePasteboardBridge.write(text: text)
@@ -212,7 +239,9 @@ public actor SpiceAgentManager {
             emit(.failed(error))
             return
         }
-        guard let session else {
+        guard let session = admittedSession,
+              let admittedEpoch,
+              ownsAgentWork(admittedEpoch, using: session) else {
             return
         }
         await execute(state.localPasteboardChanged(
@@ -286,7 +315,8 @@ public actor SpiceAgentManager {
         at source: URL,
         name: String? = nil
     ) async throws(SpiceFileTransferError) -> SpiceFileTransferID {
-        guard let session else {
+        guard let session,
+              let epoch = currentAgentWorkEpoch(using: session) else {
             throw .agentManagerNotRunning
         }
         guard state.isAgentConnected else {
@@ -299,7 +329,7 @@ public actor SpiceAgentManager {
             throw .tooManyConcurrentTransfers(maximum: maximumConcurrentFileTransfers)
         }
         let info = try await Self.inspectFile(source, overrideName: name)
-        guard self.session != nil, state.isAgentConnected else {
+        guard ownsAgentWork(epoch, using: session), state.isAgentConnected else {
             info.reader.close()
             throw .agentUnavailable
         }
@@ -325,6 +355,9 @@ public actor SpiceAgentManager {
         fileTransferReaders[id] = info.reader
         emitFileTransfer(.queued(id: id, name: info.name, totalBytes: info.size))
         await driveFileTransfers(using: session)
+        guard ownsAgentWork(epoch, using: session), fileTransfers[id] != nil else {
+            throw .agentUnavailable
+        }
         return id
     }
 
@@ -385,7 +418,13 @@ public actor SpiceAgentManager {
             guard !state.isAgentConnected else {
                 return
             }
-            invalidateAgentWork()
+            await invalidateAgentWork()
+            guard ownsLifecycle(
+                session: session,
+                generation: lifecycleGeneration
+            ) else {
+                return
+            }
             displayCoordinator.disconnected()
             await execute(state.connected(), using: session)
             emitDisplayConfigurationSupportIfChanged()
@@ -399,7 +438,13 @@ public actor SpiceAgentManager {
             await sendPendingDisplayConfiguration(using: session)
             await driveFileTransfers(using: session)
         case .disconnected:
-            invalidateAgentWork()
+            await invalidateAgentWork()
+            guard ownsLifecycle(
+                session: session,
+                generation: lifecycleGeneration
+            ) else {
+                return
+            }
             displayCoordinator.disconnected()
             failAllFileTransfers(with: .agentUnavailable)
             emitActions(state.disconnected())
@@ -1227,6 +1272,7 @@ public actor SpiceAgentManager {
         case .agentCancelled,
              .alreadyConnected,
              .agentDisconnected,
+             .inputGenerationExpired,
              .agentMessageFailed,
              .agentMigrationRebind(partial: true),
              .agentStalled,
@@ -1248,7 +1294,14 @@ public actor SpiceAgentManager {
         requiredControl: Bool,
         using session: SpiceSession
     ) async throws(SpiceError) {
+        guard let epoch = currentAgentWorkEpoch(using: session) else {
+            throw .cancelled
+        }
+        let ownerID = allocateOwnedAgentSendID()
         let owner: Task<Result<Void, SpiceError>, Never> = Task.detached {
+            guard !Task.isCancelled else {
+                return .failure(.cancelled)
+            }
             do {
                 try await session.sendAgentMessage(
                     message,
@@ -1262,7 +1315,12 @@ public actor SpiceAgentManager {
                 return .failure(.protocolError(String(describing: error)))
             }
         }
+        ownedAgentSends[ownerID] = OwnedAgentSend(epoch: epoch, task: owner)
         let result = await owner.value
+        ownedAgentSends.removeValue(forKey: ownerID)
+        guard ownsAgentWork(epoch, using: session) else {
+            throw .cancelled
+        }
         switch result {
         case .success:
             return
@@ -1293,6 +1351,36 @@ public actor SpiceAgentManager {
         return id
     }
 
+    private func allocateOwnedAgentSendID() -> UInt64 {
+        let id = nextOwnedAgentSendID
+        nextOwnedAgentSendID &+= 1
+        if nextOwnedAgentSendID == 0 { nextOwnedAgentSendID = 1 }
+        return id
+    }
+
+    private func currentAgentWorkEpoch(using session: SpiceSession) -> AgentWorkEpoch? {
+        guard agentWorkInvalidationGeneration == nil,
+              self.session === session else {
+            return nil
+        }
+        return AgentWorkEpoch(
+            lifecycleGeneration: lifecycleGeneration,
+            agentWorkGeneration: agentWorkGeneration,
+            sessionID: ObjectIdentifier(session)
+        )
+    }
+
+    private func ownsAgentWork(
+        _ epoch: AgentWorkEpoch,
+        using session: SpiceSession
+    ) -> Bool {
+        agentWorkInvalidationGeneration == nil
+            && self.session === session
+            && epoch.lifecycleGeneration == lifecycleGeneration
+            && epoch.agentWorkGeneration == agentWorkGeneration
+            && epoch.sessionID == ObjectIdentifier(session)
+    }
+
     private func ownsClipboardAction(_ owner: ClipboardActionOwner) -> Bool {
         clipboardInFlight == owner && owner.generation == agentWorkGeneration
     }
@@ -1303,12 +1391,45 @@ public actor SpiceAgentManager {
         }
     }
 
-    private func invalidateAgentWork() {
+    private struct AgentWorkInvalidation {
+        let generation: UInt64
+        let owners: [(id: UInt64, task: Task<Result<Void, SpiceError>, Never>)]
+    }
+
+    private func beginAgentWorkInvalidation() -> AgentWorkInvalidation {
         agentWorkGeneration &+= 1
+        let generation = agentWorkGeneration
+        agentWorkInvalidationGeneration = generation
         pendingActions.removeAll(keepingCapacity: false)
         clipboardInFlight = nil
         clipboardDriverGeneration = nil
         fileTransferDriverGeneration = nil
+        let owners = ownedAgentSends.map { (id: $0.key, task: $0.value.task) }
+        for owner in owners {
+            owner.task.cancel()
+        }
+        return AgentWorkInvalidation(generation: generation, owners: owners)
+    }
+
+    private func finishAgentWorkInvalidation(
+        _ invalidation: AgentWorkInvalidation
+    ) async {
+        for owner in invalidation.owners {
+            _ = await owner.task.value
+            ownedAgentSends.removeValue(forKey: owner.id)
+        }
+        if agentWorkInvalidationGeneration == invalidation.generation {
+            agentWorkInvalidationGeneration = nil
+        }
+    }
+
+    private func invalidateAgentWork() async {
+        let invalidation = beginAgentWorkInvalidation()
+        await finishAgentWorkInvalidation(invalidation)
+    }
+
+    package func ownedAgentSendCountForTesting() -> Int {
+        ownedAgentSends.count
     }
 
     private func emitActions(_ actions: [ClipboardStateMachine.Action]) {

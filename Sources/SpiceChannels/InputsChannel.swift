@@ -2,7 +2,7 @@ import SpiceCore
 import SpiceProtocol
 import SpiceWire
 
-package enum SpiceMouseButton: UInt8, Sendable, Equatable {
+package enum SpiceMouseButton: UInt8, Sendable, Equatable, Hashable {
     case left = 1
     case middle = 2
     case right = 3
@@ -32,9 +32,25 @@ package enum InputsServerEvent: Sendable, Equatable {
 }
 
 package actor InputsChannel: SpiceManagedChannel {
+    private enum SendTurn: Sendable {
+        case acquired
+        case cancelled
+        case generationChanged
+    }
+
+    private struct SendWaiter {
+        let id: UInt64
+        let continuation: CheckedContinuation<SendTurn, Never>
+    }
+
     private var connection: ChannelConnection
+    private var connectionGeneration: UInt64 = 0
     private var buttonsState: UInt16 = 0
     private var ackController = AckController()
+    private var isSending = false
+    private var nextSendWaiterID: UInt64 = 0
+    private var sendWaiters: [SendWaiter] = []
+    private var isClosed = false
     private(set) var keyboardModifiers: UInt16 = 0
 
     package init(connection: ChannelConnection) {
@@ -54,6 +70,24 @@ package actor InputsChannel: SpiceManagedChannel {
     }
 
     package func send(_ event: SpiceInputEvent) async throws(ChannelError) {
+        guard !isClosed else { throw .invalidState }
+        let admittedGeneration = connectionGeneration
+        switch await acquireSendTurn() {
+        case .acquired:
+            break
+        case .cancelled:
+            throw .cancelledBeforeWrite
+        case .generationChanged:
+            throw .invalidState
+        }
+        defer { releaseSendTurn() }
+        guard !Task.isCancelled else {
+            throw .cancelledBeforeWrite
+        }
+        guard admittedGeneration == connectionGeneration, !isClosed else {
+            throw .invalidState
+        }
+        let generation = connectionGeneration
         switch event {
         case let .keyDown(scanCode):
             try await connection.send(SpiceMsgcInputsKeyDown(
@@ -79,17 +113,25 @@ package actor InputsChannel: SpiceManagedChannel {
                 displayID: displayID
             ))
         case let .mousePress(button):
-            buttonsState |= mask(for: button)
+            let proposedButtonsState = buttonsState | mask(for: button)
             try await connection.send(SpiceMsgcInputsMousePress(
                 button: button.rawValue,
-                buttonsState: buttonsState
+                buttonsState: proposedButtonsState
             ))
+            guard generation == connectionGeneration else {
+                throw .invalidState
+            }
+            buttonsState = proposedButtonsState
         case let .mouseRelease(button):
-            buttonsState &= ~mask(for: button)
+            let proposedButtonsState = buttonsState & ~mask(for: button)
             try await connection.send(SpiceMsgcInputsMouseRelease(
                 button: button.rawValue,
-                buttonsState: buttonsState
+                buttonsState: proposedButtonsState
             ))
+            guard generation == connectionGeneration else {
+                throw .invalidState
+            }
+            buttonsState = proposedButtonsState
         }
     }
 
@@ -166,22 +208,76 @@ package actor InputsChannel: SpiceManagedChannel {
     }
 
     package func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        connectionGeneration &+= 1
+        invalidateSendWaiters()
         await connection.close()
     }
 
     package func replaceConnection(
         with replacement: ChannelConnection
     ) throws(ChannelError) -> ChannelConnection {
+        guard !isClosed else { throw .invalidState }
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Inputs Channel")
         }
         let previous = connection
         connection = replacement
+        connectionGeneration &+= 1
+        invalidateSendWaiters()
         return previous
     }
 
     private func mask(for button: SpiceMouseButton) -> UInt16 {
         UInt16(1) << UInt16(button.rawValue - 1)
+    }
+
+    private func acquireSendTurn() async -> SendTurn {
+        guard !Task.isCancelled else { return .cancelled }
+        guard isSending else {
+            isSending = true
+            return .acquired
+        }
+        nextSendWaiterID &+= 1
+        let waiterID = nextSendWaiterID
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                sendWaiters.append(SendWaiter(
+                    id: waiterID,
+                    continuation: continuation
+                ))
+            }
+        } onCancel: {
+            Task { await self.cancelSendWaiter(id: waiterID) }
+        }
+    }
+
+    private func releaseSendTurn() {
+        guard !sendWaiters.isEmpty else {
+            isSending = false
+            return
+        }
+        sendWaiters.removeFirst().continuation.resume(returning: .acquired)
+    }
+
+    private func cancelSendWaiter(id: UInt64) {
+        guard let index = sendWaiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        sendWaiters.remove(at: index).continuation.resume(returning: .cancelled)
+    }
+
+    private func invalidateSendWaiters() {
+        let waiters = sendWaiters
+        sendWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.continuation.resume(returning: .generationChanged)
+        }
     }
 
     private func encodedScanCode(
