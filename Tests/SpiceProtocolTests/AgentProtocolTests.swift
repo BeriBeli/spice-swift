@@ -25,6 +25,46 @@ struct AgentProtocolTests {
         #expect(decoded == [expected])
     }
 
+    @Test func lazyEncodedMessageProducesCompatibilityFragmentsOnDemand() throws {
+        let limits = VDAgentWireLimits(maximumPacketBytes: 17, maximumMessageDataBytes: 128)
+        let message = VDAgentMessage(
+            protocolID: 1,
+            type: 6,
+            opaque: 9,
+            data: Data((0..<97).map(UInt8.init))
+        )
+        let encoded = try VDAgentWireEncoder.encode(message, limits: limits)
+        let lazyFragments = try (0..<encoded.fragmentCount).map { index in
+            try #require(encoded.fragment(at: index))
+        }
+        let compatibilityFragments = try VDAgentWireEncoder.fragments(
+            for: message,
+            limits: limits
+        )
+
+        #expect(lazyFragments == compatibilityFragments)
+        #expect(encoded.fragment(at: -1) == nil)
+        #expect(encoded.fragment(at: encoded.fragmentCount) == nil)
+
+        var decoder = VDAgentStreamDecoder(limits: limits)
+        var decoded: [VDAgentMessage] = []
+        for fragment in lazyFragments {
+            decoded += try decoder.append(packet: fragment)
+        }
+        #expect(decoded == [message])
+    }
+
+    @Test func fragmentCountDoesNotOverflowForAnUnboundedPacketLimit() throws {
+        let message = VDAgentMessage(type: 6, data: Data([1]))
+        let encoded = try VDAgentWireEncoder.encode(message, limits: .init(
+            maximumPacketBytes: .max,
+            maximumMessageDataBytes: 1
+        ))
+
+        #expect(encoded.fragmentCount == 1)
+        #expect(try #require(encoded.fragment(at: 0)).count == 21)
+    }
+
     @Test func decodesMultipleMessagesAndPreservesUnknownProtocol() throws {
         let first = VDAgentMessage(type: 3, data: Data())
         let second = VDAgentMessage(

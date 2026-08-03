@@ -105,6 +105,12 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
     case connectionFailed(String)
     case authenticationFailed(String)
     case protocolError(String)
+    case agentQueueFull
+    case agentCancelled(partial: Bool)
+    case agentDisconnected
+    case agentMessageFailed(partial: Bool)
+    case agentMigrationRebind(partial: Bool)
+    case agentStalled(partial: Bool)
     case cancelled
 
     public var description: String {
@@ -117,6 +123,26 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
             "authentication failed: \(reason)"
         case let .protocolError(reason):
             "protocol error: \(reason)"
+        case .agentQueueFull:
+            "guest Agent outbound queue is full"
+        case let .agentCancelled(partial):
+            partial
+                ? "guest Agent caller cancelled after a partial write"
+                : "guest Agent caller cancelled before its first write"
+        case .agentDisconnected:
+            "guest Agent is disconnected"
+        case let .agentMessageFailed(partial):
+            partial
+                ? "guest Agent message failed after a partial write"
+                : "guest Agent message failed before its first write"
+        case let .agentMigrationRebind(partial):
+            partial
+                ? "guest Agent migration interrupted a partial message"
+                : "guest Agent message was not started before migration"
+        case let .agentStalled(partial):
+            partial
+                ? "guest Agent stalled after a partial message"
+                : "guest Agent stalled before sending a message"
         case .cancelled:
             "connection cancelled"
         }
@@ -125,10 +151,12 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
 
 public actor SpiceSession {
     package typealias TransportFactory = @Sendable (SpiceEndpoint) -> any SpiceTransport
+    package typealias MigrationRebindFault = @Sendable (ChannelKey) -> ChannelError?
 
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
+    private let injectedMigrationRebindFault: MigrationRebindFault?
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
@@ -188,6 +216,11 @@ public actor SpiceSession {
         }
     }
 
+    private enum MigrationAdoptionFailure: Error, Sendable {
+        case sourceResumed(ChannelError)
+        case rollbackIncomplete(ChannelError)
+    }
+
     public init() {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
@@ -231,12 +264,14 @@ public actor SpiceSession {
         transportFactory = Self.makeNetworkTransport
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
+        injectedMigrationRebindFault = nil
     }
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
-        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
+        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
+        migrationRebindFault: MigrationRebindFault? = nil
     ) {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
@@ -280,6 +315,7 @@ public actor SpiceSession {
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
+        injectedMigrationRebindFault = migrationRebindFault
     }
 
     deinit {
@@ -754,18 +790,26 @@ public actor SpiceSession {
         webDAVServers[channelID] = server
     }
 
-    package func sendAgentMessage(_ message: SpiceAgentMessage) async throws(SpiceError) {
+    package func sendAgentMessage(
+        _ message: SpiceAgentMessage,
+        priority: AgentOutboundPriority = .normal,
+        requiredControl: Bool = false
+    ) async throws(SpiceError) {
         try ensureClientSendsAllowed()
         guard let mainChannel else {
             throw .protocolError("Main Channel is not connected")
         }
         do {
-            try await mainChannel.sendAgentMessage(VDAgentMessage(
-                protocolID: message.protocolID,
-                type: message.type,
-                opaque: message.opaque,
-                data: message.data
-            ))
+            try await mainChannel.sendAgentMessage(
+                VDAgentMessage(
+                    protocolID: message.protocolID,
+                    type: message.type,
+                    opaque: message.opaque,
+                    data: message.data
+                ),
+                priority: priority,
+                requiredControl: requiredControl
+            )
         } catch {
             throw Self.map(channelError: error)
         }
@@ -1021,13 +1065,13 @@ public actor SpiceSession {
                 throw ChannelError.protocolViolation("prepared seamless target was cancelled")
             }
             removedForAdoption = true
-            seamlessMigrationPayloads.removeValue(forKey: offer.id)
             guard let credentials = credentialStorage else {
                 throw ChannelError.protocolViolation(
                     "seamless migration lost active credentials"
                 )
             }
             try await adoptMigrationTarget(prepared, credentials: credentials)
+            seamlessMigrationPayloads.removeValue(forKey: offer.id)
             await migrationHandoffCompleted(offerID: offer.id)
         } catch {
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
@@ -1036,7 +1080,16 @@ public actor SpiceSession {
             } else if let owned = preparedMigrations.removeValue(forKey: offer.id) {
                 await Self.closePrepared(owned)
             }
-            await receiveFailed(Self.channelError(error), generation: generation)
+            if error is MigrationAdoptionFailure {
+                await migrationOperationFailed(
+                    offerID: offer.id,
+                    operation: .commit,
+                    error: error,
+                    generation: generation
+                )
+            } else {
+                await receiveFailed(Self.channelError(error), generation: generation)
+            }
         }
     }
 
@@ -1336,7 +1389,7 @@ public actor SpiceSession {
                 await self?.migrationOperationFailed(
                     offerID: offer.id,
                     operation: operation,
-                    reason: String(describing: error),
+                    error: error,
                     generation: generation
                 )
             }
@@ -1366,10 +1419,25 @@ public actor SpiceSession {
     private func migrationOperationFailed(
         offerID: UInt64,
         operation: MigrationOperation,
-        reason: String,
+        error: any Error,
         generation: UInt64
     ) async {
-        guard generation == supervisionGeneration else { return }
+        let effectiveGeneration: UInt64
+        let reason: String
+        if let adoptionFailure = error as? MigrationAdoptionFailure {
+            switch adoptionFailure {
+            case let .sourceResumed(channelError):
+                effectiveGeneration = supervisionGeneration
+                reason = String(describing: channelError)
+            case let .rollbackIncomplete(channelError):
+                await receiveFailed(channelError, generation: supervisionGeneration)
+                return
+            }
+        } else {
+            effectiveGeneration = generation
+            reason = String(describing: error)
+        }
+        guard effectiveGeneration == supervisionGeneration else { return }
         migrationTask = nil
         let actions: [MigrationHandoffCoordinator.Action]
         switch operation {
@@ -1384,7 +1452,7 @@ public actor SpiceSession {
                 reason: reason
             )
         }
-        await processMigrationActions(actions, generation: generation)
+        await processMigrationActions(actions, generation: effectiveGeneration)
     }
 
     private func cancelMigrationHandoff() async {
@@ -1600,19 +1668,22 @@ public actor SpiceSession {
                 "migration target channel inventory does not match active session"
             )
         }
+        guard let mainChannel,
+              let targetMainConnection = prepared.connections[mainKey] else {
+            throw SpiceError.protocolError("migration lost active Main Channel")
+        }
 
         supervisionGeneration &+= 1
         let oldTasks = receiveTasks
         receiveTasks.removeAll(keepingCapacity: false)
         for task in oldTasks { task.cancel() }
 
-        guard let mainChannel,
-              let targetMainConnection = prepared.connections[mainKey] else {
-            throw SpiceError.protocolError("migration lost active Main Channel")
-        }
-
         var previousConnections: [ChannelKey: ChannelConnection] = [:]
         do {
+            try await mainChannel.prepareAgentForMigrationRebind()
+            if let failure = injectedMigrationRebindFault?(mainKey) {
+                throw failure
+            }
             previousConnections[mainKey] = try await mainChannel.replaceConnection(
                 with: targetMainConnection
             )
@@ -1623,21 +1694,56 @@ public actor SpiceSession {
                         "migration target is missing an active Channel connection"
                     )
                 }
+                if let failure = injectedMigrationRebindFault?(key) {
+                    throw failure
+                }
                 previousConnections[key] = try await channel.replaceConnection(
                     with: replacement
                 )
             }
         } catch {
-            if let previousMain = previousConnections[mainKey] {
-                _ = try? await mainChannel.replaceConnection(with: previousMain)
-            }
-            for key in channels.keys.sorted(by: Self.channelKeySort) {
-                guard let previous = previousConnections[key], let channel = channels[key] else {
+            let adoptionError = Self.channelError(error)
+            var rollbackError: ChannelError?
+            let replacedChannelKeys = previousConnections.keys
+                .filter { $0 != mainKey }
+                .sorted(by: Self.channelKeySort)
+                .reversed()
+            for key in replacedChannelKeys {
+                guard let previous = previousConnections[key],
+                      let channel = channels[key] else {
                     continue
                 }
-                _ = try? await channel.replaceConnection(with: previous)
+                do {
+                    _ = try await channel.replaceConnection(with: previous)
+                } catch {
+                    rollbackError = rollbackError ?? Self.channelError(error)
+                }
             }
-            throw Self.map(channelError: error as? ChannelError ?? .invalidState)
+            if let previousMain = previousConnections[mainKey] {
+                do {
+                    _ = try await mainChannel.replaceConnection(with: previousMain)
+                } catch {
+                    rollbackError = rollbackError ?? Self.channelError(error)
+                }
+            } else if !(await mainChannel.abortAgentMigrationRebind()) {
+                rollbackError = rollbackError ?? .invalidState
+            }
+
+            if let rollbackError {
+                throw MigrationAdoptionFailure.rollbackIncomplete(.protocolViolation(
+                    "migration adoption failed (\(adoptionError)); "
+                        + "source rollback incomplete (\(rollbackError))"
+                ))
+            }
+
+            for sourceConnection in connections.values {
+                await sourceConnection.resumeAfterMigrationCancellation()
+            }
+            // The transaction invalidated all old receive tasks before replacing
+            // connections. A complete rollback must therefore establish a fresh
+            // generation before surfacing the migration failure to the coordinator.
+            startSupervision(mainChannel: mainChannel)
+            throw MigrationAdoptionFailure.sourceResumed(adoptionError)
         }
 
         connections = prepared.connections
@@ -2006,6 +2112,18 @@ public actor SpiceSession {
             .protocolError(
                 "unexpected migration request on channel type=\(key.type) id=\(key.id)"
             )
+        case .agentQueueFull:
+            .agentQueueFull
+        case let .agentCancelled(partial):
+            .agentCancelled(partial: partial)
+        case .agentDisconnected:
+            .agentDisconnected
+        case let .agentMessageFailed(partial):
+            .agentMessageFailed(partial: partial)
+        case let .agentMigrationRebind(partial):
+            .agentMigrationRebind(partial: partial)
+        case let .agentStalled(partial):
+            .agentStalled(partial: partial)
         case .invalidState:
             .protocolError("invalid channel state")
         case .unsupportedCapability:

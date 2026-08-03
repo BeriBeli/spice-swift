@@ -110,10 +110,40 @@ package struct VDAgentStreamDecoder: Sendable {
 }
 
 package enum VDAgentWireEncoder {
-    package static func fragments(
-        for message: VDAgentMessage,
+    package struct EncodedMessage: Sendable, Equatable {
+        private let bytes: Data
+        private let maximumPacketBytes: Int
+        package let payloadByteCount: Int
+
+        package var fragmentCount: Int {
+            let completePackets = bytes.count / maximumPacketBytes
+            return completePackets + (bytes.count.isMultiple(of: maximumPacketBytes) ? 0 : 1)
+        }
+
+        fileprivate init(
+            bytes: consuming Data,
+            maximumPacketBytes: Int,
+            payloadByteCount: Int
+        ) {
+            self.bytes = bytes
+            self.maximumPacketBytes = maximumPacketBytes
+            self.payloadByteCount = payloadByteCount
+        }
+
+        package func fragment(at index: Int) -> Data? {
+            guard index >= 0 else { return nil }
+            let (start, overflow) = index.multipliedReportingOverflow(by: maximumPacketBytes)
+            guard !overflow, start < bytes.count else { return nil }
+            let (candidateEnd, endOverflow) = start.addingReportingOverflow(maximumPacketBytes)
+            let end = endOverflow ? bytes.count : min(candidateEnd, bytes.count)
+            return bytes.subdata(in: start..<end)
+        }
+    }
+
+    package static func encode(
+        _ message: VDAgentMessage,
         limits: VDAgentWireLimits = .init()
-    ) throws(WireError) -> [Data] {
+    ) throws(WireError) -> EncodedMessage {
         guard message.data.count <= limits.maximumMessageDataBytes else {
             throw .messageTooLarge(
                 actual: message.data.count,
@@ -135,20 +165,25 @@ package enum VDAgentWireEncoder {
         writer.writeUInt64LE(message.opaque)
         writer.writeUInt32LE(UInt32(message.data.count))
         writer.writeBytes(message.data)
-
-        var fragments: [Data] = []
-        let (roundedSize, roundedOverflow) = writer.data.count.addingReportingOverflow(
-            limits.maximumPacketBytes - 1
+        return EncodedMessage(
+            bytes: writer.data,
+            maximumPacketBytes: limits.maximumPacketBytes,
+            payloadByteCount: message.data.count
         )
-        guard !roundedOverflow else {
-            throw .integerOverflow
-        }
-        fragments.reserveCapacity(roundedSize / limits.maximumPacketBytes)
-        var offset = 0
-        while offset < writer.data.count {
-            let end = min(offset + limits.maximumPacketBytes, writer.data.count)
-            fragments.append(writer.data.subdata(in: offset..<end))
-            offset = end
+    }
+
+    package static func fragments(
+        for message: VDAgentMessage,
+        limits: VDAgentWireLimits = .init()
+    ) throws(WireError) -> [Data] {
+        let encoded = try encode(message, limits: limits)
+        var fragments: [Data] = []
+        fragments.reserveCapacity(encoded.fragmentCount)
+        for index in 0..<encoded.fragmentCount {
+            guard let fragment = encoded.fragment(at: index) else {
+                throw .integerOverflow
+            }
+            fragments.append(fragment)
         }
         return fragments
     }
