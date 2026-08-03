@@ -35,6 +35,7 @@ class BenchmarkEvidenceTests(unittest.TestCase):
         metal_2d_commands: int = 0,
         revisioned_allocated_frames: int = 0,
         cpu_fill_operations: int = 1,
+        report_overrides: dict[str, object] | None = None,
     ) -> None:
         prefix = directory / f"run-{run:02d}-{client}"
         report = {
@@ -54,6 +55,7 @@ class BenchmarkEvidenceTests(unittest.TestCase):
             "metal_2d_renderer_enabled": metal_2d_renderer_enabled,
             "metal_2d_command_buffers": metal_2d_command_buffers,
             "metal_2d_commands": metal_2d_commands,
+            "metal_2d_cpu_fallback_operations": 0,
             "revisioned_allocated_frames": revisioned_allocated_frames,
             "pool_exhaustions": 0,
             "cpu_materializations": 0,
@@ -64,6 +66,8 @@ class BenchmarkEvidenceTests(unittest.TestCase):
             "cpu_surface_copy_operations": 0,
             "cpu_scaled_copy_operations": 0,
         }
+        if report_overrides:
+            report.update(report_overrides)
         prefix.with_suffix(".json").write_text(json.dumps(report))
         prefix.with_suffix(".meta.json").write_text(
             json.dumps(
@@ -150,6 +154,38 @@ class BenchmarkEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid automatic"):
                 analyze_module.load_client(directory, 1, "swiftspice")
 
+    def test_accepts_automatic_with_cpu_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.write_sample(directory, "swiftspice", renderer="automatic")
+            report = analyze_module.load_client(directory, 1, "swiftspice")
+            self.assertEqual(report["renderer"], "automatic")
+
+    def test_rejects_automatic_without_cpu_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.write_sample(
+                directory,
+                "swiftspice",
+                renderer="automatic",
+                cpu_fill_operations=0,
+            )
+            with self.assertRaisesRegex(ValueError, "cpu_opcode_operations"):
+                analyze_module.load_client(directory, 1, "swiftspice")
+
+    def test_rejects_automatic_gpu_or_pool_failure(self) -> None:
+        for field in ("gpu_errors", "pool_exhaustions"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                self.write_sample(
+                    directory,
+                    "swiftspice",
+                    renderer="automatic",
+                    report_overrides={field: 1},
+                )
+                with self.assertRaisesRegex(ValueError, f"invalid automatic.*{field}"):
+                    analyze_module.load_client(directory, 1, "swiftspice")
+
     def test_rejects_integer_in_place_of_renderer_boolean(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -174,9 +210,47 @@ class BenchmarkEvidenceTests(unittest.TestCase):
                 metal_2d_renderer_enabled=True,
                 metal_2d_command_buffers=1,
                 metal_2d_commands=4,
+                cpu_fill_operations=0,
             )
             report = analyze_module.load_client(directory, 1, "swiftspice")
             self.assertEqual(report["renderer"], "metal")
+
+    def test_rejects_metal_supported_opcode_cpu_fallback(self) -> None:
+        for field in analyze_module.METAL_2D_SUPPORTED_CPU_OPCODE_FIELDS:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                self.write_sample(
+                    directory,
+                    "swiftspice",
+                    renderer="metal",
+                    revisioned_backing_enabled=True,
+                    metal_2d_renderer_enabled=True,
+                    metal_2d_command_buffers=1,
+                    metal_2d_commands=1,
+                    cpu_fill_operations=0,
+                    report_overrides={field: 1},
+                )
+                with self.assertRaisesRegex(ValueError, f"invalid metal.*{field}"):
+                    analyze_module.load_client(directory, 1, "swiftspice")
+
+    def test_rejects_metal_dedicated_cpu_fallback_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.write_sample(
+                directory,
+                "swiftspice",
+                renderer="metal",
+                revisioned_backing_enabled=True,
+                metal_2d_renderer_enabled=True,
+                metal_2d_command_buffers=1,
+                metal_2d_commands=1,
+                cpu_fill_operations=0,
+                report_overrides={"metal_2d_cpu_fallback_operations": 1},
+            )
+            with self.assertRaisesRegex(
+                ValueError, "invalid metal.*metal_2d_cpu_fallback_operations"
+            ):
+                analyze_module.load_client(directory, 1, "swiftspice")
 
     def test_rejects_renderer_metadata_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -203,6 +277,22 @@ class BenchmarkEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid cpu-iosurface"):
                 analyze_module.load_client(directory, 1, "swiftspice")
 
+    def test_rejects_mjpeg_cpu_iosurface_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.write_sample(
+                directory,
+                "swiftspice",
+                renderer="cpu-iosurface",
+                revisioned_backing_enabled=True,
+                revisioned_allocated_frames=1,
+                report_overrides={"cpu_materializations": 1},
+            )
+            with self.assertRaisesRegex(
+                ValueError, "invalid cpu-iosurface.*cpu_materializations"
+            ):
+                analyze_module.load_client(directory, 1, "swiftspice")
+
     def test_rejects_mixed_renderers_across_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -217,6 +307,7 @@ class BenchmarkEvidenceTests(unittest.TestCase):
                     metal_2d_renderer_enabled=True,
                     metal_2d_command_buffers=1,
                     metal_2d_commands=1,
+                    cpu_fill_operations=0,
                 )
             with self.assertRaisesRegex(ValueError, "mixed renderers"):
                 analyze_module.analyze(directory, expected_pairs=2)
@@ -257,7 +348,15 @@ class BenchmarkEvidenceTests(unittest.TestCase):
     def test_accepts_complete_native_video_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            self.write_sample(directory, "swiftspice", video_codec="h265")
+            self.write_sample(
+                directory,
+                "swiftspice",
+                video_codec="h265",
+                renderer="cpu-iosurface",
+                revisioned_backing_enabled=True,
+                revisioned_allocated_frames=1,
+                report_overrides={"cpu_materializations": 1},
+            )
             report_path = directory / "run-01-swiftspice.json"
             report = json.loads(report_path.read_text())
             report.update(

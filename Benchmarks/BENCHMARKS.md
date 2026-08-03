@@ -42,8 +42,9 @@ SPICE_PASSWORD='...' .build/release/spice-probe \
 SPICE_PASSWORD='...' /private/tmp/spice-glib-bench 127.0.0.1 15930 30
 ```
 
-Reset the guest workload between clients and alternate their order. Use at
-least ten paired runs for a non-inferiority decision. Compare paired bootstrap
+Reset the guest workload between clients and alternate their order. For the
+current selected-Swift-renderer versus spice-client-glib2 runner, use at least
+ten paired runs for a non-inferiority decision. Compare paired bootstrap
 confidence intervals rather than a single run. Frame counts are comparable
 only for the fixed 16 ms publication cadence; the raw GLib `invalidations`
 counter is diagnostic and has no direct SwiftSpice equivalent.
@@ -83,7 +84,7 @@ may legitimately select its software decoder.
 | --- | --- | --- | --- |
 | `automatic` | CPU | Automatic; revisioned IOSurface when supported | Production default |
 | `cpu` | CPU | Data | Historical reference-compatible benchmark |
-| `cpu-iosurface` | CPU | Required revisioned IOSurface | Fair baseline for Metal 2D |
+| `cpu-iosurface` | CPU | Required revisioned IOSurface | Matched-backing Metal candidate; current runner still pairs it with GLib |
 | `metal` | Experimental Metal 2D | Required revisioned IOSurface | Explicit GPU experiment; runner default |
 
 Both the runner and analyzer reject a sample whose observed backing or Metal
@@ -93,18 +94,24 @@ command-buffer and command
 counts, shared-buffer upload bytes, scratch/copy blit bytes, completed GPU time,
 CPU materializations, and GPU errors. Frames count only after Metal completion;
 a valid Metal sample must execute at least one 2D command buffer and command,
-while keeping CPU materialization and GPU errors at zero. Both the runner and
-the analyzer reject samples that fail this evidence gate. The report separates
-revision GPU clones, Metal-batch CPU/GPU seed copies, snapshot catch-up copies,
-2D opcodes, and upload-buffer allocations/reuses. CPU fallback opcodes include
-aggregate nanosecond timings.
+while keeping CPU materialization, GPU errors, pool exhaustion, the dedicated
+Metal-to-CPU fallback count, and all four Metal-supported CPU opcode counts at
+zero. `automatic` samples require observed CPU opcode activity and zero GPU or
+pool failures. MJPEG `cpu-iosurface` samples additionally require zero CPU
+materializations. Both the runner and the analyzer reject samples that fail
+these evidence gates. The report separates revision GPU clones, Metal-batch
+CPU/GPU seed copies, snapshot catch-up copies, 2D opcodes, the dedicated
+`metal_2d_cpu_fallback_operations` count, and upload-buffer
+allocations/reuses. CPU fallback opcodes include aggregate nanosecond timings.
 
 The current paired analyzer compares the selected Swift configuration with
-spice-client-glib2. A claim that Metal 2D improves SwiftSpice must additionally
-compare `cpu-iosurface` and `metal` under the same guest epoch, reset sequence,
-resolution, and client-order schedule. The historical `cpu` versus `metal`
-absolute medians changed both the draw engine and backing policy and therefore
-do not isolate the effect of Metal 2D.
+spice-client-glib2; it cannot directly pair two Swift renderer configurations.
+A claim that Metal 2D improves SwiftSpice requires a dedicated direct-pair
+runner and analyzer comparing `cpu-iosurface` with `metal` under the same guest
+epoch, reset sequence, resolution, and client-order schedule. Two separate
+Swift-versus-GLib result directories do not satisfy that paired contract. The
+historical `cpu` versus `metal` absolute medians changed both the draw engine
+and backing policy and therefore do not isolate the effect of Metal 2D.
 
 The runner requires a guest boot epoch. Set `SWIFTSPICE_BENCH_BOOT_EPOCH` when
 the complete batch is guaranteed to remain in one epoch, or provide an
@@ -132,8 +139,9 @@ uv run Benchmarks/analyze.py /private/tmp/swiftspice-live-results
 ```
 
 The analyzer exits nonzero when any confidence-interval gate fails. A formal
-decision uses exactly `10` pairs of `30` seconds and should pass
-`--expected-pairs 10`; shorter runs are smoke tests only.
+selected-Swift-renderer versus GLib decision uses exactly `10` pairs of `30`
+seconds and should pass `--expected-pairs 10`; shorter runs are smoke tests
+only.
 
 This headless gate covers connection, wire processing, codec execution, Surface
 mutation, snapshot publication, and coalescing. It does not cover AppKit/GTK

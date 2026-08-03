@@ -916,9 +916,13 @@ such by an embedding application.
 - CPU-only rendering bypasses Metal enqueue and empty-flush calls. Probe
   diagnostics now split CPU opcode counts/timing, revision GPU clones, batch
   seed CPU/GPU copies, snapshot catch-up copies, per-Metal-opcode counts, and
-  upload-buffer allocation/reuse. Bitmap uploads use a power-of-two persistent
-  MTLBuffer pool across completed batches; a hard resident-byte/class cap and
-  memory-pressure purge remain required before production enablement.
+  upload-buffer allocation/reuse. A dedicated Metal-to-CPU fallback counter
+  covers every supported opcode that takes a CPU route, including all commands
+  replayed after a failed Metal batch. Live Metal evidence rejects any such
+  fallback or supported CPU opcode activity. Bitmap uploads use a power-of-two
+  persistent MTLBuffer pool across completed batches; hard resident-byte and
+  buffer-class caps plus memory-pressure purge remain required before
+  production enablement.
 - In-place mutation of the current IOSurface was not enabled: it would break
   the batch's rollback guarantee when GPU execution fails. Snapshot-driven
   commits also remain at the 16-ms publication boundary; reducing them would
@@ -942,7 +946,10 @@ such by an embedding application.
   A/B: `cpu` used Data backing while `metal` used revisioned IOSurface backing,
   and the variants came from different batches. Future Metal benefit claims
   must pair `cpu-iosurface` against `metal` while also retaining `cpu` as the
-  historical Swift-versus-GLib configuration.
+  historical Swift-versus-GLib configuration. The current live runner and
+  analyzer only pair one selected Swift renderer against GLib, so two separate
+  result directories do not meet this direct paired contract; a dedicated
+  Swift-renderer-pair runner/analyzer remains required.
 - All 20 Metal processes in that collection exited zero, recorded zero GPU
   errors and zero CPU materializations in valid samples, and avoided the former
   encoder-lifecycle abort. Median 4K Metal diagnostics nevertheless recorded
@@ -953,8 +960,9 @@ such by an embedding application.
   instead of repeatedly creating xterm clients. A fixed-fixture 10x5-second
   stress produced 20/20 activity-valid 720p samples and 19/20 at 4K; one 4K
   GLib sample still became static. Therefore the next formal run is gated on a
-  20/20 4K stress pass followed by fresh `cpu`, `cpu-iosurface`, and `metal`
-  10x30-second batches. Full
+  20/20 4K stress pass, followed by a fresh `cpu` versus GLib 10x30-second
+  reference batch and, after adding the direct Swift renderer runner/analyzer,
+  a separate `cpu-iosurface` versus `metal` 10x30-second batch. Full
   ratios, absolute medians, and retained paths are in
   `Benchmarks/RESULTS_ROCKY8_2026-08-02.md`.
 - The previous 2026-08-01 current-tree five-second Rocky smoke used an arm64
@@ -993,7 +1001,7 @@ such by an embedding application.
   still needs its custom KVM kernel and local QEMU image restored before rerun.
 
 The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate passes 354 tests in 69 suites. The current Rocky
+warnings-as-errors gate passes 356 tests in 69 suites. The current Rocky
 yuv420p H.264/H.265 native composition gate is closed; broader codec profiles,
 resolutions, and display behavior remain part of the real-host gate. Smartcard
 hardware, a redirected USB device, human-audible Playback/device route
@@ -1019,7 +1027,7 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 354 tests in 69 suites, `swift build`,
+The current warnings-as-errors gate passes 356 tests in 69 suites, `swift build`,
 the generated-protocol consistency check, and exact-arm64 app packaging with
 recursive native-closure verification.
 

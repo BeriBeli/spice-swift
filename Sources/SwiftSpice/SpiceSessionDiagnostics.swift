@@ -37,6 +37,7 @@ package struct SpiceSessionDiagnostics: Sendable, Equatable {
     package var metal2DBitmapCopyCommands: UInt64 = 0
     package var metal2DCopyBitsCommands: UInt64 = 0
     package var metal2DSurfaceCopyCommands: UInt64 = 0
+    package var metal2DCPUFallbackOperations: UInt64 = 0
     package var metal2DUploadBufferAllocations: UInt64 = 0
     package var metal2DUploadBufferReuses: UInt64 = 0
     package var cpuFillOperations: UInt64 = 0
@@ -112,6 +113,7 @@ package struct SpiceSessionDiagnostics: Sendable, Equatable {
         metal2DBitmapCopyCommands &+= surface.metal2DBitmapCopyCommands
         metal2DCopyBitsCommands &+= surface.metal2DCopyBitsCommands
         metal2DSurfaceCopyCommands &+= surface.metal2DSurfaceCopyCommands
+        metal2DCPUFallbackOperations &+= surface.metal2DCPUFallbackOperations
         metal2DUploadBufferAllocations &+= surface.metal2DUploadBufferAllocations
         metal2DUploadBufferReuses &+= surface.metal2DUploadBufferReuses
         cpuFillOperations &+= surface.cpuFillOperations

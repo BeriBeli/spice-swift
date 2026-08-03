@@ -1398,6 +1398,7 @@ struct SurfaceStoreTests {
         #expect(metrics.metal2DBatchSeedGPUCopyBytes == 0)
         #expect(metrics.snapshotCatchUpCPUCopyBytes == 0)
         #expect(metrics.gpuErrors == 0)
+        #expect(metrics.metal2DCPUFallbackOperations == 0)
     }
 
     @Test func metal2DUploadBuffersAreReusedAcrossCommittedBatches() async throws {
@@ -1438,7 +1439,7 @@ struct SurfaceStoreTests {
         #expect(metrics.revisionGPUCopyBytes == 8)
     }
 
-    @Test func metal2DPoolExhaustionReportsCPUFallback() async throws {
+    @Test func metal2DPoolExhaustionKeepsStaleCanonicalOutOfSurfaceCopies() async throws {
         guard let pool = RevisionedIOSurfacePool.makeIfSupported(
             limits: .init(maximumFramesPerSurface: 1, maximumBytes: 1_024 * 1_024)
         ) else {
@@ -1461,14 +1462,109 @@ struct SurfaceStoreTests {
             rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
             colorARGB: 0x00aa_bbcc
         )
-        let frame = try await store.snapshot(surfaceID: 35)
-        #expect(pixel(frame, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
+        try await store.create(id: 41, width: 2, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 41,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 35,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+        let copied = try await store.snapshot(surfaceID: 41)
+        #expect(pixel(copied, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
 
         let metrics = await store.metrics()
         #expect(metrics.metal2DCommandBuffers == 1)
         #expect(metrics.metal2DCommands == 1)
         #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
         #expect(metrics.poolExhaustions == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 2)
+    }
+
+    @Test func requestedMetalCountsEverySupportedCPUFallback() async throws {
+        let store = SurfaceStore(
+            backingPolicy: .dataOnly,
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 36, width: 2, height: 1, format: 32)
+        try await store.create(id: 37, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 36,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        try await store.drawCopy(
+            surfaceID: 36,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            bitmap: RawBitmap(
+                format: .argb8888,
+                width: 2,
+                height: 1,
+                stride: 8,
+                topDown: true,
+                pixels: Data([1, 2, 3, 4, 5, 6, 7, 8])
+            )
+        )
+        try await store.copyBits(
+            surfaceID: 36,
+            destination: PixelRect(x: 1, y: 0, width: 1, height: 1),
+            sourceX: 0,
+            sourceY: 0
+        )
+        try await store.drawCopy(
+            surfaceID: 37,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 36,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+
+        let metrics = await store.metrics()
+        #expect(!metrics.metal2DRendererEnabled)
+        #expect(metrics.metal2DCPUFallbackOperations == 4)
+        #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.cpuBitmapCopyOperations == 1)
+        #expect(metrics.cpuCopyBitsOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
+        #expect(metrics.gpuErrors == 0)
+        #expect(metrics.poolExhaustions == 0)
+    }
+
+    @Test func metalEvidenceExposesMissingCanonicalSourceFallback() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 38, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 38,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        _ = try await store.snapshot(surfaceID: 38)
+
+        try await store.create(id: 39, width: 2, height: 1, format: 32)
+        try await store.create(id: 40, width: 2, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 40,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 39,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+        _ = try await store.snapshot(surfaceID: 40)
+
+        let metrics = await store.metrics()
+        #expect(metrics.metal2DCommandBuffers == 1)
+        #expect(metrics.metal2DCommands == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
+        #expect(metrics.cpuMaterializations == 0)
+        #expect(metrics.gpuErrors == 0)
+        #expect(metrics.poolExhaustions == 0)
     }
 
     @Test func failedMetal2DBatchReplaysAtomicallyOnCPU() async throws {
@@ -1504,6 +1600,7 @@ struct SurfaceStoreTests {
         ]))
         let metrics = await store.metrics()
         #expect(metrics.gpuErrors == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 2)
         #expect(metrics.metal2DCommandBuffers == 0)
         #expect(metrics.snapshots == 1)
     }
@@ -1535,6 +1632,7 @@ struct SurfaceStoreTests {
         let metricsBeforeReadback = await store.metrics()
         #expect(metricsBeforeReadback.metal2DCommandBuffers == 2)
         #expect(metricsBeforeReadback.metal2DCommands == 2)
+        #expect(metricsBeforeReadback.metal2DCPUFallbackOperations == 0)
         #expect(metricsBeforeReadback.cpuMaterializations == 0)
         #expect(destination.pixels == Data([
             0x33, 0x22, 0x11, 0x7f,

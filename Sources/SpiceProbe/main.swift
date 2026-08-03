@@ -1164,6 +1164,7 @@ private struct ProbeBenchmarkReport: Codable {
     let metal2DBitmapCopyCommands: UInt64
     let metal2DCopyBitsCommands: UInt64
     let metal2DSurfaceCopyCommands: UInt64
+    let metal2DCPUFallbackOperations: UInt64
     let metal2DUploadBufferAllocations: UInt64
     let metal2DUploadBufferReuses: UInt64
     let cpuFillOperations: UInt64
@@ -1268,6 +1269,7 @@ private struct ProbeBenchmarkReport: Codable {
         metal2DBitmapCopyCommands = diagnostics.metal2DBitmapCopyCommands
         metal2DCopyBitsCommands = diagnostics.metal2DCopyBitsCommands
         metal2DSurfaceCopyCommands = diagnostics.metal2DSurfaceCopyCommands
+        metal2DCPUFallbackOperations = diagnostics.metal2DCPUFallbackOperations
         metal2DUploadBufferAllocations = diagnostics.metal2DUploadBufferAllocations
         metal2DUploadBufferReuses = diagnostics.metal2DUploadBufferReuses
         cpuFillOperations = diagnostics.cpuFillOperations
@@ -1353,6 +1355,7 @@ private struct ProbeBenchmarkReport: Codable {
         case metal2DBitmapCopyCommands = "metal_2d_bitmap_copy_commands"
         case metal2DCopyBitsCommands = "metal_2d_copy_bits_commands"
         case metal2DSurfaceCopyCommands = "metal_2d_surface_copy_commands"
+        case metal2DCPUFallbackOperations = "metal_2d_cpu_fallback_operations"
         case metal2DUploadBufferAllocations = "metal_2d_upload_buffer_allocations"
         case metal2DUploadBufferReuses = "metal_2d_upload_buffer_reuses"
         case cpuFillOperations = "cpu_fill_operations"

@@ -29,6 +29,12 @@ CPU_OPCODE_FIELDS = (
     "cpu_surface_copy_operations",
     "cpu_scaled_copy_operations",
 )
+METAL_2D_SUPPORTED_CPU_OPCODE_FIELDS = (
+    "cpu_fill_operations",
+    "cpu_copy_bits_operations",
+    "cpu_bitmap_copy_operations",
+    "cpu_surface_copy_operations",
+)
 
 
 def parse_time(path: Path) -> dict[str, float]:
@@ -43,7 +49,9 @@ def parse_time(path: Path) -> dict[str, float]:
     return values
 
 
-def validate_swift_renderer_evidence(report: dict[str, object], path: Path) -> None:
+def validate_swift_renderer_evidence(
+    report: dict[str, object], video_codec: str, path: Path
+) -> None:
     renderer = report.get("renderer")
     if not isinstance(renderer, str) or renderer not in SUPPORTED_RENDERERS:
         raise ValueError(f"missing or invalid renderer in {path}")
@@ -54,6 +62,8 @@ def validate_swift_renderer_evidence(report: dict[str, object], path: Path) -> N
             "metal_2d_renderer_enabled": False,
             "metal_2d_command_buffers": 0,
             "metal_2d_commands": 0,
+            "pool_exhaustions": 0,
+            "gpu_errors": 0,
         }
     elif renderer == "cpu":
         requirements = {
@@ -73,6 +83,8 @@ def validate_swift_renderer_evidence(report: dict[str, object], path: Path) -> N
             "pool_exhaustions": 0,
             "gpu_errors": 0,
         }
+        if video_codec == "mjpeg":
+            requirements["cpu_materializations"] = 0
     else:
         requirements = {
             "revisioned_backing_enabled": True,
@@ -80,7 +92,11 @@ def validate_swift_renderer_evidence(report: dict[str, object], path: Path) -> N
             "cpu_materializations": 0,
             "gpu_errors": 0,
             "pool_exhaustions": 0,
+            "metal_2d_cpu_fallback_operations": 0,
         }
+        requirements.update(
+            {name: 0 for name in METAL_2D_SUPPORTED_CPU_OPCODE_FIELDS}
+        )
 
     invalid = [
         name
@@ -98,7 +114,7 @@ def validate_swift_renderer_evidence(report: dict[str, object], path: Path) -> N
         allocated_frames = report.get("revisioned_allocated_frames")
         if type(allocated_frames) is not int or allocated_frames < 1:
             invalid.append("revisioned_allocated_frames")
-    if renderer in {"cpu", "cpu-iosurface"}:
+    if renderer in {"automatic", "cpu", "cpu-iosurface"}:
         cpu_counts = [report.get(name) for name in CPU_OPCODE_FIELDS]
         if (
             any(type(value) is not int for value in cpu_counts)
@@ -188,7 +204,9 @@ def load_client(directory: Path, run: int, client: str) -> dict[str, object]:
             + ", ".join(invalid_activity)
         )
     if client == "swiftspice":
-        validate_swift_renderer_evidence(report, prefix.with_suffix(".json"))
+        validate_swift_renderer_evidence(
+            report, video_codec, prefix.with_suffix(".json")
+        )
         validate_swift_video_evidence(
             report, video_codec, prefix.with_suffix(".json")
         )

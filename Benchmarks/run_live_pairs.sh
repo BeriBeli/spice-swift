@@ -202,13 +202,24 @@ run_client() {
         case "$RENDERER" in
             automatic)
                 renderer_evidence='
-                    .metal_2d_renderer_enabled == false
+                    .renderer == $renderer
+                    and .metal_2d_renderer_enabled == false
                     and .metal_2d_command_buffers == 0
-                    and .metal_2d_commands == 0'
+                    and .metal_2d_commands == 0
+                    and .pool_exhaustions == 0
+                    and .gpu_errors == 0
+                    and ((
+                        .cpu_fill_operations
+                        + .cpu_copy_bits_operations
+                        + .cpu_bitmap_copy_operations
+                        + .cpu_surface_copy_operations
+                        + .cpu_scaled_copy_operations
+                    ) >= 1)'
                 ;;
             cpu)
                 renderer_evidence='
-                    .revisioned_backing_enabled == false
+                    .renderer == $renderer
+                    and .revisioned_backing_enabled == false
                     and .metal_2d_renderer_enabled == false
                     and .metal_2d_command_buffers == 0
                     and .metal_2d_commands == 0
@@ -224,13 +235,15 @@ run_client() {
                 ;;
             cpu-iosurface)
                 renderer_evidence='
-                    .revisioned_backing_enabled == true
+                    .renderer == $renderer
+                    and .revisioned_backing_enabled == true
                     and .revisioned_allocated_frames >= 1
                     and .metal_2d_renderer_enabled == false
                     and .metal_2d_command_buffers == 0
                     and .metal_2d_commands == 0
                     and .pool_exhaustions == 0
                     and .gpu_errors == 0
+                    and ($video_codec != "mjpeg" or .cpu_materializations == 0)
                     and ((
                         .cpu_fill_operations
                         + .cpu_copy_bits_operations
@@ -241,16 +254,26 @@ run_client() {
                 ;;
             metal)
                 renderer_evidence='
-                    .revisioned_backing_enabled == true
+                    .renderer == $renderer
+                    and .revisioned_backing_enabled == true
                     and .metal_2d_renderer_enabled == true
                     and .metal_2d_command_buffers >= 1
                     and .metal_2d_commands >= 1
                     and .cpu_materializations == 0
                     and .gpu_errors == 0
-                    and .pool_exhaustions == 0'
+                    and .pool_exhaustions == 0
+                    and .metal_2d_cpu_fallback_operations == 0
+                    and .cpu_fill_operations == 0
+                    and .cpu_copy_bits_operations == 0
+                    and .cpu_bitmap_copy_operations == 0
+                    and .cpu_surface_copy_operations == 0'
                 ;;
         esac
-        if ! jq -e "$renderer_evidence" "$prefix.json" >/dev/null; then
+        if ! jq -e \
+            --arg renderer "$RENDERER" \
+            --arg video_codec "$VIDEO_CODEC" \
+            "$renderer_evidence" "$prefix.json" >/dev/null
+        then
             echo "$RENDERER renderer evidence gate failed in $prefix.json" >&2
             if [[ "$CONTINUE_ON_FAILURE" != 1 ]]; then
                 return 1

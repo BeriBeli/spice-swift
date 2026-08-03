@@ -25,10 +25,12 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - Validate real Smartcard and redirected USB devices.
 - Exercise live semi-seamless and seamless migration.
 - Make the signal-reset guest fixture activity-valid for 20/20 short 4K stress
-  samples, then rerun fresh ten-pair, 30-second `cpu`, `cpu-iosurface`, and
-  `metal` batches at both 1280x720 and 3840x2160. Pair `cpu-iosurface` directly
-  with `metal` before making a Metal benefit claim. The 2026-08-02 formal
-  collection was rejected because the old fixture became static in late pairs.
+  samples, then rerun the fresh ten-pair, 30-second `cpu` versus GLib reference
+  at both 1280x720 and 3840x2160. Implement a dedicated direct Swift-renderer
+  pair runner and analyzer before separately collecting `cpu-iosurface` versus
+  `metal` under the same epoch, reset, and order schedule. The 2026-08-02
+  formal collection was rejected because the old fixture became static in late
+  pairs.
 - Before production-enabling Metal 2D, eliminate the per-publication full-frame
   seed and serial seed/draw completion waits, preserve partial damage history,
   avoid scratch for non-overlapping COPY_BITS, deduplicate clipped bitmap

@@ -160,9 +160,12 @@ run IDs `20260802T021211Z`, `20260802T023733Z`, `20260802T024924Z`,
 
 1. Make the repaired 4K fixture pass all 20 samples in a ten-pair, five-second
    activity stress run.
-2. Start a fresh guest epoch and collect `cpu`, `cpu-iosurface`, and `metal` at
-   both resolutions using ten paired 30-second runs per configuration.
-3. Reject the entire affected batch on any process, epoch, activity, or Metal
+2. Start a fresh guest epoch and collect the historical `cpu` versus GLib
+   reference at both resolutions using ten paired 30-second runs.
+3. Add a dedicated direct-pair runner/analyzer, then collect
+   `cpu-iosurface` versus `metal` at both resolutions using ten paired
+   30-second runs under the same reset and client-order schedule.
+4. Reject the entire affected batch on any process, epoch, activity, or Metal
    evidence failure.
-4. Treat CPU/frame <= 1.10 and 4K Metal RSS <= 1.15 as unresolved performance
+5. Treat CPU/frame <= 1.10 and 4K Metal RSS <= 1.15 as unresolved performance
    requirements; the diagnostic prefixes currently miss them.

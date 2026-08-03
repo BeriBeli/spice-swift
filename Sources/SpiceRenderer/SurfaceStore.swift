@@ -118,6 +118,7 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let metal2DBitmapCopyCommands: UInt64
     package let metal2DCopyBitsCommands: UInt64
     package let metal2DSurfaceCopyCommands: UInt64
+    package let metal2DCPUFallbackOperations: UInt64
     package let metal2DUploadBufferAllocations: UInt64
     package let metal2DUploadBufferReuses: UInt64
     package let cpuFillOperations: UInt64
@@ -395,6 +396,7 @@ package actor SurfaceStore {
     private let revisionedNamespace = RevisionedIOSurfaceNamespace()
     private let metalCompositor: SpiceMetalCompositor?
     private let metal2DRenderer: SpiceMetal2DRenderer?
+    private let metal2DRendererRequested: Bool
     private let metalCompositorInitializationError: SpiceMetalCompositorError?
     private let compositorFailureForAttempt: @Sendable (Int) -> SpiceMetalCompositorError?
     private var compositorAttempt = 0
@@ -427,6 +429,7 @@ package actor SurfaceStore {
     private var metal2DBatchSeedCPUCopyBytes: UInt64 = 0
     private var snapshotCatchUpCPUCopyBytes: UInt64 = 0
     private var revisionedGPUErrors: UInt64 = 0
+    private var metal2DCPUFallbackOperations: UInt64 = 0
     private let diagnosticsClock = ContinuousClock()
     private var cpuFillOperations: UInt64 = 0
     private var cpuFillNanoseconds: UInt64 = 0
@@ -463,6 +466,7 @@ package actor SurfaceStore {
         )
         self.compositorFailureForAttempt = compositorFailureForAttempt
         self.metal2DBatchFailureForAttempt = metal2DBatchFailureForAttempt
+        metal2DRendererRequested = enableMetal2DRenderer
         let selectedRevisionedPool: RevisionedIOSurfacePool?
         switch backingPolicy {
         case .automatic:
@@ -607,6 +611,7 @@ package actor SurfaceStore {
         ) {
             return revision
         }
+        recordMetal2DCPUFallback()
         let blue = UInt8(truncatingIfNeeded: colorARGB)
         let green = UInt8(truncatingIfNeeded: colorARGB >> 8)
         let red = UInt8(truncatingIfNeeded: colorARGB >> 16)
@@ -671,6 +676,7 @@ package actor SurfaceStore {
         ) {
             return revision
         }
+        recordMetal2DCPUFallback()
         return try copyBitsUnlocked(
             surfaceID: surfaceID,
             destination: destination,
@@ -773,6 +779,7 @@ package actor SurfaceStore {
         ) {
             return revision
         }
+        recordMetal2DCPUFallback()
 
         let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(surface.revision)
@@ -894,7 +901,11 @@ package actor SurfaceStore {
             throw .invalidRectangle
         }
         if metal2DRenderer != nil,
-           let sourceFrame = sourceSurface.storage.unifiedBacking?.current?.makeLease(),
+           let sourceBacking = sourceSurface.storage.unifiedBacking,
+           sourceBacking.damageJournal.isEmpty,
+           let sourceRevision = sourceBacking.current,
+           sourceRevision.revision == sourceSurface.revision,
+           let sourceFrame = sourceRevision.makeLease(),
            let revision = try await enqueueMetalSurfaceCopy(
                surface: &destinationSurface,
                destination: destination,
@@ -906,6 +917,7 @@ package actor SurfaceStore {
         {
             return revision
         }
+        recordMetal2DCPUFallback()
         let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(destinationSurface.revision)
         try prepareForCrossSurfaceCopy(
@@ -1392,6 +1404,7 @@ package actor SurfaceStore {
             metal2DBitmapCopyCommands: metal2DMetrics?.bitmapCopyCommands ?? 0,
             metal2DCopyBitsCommands: metal2DMetrics?.copyBitsCommands ?? 0,
             metal2DSurfaceCopyCommands: metal2DMetrics?.surfaceCopyCommands ?? 0,
+            metal2DCPUFallbackOperations: metal2DCPUFallbackOperations,
             metal2DUploadBufferAllocations:
                 metal2DMetrics?.uploadBufferAllocations ?? 0,
             metal2DUploadBufferReuses: metal2DMetrics?.uploadBufferReuses ?? 0,
@@ -1727,6 +1740,7 @@ package actor SurfaceStore {
         _ pending: PendingMetalBatch,
         onto surface: inout Surface
     ) throws(RenderError) {
+        recordMetal2DCPUFallback(count: pending.commands.count)
         let basePixels: Data
         if let baseCanonical = pending.baseCanonical {
             guard let pixels = baseCanonical.copyPixels(),
@@ -2331,6 +2345,11 @@ package actor SurfaceStore {
         let bytes = UInt64(rectangle.width) * UInt64(rectangle.height) * 4
         damageOperations &+= 1
         damageBytes &+= bytes
+    }
+
+    private func recordMetal2DCPUFallback(count: Int = 1) {
+        guard metal2DRendererRequested, count > 0 else { return }
+        metal2DCPUFallbackOperations &+= UInt64(count)
     }
 
     private func recordCPUOperation(
