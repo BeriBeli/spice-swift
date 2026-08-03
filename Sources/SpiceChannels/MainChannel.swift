@@ -260,11 +260,39 @@ package actor MainChannel: SpiceManagedChannel {
         priority: AgentOutboundPriority = .normal,
         requiredControl: Bool = false
     ) async throws(ChannelError) {
+        try await sendAgentMessage(
+            message,
+            priority: priority,
+            requiredControl: requiredControl,
+            cancellationCompletionPolicy: .caller
+        )
+    }
+
+    package func sendAgentMessageJoiningPhysicalTerminal(
+        _ message: consuming VDAgentMessage,
+        priority: AgentOutboundPriority = .normal,
+        requiredControl: Bool = false
+    ) async throws(ChannelError) {
+        try await sendAgentMessage(
+            message,
+            priority: priority,
+            requiredControl: requiredControl,
+            cancellationCompletionPolicy: .physicalTerminal
+        )
+    }
+
+    private func sendAgentMessage(
+        _ message: consuming VDAgentMessage,
+        priority: AgentOutboundPriority,
+        requiredControl: Bool,
+        cancellationCompletionPolicy: AgentOutboundCancellationCompletionPolicy
+    ) async throws(ChannelError) {
         let payload = try encodeAgentMessage(message)
         let result = await enqueueAgentMessage(
             payload,
             priority: priority,
-            requiredControl: requiredControl
+            requiredControl: requiredControl,
+            cancellationCompletionPolicy: cancellationCompletionPolicy
         )
         if case let .failure(error) = result {
             throw error
@@ -317,7 +345,8 @@ package actor MainChannel: SpiceManagedChannel {
     private func enqueueAgentMessage(
         _ payload: VDAgentWireEncoder.EncodedMessage,
         priority: AgentOutboundPriority,
-        requiredControl: Bool
+        requiredControl: Bool,
+        cancellationCompletionPolicy: AgentOutboundCancellationCompletionPolicy = .caller
     ) async -> Result<Void, ChannelError> {
         let requestID = agentScheduler.allocateID()
         return await withTaskCancellationHandler {
@@ -327,6 +356,7 @@ package actor MainChannel: SpiceManagedChannel {
                     payload: payload,
                     priority: priority,
                     requiredControl: requiredControl,
+                    cancellationCompletionPolicy: cancellationCompletionPolicy,
                     completion: { result in
                         continuation.resume(returning: result)
                     }
@@ -368,6 +398,8 @@ package actor MainChannel: SpiceManagedChannel {
             finishAgentMigrationDrainIfReady()
         case let .detached(completion):
             completion(.failure(.agentCancelled(partial: true)))
+        case .deferredToPhysicalTerminal:
+            break
         case .notFound:
             break
         }
@@ -457,9 +489,13 @@ package actor MainChannel: SpiceManagedChannel {
             }
             agentWriteInFlightID = nil
             switch agentScheduler.didWriteFragment(id: activeID) {
-            case let .completed(completion):
+            case let .completed(completion, cancelledAfterStart):
                 disarmAgentWatchdog()
-                completion?(.success(()))
+                if cancelledAfterStart {
+                    completion?(.failure(.agentCancelled(partial: true)))
+                } else {
+                    completion?(.success(()))
+                }
                 finishAgentMigrationDrainIfReady()
             case .inProgress:
                 armAgentWatchdog(activeID: activeID)

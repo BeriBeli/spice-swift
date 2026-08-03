@@ -45,11 +45,13 @@ package actor InputsChannel: SpiceManagedChannel {
 
     private var connection: ChannelConnection
     private var connectionGeneration: UInt64 = 0
+    private var activeSendGeneration: UInt64?
     private var buttonsState: UInt16 = 0
     private var ackController = AckController()
     private var isSending = false
     private var nextSendWaiterID: UInt64 = 0
     private var sendWaiters: [SendWaiter] = []
+    private var queuedSendTestWaiters: [CheckedContinuation<Void, Never>] = []
     private var isClosed = false
     private(set) var keyboardModifiers: UInt16 = 0
 
@@ -69,8 +71,13 @@ package actor InputsChannel: SpiceManagedChannel {
         }
     }
 
-    package func send(_ event: SpiceInputEvent) async throws(ChannelError) {
-        guard !isClosed else { throw .invalidState }
+    package func send(
+        _ event: SpiceInputEvent,
+        generation expectedSendGeneration: UInt64
+    ) async throws(ChannelError) {
+        guard !isClosed, activeSendGeneration == expectedSendGeneration else {
+            throw .invalidState
+        }
         let admittedGeneration = connectionGeneration
         switch await acquireSendTurn() {
         case .acquired:
@@ -84,54 +91,99 @@ package actor InputsChannel: SpiceManagedChannel {
         guard !Task.isCancelled else {
             throw .cancelledBeforeWrite
         }
-        guard admittedGeneration == connectionGeneration, !isClosed else {
+        guard admittedGeneration == connectionGeneration,
+              activeSendGeneration == expectedSendGeneration,
+              !isClosed else {
             throw .invalidState
         }
         let generation = connectionGeneration
-        switch event {
-        case let .keyDown(scanCode):
-            try await connection.send(SpiceMsgcInputsKeyDown(
-                code: try encodedScanCode(scanCode, release: false)
-            ))
-        case let .keyUp(scanCode):
-            try await connection.send(SpiceMsgcInputsKeyUp(
-                code: try encodedScanCode(scanCode, release: true)
-            ))
-        case let .lockModifiers(modifiers):
-            try await connection.send(SpiceMsgcInputsKeyModifiers(modifiers: modifiers))
-        case let .mouseMotion(dx, dy):
-            try await connection.send(SpiceMsgcInputsMouseMotion(
-                dx: dx,
-                dy: dy,
-                buttonsState: buttonsState
-            ))
-        case let .mousePosition(x, y, displayID):
-            try await connection.send(SpiceMsgcInputsMousePosition(
-                x: x,
-                y: y,
-                buttonsState: buttonsState,
-                displayID: displayID
-            ))
-        case let .mousePress(button):
-            let proposedButtonsState = buttonsState | mask(for: button)
-            try await connection.send(SpiceMsgcInputsMousePress(
-                button: button.rawValue,
-                buttonsState: proposedButtonsState
-            ))
-            guard generation == connectionGeneration else {
-                throw .invalidState
+        var proposedButtonsState: UInt16?
+        do {
+            switch event {
+            case let .keyDown(scanCode):
+                try await connection.send(SpiceMsgcInputsKeyDown(
+                    code: try encodedScanCode(scanCode, release: false)
+                ))
+            case let .keyUp(scanCode):
+                try await connection.send(SpiceMsgcInputsKeyUp(
+                    code: try encodedScanCode(scanCode, release: true)
+                ))
+            case let .lockModifiers(modifiers):
+                try await connection.send(SpiceMsgcInputsKeyModifiers(modifiers: modifiers))
+            case let .mouseMotion(dx, dy):
+                try await connection.send(SpiceMsgcInputsMouseMotion(
+                    dx: dx,
+                    dy: dy,
+                    buttonsState: buttonsState
+                ))
+            case let .mousePosition(x, y, displayID):
+                try await connection.send(SpiceMsgcInputsMousePosition(
+                    x: x,
+                    y: y,
+                    buttonsState: buttonsState,
+                    displayID: displayID
+                ))
+            case let .mousePress(button):
+                let nextButtonsState = buttonsState | mask(for: button)
+                try await connection.send(SpiceMsgcInputsMousePress(
+                    button: button.rawValue,
+                    buttonsState: nextButtonsState
+                ))
+                proposedButtonsState = nextButtonsState
+            case let .mouseRelease(button):
+                let nextButtonsState = buttonsState & ~mask(for: button)
+                try await connection.send(SpiceMsgcInputsMouseRelease(
+                    button: button.rawValue,
+                    buttonsState: nextButtonsState
+                ))
+                proposedButtonsState = nextButtonsState
             }
-            buttonsState = proposedButtonsState
-        case let .mouseRelease(button):
-            let proposedButtonsState = buttonsState & ~mask(for: button)
-            try await connection.send(SpiceMsgcInputsMouseRelease(
-                button: button.rawValue,
-                buttonsState: proposedButtonsState
-            ))
-            guard generation == connectionGeneration else {
-                throw .invalidState
+        } catch let error {
+            // A transport failure is a physical-terminal ambiguity. Fence the
+            // queue before releasing the active turn so an older waiter cannot
+            // enter the same connection generation ahead of session teardown.
+            if case .transport = error, generation == connectionGeneration {
+                invalidateSendGeneration()
             }
+            throw error
+        }
+
+        guard generation == connectionGeneration,
+              activeSendGeneration == expectedSendGeneration,
+              !isClosed else {
+            throw .invalidState
+        }
+        guard !Task.isCancelled else {
+            // Cancellation observed after a successful write is likewise
+            // ambiguous. Poison queued work before defer releases the turn.
+            invalidateSendGeneration()
+            throw .transport(.cancelled)
+        }
+        if let proposedButtonsState {
             buttonsState = proposedButtonsState
+        }
+    }
+
+    /// Invalidates the local send generation without replacing or closing the
+    /// transport. Active wire work may finish ambiguously, but every waiter
+    /// admitted before this barrier is rejected before it can start a write.
+    package func invalidateSendGeneration() {
+        activeSendGeneration = nil
+        connectionGeneration &+= 1
+        invalidateSendWaiters()
+    }
+
+    package func activateSendGeneration(_ generation: UInt64) throws(ChannelError) {
+        guard !isClosed else { throw .invalidState }
+        connectionGeneration &+= 1
+        invalidateSendWaiters()
+        activeSendGeneration = generation
+    }
+
+    package func waitUntilSendIsQueuedForTesting() async {
+        guard sendWaiters.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            queuedSendTestWaiters.append(continuation)
         }
     }
 
@@ -210,8 +262,7 @@ package actor InputsChannel: SpiceManagedChannel {
     package func close() async {
         guard !isClosed else { return }
         isClosed = true
-        connectionGeneration &+= 1
-        invalidateSendWaiters()
+        invalidateSendGeneration()
         await connection.close()
     }
 
@@ -224,8 +275,7 @@ package actor InputsChannel: SpiceManagedChannel {
         }
         let previous = connection
         connection = replacement
-        connectionGeneration &+= 1
-        invalidateSendWaiters()
+        invalidateSendGeneration()
         return previous
     }
 
@@ -251,6 +301,9 @@ package actor InputsChannel: SpiceManagedChannel {
                     id: waiterID,
                     continuation: continuation
                 ))
+                let testWaiters = queuedSendTestWaiters
+                queuedSendTestWaiters.removeAll(keepingCapacity: false)
+                for waiter in testWaiters { waiter.resume() }
             }
         } onCancel: {
             Task { await self.cancelSendWaiter(id: waiterID) }

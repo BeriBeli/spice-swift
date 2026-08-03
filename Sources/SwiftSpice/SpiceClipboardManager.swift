@@ -39,6 +39,8 @@ public actor SpiceAgentManager {
     private var nextClipboardOwnerID: UInt64 = 1
     private var agentWorkGeneration: UInt64 = 1
     private var agentWorkInvalidationGeneration: UInt64?
+    private var agentWorkInvalidationSequence: UInt64 = 0
+    private var agentWorkInvalidationWaiters: [AgentWorkInvalidationWaiter] = []
     private var ownedAgentSends: [UInt64: OwnedAgentSend] = [:]
     private var nextOwnedAgentSendID: UInt64 = 1
     private var displayCoordinator = DisplayConfigurationCoordinator()
@@ -69,6 +71,11 @@ public actor SpiceAgentManager {
     private struct OwnedAgentSend {
         let epoch: AgentWorkEpoch
         let task: Task<Result<Void, SpiceError>, Never>
+    }
+
+    private struct AgentWorkInvalidationWaiter {
+        let observedSequence: UInt64
+        let continuation: CheckedContinuation<Void, Never>
     }
 
     public init(
@@ -124,6 +131,9 @@ public actor SpiceAgentManager {
         pollTask?.cancel()
         for send in ownedAgentSends.values {
             send.task.cancel()
+        }
+        for waiter in agentWorkInvalidationWaiters {
+            waiter.continuation.resume()
         }
         eventContinuation.finish()
         displayConfigurationContinuation.finish()
@@ -1303,7 +1313,7 @@ public actor SpiceAgentManager {
                 return .failure(.cancelled)
             }
             do {
-                try await session.sendAgentMessage(
+                try await session.sendAgentMessageJoiningPhysicalTerminal(
                     message,
                     priority: priority,
                     requiredControl: requiredControl
@@ -1400,6 +1410,16 @@ public actor SpiceAgentManager {
         agentWorkGeneration &+= 1
         let generation = agentWorkGeneration
         agentWorkInvalidationGeneration = generation
+        agentWorkInvalidationSequence &+= 1
+        var pendingWaiters: [AgentWorkInvalidationWaiter] = []
+        for waiter in agentWorkInvalidationWaiters {
+            if waiter.observedSequence == agentWorkInvalidationSequence {
+                pendingWaiters.append(waiter)
+            } else {
+                waiter.continuation.resume()
+            }
+        }
+        agentWorkInvalidationWaiters = pendingWaiters
         pendingActions.removeAll(keepingCapacity: false)
         clipboardInFlight = nil
         clipboardDriverGeneration = nil
@@ -1430,6 +1450,22 @@ public actor SpiceAgentManager {
 
     package func ownedAgentSendCountForTesting() -> Int {
         ownedAgentSends.count
+    }
+
+    package func agentWorkInvalidationSequenceForTesting() -> UInt64 {
+        agentWorkInvalidationSequence
+    }
+
+    package func waitUntilAgentWorkInvalidatesForTesting(
+        after observedSequence: UInt64
+    ) async {
+        guard agentWorkInvalidationSequence == observedSequence else { return }
+        await withCheckedContinuation { continuation in
+            agentWorkInvalidationWaiters.append(AgentWorkInvalidationWaiter(
+                observedSequence: observedSequence,
+                continuation: continuation
+            ))
+        }
     }
 
     private func emitActions(_ actions: [ClipboardStateMachine.Action]) {

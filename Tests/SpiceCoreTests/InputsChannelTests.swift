@@ -22,6 +22,7 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         #expect(try await channel.processNext() == .initialized(keyboardModifiers: 1))
         #expect(try await channel.processNext() == .keyboardModifiersChanged(3))
@@ -52,6 +53,7 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         try await channel.send(.keyDown(scanCode: 0x14b))
         try await channel.send(.keyUp(scanCode: 0x14b))
@@ -69,20 +71,23 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         await #expect(throws: ChannelError.transport(
             .connectionFailed("fixture write 1")
         )) {
             try await channel.send(.mousePress(.left))
         }
-        try await channel.send(.mouseMotion(dx: 1, dy: 2))
-        try await channel.send(.mousePress(.left))
+        try await channel.activateSendGeneration(2)
+        try await channel.send(.mouseMotion(dx: 1, dy: 2), generation: 2)
+        try await channel.send(.mousePress(.left), generation: 2)
         await #expect(throws: ChannelError.transport(
             .connectionFailed("fixture write 4")
         )) {
-            try await channel.send(.mouseRelease(.left))
+            try await channel.send(.mouseRelease(.left), generation: 2)
         }
-        try await channel.send(.mouseMotion(dx: 3, dy: 4))
+        try await channel.activateSendGeneration(3)
+        try await channel.send(.mouseMotion(dx: 3, dy: 4), generation: 3)
 
         let outbound = await transport.outbound
         #expect(try outbound.map(messageID) == [111, 113, 111])
@@ -99,6 +104,7 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         let left = Task { try await channel.send(.mousePress(.left)) }
         await transport.waitUntilFirstWriteStarts()
@@ -124,6 +130,7 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         let active = Task { try await channel.send(.mousePress(.left)) }
         await transport.waitUntilFirstWriteStarts()
@@ -147,6 +154,7 @@ struct InputsChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         let active = Task { try await channel.send(.mousePress(.left)) }
         await transport.waitUntilFirstWriteStarts()
@@ -172,6 +180,7 @@ struct InputsChannelTests {
             transport: sourceTransport,
             headerMode: .mini
         ))
+        try await channel.activateSendGeneration(1)
 
         let active = Task { try await channel.send(.mousePress(.left)) }
         await sourceTransport.waitUntilFirstWriteStarts()
@@ -188,11 +197,103 @@ struct InputsChannelTests {
         await #expect(throws: ChannelError.invalidState) {
             try await active.value
         }
-        try await channel.send(.mouseMotion(dx: 4, dy: 5))
+        try await channel.activateSendGeneration(2)
+        try await channel.send(.mouseMotion(dx: 4, dy: 5), generation: 2)
         let replacementOutbound = await replacementTransport.outbound
         #expect(replacementOutbound.count == 1)
         #expect(try buttonsState(replacementOutbound[0], offset: 8) == 0)
         await previous.close()
+    }
+
+    @Test func generationBarrierRejectsQueuedAndLateActiveSends() async throws {
+        let transport = BlockingFirstWriteTransport()
+        try await transport.connect()
+        let channel = InputsChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 3, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        try await channel.activateSendGeneration(1)
+
+        let active = Task { try await channel.send(.mousePress(.left), generation: 1) }
+        await transport.waitUntilFirstWriteStarts()
+        let queued = Task { try await channel.send(.mousePress(.right), generation: 1) }
+        await channel.waitUntilSendIsQueuedForTesting()
+
+        await channel.invalidateSendGeneration()
+        try await channel.activateSendGeneration(2)
+        await #expect(throws: ChannelError.invalidState) {
+            try await channel.send(.keyDown(scanCode: 0x1e), generation: 1)
+        }
+        await #expect(throws: ChannelError.invalidState) {
+            try await queued.value
+        }
+        #expect(await transport.writeCount == 1)
+
+        await transport.completeFirstWrite()
+        await #expect(throws: ChannelError.invalidState) {
+            try await active.value
+        }
+        try await channel.send(.mouseMotion(dx: 7, dy: 8), generation: 2)
+
+        let outbound = await transport.outbound
+        #expect(outbound.count == 2)
+        #expect(try buttonsState(outbound[1], offset: 8) == 0)
+    }
+
+    @Test func activeTransportFailurePoisonsQueuedSendBeforeTurnRelease() async throws {
+        let transport = BlockingFirstWriteTransport(
+            firstWriteError: .connectionFailed("fixture active failure")
+        )
+        try await transport.connect()
+        let channel = InputsChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 3, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        try await channel.activateSendGeneration(1)
+
+        let active = Task { try await channel.send(.mousePress(.left), generation: 1) }
+        await transport.waitUntilFirstWriteStarts()
+        let queued = Task { try await channel.send(.mousePress(.right), generation: 1) }
+        await channel.waitUntilSendIsQueuedForTesting()
+        await transport.completeFirstWrite()
+
+        await #expect(throws: ChannelError.transport(
+            .connectionFailed("fixture active failure")
+        )) {
+            try await active.value
+        }
+        await #expect(throws: ChannelError.invalidState) {
+            try await queued.value
+        }
+        #expect(await transport.writeCount == 1)
+    }
+
+    @Test func activePostWriteCancellationPoisonsQueuedSendBeforeTurnRelease() async throws {
+        let transport = BlockingFirstWriteTransport()
+        try await transport.connect()
+        let channel = InputsChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 3, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        try await channel.activateSendGeneration(1)
+
+        let active = Task { try await channel.send(.mousePress(.left), generation: 1) }
+        await transport.waitUntilFirstWriteStarts()
+        let queued = Task { try await channel.send(.mousePress(.right), generation: 1) }
+        await channel.waitUntilSendIsQueuedForTesting()
+        active.cancel()
+        await transport.completeFirstWrite()
+
+        await #expect(throws: ChannelError.transport(.cancelled)) {
+            try await active.value
+        }
+        await #expect(throws: ChannelError.invalidState) {
+            try await queued.value
+        }
+        #expect(await transport.writeCount == 1)
     }
 
     private func messageID(_ framed: Data) throws -> UInt16 {
@@ -219,6 +320,12 @@ struct InputsChannelTests {
         writer.writeUInt32LE(UInt32(body.data.count))
         writer.writeBytes(body.data)
         return writer.data
+    }
+}
+
+private extension InputsChannel {
+    func send(_ event: SpiceInputEvent) async throws(ChannelError) {
+        try await send(event, generation: 1)
     }
 }
 
@@ -255,11 +362,16 @@ private actor SelectiveWriteFailureTransport: SpiceTransport {
 }
 
 private actor BlockingFirstWriteTransport: SpiceTransport {
+    private let firstWriteError: TransportError?
     private var firstWriteCompletion: CheckedContinuation<Void, Never>?
     private var firstWriteStartWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var outbound: [Data] = []
     private(set) var writeCount = 0
     private var isConnected = false
+
+    init(firstWriteError: TransportError? = nil) {
+        self.firstWriteError = firstWriteError
+    }
 
     func connect() async throws(TransportError) {
         isConnected = true
@@ -278,6 +390,9 @@ private actor BlockingFirstWriteTransport: SpiceTransport {
             for waiter in waiters { waiter.resume() }
             await withCheckedContinuation { continuation in
                 firstWriteCompletion = continuation
+            }
+            if let firstWriteError {
+                throw firstWriteError
             }
         }
         outbound.append(data)

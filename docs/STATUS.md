@@ -834,6 +834,12 @@ such by an embedding application.
   only after every source child Channel is authenticated and constructed;
   preparation failure or cancellation closes only those target transports and
   leaves source supervision running.
+- Every asynchronous prepare, commit, switch, and inline seamless adoption
+  claims a monotonic `{offerID, operationID}` owner. Completion and recoverable
+  failure callbacks may advance coordinator state or clear the task slot only
+  while that exact owner is current; a stale callback can never detach or
+  cancel its successor. A newer offer, CANCEL, and teardown invalidate the old
+  operation identity before starting or releasing anything else.
 - Semi-seamless END first writes client MIGRATE_END to the prepared target, then
   atomically replaces the Main/child Channel set and starts its supervision
   before closing the source set. A dual-session fixture proves that subsequent

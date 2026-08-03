@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
@@ -211,6 +212,50 @@ struct AgentOutboundSchedulerTests {
         }
         #expect(scheduler.activeID == active)
         #expect(scheduler.activeFragment() != nil)
+    }
+
+    @Test func physicalTerminalCancellationRetainsCompletionUntilDrainEnds() throws {
+        var scheduler = AgentOutboundScheduler(limits: .init(
+            maximumMessageDataBytes: 4_096
+        ))
+        let completions = Mutex(0)
+        let active = scheduler.allocateID()
+        #expect(scheduler.enqueue(
+            id: active,
+            payload: try payload(byteCount: 3_000),
+            priority: .normal,
+            requiredControl: false,
+            cancellationCompletionPolicy: .physicalTerminal,
+            completion: { _ in completions.withLock { $0 += 1 } }
+        ).isAccepted)
+        #expect(scheduler.activateNextIfNeeded() == active)
+        guard case .inProgress = scheduler.didWriteFragment(id: active) else {
+            Issue.record("first fragment must leave the request active")
+            return
+        }
+        guard case .deferredToPhysicalTerminal = scheduler.cancel(
+            id: active,
+            writeInFlightID: nil
+        ) else {
+            Issue.record("semantic owner must remain joined after partial cancellation")
+            return
+        }
+        #expect(completions.withLock { $0 } == 0)
+
+        guard case let .completed(completion, cancelledAfterStart) =
+            scheduler.didWriteFragment(id: active) else {
+            Issue.record("second fragment must physically terminate the request")
+            return
+        }
+        #expect(cancelledAfterStart)
+        #expect(completion != nil)
+        completion?(.failure(.agentCancelled(partial: true)))
+        #expect(completions.withLock { $0 } == 1)
+        guard case .notActive = scheduler.didWriteFragment(id: active) else {
+            Issue.record("completed request must not expose another terminal callback")
+            return
+        }
+        #expect(completions.withLock { $0 } == 1)
     }
 
     private func payload(byteCount: Int) throws -> VDAgentWireEncoder.EncodedMessage {

@@ -12,6 +12,17 @@ package enum AgentOutboundPriority: Int, Sendable, Comparable {
     }
 }
 
+package enum AgentOutboundCancellationCompletionPolicy: Sendable {
+    /// Preserve the public caller contract: cancellation after a physical
+    /// write starts completes the caller immediately while wire draining
+    /// continues in the scheduler.
+    case caller
+    /// Keep the logical owner joined to the scheduler until the active message
+    /// physically completes or its Agent generation reaches another terminal
+    /// state. Used by semantic managers during lifecycle invalidation.
+    case physicalTerminal
+}
+
 package protocol AgentOutboundClock: Sendable {
     func sleep(for duration: Duration) async throws
 }
@@ -63,13 +74,14 @@ package struct AgentOutboundScheduler {
     package enum CancellationResult {
         case removed(Completion)
         case detached(Completion)
+        case deferredToPhysicalTerminal
         case notFound
     }
 
     package enum WriteResult {
         case notActive
         case inProgress
-        case completed(Completion?)
+        case completed(Completion?, cancelledAfterStart: Bool)
     }
 
     package struct RemovedRequest {
@@ -81,8 +93,10 @@ package struct AgentOutboundScheduler {
         let id: UInt64
         let priority: AgentOutboundPriority
         let payload: VDAgentWireEncoder.EncodedMessage
+        let cancellationCompletionPolicy: AgentOutboundCancellationCompletionPolicy
         var completion: Completion?
         var nextFragmentIndex = 0
+        var cancelledAfterStart = false
 
         var hasWrittenFragment: Bool {
             nextFragmentIndex > 0
@@ -146,6 +160,7 @@ package struct AgentOutboundScheduler {
         payload: consuming VDAgentWireEncoder.EncodedMessage,
         priority: AgentOutboundPriority,
         requiredControl: Bool,
+        cancellationCompletionPolicy: AgentOutboundCancellationCompletionPolicy = .caller,
         completion: @escaping Completion
     ) -> EnqueueResult {
         let payloadByteCount = payload.payloadByteCount
@@ -167,6 +182,7 @@ package struct AgentOutboundScheduler {
             id: id,
             priority: priority,
             payload: payload,
+            cancellationCompletionPolicy: cancellationCompletionPolicy,
             completion: completion
         )
         queue(request)
@@ -210,7 +226,10 @@ package struct AgentOutboundScheduler {
         retainedPayloadBytes -= request.payload.payloadByteCount
         retainedWireBytes -= request.payload.wireByteCount
         active = nil
-        return .completed(request.completion)
+        return .completed(
+            request.completion,
+            cancelledAfterStart: request.cancelledAfterStart
+        )
     }
 
     package mutating func cancel(
@@ -225,9 +244,16 @@ package struct AgentOutboundScheduler {
                 active = nil
                 return .removed(completion)
             }
-            request.completion = nil
-            active = request
-            return .detached(completion)
+            switch request.cancellationCompletionPolicy {
+            case .caller:
+                request.completion = nil
+                active = request
+                return .detached(completion)
+            case .physicalTerminal:
+                request.cancelledAfterStart = true
+                active = request
+                return .deferredToPhysicalTerminal
+            }
         }
 
         for priority in [AgentOutboundPriority.high, .normal, .low] {

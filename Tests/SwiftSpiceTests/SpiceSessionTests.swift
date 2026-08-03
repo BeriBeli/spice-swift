@@ -585,9 +585,23 @@ struct SpiceSessionTests {
         }
         await transport.waitForBlockedAgentWriteCount(1)
 
-        await manager.stop()
-        #expect(await manager.ownedAgentSendCountForTesting() == 0)
+        let stopReturned = Mutex(false)
+        let invalidationBaseline = await manager.agentWorkInvalidationSequenceForTesting()
+        let stop = Task {
+            await manager.stop()
+            stopReturned.withLock { $0 = true }
+        }
+        await manager.waitUntilAgentWorkInvalidatesForTesting(after: invalidationBaseline)
+        #expect(await manager.ownedAgentSendCountForTesting() == 1)
+        #expect(!stopReturned.withLock { $0 })
+        await #expect(throws: SpiceClipboardError.alreadyRunning) {
+            try await manager.start(session: session)
+        }
+
         await transport.releaseBlockedAgentWrites()
+        await stop.value
+        #expect(stopReturned.withLock { $0 })
+        #expect(await manager.ownedAgentSendCountForTesting() == 0)
         await #expect(throws: SpiceClipboardError.transport(.cancelled)) {
             try await staleStart.value
         }
@@ -1494,6 +1508,124 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func supersededNonSeamlessCommitFailsClosedBeforeTargetEnd() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let firstTarget = StreamingSessionTransport(initial: try makeLinkResponses())
+        let secondTarget = BlockingTransport()
+        let transports = TransportPool([source, firstTarget, secondTarget])
+        let endGate = MigrationEndGate()
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationTargetEndHook: { await endGate.intercept() }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "first.example")
+        ))
+        let first = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(first, seamless: false)))
+        let firstTargetOutboundBaseline = (await firstTarget.outbound).count
+        await source.enqueue(encodeMini(id: 112, body: Data()))
+        #expect(await events.next() == .migration(.committing(first)))
+        await endGate.waitUntilBlocked()
+
+        await source.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "second.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(first)))
+        _ = try #require(preparingOffer(await events.next()))
+        await secondTarget.waitUntilFirstWrite()
+        await endGate.release()
+
+        guard case .failed = await events.next() else {
+            Issue.record("superseded gated commit must fail the whole session closed")
+            return
+        }
+        #expect((await firstTarget.outbound).count == firstTargetOutboundBaseline)
+        #expect(await source.waitUntilDisconnected())
+        #expect(await firstTarget.waitUntilDisconnected())
+        await secondTarget.waitUntilClosed()
+        #expect(await secondTarget.isClosed)
+    }
+
+    @Test func supersededSwitchFailsClosedBeforePublishingOldTarget() async throws {
+        let inputChannels = [SpiceChannelID(type: 3, id: 0)]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: inputChannels
+        ))
+        let sourceInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let firstTarget = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: inputChannels
+        ))
+        let firstTargetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let secondTarget = BlockingTransport()
+        let transports = TransportPool([
+            source,
+            sourceInputs,
+            firstTarget,
+            firstTargetInputs,
+            secondTarget,
+        ])
+        let activationGate = MigrationInputActivationGate()
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationReplacementHook: { phase, key in
+                await activationGate.intercept(phase: phase, key: key)
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sourceSender = try await session.makeInputSender()
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 111,
+            body: migrationDestinationBody(host: "first.example")
+        ))
+        guard case let .migration(.switching(first)) = await events.next() else {
+            Issue.record("expected first switch offer")
+            return
+        }
+        await activationGate.waitUntilBlocked()
+
+        await source.enqueue(encodeMini(
+            id: 111,
+            body: migrationDestinationBody(host: "second.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(first)))
+        guard case .migration(.switching) = await events.next() else {
+            Issue.record("expected replacement switch offer")
+            return
+        }
+        await secondTarget.waitUntilFirstWrite()
+        await activationGate.release()
+
+        guard case .failed = await events.next() else {
+            Issue.record("superseded gated switch must fail the whole session closed")
+            return
+        }
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await sourceSender.send(.keyDown(scanCode: 0x1e))
+        }
+        #expect(await source.waitUntilDisconnected())
+        #expect(await sourceInputs.waitUntilDisconnected())
+        #expect(await firstTarget.waitUntilDisconnected())
+        #expect(await firstTargetInputs.waitUntilDisconnected())
+        await secondTarget.waitUntilClosed()
+        #expect(await secondTarget.isClosed)
+    }
+
     @Test func nonSeamlessApplyFailureFailsClosedWithoutSourceRestart() async throws {
         let inputChannel = [SpiceChannelID(type: 3, id: 0)]
         let source = StreamingSessionTransport(initial: try makeServerTranscript(
@@ -1677,6 +1809,88 @@ struct SpiceSessionTests {
         await sourceInputs.waitForOutboundCount(sourceInputCount + 1)
         #expect(await sourceInputs.outbound.count == sourceInputCount + 1)
 
+        await session.disconnect()
+    }
+
+    @Test func seamlessRollbackExpiresQueuedInputBeforeItCanReachFreshGeneration() async throws {
+        let sourceChannels = [
+            SpiceChannelID(type: 2, id: 0),
+            SpiceChannelID(type: 3, id: 0),
+        ]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: sourceChannels
+        ))
+        let sourceDisplay = StreamingSessionTransport(initial: try makeLinkResponses())
+        let sourceInputs = BlockingEventSessionTransport(initial: try makeLinkResponses())
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let targetDisplay = StreamingSessionTransport(initial: try makeLinkResponses())
+        let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            source,
+            sourceDisplay,
+            sourceInputs,
+            target,
+            targetDisplay,
+            targetInputs,
+        ])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationReplacementHook: { phase, key in
+                if case .applying = phase, key == ChannelKey(type: 2, id: 0) {
+                    throw ChannelError.protocolViolation("fixture early Display apply failure")
+                }
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let sourceSender = try await session.makeInputSender()
+        let active = Task { try await sourceSender.send(.mousePress(.left)) }
+        await sourceInputs.waitUntilEventWriteStarts()
+        let queued = Task { try await sourceSender.send(.mousePress(.right)) }
+        await session.waitUntilInputSendIsQueuedForTesting()
+        let sourceInputBaseline = (await sourceInputs.outbound).count
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+        await source.enqueue(encodeMini(id: 1, body: uint32(1)))
+        await sourceDisplay.enqueue(encodeMini(id: 1, body: uint32(1)))
+        await sourceInputs.enqueue(encodeMini(id: 1, body: uint32(1)))
+        #expect(await events.next() == .migration(.committing(offer)))
+
+        guard case let .migration(.failed(failedOffer, reason)) = await events.next() else {
+            Issue.record("expected a rollback-complete migration failure")
+            return
+        }
+        #expect(failedOffer == offer)
+        #expect(reason.contains("fixture early Display apply failure"))
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await queued.value
+        }
+        #expect((await sourceInputs.outbound).count == sourceInputBaseline + 1)
+
+        await sourceInputs.completeEventWrite()
+        await #expect(throws: SpiceError.inputGenerationExpired) {
+            try await active.value
+        }
+        let freshSender = try await session.makeInputSender()
+        try await freshSender.send(.mouseMotion(dx: 4, dy: 5))
+
+        let outbound = await sourceInputs.outbound
+        #expect(outbound.count == sourceInputBaseline + 3)
+        #expect(try decodeMiniMessageID(outbound[sourceInputBaseline + 1]) == 113)
+        #expect(try decodeMiniMessageID(outbound[sourceInputBaseline + 2]) == 111)
+        #expect(try inputButtonsState(outbound[sourceInputBaseline + 2], offset: 8) == 0)
         await session.disconnect()
     }
 
@@ -2012,6 +2226,132 @@ struct SpiceSessionTests {
         #expect(await events.next() == .migration(.completed(second)))
         #expect(await executor.committedOffers == [second])
         await session.disconnect()
+    }
+
+    @Test func stalePreparationCallbackCannotClearNewerMigrationOwner() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let executor = NonCooperativeMigrationExecutor()
+        let preparationGate = MigrationCompletionGate()
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationExecutor: executor,
+            migrationPreparationCompletionHook: { offerID, operationID in
+                await preparationGate.intercept(
+                    offerID: offerID,
+                    operationID: operationID
+                )
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await transport.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "first.example")
+        ))
+        let first = try #require(preparingOffer(await events.next()))
+        await executor.waitUntilPreparing(first.id)
+        await executor.completePreparation(first.id, seamless: false)
+        await preparationGate.waitUntilBlocked()
+
+        await transport.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "second.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(first)))
+        let second = try #require(preparingOffer(await events.next()))
+        await executor.waitUntilPreparing(second.id)
+
+        let callbackBaseline = await session.migrationCallbackAttemptSequenceForTesting()
+        await preparationGate.release()
+        await session.waitUntilMigrationCallbackAttemptsForTesting(after: callbackBaseline)
+
+        await transport.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "third.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(second)))
+        let third = try #require(preparingOffer(await events.next()))
+        await executor.waitUntilPreparing(third.id)
+        await executor.waitUntilTaskCancelled(second.id)
+
+        await session.disconnect()
+        await executor.waitUntilTaskCancelled(third.id)
+        await executor.finishAllPreparations()
+    }
+
+    @Test func staleSeamlessCompletionCannotClearNewerMigrationOwner() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let firstTarget = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let secondTarget = BlockingTransport()
+        let thirdTarget = BlockingTransport()
+        let transports = TransportPool([
+            source,
+            firstTarget,
+            secondTarget,
+            thirdTarget,
+        ])
+        let completionGate = MigrationCompletionGate()
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            migrationCompletionHook: { offerID, operationID in
+                await completionGate.intercept(
+                    offerID: offerID,
+                    operationID: operationID
+                )
+            }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "first.example") + uint32(9)
+        ))
+        let first = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(first, seamless: true)))
+        await source.enqueue(encodeMini(id: 1, body: uint32(1)))
+        #expect(await events.next() == .migration(.committing(first)))
+        await completionGate.waitUntilBlocked()
+
+        await firstTarget.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "second.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(first)))
+        let second = try #require(preparingOffer(await events.next()))
+        await secondTarget.waitUntilFirstWrite()
+
+        let completionAttemptBaseline =
+            await session.migrationCallbackAttemptSequenceForTesting()
+        await completionGate.release()
+        await session.waitUntilMigrationCallbackAttemptsForTesting(
+            after: completionAttemptBaseline
+        )
+        await firstTarget.enqueue(encodeMini(
+            id: 101,
+            body: migrationDestinationBody(host: "third.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(second)))
+        _ = try #require(preparingOffer(await events.next()))
+        await secondTarget.waitUntilClosed()
+        await thirdTarget.waitUntilFirstWrite()
+
+        await session.disconnect()
+        await thirdTarget.waitUntilClosed()
+        #expect(await secondTarget.isClosed)
+        #expect(await thirdTarget.isClosed)
     }
 
     @Test func inputGenerationsAreScopedToTheirOwningSession() async throws {
@@ -2371,6 +2711,11 @@ struct SpiceSessionTests {
         return try reader.readUInt16LE()
     }
 
+    private func inputButtonsState(_ data: Data, offset: Int) throws -> UInt16 {
+        var reader = try ByteReader(data, offset: 6 + offset)
+        return try reader.readUInt16LE()
+    }
+
     private func decodeMiniBody(_ data: Data) throws -> Data {
         var reader = try ByteReader(data)
         _ = try reader.readUInt16LE()
@@ -2523,6 +2868,77 @@ private actor MigrationReplacementGate {
     }
 }
 
+private actor MigrationCompletionGate {
+    private var didBlock = false
+    private var isBlocked = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func intercept(offerID: UInt64, operationID: UInt64) async {
+        _ = offerID
+        _ = operationID
+        guard !didBlock else { return }
+        didBlock = true
+        isBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        isBlocked = false
+    }
+
+    func waitUntilBlocked() async {
+        guard !isBlocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor MigrationInputActivationGate {
+    private var didBlock = false
+    private var isBlocked = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func intercept(
+        phase: SpiceSession.MigrationReplacementPhase,
+        key: ChannelKey
+    ) async {
+        guard case .applying = phase,
+              key == ChannelKey(type: 3, id: 0),
+              !didBlock else { return }
+        didBlock = true
+        isBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        isBlocked = false
+    }
+
+    func waitUntilBlocked() async {
+        guard !isBlocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor BlockingTransport: SpiceTransport {
     private let inbound: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
@@ -2530,6 +2946,7 @@ private actor BlockingTransport: SpiceTransport {
     private let writeContinuation: AsyncStream<Void>.Continuation
     private(set) var outboundCount = 0
     private(set) var isClosed = false
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
 
     init() {
         let stream = AsyncStream.makeStream(of: Data.self)
@@ -2564,13 +2981,17 @@ private actor BlockingTransport: SpiceTransport {
     }
 
     func waitUntilClosed() async {
-        while !isClosed {
-            await Task.yield()
+        guard !isClosed else { return }
+        await withCheckedContinuation { continuation in
+            closeWaiters.append(continuation)
         }
     }
 
     func close() async {
         isClosed = true
+        let waiters = closeWaiters
+        closeWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
         continuation.finish()
         writeContinuation.finish()
     }
@@ -2880,6 +3301,10 @@ private actor BlockingEventSessionTransport: SpiceTransport {
         }
     }
 
+    func enqueue(_ data: Data) {
+        inboundContinuation.yield(data)
+    }
+
     func completeEventWrite() {
         eventWriteCompletion?.resume()
         eventWriteCompletion = nil
@@ -2958,6 +3383,71 @@ private actor ControlledMigrationExecutor: SpiceMigrationHandoffExecuting {
         guard !cancelledIDs.contains(id) else { return }
         await withCheckedContinuation { continuation in
             cancellationWaiters[id, default: []].append(continuation)
+        }
+    }
+}
+
+private actor NonCooperativeMigrationExecutor: SpiceMigrationHandoffExecuting {
+    private var preparationContinuations:
+        [UInt64: CheckedContinuation<Bool, any Error>] = [:]
+    private var preparingIDs: Set<UInt64> = []
+    private var cancelledTaskIDs: Set<UInt64> = []
+    private var preparingWaiters: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
+    private var cancellationWaiters: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
+
+    func prepare(_ offer: SpiceMigrationOffer) async throws -> Bool {
+        preparingIDs.insert(offer.id)
+        for waiter in preparingWaiters.removeValue(forKey: offer.id) ?? [] {
+            waiter.resume()
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                preparationContinuations[offer.id] = continuation
+            }
+        } onCancel: {
+            Task { await self.recordTaskCancellation(offer.id) }
+        }
+    }
+
+    func commit(_ offer: SpiceMigrationOffer) async throws {}
+    func switchHost(_ offer: SpiceMigrationOffer) async throws {}
+
+    func cancel(_ offer: SpiceMigrationOffer) {
+        // Deliberately does not finish prepare. The fixture distinguishes the
+        // coordinator's semantic cancel callback from cancellation of the
+        // Session-owned Task slot.
+    }
+
+    func completePreparation(_ id: UInt64, seamless: Bool) {
+        preparationContinuations.removeValue(forKey: id)?.resume(returning: seamless)
+    }
+
+    func waitUntilPreparing(_ id: UInt64) async {
+        guard !preparingIDs.contains(id) else { return }
+        await withCheckedContinuation { continuation in
+            preparingWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    func waitUntilTaskCancelled(_ id: UInt64) async {
+        guard !cancelledTaskIDs.contains(id) else { return }
+        await withCheckedContinuation { continuation in
+            cancellationWaiters[id, default: []].append(continuation)
+        }
+    }
+
+    func finishAllPreparations() {
+        let continuations = preparationContinuations.values
+        preparationContinuations.removeAll(keepingCapacity: false)
+        for continuation in continuations {
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func recordTaskCancellation(_ id: UInt64) {
+        cancelledTaskIDs.insert(id)
+        for waiter in cancellationWaiters.removeValue(forKey: id) ?? [] {
+            waiter.resume()
         }
     }
 }
