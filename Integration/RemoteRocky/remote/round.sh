@@ -31,11 +31,18 @@ case "${command}" in
         started_at="$(<"${PERF_STATE}/round-start")"
         round_id="$(<"${PERF_STATE}/round-id")"
         round_log="${run_dir}/rounds/${round_id}-server.log"
+        round_telemetry="${run_dir}/rounds/${round_id}-guest-telemetry.log"
         podman logs --since "${started_at}" "${PERF_CONTAINER}" > "${round_log}" 2>&1
+        grep '^PERF_GENERATOR ' "${round_log}" > "${round_telemetry}" || true
+        telemetry_samples="$(wc -l < "${round_telemetry}")"
         cp "${run_dir}/configuration.txt" "${run_dir}/rounds/${round_id}-configuration.txt"
         cp "${run_dir}/versions.txt" "${run_dir}/rounds/${round_id}-versions.txt"
         rm -f "${PERF_STATE}/round-start" "${PERF_STATE}/round-id"
-        printf 'round=%s state=ended log=%s\n' "${round_id}" "${round_log}"
+        printf 'round=%s state=ended log=%s guest_telemetry=%s telemetry_samples=%d\n' \
+            "${round_id}" \
+            "${round_log}" \
+            "${round_telemetry}" \
+            "${telemetry_samples}"
         ;;
     *)
         echo "Usage: $0 begin [label] | end" >&2

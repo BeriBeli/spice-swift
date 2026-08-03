@@ -929,19 +929,24 @@ such by an embedding application.
   trade benchmark CPU for visible frame latency and needs a separate policy.
 - A 2026-08-03 host rerun at PR #4 head `d68a8ec` collected all requested
   10x30-second CPU/GLib and Metal/GLib samples at 1280x720 and 3840x2160. All
-  four formal batches remained invalid because the guest animation became
-  static in late samples. Activity-valid diagnostics failed CPU/frame in all
+  four formal batches remained invalid because display activity stopped in late
+  samples. Activity-valid diagnostics failed CPU/frame in all
   configurations: 1.313759 (720p CPU, 8 pairs), 2.174098 (720p Metal, 7 pairs),
   1.107982 (4K CPU, 8 pairs), and 1.811612 (4K Metal, 8 pairs). The 4K Metal
   RSS ratio was 1.255131. Every Metal process exited zero and recorded completed
-  commands with zero supported CPU opcode activity, dedicated fallback, CPU
-  materialization, GPU error, and pool exhaustion. Median Metal batch-seed GPU
+  commands with zero CPU execution of the four supported Metal 2D opcodes,
+  dedicated fallback, CPU materialization, GPU error, and pool exhaustion.
+  Scaled copy and native-video counters were also zero in every activity-valid
+  sample; the actual command mix was bitmap copy, so snapshot catch-up cannot be
+  attributed to MJPEG scaling in this workload. Median Metal batch-seed GPU
   copies were 5.65 GB at 720p and 53.91 GB at 4K; snapshot catch-up CPU copies
   were 2.44 GB and 30.34 GB. The seed totals exactly match one full-surface
   clone per command buffer, so canonical cloning, snapshot catch-up, and
   publication-driven flush frequency remain higher-priority than shader tuning.
-  The full evidence disposition and retained paths are in
-  `Benchmarks/RESULTS_ROCKY8_2026-08-03.md`.
+  The reported Metal GPU time covers draw batches but excludes the separate
+  seed blit. A sanitized nine-set evidence archive with exact tested tools and
+  per-file checksums is retained under `Benchmarks/Results/2026-08-03/`; the
+  full evidence disposition is in `Benchmarks/RESULTS_ROCKY8_2026-08-03.md`.
 - `spice-probe --renderer automatic|cpu|cpu-iosurface|metal` provides explicit
   engine/backing configurations. `automatic` and `cpu-iosurface` use CPU 2D
   with automatic and required revisioned backing respectively; `cpu` is the
@@ -961,10 +966,14 @@ such by an embedding application.
   A/B: `cpu` used Data backing while `metal` used revisioned IOSurface backing,
   and the variants came from different batches. Future Metal benefit claims
   must pair `cpu-iosurface` against `metal` while also retaining `cpu` as the
-  historical Swift-versus-GLib configuration. The current live runner and
-  analyzer only pair one selected Swift renderer against GLib, so two separate
-  result directories do not meet this direct paired contract; a dedicated
-  Swift-renderer-pair runner/analyzer remains required.
+  historical Swift-versus-GLib configuration. A dedicated direct runner and
+  analyzer now alternate `cpu-iosurface` with `metal`, require matching start
+  and end boot IDs plus one batch-wide guest epoch/codec/resolution, reject
+  Metal scaled-copy and cpu-iosurface materialization, verify frame bytes
+  against the declared resolution, and compute `metal / cpu-iosurface` pairwise
+  ratios. The tooling
+  has not yet been run against the live fixture, so it provides no Metal-benefit
+  result yet; two separate Swift-versus-GLib directories remain insufficient.
 - All 20 Metal processes in that collection exited zero, recorded zero GPU
   errors and zero CPU materializations in valid samples, and avoided the former
   encoder-lifecycle abort. Median 4K Metal diagnostics nevertheless recorded
@@ -977,10 +986,14 @@ such by an embedding application.
   and 19/20 at 4K. A fresh 2026-08-03 4K stress reached 20/20, but the longer
   CPU and Metal batches still became static; even `control.sh start` did not
   restore sustained activity after degradation. Short stress alone is
-  therefore insufficient. The next formal run is gated on replacing or
-  repairing the xterm-based renderer, full-duration activity preflight, and a
-  fresh `cpu` versus GLib reference. A separate direct `cpu-iosurface` versus
-  `metal` runner remains required for any Metal benefit claim.
+  therefore insufficient. The fixture now emits a generation, completed-frame
+  ID, monotonic uptime, PID, and Linux boot ID about once per second; each round
+  preserves those records separately, and a host wrapper exposes the guest boot
+  ID to the benchmark runners. This localizes future generator stalls but does
+  not count X11 Present/Damage. The next formal run is gated on deploying and
+  exercising this telemetry, replacing or repairing the xterm renderer,
+  full-duration activity preflight, a fresh `cpu` versus GLib reference, and a
+  live direct `cpu-iosurface` versus `metal` collection.
 - The previous 2026-08-01 current-tree five-second Rocky smoke used an arm64
   Release probe containing the uncommitted publisher revision-race fixes.
   SwiftSpice published 52.0 fps versus 49.2 fps for spice-client-glib2, a

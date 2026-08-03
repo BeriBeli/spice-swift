@@ -22,6 +22,10 @@ full-surface canonical clone per command buffer plus large snapshot catch-up
 copies as the primary Metal data-movement costs. See
 [RESULTS_ROCKY8_2026-08-03.md](RESULTS_ROCKY8_2026-08-03.md) for the complete
 ratios, absolute medians, rejected samples, raw evidence paths, and next gate.
+The sanitized [evidence archive](Results/2026-08-03/) retains all formal raw
+samples, the activity-valid diagnostic selections, the 4K preflight, analyzer
+outputs, exact tested tools, and checksums so reviewers do not depend on
+ephemeral `/private/tmp` paths.
 
 The earlier [2026-08-02 result](RESULTS_ROCKY8_2026-08-02.md) remains available
 as historical evidence; it must not be combined with the new batches to create
@@ -110,22 +114,57 @@ these evidence gates. The report separates revision GPU clones, Metal-batch
 CPU/GPU seed copies, snapshot catch-up copies, 2D opcodes, the dedicated
 `metal_2d_cpu_fallback_operations` count, and upload-buffer
 allocations/reuses. CPU fallback opcodes include aggregate nanosecond timings.
+`metal_2d_gpu_time_ns` covers the Metal 2D draw command buffer only. The
+revisioned-pool seed blit uses a separate command queue and is not included, so
+this counter must not be presented as total GPU time or total GPU utilization.
+Scaled copy remains a CPU opcode outside the four currently supported Metal 2D
+opcodes and must be reported separately when interpreting a workload.
 
-The current paired analyzer compares the selected Swift configuration with
-spice-client-glib2; it cannot directly pair two Swift renderer configurations.
-A claim that Metal 2D improves SwiftSpice requires a dedicated direct-pair
-runner and analyzer comparing `cpu-iosurface` with `metal` under the same guest
-epoch, reset sequence, resolution, and client-order schedule. Two separate
-Swift-versus-GLib result directories do not satisfy that paired contract. The
-historical `cpu` versus `metal` absolute medians changed both the draw engine
-and backing policy and therefore do not isolate the effect of Metal 2D.
+`run_renderer_pairs.sh` and `analyze_renderer_pairs.py` provide the direct
+matched-backing comparison required for a Metal-benefit claim. They alternate
+`cpu-iosurface -> metal` in odd pairs and `metal -> cpu-iosurface` in even
+pairs, with a deterministic reset before each sample. The analyzer computes
+pairwise `metal / cpu-iosurface` ratios and requires one boot epoch, codec,
+resolution, observation duration, reset source, and frame byte footprint for
+the entire batch. It also rejects incomplete/non-contiguous pairs, order
+errors, process/hook failures, incomplete activity, renderer/backing mismatch,
+fallback evidence, Metal scaled-copy CPU work, cpu-iosurface materialization,
+and unusable metrics. The boot-epoch script runs before and after every sample;
+both readings must match, and the same epoch must cover the whole batch. The
+resolution must be supplied as
+`SWIFTSPICE_BENCH_RESOLUTION=WIDTHxHEIGHT`; each sample must report exactly
+`frames * width * height * 4` bytes.
 
-The runner requires a guest boot epoch. Set `SWIFTSPICE_BENCH_BOOT_EPOCH` when
-the complete batch is guaranteed to remain in one epoch, or provide an
-executable `SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT`. The script receives
-`RUN_NUMBER CLIENT` after reset and the before-hook, and must print one stable,
-non-empty line such as the guest `/proc/sys/kernel/random/boot_id`. Both clients
-inside a pair must report the same value; epochs may change between pairs.
+Run the direct pair on the macOS host because building and exercising the
+Metal/IOSurface renderer is not a sandbox-safe operation. The Rocky wrappers
+assume the `rocky8` SSH alias and the deployed remote fixture:
+
+```sh
+SPICE_PASSWORD='...' \
+SWIFTSPICE_BENCH_HOOK_SCRIPT=Benchmarks/remote_rocky_hook.sh \
+SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT=Benchmarks/remote_rocky_boot_epoch.sh \
+SWIFTSPICE_BENCH_RESOLUTION=3840x2160 \
+Benchmarks/run_renderer_pairs.sh 127.0.0.1 15930 10 30 \
+  /private/tmp/swiftspice-renderer-pairs-4k
+
+uv run Benchmarks/analyze_renderer_pairs.py \
+  /private/tmp/swiftspice-renderer-pairs-4k --expected-pairs 10
+```
+
+The runner exists on this PR but has not yet produced a formal result. Two
+separate Swift-versus-GLib result directories still do not satisfy this paired
+contract. Historical `cpu` versus `metal` absolute medians changed both the
+draw engine and backing policy and therefore do not isolate Metal 2D.
+
+The selected-renderer-versus-GLib runner accepts `SWIFTSPICE_BENCH_BOOT_EPOCH`
+when the complete batch is independently guaranteed to remain in one epoch, or
+an executable `SWIFTSPICE_BENCH_BOOT_EPOCH_SCRIPT`. The direct renderer runner
+requires the executable script so it can verify the guest before and after each
+sample. The script receives `RUN_NUMBER CLIENT_OR_RENDERER` after reset and the
+before-hook, and must print one stable, non-empty line such as the guest
+`/proc/sys/kernel/random/boot_id`. The selected runner requires both clients
+inside a pair to match; the direct runner additionally requires one epoch for
+the full batch.
 
 By default, the runner stops at the first process or evidence failure. Set
 `SWIFTSPICE_BENCH_CONTINUE_ON_FAILURE=1` only when the test contract requires
@@ -149,6 +188,17 @@ The analyzer exits nonzero when any confidence-interval gate fails. A formal
 selected-Swift-renderer versus GLib decision uses exactly `10` pairs of `30`
 seconds and should pass `--expected-pairs 10`; shorter runs are smoke tests
 only.
+
+Use `archive_results.sh` to preserve a sanitized selected-renderer-versus-GLib
+result set together with the exact tested analyzer/runner and their Git blob
+IDs. It refuses to overwrite an archive, omits the generated GLib binary,
+scans JSON for credential fields, records each analyzer exit code, and writes
+per-file SHA-256 checksums:
+
+```sh
+Benchmarks/archive_results.sh /private/tmp/evidence.tar.gz TESTED_GIT_REF \
+  /private/tmp/raw-results /private/tmp/diagnostic-results
+```
 
 This headless gate covers connection, wire processing, codec execution, Surface
 mutation, snapshot publication, and coalescing. It does not cover AppKit/GTK
