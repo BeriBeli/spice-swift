@@ -217,6 +217,9 @@ public actor SpiceSession {
     private var activeMigrationOperation: MigrationOperationOwner?
     private var migrationCallbackAttemptSequence: UInt64 = 0
     private var migrationCallbackAttemptWaiters: [MigrationCallbackAttemptWaiter] = []
+    private var migrationCancellationCompletionSequence: UInt64 = 0
+    private var migrationCancellationCompletionWaiters: [MigrationCancellationCompletionWaiter] = []
+    private var pendingMigrationSourceResumes: [UInt64: MigrationSourceResume] = [:]
     private var preparedMigrations: [UInt64: PreparedSession] = [:]
     private struct ChannelMigrationPayload: Sendable {
         let data: Data?
@@ -269,6 +272,26 @@ public actor SpiceSession {
     private struct MigrationCallbackAttemptWaiter {
         let observedSequence: UInt64
         let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct MigrationCancellationCompletionWaiter {
+        let observedSequence: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct MigrationOfferCancellation {
+        let offer: SpiceMigrationOffer
+        let prepared: PreparedSession?
+        let sourceResume: MigrationSourceResume?
+    }
+
+    private struct MigrationSourceResume {
+        let lifecycleGeneration: UInt64
+        let supervisionGeneration: UInt64
+        let mainChannel: MainChannel
+        let connections: [ChannelKey: ChannelConnection]
+        let channels: [ChannelKey: any SpiceManagedChannel]
+        let keys: [ChannelKey]
     }
 
     private enum MigrationAdoptionPolicy: Sendable {
@@ -604,8 +627,33 @@ public actor SpiceSession {
         }
     }
 
+    package func migrationCancellationCompletionSequenceForTesting() -> UInt64 {
+        migrationCancellationCompletionSequence
+    }
+
+    package func waitUntilMigrationCancellationCompletesForTesting(
+        after observedSequence: UInt64
+    ) async {
+        guard migrationCancellationCompletionSequence == observedSequence else { return }
+        await withCheckedContinuation { continuation in
+            migrationCancellationCompletionWaiters.append(
+                MigrationCancellationCompletionWaiter(
+                    observedSequence: observedSequence,
+                    continuation: continuation
+                )
+            )
+        }
+    }
+
+    package func supervisionTaskCountForTesting() -> Int {
+        receiveTasks.count
+    }
+
     package func isChannelMigrationFlushing() -> Bool {
         !seamlessMigrationPayloads.isEmpty
+            || pendingMigrationSourceResumes.values.contains(where: {
+                migrationSourceResumeIsCurrent($0)
+            })
     }
 
     package func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
@@ -1256,6 +1304,11 @@ public actor SpiceSession {
         guard seamlessMigrationPayloads.isEmpty else {
             throw .protocolError("channel migration is flushing client messages")
         }
+        guard !pendingMigrationSourceResumes.values.contains(where: {
+            migrationSourceResumeIsCurrent($0)
+        }) else {
+            throw .protocolError("channel migration is flushing client messages")
+        }
     }
 
     private func channelMigrationRequested(
@@ -1604,8 +1657,12 @@ public actor SpiceSession {
                 }
             case let .cancel(offer):
                 invalidateMigrationOperation()
+                let cancellation = takeMigrationOfferCancellation(
+                    offer,
+                    resumeSource: true
+                )
                 Task { [weak self] in
-                    await self?.cancelMigrationOffer(offer, resumeSource: true)
+                    await self?.finishMigrationOfferCancellation(cancellation)
                 }
             case let .prepare(offer):
                 startMigrationTask(offer: offer, operation: .prepare, generation: generation)
@@ -1869,7 +1926,11 @@ public actor SpiceSession {
         let actions = migrationCoordinator.disconnect()
         for action in actions {
             if case let .cancel(offer) = action {
-                await cancelMigrationOffer(offer, resumeSource: false)
+                let cancellation = takeMigrationOfferCancellation(
+                    offer,
+                    resumeSource: false
+                )
+                await finishMigrationOfferCancellation(cancellation)
             }
         }
     }
@@ -2540,27 +2601,120 @@ public actor SpiceSession {
         lhs.type == rhs.type ? lhs.id < rhs.id : lhs.type < rhs.type
     }
 
-    private func cancelMigrationOffer(
+    private func takeMigrationOfferCancellation(
         _ offer: SpiceMigrationOffer,
         resumeSource: Bool
-    ) async {
-        if let executor = injectedMigrationExecutor {
-            await executor.cancel(offer)
+    ) -> MigrationOfferCancellation {
+        let prepared = preparedMigrations.removeValue(forKey: offer.id)
+        let partialPayloads = seamlessMigrationPayloads.removeValue(forKey: offer.id)
+        let sourceResume: MigrationSourceResume?
+        if resumeSource,
+           let partialPayloads,
+           let mainChannel {
+            let keys = partialPayloads.keys.sorted(by: Self.channelKeySort)
+            var sourceConnections: [ChannelKey: ChannelConnection] = [:]
+            var sourceChannels: [ChannelKey: any SpiceManagedChannel] = [:]
+            for key in keys {
+                sourceConnections[key] = connections[key]
+                if let channel = channels[key] {
+                    sourceChannels[key] = channel
+                }
+            }
+            let resume = MigrationSourceResume(
+                lifecycleGeneration: lifecycleGeneration,
+                supervisionGeneration: supervisionGeneration,
+                mainChannel: mainChannel,
+                connections: sourceConnections,
+                channels: sourceChannels,
+                keys: keys
+            )
+            // A channel cannot cross another migration boundary until this
+            // captured boundary has been resumed and its reader reinstalled.
+            // Keep admission closed for the current source while slow target
+            // cleanup runs; a published replacement fails the identity guard
+            // and is therefore not held behind stale cleanup.
+            pendingMigrationSourceResumes[offer.id] = resume
+            sourceResume = resume
+        } else {
+            sourceResume = nil
         }
-        if let prepared = preparedMigrations.removeValue(forKey: offer.id) {
+        return MigrationOfferCancellation(
+            offer: offer,
+            prepared: prepared,
+            sourceResume: sourceResume
+        )
+    }
+
+    private func finishMigrationOfferCancellation(
+        _ cancellation: MigrationOfferCancellation
+    ) async {
+        defer {
+            pendingMigrationSourceResumes.removeValue(forKey: cancellation.offer.id)
+            noteMigrationCancellationCompletion()
+        }
+        if let executor = injectedMigrationExecutor {
+            await executor.cancel(cancellation.offer)
+        }
+        if let prepared = cancellation.prepared {
             await Self.closePrepared(prepared)
         }
-        let partialPayloads = seamlessMigrationPayloads.removeValue(forKey: offer.id)
-        guard resumeSource, let partialPayloads else { return }
-        let generation = supervisionGeneration
-        for key in partialPayloads.keys {
-            await connections[key]?.resumeAfterMigrationCancellation()
-            if key == ChannelKey(type: 1, id: 0), let mainChannel {
-                appendSupervisionTask(for: mainChannel, key: key, generation: generation)
-            } else if let channel = channels[key] {
-                appendSupervisionTask(for: channel, key: key, generation: generation)
+        guard let sourceResume = cancellation.sourceResume,
+              migrationSourceResumeIsCurrent(sourceResume) else { return }
+        let mainKey = ChannelKey(type: 1, id: 0)
+        for key in sourceResume.keys {
+            guard migrationSourceResumeIsCurrent(sourceResume),
+                  let connection = sourceResume.connections[key] else {
+                return
+            }
+            await connection.resumeAfterMigrationCancellation()
+            guard migrationSourceResumeIsCurrent(sourceResume) else { return }
+            if key == mainKey {
+                appendSupervisionTask(
+                    for: sourceResume.mainChannel,
+                    key: key,
+                    generation: sourceResume.supervisionGeneration
+                )
+            } else if let channel = sourceResume.channels[key] {
+                appendSupervisionTask(
+                    for: channel,
+                    key: key,
+                    generation: sourceResume.supervisionGeneration
+                )
             }
         }
+    }
+
+    private func migrationSourceResumeIsCurrent(
+        _ sourceResume: MigrationSourceResume
+    ) -> Bool {
+        guard lifecycleGeneration == sourceResume.lifecycleGeneration,
+              supervisionGeneration == sourceResume.supervisionGeneration,
+              mainChannel === sourceResume.mainChannel else {
+            return false
+        }
+        for (key, connection) in sourceResume.connections {
+            guard connections[key] === connection else { return false }
+        }
+        for (key, channel) in sourceResume.channels {
+            guard let current = channels[key],
+                  ObjectIdentifier(current) == ObjectIdentifier(channel) else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func noteMigrationCancellationCompletion() {
+        migrationCancellationCompletionSequence &+= 1
+        var pendingWaiters: [MigrationCancellationCompletionWaiter] = []
+        for waiter in migrationCancellationCompletionWaiters {
+            if waiter.observedSequence == migrationCancellationCompletionSequence {
+                pendingWaiters.append(waiter)
+            } else {
+                waiter.continuation.resume()
+            }
+        }
+        migrationCancellationCompletionWaiters = pendingWaiters
     }
 
     private func migrationEndpoint(for offer: SpiceMigrationOffer) throws -> SpiceEndpoint {

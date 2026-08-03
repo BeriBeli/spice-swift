@@ -2083,7 +2083,7 @@ struct SpiceSessionTests {
             initial: try makeLinkResponses(mainCapabilities: [0x8])
                 + [encodeMini(id: 117, body: Data())]
         )
-        let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let targetInputs = BlockingCloseSessionTransport(initial: try makeLinkResponses())
         let transports = TransportPool([source, sourceInputs, target, targetInputs])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
@@ -2105,16 +2105,105 @@ struct SpiceSessionTests {
         await sourceInputs.waitForOutboundCount(4)
         while !(await session.isChannelMigrationFlushing()) { await Task.yield() }
 
+        let cancellationBaseline =
+            await session.migrationCancellationCompletionSequenceForTesting()
+        let sourceInputCount = await sourceInputs.outbound.count
         await source.enqueue(encodeMini(id: 102, body: Data()))
         #expect(await events.next() == .migration(.cancelled(offer)))
-        while await session.isChannelMigrationFlushing() { await Task.yield() }
-        while await target.isConnected { await Task.yield() }
-        while await targetInputs.isConnected { await Task.yield() }
+        await targetInputs.waitUntilCloseStarts()
+        await #expect(throws: SpiceError.protocolError(
+            "channel migration is flushing client messages"
+        )) {
+            try await session.send(.keyDown(scanCode: 0x1e))
+        }
+        #expect(await sourceInputs.outbound.count == sourceInputCount)
 
-        let sourceInputCount = await sourceInputs.outbound.count
+        await targetInputs.completeClose()
+        await session.waitUntilMigrationCancellationCompletesForTesting(
+            after: cancellationBaseline
+        )
+        #expect(!(await session.isChannelMigrationFlushing()))
+        #expect(!(await target.isConnected))
+        #expect(!(await targetInputs.isConnected))
         try await session.send(.keyDown(scanCode: 0x1e))
         await sourceInputs.waitForOutboundCount(sourceInputCount + 1)
         #expect(await sourceInputs.isConnected)
+        await session.disconnect()
+    }
+
+    @Test func staleCancellationCleanupCannotResumePublishedReplacement() async throws {
+        let inputChannel = [SpiceChannelID(type: 3, id: 0)]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: inputChannel
+        ))
+        let sourceInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let oldTarget = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let oldTargetInputs = BlockingCloseSessionTransport(initial: try makeLinkResponses())
+        let replacement = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: inputChannel
+        ))
+        let replacementInputs = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            source,
+            sourceInputs,
+            oldTarget,
+            oldTargetInputs,
+            replacement,
+            replacementInputs,
+        ])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "old-target.example") + uint32(9)
+        ))
+        let oldOffer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(oldOffer, seamless: true)))
+        await sourceInputs.enqueue(encodeMini(id: 1, body: uint32(1)))
+        while !(await session.isChannelMigrationFlushing()) { await Task.yield() }
+
+        let cancellationBaseline =
+            await session.migrationCancellationCompletionSequenceForTesting()
+        await source.enqueue(encodeMini(
+            id: 111,
+            body: migrationDestinationBody(host: "replacement.example")
+        ))
+        #expect(await events.next() == .migration(.cancelled(oldOffer)))
+        guard case let .migration(.switching(replacementOffer)) = await events.next() else {
+            Issue.record("expected replacement switch offer")
+            return
+        }
+        await oldTargetInputs.waitUntilCloseStarts()
+        #expect(await events.next() == .migration(.completed(replacementOffer)))
+
+        let firstReplacementInputCount = await replacementInputs.outbound.count
+        try await session.send(.keyDown(scanCode: 0x1e))
+        await replacementInputs.waitForOutboundCount(firstReplacementInputCount + 1)
+        #expect(await session.supervisionTaskCountForTesting() == 2)
+
+        await oldTargetInputs.completeClose()
+        await session.waitUntilMigrationCancellationCompletesForTesting(
+            after: cancellationBaseline
+        )
+        #expect(await session.supervisionTaskCountForTesting() == 2)
+        for _ in 0..<100 { await Task.yield() }
+        #expect(await replacementInputs.peakConcurrentReadCount == 1)
+
+        let secondReplacementInputCount = await replacementInputs.outbound.count
+        try await session.send(.keyUp(scanCode: 0x1e))
+        await replacementInputs.waitForOutboundCount(secondReplacementInputCount + 1)
+        #expect(await replacementInputs.outbound.count == secondReplacementInputCount + 1)
         await session.disconnect()
     }
 
@@ -3009,6 +3098,8 @@ private actor StreamingSessionTransport: SpiceTransport {
     private var blockedAgentWriteWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var blockedAgentWriteCount = 0
     private(set) var agentWriteCount = 0
+    private var activeReadCount = 0
+    private(set) var peakConcurrentReadCount = 0
 
     init(initial: [Data]) {
         let inboundPipe = AsyncStream.makeStream(of: Data.self)
@@ -3030,6 +3121,9 @@ private actor StreamingSessionTransport: SpiceTransport {
         guard isConnected else {
             throw .connectionClosed
         }
+        activeReadCount += 1
+        peakConcurrentReadCount = max(peakConcurrentReadCount, activeReadCount)
+        defer { activeReadCount -= 1 }
         for await packet in inbound {
             guard packet.count <= maximum else {
                 throw .connectionFailed("fixture exceeds requested maximum")
