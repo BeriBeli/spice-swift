@@ -102,6 +102,9 @@ package struct AgentOutboundScheduler {
     private var lowQueue: [Request] = []
     private var weightedCursor = 0
     private(set) package var retainedPayloadBytes = 0
+    private(set) package var retainedWireBytes = 0
+    private(set) package var fragmentMaterializationCount = 0
+    private(set) package var peakMaterializedFragmentBytes = 0
 
     package init(
         limits: AgentOutboundSchedulerLimits = .init(
@@ -140,12 +143,21 @@ package struct AgentOutboundScheduler {
 
     package mutating func enqueue(
         id: UInt64,
-        payload: VDAgentWireEncoder.EncodedMessage,
+        payload: consuming VDAgentWireEncoder.EncodedMessage,
         priority: AgentOutboundPriority,
         requiredControl: Bool,
         completion: @escaping Completion
     ) -> EnqueueResult {
-        guard canAdmit(payload: payload, priority: priority) else {
+        let payloadByteCount = payload.payloadByteCount
+        let wireByteCount = payload.wireByteCount
+        // Admission uses only the descriptor's checked counts.  No fragment is
+        // assembled, and the single logical payload is retained only after the
+        // request has been accepted.
+        guard canAdmit(
+            payloadByteCount: payloadByteCount,
+            wireByteCount: wireByteCount,
+            priority: priority
+        ) else {
             return requiredControl && priority == .high
                 ? .requiredControlCannotFit
                 : .queueFull
@@ -158,7 +170,8 @@ package struct AgentOutboundScheduler {
             completion: completion
         )
         queue(request)
-        retainedPayloadBytes += payload.payloadByteCount
+        retainedPayloadBytes += payloadByteCount
+        retainedWireBytes += wireByteCount
         return .accepted
     }
 
@@ -177,11 +190,13 @@ package struct AgentOutboundScheduler {
         return nil
     }
 
-    package func activeFragment() -> (id: UInt64, data: Data)? {
+    package mutating func activeFragment() -> (id: UInt64, data: Data)? {
         guard let active,
               let fragment = active.payload.fragment(at: active.nextFragmentIndex) else {
             return nil
         }
+        fragmentMaterializationCount += 1
+        peakMaterializedFragmentBytes = max(peakMaterializedFragmentBytes, fragment.count)
         return (active.id, fragment)
     }
 
@@ -193,6 +208,7 @@ package struct AgentOutboundScheduler {
             return .inProgress
         }
         retainedPayloadBytes -= request.payload.payloadByteCount
+        retainedWireBytes -= request.payload.wireByteCount
         active = nil
         return .completed(request.completion)
     }
@@ -205,6 +221,7 @@ package struct AgentOutboundScheduler {
             guard let completion = request.completion else { return .notFound }
             if !request.hasWrittenFragment, writeInFlightID != id {
                 retainedPayloadBytes -= request.payload.payloadByteCount
+                retainedWireBytes -= request.payload.wireByteCount
                 active = nil
                 return .removed(completion)
             }
@@ -216,6 +233,7 @@ package struct AgentOutboundScheduler {
         for priority in [AgentOutboundPriority.high, .normal, .low] {
             guard let request = removeQueued(id: id, priority: priority) else { continue }
             retainedPayloadBytes -= request.payload.payloadByteCount
+            retainedWireBytes -= request.payload.wireByteCount
             guard let completion = request.completion else { return .notFound }
             return .removed(completion)
         }
@@ -232,6 +250,7 @@ package struct AgentOutboundScheduler {
            !request.hasWrittenFragment,
            writeInFlightID != request.id {
             retainedPayloadBytes -= request.payload.payloadByteCount
+            retainedWireBytes -= request.payload.wireByteCount
             active = nil
             removed.append(RemovedRequest(
                 completion: request.completion,
@@ -256,6 +275,7 @@ package struct AgentOutboundScheduler {
         })
         active = nil
         retainedPayloadBytes = 0
+        retainedWireBytes = 0
         return removed
     }
 
@@ -264,14 +284,20 @@ package struct AgentOutboundScheduler {
     }
 
     private func canAdmit(
-        payload: VDAgentWireEncoder.EncodedMessage,
+        payloadByteCount: Int,
+        wireByteCount: Int,
         priority: AgentOutboundPriority
     ) -> Bool {
         guard pendingCount < limits.maximumMessages else { return false }
-        let (newPayloadBytes, overflow) = retainedPayloadBytes.addingReportingOverflow(
-            payload.payloadByteCount
+        let (expectedWireBytes, wireOverflow) = payloadByteCount.addingReportingOverflow(
+            VDAgentMessage.headerByteCount
         )
-        guard !overflow else { return false }
+        guard !wireOverflow, wireByteCount == expectedWireBytes else { return false }
+        let (newPayloadBytes, overflow) = retainedPayloadBytes.addingReportingOverflow(
+            payloadByteCount
+        )
+        let (_, retainedWireOverflow) = retainedWireBytes.addingReportingOverflow(wireByteCount)
+        guard !overflow, !retainedWireOverflow else { return false }
 
         switch priority {
         case .high:
@@ -330,6 +356,7 @@ package struct AgentOutboundScheduler {
         lowQueue.removeAll(keepingCapacity: false)
         for request in requests {
             retainedPayloadBytes -= request.payload.payloadByteCount
+            retainedWireBytes -= request.payload.wireByteCount
         }
         return requests
     }

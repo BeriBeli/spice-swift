@@ -37,12 +37,27 @@ struct AgentProtocolTests {
         let lazyFragments = try (0..<encoded.fragmentCount).map { index in
             try #require(encoded.fragment(at: index))
         }
-        let compatibilityFragments = try VDAgentWireEncoder.fragments(
-            for: message,
-            limits: limits
-        )
+        var writer = ByteWriter(capacity: VDAgentMessage.headerByteCount + message.data.count)
+        writer.writeUInt32LE(message.protocolID)
+        writer.writeUInt32LE(message.type)
+        writer.writeUInt64LE(message.opaque)
+        writer.writeUInt32LE(UInt32(message.data.count))
+        writer.writeBytes(message.data)
+        let contiguous = writer.data
+        let compatibilityFragments = stride(
+            from: 0,
+            to: contiguous.count,
+            by: limits.maximumPacketBytes
+        ).map { start in
+            contiguous.subdata(in: start..<min(
+                start + limits.maximumPacketBytes,
+                contiguous.count
+            ))
+        }
 
         #expect(lazyFragments == compatibilityFragments)
+        #expect(encoded.payloadByteCount == message.data.count)
+        #expect(encoded.wireByteCount == VDAgentMessage.headerByteCount + message.data.count)
         #expect(encoded.fragment(at: -1) == nil)
         #expect(encoded.fragment(at: encoded.fragmentCount) == nil)
 

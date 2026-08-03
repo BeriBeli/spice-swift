@@ -53,6 +53,7 @@ struct AgentOutboundSchedulerTests {
                 completion: { _ in }
             ).isAccepted)
         }
+        #expect(scheduler.fragmentMaterializationCount == 0)
         #expect(scheduler.enqueue(
             id: scheduler.allocateID(),
             payload: try payload(byteCount: 1),
@@ -60,6 +61,33 @@ struct AgentOutboundSchedulerTests {
             requiredControl: false,
             completion: { _ in }
         ).isQueueFull)
+        #expect(scheduler.fragmentMaterializationCount == 0)
+    }
+
+    @Test func maximumMessageRetainsOnePayloadAndMaterializesOneBoundedFragment() throws {
+        let maximum = 16 * 1_024 * 1_024
+        var scheduler = AgentOutboundScheduler(limits: .init(
+            maximumMessageDataBytes: maximum
+        ))
+        let id = scheduler.allocateID()
+        #expect(scheduler.enqueue(
+            id: id,
+            payload: try payload(byteCount: maximum),
+            priority: .normal,
+            requiredControl: false,
+            completion: { _ in }
+        ).isAccepted)
+        #expect(scheduler.retainedPayloadBytes == maximum)
+        #expect(scheduler.retainedWireBytes == maximum + VDAgentMessage.headerByteCount)
+        #expect(scheduler.fragmentMaterializationCount == 0)
+
+        #expect(scheduler.activateNextIfNeeded() == id)
+        let activeFragment = scheduler.activeFragment()
+        let fragment = try #require(activeFragment)
+        #expect(fragment.data.count == 2_048)
+        #expect(scheduler.fragmentMaterializationCount == 1)
+        #expect(scheduler.peakMaterializedFragmentBytes == 2_048)
+        #expect(scheduler.retainedPayloadBytes + fragment.data.count == maximum + 2_048)
     }
 
     @Test func payloadBudgetsReserveNormalAndHighControlCapacity() throws {

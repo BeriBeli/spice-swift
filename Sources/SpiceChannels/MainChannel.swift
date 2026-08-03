@@ -44,6 +44,7 @@ package actor MainChannel: SpiceManagedChannel {
     private var agentSchedulerGeneration: UInt64 = 1
     private var agentSchedulerPoisoned = false
     private var agentAdmissionPaused = false
+    private var agentMigrationRebindPrepared = false
     private var agentAdmissionFailure: ChannelError?
     private var isAgentDrainerRunning = false
     private var agentWriteInFlightID: UInt64?
@@ -161,15 +162,17 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     package func prepareAgentForMigrationRebind() async throws(ChannelError) {
-        guard isAgentConnected else { return }
         if let agentAdmissionFailure {
             throw agentAdmissionFailure
         }
-        guard agentMigrationCompletion == nil else {
+        guard !agentMigrationRebindPrepared,
+              agentMigrationCompletion == nil else {
             throw .invalidState
         }
 
+        agentMigrationRebindPrepared = true
         agentAdmissionPaused = true
+        guard isAgentConnected else { return }
         let removed = agentScheduler.removeUnstartedForMigration(
             writeInFlightID: agentWriteInFlightID
         )
@@ -199,6 +202,25 @@ package actor MainChannel: SpiceManagedChannel {
 
     @discardableResult
     package func abortAgentMigrationRebind() -> Bool {
+        guard agentMigrationRebindPrepared else {
+            return !agentAdmissionPaused
+        }
+        return resumeAgentAdmissionAfterMigrationRebind()
+    }
+
+    /// Opens Agent admission after the session has synchronously committed the
+    /// complete replacement inventory and its target metadata.  Replacing only
+    /// the Main transport is not itself a migration commit.
+    package func commitAgentMigrationRebind() throws(ChannelError) {
+        guard agentMigrationRebindPrepared else {
+            throw .invalidState
+        }
+        guard resumeAgentAdmissionAfterMigrationRebind() else {
+            throw .invalidState
+        }
+    }
+
+    private func resumeAgentAdmissionAfterMigrationRebind() -> Bool {
         guard !agentSchedulerPoisoned, agentAdmissionFailure == nil else {
             return false
         }
@@ -211,6 +233,7 @@ package actor MainChannel: SpiceManagedChannel {
         }
         disarmAgentMigrationDeadline()
         agentSchedulerGeneration &+= 1
+        agentMigrationRebindPrepared = false
         agentAdmissionPaused = false
         agentAdmissionFailure = nil
         return true
@@ -229,17 +252,11 @@ package actor MainChannel: SpiceManagedChannel {
         }
         let previous = connection
         connection = replacement
-        if agentAdmissionPaused {
-            agentSchedulerGeneration &+= 1
-            agentAdmissionPaused = false
-            agentAdmissionFailure = nil
-            disarmAgentMigrationDeadline()
-        }
         return previous
     }
 
     package func sendAgentMessage(
-        _ message: VDAgentMessage,
+        _ message: consuming VDAgentMessage,
         priority: AgentOutboundPriority = .normal,
         requiredControl: Bool = false
     ) async throws(ChannelError) {
@@ -255,7 +272,7 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     package func sendAgentMessageIfTokensAvailable(
-        _ message: VDAgentMessage,
+        _ message: consuming VDAgentMessage,
         priority: AgentOutboundPriority = .low
     ) async throws(ChannelError) -> Bool {
         let payload = try encodeAgentMessage(message)
@@ -279,7 +296,7 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func encodeAgentMessage(
-        _ message: VDAgentMessage
+        _ message: consuming VDAgentMessage
     ) throws(ChannelError) -> VDAgentWireEncoder.EncodedMessage {
         guard isAgentConnected else {
             throw .agentDisconnected
@@ -778,6 +795,7 @@ package actor MainChannel: SpiceManagedChannel {
             error: { _ in failure }
         )
         agentAdmissionPaused = false
+        agentMigrationRebindPrepared = false
         isAgentConnected = false
         clientAgentTokens = 0
         serverAgentTokens = 0

@@ -95,4 +95,22 @@ package extension FileTransferPhase {
             false
         }
     }
+
+    var isCancellationPending: Bool {
+        switch self {
+        case .queuedCancellation, .sendingCancellation, .awaitingCancellation:
+            true
+        case .queuedStart,
+             .sendingStart,
+             .awaitingGuestApproval,
+             .readyToRead,
+             .reading,
+             .readyToSend,
+             .sendingData,
+             .awaitingCompletion,
+             .queuedFailure,
+             .sendingFailure:
+            false
+        }
+    }
 }

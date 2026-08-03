@@ -12,7 +12,7 @@ struct DisplayConfigurationCoordinatorTests {
         ) == .failed)
         #expect(SpiceAgentManager.agentSendDisposition(
             .agentCancelled(partial: true)
-        ) == .completed)
+        ) == .failed)
     }
 
     @Test func keepsOnlyLatestResizeWhileWaitingForReply() throws {

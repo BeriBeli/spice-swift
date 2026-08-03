@@ -150,13 +150,19 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
 }
 
 public actor SpiceSession {
+    package enum MigrationReplacementPhase: Sendable {
+        case applying
+        case rollingBack
+    }
+
     package typealias TransportFactory = @Sendable (SpiceEndpoint) -> any SpiceTransport
-    package typealias MigrationRebindFault = @Sendable (ChannelKey) -> ChannelError?
+    package typealias MigrationReplacementHook =
+        @Sendable (MigrationReplacementPhase, ChannelKey) async throws -> Void
 
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
-    private let injectedMigrationRebindFault: MigrationRebindFault?
+    private let injectedMigrationReplacementHook: MigrationReplacementHook?
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
@@ -264,14 +270,14 @@ public actor SpiceSession {
         transportFactory = Self.makeNetworkTransport
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
-        injectedMigrationRebindFault = nil
+        injectedMigrationReplacementHook = nil
     }
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
         migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
-        migrationRebindFault: MigrationRebindFault? = nil
+        migrationReplacementHook: MigrationReplacementHook? = nil
     ) {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
@@ -315,7 +321,7 @@ public actor SpiceSession {
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
-        injectedMigrationRebindFault = migrationRebindFault
+        injectedMigrationReplacementHook = migrationReplacementHook
     }
 
     deinit {
@@ -965,6 +971,13 @@ public actor SpiceSession {
         }
     }
 
+    private func invalidateSupervisionTasks() {
+        supervisionGeneration &+= 1
+        let tasks = receiveTasks
+        receiveTasks.removeAll(keepingCapacity: false)
+        for task in tasks { task.cancel() }
+    }
+
     private func appendSupervisionTask(
         for channel: any SpiceManagedChannel,
         key: ChannelKey,
@@ -1070,8 +1083,12 @@ public actor SpiceSession {
                     "seamless migration lost active credentials"
                 )
             }
-            try await adoptMigrationTarget(prepared, credentials: credentials)
+            // Every source channel has reached its migration boundary and the
+            // target payloads have been forwarded.  From here the Main
+            // admission pause is the authoritative semantic-send gate; keeping
+            // this bookkeeping entry would mask a premature Main resume.
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
+            try await adoptMigrationTarget(prepared, credentials: credentials)
             await migrationHandoffCompleted(offerID: offer.id)
         } catch {
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
@@ -1673,17 +1690,22 @@ public actor SpiceSession {
             throw SpiceError.protocolError("migration lost active Main Channel")
         }
 
+        let sourceConnections = connections
+        let sourceEndpoint = currentEndpoint
+        let sourceBootstrap = currentBootstrap
+        let sourceCredentials = credentialStorage
+
         supervisionGeneration &+= 1
         let oldTasks = receiveTasks
         receiveTasks.removeAll(keepingCapacity: false)
         for task in oldTasks { task.cancel() }
 
         var previousConnections: [ChannelKey: ChannelConnection] = [:]
+        var targetStateCommitted = false
+        var targetSupervisionStarted = false
         do {
             try await mainChannel.prepareAgentForMigrationRebind()
-            if let failure = injectedMigrationRebindFault?(mainKey) {
-                throw failure
-            }
+            try await injectedMigrationReplacementHook?(.applying, mainKey)
             previousConnections[mainKey] = try await mainChannel.replaceConnection(
                 with: targetMainConnection
             )
@@ -1694,15 +1716,34 @@ public actor SpiceSession {
                         "migration target is missing an active Channel connection"
                     )
                 }
-                if let failure = injectedMigrationRebindFault?(key) {
-                    throw failure
-                }
+                try await injectedMigrationReplacementHook?(.applying, key)
                 previousConnections[key] = try await channel.replaceConnection(
                     with: replacement
                 )
             }
+
+            // Publish the target inventory and metadata as one actor-isolated
+            // state transition while Main admission remains paused.  Only the
+            // explicit commit below may open semantic Agent writes.
+            connections = prepared.connections
+            currentEndpoint = prepared.endpoint
+            currentBootstrap = prepared.bootstrap
+            credentialStorage = credentials
+            targetStateCommitted = true
+            startSupervision(mainChannel: mainChannel)
+            targetSupervisionStarted = true
+            try await mainChannel.commitAgentMigrationRebind()
         } catch {
             let adoptionError = Self.channelError(error)
+            if targetSupervisionStarted {
+                invalidateSupervisionTasks()
+            }
+            if targetStateCommitted {
+                connections = sourceConnections
+                currentEndpoint = sourceEndpoint
+                currentBootstrap = sourceBootstrap
+                credentialStorage = sourceCredentials
+            }
             var rollbackError: ChannelError?
             let replacedChannelKeys = previousConnections.keys
                 .filter { $0 != mainKey }
@@ -1714,46 +1755,56 @@ public actor SpiceSession {
                     continue
                 }
                 do {
+                    try await injectedMigrationReplacementHook?(.rollingBack, key)
                     _ = try await channel.replaceConnection(with: previous)
                 } catch {
                     rollbackError = rollbackError ?? Self.channelError(error)
                 }
             }
+            var mainRestored = previousConnections[mainKey] == nil
             if let previousMain = previousConnections[mainKey] {
                 do {
+                    try await injectedMigrationReplacementHook?(.rollingBack, mainKey)
                     _ = try await mainChannel.replaceConnection(with: previousMain)
+                    mainRestored = true
                 } catch {
                     rollbackError = rollbackError ?? Self.channelError(error)
                 }
-            } else if !(await mainChannel.abortAgentMigrationRebind()) {
-                rollbackError = rollbackError ?? .invalidState
             }
 
-            if let rollbackError {
+            guard rollbackError == nil, mainRestored else {
+                let rollbackError = rollbackError ?? .invalidState
                 throw MigrationAdoptionFailure.rollbackIncomplete(.protocolViolation(
                     "migration adoption failed (\(adoptionError)); "
                         + "source rollback incomplete (\(rollbackError))"
                 ))
             }
 
-            for sourceConnection in connections.values {
+            // Restore every source connection's migration gate before opening
+            // Main Agent admission again.
+            for sourceConnection in sourceConnections.values {
                 await sourceConnection.resumeAfterMigrationCancellation()
             }
-            // The transaction invalidated all old receive tasks before replacing
-            // connections. A complete rollback must therefore establish a fresh
-            // generation before surfacing the migration failure to the coordinator.
+            // Supervision must own the restored source before Main admission is
+            // reopened.  If reopening fails, discard this epoch before the
+            // rollback is reported incomplete/fail-closed.
             startSupervision(mainChannel: mainChannel)
+            guard await mainChannel.abortAgentMigrationRebind() else {
+                invalidateSupervisionTasks()
+                throw MigrationAdoptionFailure.rollbackIncomplete(.protocolViolation(
+                    "migration adoption failed (\(adoptionError)); "
+                        + "source Agent admission could not be restored"
+                ))
+            }
             throw MigrationAdoptionFailure.sourceResumed(adoptionError)
         }
 
-        connections = prepared.connections
-        currentEndpoint = prepared.endpoint
-        currentBootstrap = prepared.bootstrap
-        credentialStorage = credentials
+        // Inventory, metadata, supervision, and Agent admission now all refer
+        // to the target generation; old transport cleanup cannot create an
+        // unsupervised admission window.
         for connection in previousConnections.values {
             await connection.close()
         }
-        startSupervision(mainChannel: mainChannel)
     }
 
     private func replaceSessionWithTarget(

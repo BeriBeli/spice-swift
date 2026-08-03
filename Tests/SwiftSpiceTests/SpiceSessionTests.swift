@@ -562,6 +562,89 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func stoppedInitialAnnouncementCannotResurrectManagerTasks() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.announceCapabilities.rawValue,
+        ])
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        let staleStart = Task {
+            try await manager.start(session: session)
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+
+        await manager.stop()
+        await transport.releaseBlockedAgentWrites()
+        await #expect(throws: SpiceClipboardError.transport(.cancelled)) {
+            try await staleStart.value
+        }
+
+        // The stale start must not install event/poll tasks after stop; a fresh
+        // lifecycle can start immediately instead of reporting alreadyRunning.
+        try await manager.start(session: session)
+        await manager.stop()
+        #expect(await transport.agentWriteCount == 2)
+        await session.disconnect()
+    }
+
+    @Test func clipboardOwnerWaitsForPartialCancelledWireCompletion() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        let agentWritesBeforeData = await transport.agentWriteCount
+        await transport.blockAgentWrites(afterWrittenCount: agentWritesBeforeData + 1)
+        let payload = Data(repeating: 0x61, count: 3_000)
+        let finished = Mutex(false)
+        let send = Task {
+            await manager.sendClipboardCommandForTesting(.data(
+                type: VDAgentClipboardType.utf8Text.rawValue,
+                data: payload
+            ))
+            finished.withLock { $0 = true }
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+
+        send.cancel()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(!finished.withLock { $0 })
+        await transport.releaseBlockedAgentWrites()
+        await send.value
+        #expect(finished.withLock { $0 })
+
+        let commands = try decodedAgentMessages(await transport.outbound).compactMap {
+            try VDAgentClipboardCodec.decode($0)
+        }
+        #expect(commands.filter {
+            $0 == .data(type: VDAgentClipboardType.utf8Text.rawValue, data: payload)
+        }.count == 1)
+        await manager.stop()
+        await session.disconnect()
+    }
+
     @Test func monitorReplyAndNewQueueDuringSendKeepOneOwnerPerConfiguration() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
@@ -851,7 +934,7 @@ struct SpiceSessionTests {
         ))
         #expect(await clipboardEvents.next() == .ready)
 
-        let bytes = Data([1, 2, 3, 4, 5])
+        let bytes = Data(repeating: 0xa5, count: 3_000)
         let source = FileManager.default.temporaryDirectory.appending(
             path: "spice-swift-inflight-cancel-\(UUID().uuidString).bin"
         )
@@ -866,25 +949,35 @@ struct SpiceSessionTests {
         ))
         #expect(await events.next() == .awaitingGuestApproval(id: id))
 
-        await transport.blockAgentMessages(types: [
-            VDAgentMessageType.fileTransferData.rawValue,
-        ])
+        let agentWritesBeforeData = await transport.agentWriteCount
+        await transport.blockAgentWrites(afterWrittenCount: agentWritesBeforeData + 1)
         let codec = VDAgentFileTransferCodec()
-        let canSend = codec.encodeStatus(id: id.rawValue, result: .canSendData)
-        await transport.enqueue(encodeMini(
-            id: 109,
-            body: try #require(VDAgentWireEncoder.fragments(for: canSend).first)
-        ))
+        let dataOwner = Task {
+            await manager.receiveFileTransferCommandForTesting(.status(
+                VDAgentFileTransferStatus(
+                    id: id.rawValue,
+                    result: .canSendData,
+                    detail: nil
+                )
+            ))
+        }
         await transport.waitForBlockedAgentWriteCount(1)
+        dataOwner.cancel()
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await manager.fileTransferSentByteCount(id) == 0)
 
         await manager.cancelFileTransfer(id)
-        let cancelled = codec.encodeStatus(id: id.rawValue, result: .cancelled)
-        await transport.enqueue(encodeMini(
-            id: 109,
-            body: try #require(VDAgentWireEncoder.fragments(for: cancelled).first)
+        await manager.receiveFileTransferCommandForTesting(.status(
+            VDAgentFileTransferStatus(
+                id: id.rawValue,
+                result: .cancelled,
+                detail: nil
+            )
         ))
         #expect(await transport.blockedAgentWriteCount == 1)
+        #expect(await manager.fileTransferSentByteCount(id) == 0)
         await transport.releaseBlockedAgentWrites()
+        await dataOwner.value
 
         #expect(await events.next() == .progress(
             id: id,
@@ -903,8 +996,101 @@ struct SpiceSessionTests {
             id: id.rawValue,
             result: .cancelled,
             detail: nil
-        )) }.count == 1)
+        )) }.isEmpty)
 
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func cancelAndApprovalDuringBlockedStartStillSendExactlyOneCancellation() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "spice-swift-start-cancel-\(UUID().uuidString).bin"
+        )
+        try Data([1, 2, 3]).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.fileTransferStart.rawValue,
+        ])
+        var events = manager.fileTransferEvents.makeAsyncIterator()
+        let send = Task {
+            try await manager.sendFile(at: source, name: "fixture.bin")
+        }
+        let queued = try #require(await events.next())
+        let id: SpiceFileTransferID
+        if case let .queued(queuedID, _, _) = queued {
+            id = queuedID
+        } else {
+            Issue.record("expected queued file-transfer event")
+            return
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+
+        await manager.cancelFileTransfer(id)
+        let codec = VDAgentFileTransferCodec()
+        let canSend = codec.encodeStatus(id: id.rawValue, result: .canSendData)
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: canSend).first)
+        ))
+        await transport.releaseBlockedAgentWrites()
+        #expect(try await send.value == id)
+
+        while true {
+            let commands = try decodedAgentMessages(await transport.outbound).compactMap {
+                try codec.decode($0)
+            }
+            if commands.contains(.status(VDAgentFileTransferStatus(
+                id: id.rawValue,
+                result: .cancelled,
+                detail: nil
+            ))) {
+                #expect(commands.filter {
+                    if case let .start(commandID, _) = $0 { return commandID == id.rawValue }
+                    return false
+                }.count == 1)
+                #expect(commands.filter { $0 == .status(VDAgentFileTransferStatus(
+                    id: id.rawValue,
+                    result: .cancelled,
+                    detail: nil
+                )) }.count == 1)
+                break
+            }
+            await Task.yield()
+        }
+
+        let cancelled = codec.encodeStatus(id: id.rawValue, result: .cancelled)
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: cancelled).first)
+        ))
+        // No stale awaitingGuestApproval event may precede the terminal event.
+        #expect(await events.next() == .cancelled(id: id))
         await manager.stop()
         await session.disconnect()
     }
@@ -1158,7 +1344,9 @@ struct SpiceSessionTests {
             SpiceChannelID(type: 3, id: 0),
         ]
         let source = StreamingSessionTransport(initial: try makeServerTranscript(
-            channels: sourceChannels
+            channels: sourceChannels,
+            agentConnected: 1,
+            agentTokens: 8
         ))
         let sourceDisplay = StreamingSessionTransport(initial: try makeLinkResponses())
         let sourceInputs = StreamingSessionTransport(initial: try makeLinkResponses())
@@ -1177,10 +1365,13 @@ struct SpiceSessionTests {
             targetInputs,
         ])
         let failingKey = ChannelKey(type: 3, id: 0)
+        let replacementGate = MigrationReplacementGate(failingKey: failingKey)
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
             ticketEncryptor: SessionTicketEncryptor(),
-            migrationRebindFault: { key in key == failingKey ? .invalidState : nil }
+            migrationReplacementHook: { phase, key in
+                try await replacementGate.intercept(phase: phase, key: key)
+            }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -1199,6 +1390,25 @@ struct SpiceSessionTests {
         await sourceDisplay.enqueue(encodeMini(id: 1, body: uint32(1)))
         await sourceInputs.enqueue(encodeMini(id: 1, body: uint32(1)))
         #expect(await events.next() == .migration(.committing(offer)))
+        var replacementBlocked = false
+        for _ in 0..<10_000 {
+            if await replacementGate.isCurrentlyBlocked {
+                replacementBlocked = true
+                break
+            }
+            await Task.yield()
+        }
+        try #require(replacementBlocked)
+        await #expect(throws: SpiceError.agentMigrationRebind(partial: false)) {
+            try await session.sendAgentMessage(SpiceAgentMessage(
+                protocolID: 1,
+                type: VDAgentMessageType.clipboardRelease.rawValue,
+                opaque: 0,
+                data: Data()
+            ))
+        }
+        #expect(await target.agentWriteCount == 0)
+        await replacementGate.releaseWithFailure()
 
         let failure = await events.next()
         if case let .migration(.failed(failedOffer, reason)) = failure {
@@ -1720,6 +1930,35 @@ private final class TransportPool: Sendable {
     }
 }
 
+private actor MigrationReplacementGate {
+    private let failingKey: ChannelKey
+    private var isBlocked = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    var isCurrentlyBlocked: Bool { isBlocked }
+
+    init(failingKey: ChannelKey) {
+        self.failingKey = failingKey
+    }
+
+    func intercept(
+        phase: SpiceSession.MigrationReplacementPhase,
+        key: ChannelKey
+    ) async throws {
+        guard case .applying = phase, key == failingKey else { return }
+        isBlocked = true
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        throw ChannelError.invalidState
+    }
+
+    func releaseWithFailure() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor BlockingTransport: SpiceTransport {
     private let inbound: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
@@ -1781,8 +2020,10 @@ private actor StreamingSessionTransport: SpiceTransport {
     private(set) var outbound: [Data] = []
     private(set) var isConnected = false
     private var blockedAgentMessageTypes: Set<UInt32> = []
+    private var blockAgentWritesAfterCount: Int?
     private var blockedAgentWriteWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var blockedAgentWriteCount = 0
+    private(set) var agentWriteCount = 0
 
     init(initial: [Data]) {
         let inboundPipe = AsyncStream.makeStream(of: Data.self)
@@ -1817,8 +2058,11 @@ private actor StreamingSessionTransport: SpiceTransport {
         guard isConnected else {
             throw .connectionClosed
         }
-        if let messageType = Self.agentMessageType(in: data),
-           blockedAgentMessageTypes.contains(messageType) {
+        let agentMessageType = Self.agentMessageType(in: data)
+        let isAgentWirePacket = Self.isAgentWirePacket(data)
+        if (agentMessageType.map { blockedAgentMessageTypes.contains($0) } == true)
+            || (isAgentWirePacket
+                && blockAgentWritesAfterCount.map { agentWriteCount >= $0 } == true) {
             blockedAgentWriteCount += 1
             await withCheckedContinuation { continuation in
                 blockedAgentWriteWaiters.append(continuation)
@@ -1826,6 +2070,9 @@ private actor StreamingSessionTransport: SpiceTransport {
             guard isConnected else { throw .connectionClosed }
         }
         outbound.append(data)
+        if isAgentWirePacket {
+            agentWriteCount += 1
+        }
         writeContinuation.yield(())
     }
 
@@ -1848,6 +2095,10 @@ private actor StreamingSessionTransport: SpiceTransport {
         blockedAgentMessageTypes = types
     }
 
+    func blockAgentWrites(afterWrittenCount count: Int) {
+        blockAgentWritesAfterCount = max(0, count)
+    }
+
     func waitForBlockedAgentWriteCount(_ count: Int) async {
         while blockedAgentWriteCount < count {
             await Task.yield()
@@ -1856,6 +2107,7 @@ private actor StreamingSessionTransport: SpiceTransport {
 
     func releaseBlockedAgentWrites() {
         blockedAgentMessageTypes.removeAll(keepingCapacity: false)
+        blockAgentWritesAfterCount = nil
         let waiters = blockedAgentWriteWaiters
         blockedAgentWriteWaiters.removeAll(keepingCapacity: false)
         for waiter in waiters { waiter.resume() }
@@ -1880,6 +2132,13 @@ private actor StreamingSessionTransport: SpiceTransport {
             | (UInt32(packet[start + 1]) << 8)
             | (UInt32(packet[start + 2]) << 16)
             | (UInt32(packet[start + 3]) << 24)
+    }
+
+    private nonisolated static func isAgentWirePacket(_ packet: Data) -> Bool {
+        guard packet.count >= 2 else { return false }
+        return packet[packet.startIndex] == UInt8(SpiceMainAgentWire.clientData & 0xff)
+            && packet[packet.startIndex + 1]
+                == UInt8((SpiceMainAgentWire.clientData >> 8) & 0xff)
     }
 }
 

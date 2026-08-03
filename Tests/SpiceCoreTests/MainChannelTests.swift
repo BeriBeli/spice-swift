@@ -546,6 +546,11 @@ struct MainChannelTests {
             transport: target,
             headerMode: .mini
         ))
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: false)) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
+        }
+        #expect(await target.agentWriteCount == 0)
+        try await channel.commitAgentMigrationRebind()
         try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
         #expect(await target.agentWriteCount == 1)
     }
@@ -603,6 +608,7 @@ struct MainChannelTests {
         ))
         _ = try await channel.replaceConnection(with: sourceConnection)
         await sourceConnection.resumeAfterMigrationCancellation()
+        #expect(await channel.abortAgentMigrationRebind())
 
         let received = Mutex<[VDAgentMessage]>([])
         do {

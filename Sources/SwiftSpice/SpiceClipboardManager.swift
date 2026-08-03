@@ -31,6 +31,8 @@ public actor SpiceAgentManager {
     private var eventTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var session: SpiceSession?
+    private var lifecycleGeneration: UInt64 = 1
+    private var startingGeneration: UInt64?
     private var pendingActions: [ClipboardStateMachine.Action] = []
     private var clipboardDriverGeneration: UInt64?
     private var clipboardInFlight: ClipboardActionOwner?
@@ -113,24 +115,42 @@ public actor SpiceAgentManager {
     }
 
     public func start(session: SpiceSession) async throws(SpiceClipboardError) {
-        guard eventTask == nil else {
+        guard eventTask == nil, startingGeneration == nil else {
             throw .alreadyRunning
         }
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        startingGeneration = generation
         self.session = session
+        defer {
+            if startingGeneration == generation {
+                startingGeneration = nil
+            }
+        }
         if await session.currentAgentConnectionState() {
+            guard ownsLifecycle(session: session, generation: generation) else {
+                throw .transport(.cancelled)
+            }
             await execute(state.connected(), using: session)
         }
+        guard ownsLifecycle(session: session, generation: generation) else {
+            throw .transport(.cancelled)
+        }
         emitDisplayConfigurationSupportIfChanged()
-        eventTask = Task { [weak self] in
+        let newEventTask = Task { [weak self] in
             for await event in session.agentEvents {
                 guard !Task.isCancelled else {
                     return
                 }
-                await self?.receive(event, from: session)
+                await self?.receive(
+                    event,
+                    from: session,
+                    lifecycleGeneration: generation
+                )
             }
         }
         let pollInterval = self.pollInterval
-        pollTask = Task { [weak self] in
+        let newPollTask = Task { [weak self] in
             let clock = ContinuousClock()
             while !Task.isCancelled {
                 do {
@@ -138,12 +158,22 @@ public actor SpiceAgentManager {
                 } catch {
                     return
                 }
-                await self?.performPeriodicWork()
+                await self?.performPeriodicWork(lifecycleGeneration: generation)
             }
         }
+        guard ownsLifecycle(session: session, generation: generation) else {
+            newEventTask.cancel()
+            newPollTask.cancel()
+            throw .transport(.cancelled)
+        }
+        eventTask = newEventTask
+        pollTask = newPollTask
+        startingGeneration = nil
     }
 
     public func stop() {
+        lifecycleGeneration &+= 1
+        startingGeneration = nil
         eventTask?.cancel()
         eventTask = nil
         pollTask?.cancel()
@@ -189,6 +219,15 @@ public actor SpiceAgentManager {
             changeCount: snapshot.changeCount,
             text: snapshot.text
         ), using: session)
+    }
+
+    // Package-scoped protocol harness used to verify logical-message ownership
+    // independently of the macOS pasteboard bridge.
+    package func sendClipboardCommandForTesting(
+        _ command: VDAgentClipboardCommand
+    ) async {
+        guard let session else { return }
+        await execute([.send(command)], using: session)
     }
 
     /// Changes whether this manager may advertise clipboard support or access
@@ -317,7 +356,30 @@ public actor SpiceAgentManager {
         }
     }
 
-    private func receive(_ event: SpiceAgentEvent, from session: SpiceSession) async {
+    package func fileTransferSentByteCount(
+        _ id: SpiceFileTransferID
+    ) -> UInt64? {
+        fileTransfers[id]?.sentBytes
+    }
+
+    package func receiveFileTransferCommandForTesting(
+        _ command: VDAgentFileTransferCommand
+    ) async {
+        guard let session else { return }
+        await receiveFileTransfer(command, using: session)
+    }
+
+    private func receive(
+        _ event: SpiceAgentEvent,
+        from session: SpiceSession,
+        lifecycleGeneration: UInt64
+    ) async {
+        guard ownsLifecycle(
+            session: session,
+            generation: lifecycleGeneration
+        ) else {
+            return
+        }
         switch event {
         case .connected:
             guard !state.isAgentConnected else {
@@ -432,14 +494,16 @@ public actor SpiceAgentManager {
             guard displayCoordinator.beginSend(configuration) else { return }
             let generation = agentWorkGeneration
             do {
-                try await session.sendAgentMessage(
+                try await sendOwnedAgentMessage(
                     SpiceAgentMessage(
                         protocolID: message.protocolID,
                         type: message.type,
                         opaque: message.opaque,
                         data: message.data
                     ),
-                    priority: .normal
+                    priority: .normal,
+                    requiredControl: false,
+                    using: session
                 )
             } catch let error {
                 guard generation == agentWorkGeneration,
@@ -447,8 +511,6 @@ public actor SpiceAgentManager {
                     return
                 }
                 switch Self.agentSendDisposition(error) {
-                case .completed:
-                    emitDisplay(.sent(configuration))
                 case .retry:
                     displayCoordinator.didFailSend(configuration, requeue: true)
                     emitDisplay(.failed(configuration, .transport(error)))
@@ -498,12 +560,24 @@ public actor SpiceAgentManager {
         await driveFileTransfers(using: session)
     }
 
-    private func performPeriodicWork() async {
+    private func performPeriodicWork(lifecycleGeneration: UInt64) async {
+        guard lifecycleGeneration == self.lifecycleGeneration,
+              startingGeneration == nil,
+              session != nil else {
+            return
+        }
         if automaticallySynchronizesPasteboard, pasteboardSynchronizationEnabled {
             await synchronizePasteboard()
         } else {
             await retryPendingAgentWork()
         }
+    }
+
+    private func ownsLifecycle(
+        session: SpiceSession,
+        generation: UInt64
+    ) -> Bool {
+        lifecycleGeneration == generation && self.session === session
     }
 
     private func makeWireDisplayConfiguration(
@@ -618,6 +692,12 @@ public actor SpiceAgentManager {
             }
             switch status.result {
             case .canSendData:
+                if job.cancellationRequested || job.phase.isCancellationPending {
+                    // A non-terminal approval racing with host cancellation is
+                    // stale.  Keep the job alive so its sole cancellation wire
+                    // owner can notify the guest.
+                    return
+                }
                 guard job.phase == .awaitingGuestApproval else {
                     failFileTransfer(
                         id,
@@ -632,7 +712,9 @@ public actor SpiceAgentManager {
                 removeFileTransfer(id)
                 emitFileTransfer(.cancelled(id: id))
             case .success:
-                guard job.phase == .awaitingCompletion else {
+                guard job.phase == .awaitingCompletion
+                    || (job.phase.isCancellationPending
+                        && job.sentBytes == job.totalBytes) else {
                     failFileTransfer(
                         id,
                         error: .invalidAgentResponse("SUCCESS before all bytes were sent")
@@ -738,7 +820,9 @@ public actor SpiceAgentManager {
                         ? .queuedCancellation
                         : .awaitingGuestApproval
                     fileTransfers[id] = current
-                    emitFileTransfer(.awaitingGuestApproval(id: id))
+                    if !current.cancellationRequested {
+                        emitFileTransfer(.awaitingGuestApproval(id: id))
+                    }
                     await processDeferredFileTransferStatus(id: id, using: session)
                     progressed = true
                 case .readyToRead:
@@ -894,7 +978,7 @@ public actor SpiceAgentManager {
         using session: SpiceSession
     ) async -> Bool {
         do {
-            try await session.sendAgentMessage(
+            try await sendOwnedAgentMessage(
                 SpiceAgentMessage(
                     protocolID: message.protocolID,
                     type: message.type,
@@ -902,7 +986,8 @@ public actor SpiceAgentManager {
                     data: message.data
                 ),
                 priority: priority,
-                requiredControl: requiredControl
+                requiredControl: requiredControl,
+                using: session
             )
             return true
         } catch let error {
@@ -910,8 +995,6 @@ public actor SpiceAgentManager {
                 return false
             }
             switch Self.agentSendDisposition(error) {
-            case .completed:
-                return true
             case .retry:
                 job.phase = retryPhase
                 fileTransfers[id] = job
@@ -1076,7 +1159,7 @@ public actor SpiceAgentManager {
                 }
                 let policy = Self.clipboardSendPolicy(command)
                 do {
-                    try await session.sendAgentMessage(
+                    try await sendOwnedAgentMessage(
                         SpiceAgentMessage(
                             protocolID: message.protocolID,
                             type: message.type,
@@ -1084,16 +1167,12 @@ public actor SpiceAgentManager {
                             data: message.data
                         ),
                         priority: policy.priority,
-                        requiredControl: policy.requiredControl
+                        requiredControl: policy.requiredControl,
+                        using: session
                     )
                 } catch let error {
                     guard ownsClipboardAction(owner) else { continue }
                     switch Self.agentSendDisposition(error) {
-                    case .completed:
-                        state.didSend(command)
-                        clearClipboardOwner(owner)
-                        emit(.failed(.transport(error)))
-                        continue
                     case .retry:
                         clearClipboardOwner(owner)
                         if !pendingActions.contains(action) {
@@ -1134,7 +1213,6 @@ public actor SpiceAgentManager {
     }
 
     package enum AgentSendDisposition: Sendable, Equatable {
-        case completed
         case retry
         case failed
     }
@@ -1143,12 +1221,10 @@ public actor SpiceAgentManager {
         _ error: SpiceError
     ) -> AgentSendDisposition {
         switch error {
-        case .agentCancelled(partial: true):
-            .completed
         case .agentQueueFull,
              .agentMigrationRebind(partial: false):
             .retry
-        case .agentCancelled(partial: false),
+        case .agentCancelled,
              .alreadyConnected,
              .agentDisconnected,
              .agentMessageFailed,
@@ -1159,6 +1235,39 @@ public actor SpiceAgentManager {
              .authenticationFailed,
              .protocolError:
             .failed
+        }
+    }
+
+    /// Semantic managers own a logical Agent message until its scheduler
+    /// request reaches a real terminal state.  Caller cancellation must not
+    /// detach that ownership after a partial physical write and advance the
+    /// clipboard/file state machine early.
+    private func sendOwnedAgentMessage(
+        _ message: SpiceAgentMessage,
+        priority: AgentOutboundPriority,
+        requiredControl: Bool,
+        using session: SpiceSession
+    ) async throws(SpiceError) {
+        let owner: Task<Result<Void, SpiceError>, Never> = Task.detached {
+            do {
+                try await session.sendAgentMessage(
+                    message,
+                    priority: priority,
+                    requiredControl: requiredControl
+                )
+                return Result<Void, SpiceError>.success(())
+            } catch let error as SpiceError {
+                return .failure(error)
+            } catch {
+                return .failure(.protocolError(String(describing: error)))
+            }
+        }
+        let result = await owner.value
+        switch result {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
         }
     }
 
