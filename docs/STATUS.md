@@ -896,9 +896,113 @@ such by an embedding application.
 
 ## Apple Silicon optimization acceptance status
 
-- The latest current-tree five-second Rocky smoke used an arm64 Release probe
-  containing the uncommitted publisher revision-race fixes. SwiftSpice
-  published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911
+- The production `.automatic` backend keeps ordinary SPICE 2D commands on the
+  CPU while using revisioned IOSurface publication when supported. The
+  IOSurface-canonical Metal 2D batch is retained only behind the explicit
+  experimental `.metal` backend. Fill, decoded bitmap copy, overlap-safe
+  COPY_BITS, and cross-Surface copy share one command buffer until snapshot or
+  the bounded 512-command/16-MiB threshold. Canonical output becomes visible
+  only after GPU completion; an injected failure replays the complete batch on
+  the CPU.
+- Focused M4 tests prove a four-command batch uses one command buffer and
+  matches the CPU renderer byte-for-byte, preserves ARGB cross-Surface copy
+  without CPU readback, and recovers from an injected GPU failure. Probe JSON
+  reports Metal 2D command buffers, commands, upload/blit bytes, and completed
+  GPU time. These are local correctness results, not a live performance pass.
+- Recording Metal batches now have an explicit idempotent cancellation path,
+  with close, surface destroy, stale transaction, encode failure, and injected
+  pre-commit failure all ending an active encoder before release. Focused close
+  and destroy tests no longer trigger Metal's `endEncoding` abort.
+- CPU-only rendering bypasses Metal enqueue and empty-flush calls. Probe
+  diagnostics now split CPU opcode counts/timing, revision GPU clones, batch
+  seed CPU/GPU copies, snapshot catch-up copies, per-Metal-opcode counts, and
+  upload-buffer allocation/reuse. A dedicated Metal-to-CPU fallback counter
+  covers every supported opcode that takes a CPU route, including all commands
+  replayed after a failed Metal batch. Live Metal evidence rejects any such
+  fallback or supported CPU opcode activity. Bitmap uploads use a power-of-two
+  persistent MTLBuffer pool across completed batches; hard resident-byte and
+  buffer-class caps plus memory-pressure purge remain required before
+  production enablement.
+- In-place mutation of the current IOSurface was not enabled: it would break
+  the batch's rollback guarantee when GPU execution fails. Snapshot-driven
+  commits also remain at the 16-ms publication boundary; reducing them would
+  trade benchmark CPU for visible frame latency and needs a separate policy.
+- A 2026-08-03 host rerun at PR #4 head `d68a8ec` collected all requested
+  10x30-second CPU/GLib and Metal/GLib samples at 1280x720 and 3840x2160. All
+  four formal batches remained invalid because display activity stopped in late
+  samples. Activity-valid diagnostics failed CPU/frame in all
+  configurations: 1.313759 (720p CPU, 8 pairs), 2.174098 (720p Metal, 7 pairs),
+  1.107982 (4K CPU, 8 pairs), and 1.811612 (4K Metal, 8 pairs). The 4K Metal
+  RSS ratio was 1.255131. Every Metal process exited zero and recorded completed
+  commands with zero CPU execution of the four supported Metal 2D opcodes,
+  dedicated fallback, CPU materialization, GPU error, and pool exhaustion.
+  Scaled copy and native-video counters were also zero in every activity-valid
+  sample; the actual command mix was bitmap copy, so snapshot catch-up cannot be
+  attributed to MJPEG scaling in this workload. Median Metal batch-seed GPU
+  copies were 5.65 GB at 720p and 53.91 GB at 4K; snapshot catch-up CPU copies
+  were 2.44 GB and 30.34 GB. The seed totals exactly match one full-surface
+  clone per command buffer, so canonical cloning, snapshot catch-up, and
+  publication-driven flush frequency remain higher-priority than shader tuning.
+  The reported Metal GPU time covers draw batches but excludes the separate
+  seed blit. A sanitized nine-set evidence archive with exact tested tools and
+  per-file checksums is retained under `Benchmarks/Results/2026-08-03/`; the
+  full evidence disposition is in `Benchmarks/RESULTS_ROCKY8_2026-08-03.md`.
+- `spice-probe --renderer automatic|cpu|cpu-iosurface|metal` provides explicit
+  engine/backing configurations. `automatic` and `cpu-iosurface` use CPU 2D
+  with automatic and required revisioned backing respectively; `cpu` is the
+  historical Data-backed mode; `metal` is experimental and requires revisioned
+  backing. The live
+  runner now requires full-window activity evidence, successful process exit,
+  and a stable guest boot epoch within each pair. A 2026-08-02 alternating
+  10x30-second CPU/Metal collection covered 1280x720 and 3840x2160, but its
+  formal verdict was rejected when the old reset fixture became static in late
+  pairs. The first eight contiguous valid pairs are retained only as diagnostic
+  prefixes: their CPU-per-frame ratios were 1.468515 (720p CPU), 1.944140
+  (720p Metal), 1.375421 (4K CPU), and 1.534300 (4K Metal), all above the 1.10
+  limit. The 4K Metal RSS ratio was also 1.256189, above 1.15. These failures
+  identify current optimization work; they are not a substitute for a valid
+  ten-pair confidence interval.
+- The dedicated direct runner was exercised at PR #4 head `bb3b176`, pairing
+  `cpu-iosurface` against `metal` under one boot epoch and matched revisioned
+  backing. Both 720p and 4K collected all ten requested 30-second pairs, but
+  their formal batches were invalid: 720p had nine incomplete-activity samples
+  and retained only pairs 1-5 as a contiguous diagnostic prefix; 4K had eight
+  and retained pairs 1-6. The diagnostic Metal/CPU-IOSurface ratios were,
+  respectively, fps 1.037491 and 1.114127, ready-frame 0.967597 and 1.032517,
+  p95 interval 0.982990 and 1.023784, CPU/frame 1.730965 and 1.754194, and RSS
+  1.120592 and 1.340859. The 720p ready-frame confidence interval, both
+  CPU/frame gates, and 4K RSS gate failed, so the run provides no formal
+  Metal-benefit result. The full disposition is in
+  `Benchmarks/RESULTS_DIRECT_ROCKY8_2026-08-03.md`.
+- All 20 direct Metal processes exited zero, recorded completed commands with
+  zero supported CPU opcodes, fallback, materialization, GPU error, and pool
+  exhaustion, and avoided the former encoder-lifecycle abort. Median 4K Metal
+  diagnostics nevertheless recorded 53.25 GB of batch-seed GPU copies and
+  32.50 GB of snapshot catch-up CPU copies per 30-second sample. Copy,
+  publication, and revision-allocation policy remain higher-priority targets
+  than shader tuning.
+- The guest workload resets the existing animation generator with `SIGUSR1`
+  instead of intentionally creating a new xterm per sample. The 2026-08-02
+  fixed-fixture 10x5-second stress produced 20/20 activity-valid 720p samples
+  and 19/20 at 4K. A fresh 2026-08-03 4K stress reached 20/20, but the longer
+  CPU and Metal batches still became static; even `control.sh start` did not
+  restore sustained activity after degradation. Short stress alone is
+  therefore insufficient. The fixture emits a generation, completed-frame ID,
+  monotonic uptime, PID, and Linux boot ID about once per second; each round
+  preserves those records separately, and a host wrapper exposes the guest boot
+  ID to the benchmark runners. The `bb3b176` direct run exercised this evidence:
+  all 20 telemetry files at each resolution continued through their observation
+  windows, including every sample whose client activity failed. The stall is
+  therefore downstream of the guest generator, but the telemetry does not
+  count X11 Present/Damage and cannot distinguish xterm, Xorg, spice-server,
+  transport, or client failure. The next formal run is gated on replacing or
+  repairing that downstream fixture path, adding Present/Damage evidence,
+  passing full-duration activity preflight, and repeating the direct
+  `cpu-iosurface` versus `metal` collection.
+- The previous 2026-08-01 current-tree five-second Rocky smoke used an arm64
+  Release probe containing the uncommitted publisher revision-race fixes.
+  SwiftSpice published 52.0 fps versus 49.2 fps for spice-client-glib2, a
+  passing 1.056911
   ratio. Ready-frame (0.772646), p95 (0.673903), and RSS (0.658301) also passed.
   Publisher stale snapshots fell from the earlier 48/261 (18.39%) sample to
   0/265. CPU per frame remained the blocking metric at 1.451688 ms versus
@@ -931,7 +1035,7 @@ such by an embedding application.
   still needs its custom KVM kernel and local QEMU image restored before rerun.
 
 The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate passes 324 tests in 67 suites. The current Rocky
+warnings-as-errors gate passes 356 tests in 69 suites. The current Rocky
 yuv420p H.264/H.265 native composition gate is closed; broader codec profiles,
 resolutions, and display behavior remain part of the real-host gate. Smartcard
 hardware, a redirected USB device, human-audible Playback/device route
@@ -957,7 +1061,7 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 324 tests in 67 suites, `swift build`,
+The current warnings-as-errors gate passes 356 tests in 69 suites, `swift build`,
 the generated-protocol consistency check, and exact-arm64 app packaging with
 recursive native-closure verification.
 

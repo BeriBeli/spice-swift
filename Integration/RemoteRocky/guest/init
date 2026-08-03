@@ -15,6 +15,8 @@ mkdir -p "${XDG_RUNTIME_DIR}" /tmp/.X11-unix
 chmod 0700 "${XDG_RUNTIME_DIR}"
 mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /dev/shm
+boot_epoch=unknown
+IFS= read -r boot_epoch < /proc/sys/kernel/random/boot_id || boot_epoch=unknown
 
 modprobe virtio_console
 modprobe virtio_gpu
@@ -61,14 +63,30 @@ stop_process() {
     pid_file="$1"
     if test -f "${pid_file}"; then
         pid="$(cat "${pid_file}")"
-        kill "${pid}" 2>/dev/null || true
+        kill -TERM -- "-${pid}" 2>/dev/null || kill "${pid}" 2>/dev/null || true
         wait "${pid}" 2>/dev/null || true
         rm -f "${pid_file}"
     fi
 }
 
+next_animation_generation() {
+    generation=0
+    if test -f /run/perf-animation-generation; then
+        IFS= read -r generation < /run/perf-animation-generation || generation=0
+        case "${generation}" in
+            ''|*[!0-9]*) generation=0 ;;
+        esac
+    fi
+    generation=$((generation + 1))
+    generation_tmp="/run/perf-animation-generation.tmp.$$"
+    printf '%s\n' "${generation}" > "${generation_tmp}"
+    mv "${generation_tmp}" /run/perf-animation-generation
+    printf '%s\n' "${generation}"
+}
+
 start_static() {
     stop_process /run/perf-animation.pid
+    rm -f /run/perf-animation-generator.pid
     stop_process /run/perf-static.pid
     xsetroot -solid '#17212b'
     /usr/local/bin/static-desktop.sh &
@@ -78,29 +96,50 @@ start_static() {
 
 start_animation() {
     stop_process /run/perf-animation.pid
+    rm -f /run/perf-animation-generator.pid
     stop_process /run/perf-static.pid
-    /usr/local/bin/animation-load.sh &
+    generation="$(next_animation_generation)"
+    PERF_ANIMATION_GENERATION="${generation}" /usr/local/bin/animation-load.sh &
     echo "$!" > /run/perf-animation.pid
-    echo "PERF_LOAD state=animation reset_frame=0"
+    echo "PERF_LOAD state=animation reset_frame=0 generation=${generation} method=start"
+}
+
+reset_animation() {
+    if test -f /run/perf-animation.pid \
+        && kill -0 "$(cat /run/perf-animation.pid)" 2>/dev/null \
+        && test -f /run/perf-animation-generator.pid; then
+        generator_pid="$(cat /run/perf-animation-generator.pid)"
+        generation="$(next_animation_generation)"
+        if kill -USR1 "${generator_pid}" 2>/dev/null; then
+            echo "PERF_LOAD state=animation reset_frame=0 generation=${generation} generator_pid=${generator_pid} method=signal"
+        else
+            start_animation
+        fi
+    else
+        start_animation
+    fi
 }
 
 start_static
-echo "PERF_READY resolution=1280x720"
+echo "PERF_READY resolution=1280x720 boot_epoch=${boot_epoch}"
 
 while true; do
     while IFS= read -r command; do
         case "${command}" in
-            start|reset)
+            start)
                 start_animation
+                ;;
+            reset)
+                reset_animation
                 ;;
             stop)
                 start_static
                 ;;
             status)
                 if test -f /run/perf-animation.pid; then
-                    echo "PERF_STATUS state=animation resolution=1280x720"
+                    echo "PERF_STATUS state=animation resolution=1280x720 boot_epoch=${boot_epoch}"
                 else
-                    echo "PERF_STATUS state=static resolution=1280x720"
+                    echo "PERF_STATUS state=static resolution=1280x720 boot_epoch=${boot_epoch}"
                 fi
                 ;;
             *)

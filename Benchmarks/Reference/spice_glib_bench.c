@@ -7,6 +7,8 @@
 #include <string.h>
 #include <time.h>
 
+#define ACTIVITY_BUCKET_COUNT 10u
+
 typedef struct {
     GMainLoop *loop;
     GArray *interframe_ms;
@@ -14,6 +16,9 @@ typedef struct {
     gint64 observe_start_us;
     gint64 previous_frame_us;
     gint64 first_frame_us;
+    gint64 last_frame_us;
+    gint64 observe_end_us;
+    guint16 active_bucket_mask;
     guint duration_seconds;
     guint frames;
     guint invalidations;
@@ -72,6 +77,7 @@ static IOSurfaceRef create_published_surface(gint width, gint height)
 static gboolean stop_observation(gpointer opaque)
 {
     BenchState *state = opaque;
+    state->observe_end_us = g_get_monotonic_time();
     state->observe_cpu_seconds =
         process_cpu_seconds() - state->observe_cpu_start_seconds;
     g_main_loop_quit(state->loop);
@@ -146,6 +152,14 @@ static gboolean publish_tick(gpointer opaque)
         g_array_append_val(state->interframe_ms, interval);
     }
     state->previous_frame_us = now;
+    state->last_frame_us = now;
+    const gint64 elapsed_us = now - state->observe_start_us;
+    const gint64 duration_us = (gint64)state->duration_seconds * G_USEC_PER_SEC;
+    guint bucket = (guint)(elapsed_us * ACTIVITY_BUCKET_COUNT / duration_us);
+    if (bucket >= ACTIVITY_BUCKET_COUNT) {
+        bucket = ACTIVITY_BUCKET_COUNT - 1;
+    }
+    state->active_bucket_mask |= (guint16)(1u << bucket);
     return G_SOURCE_CONTINUE;
 }
 
@@ -342,6 +356,14 @@ int main(int argc, char **argv)
         ? -1.0
         : (double)(state.first_frame_us - state.connect_start_us) / 1000.0;
     const double p95_interframe_ms = percentile95(state.interframe_ms);
+    const double active_span_ms = state.first_frame_us == 0
+        ? -1.0
+        : (double)(state.last_frame_us - state.first_frame_us) / 1000.0;
+    const double last_frame_age_ms = state.last_frame_us == 0
+        ? -1.0
+        : (double)(state.observe_end_us - state.last_frame_us) / 1000.0;
+    const guint active_time_buckets = (guint)__builtin_popcount(
+        state.active_bucket_mask);
     const double fps = (double)state.frames / (double)state.duration_seconds;
 
     if (!state.failed && state.frames > 0) {
@@ -350,6 +372,8 @@ int main(int argc, char **argv)
             "\"observe_seconds\":%u,\"frames\":%u,\"fps\":%.6f,"
             "\"first_frame_ms\":%.3f,\"ready_frame_ms\":%.3f,"
             "\"p95_interframe_ms\":%.3f,"
+            "\"active_span_ms\":%.3f,\"last_frame_age_ms\":%.3f,"
+            "\"active_time_buckets\":%u,\"expected_time_buckets\":%u,"
             "\"invalidations\":%u,\"frame_bytes\":%" G_GUINT64_FORMAT ","
             "\"frame_copy_ms\":%.3f,\"observe_cpu_seconds\":%.6f,"
             "\"frame_copy_checksum\":%u}\n",
@@ -360,6 +384,10 @@ int main(int argc, char **argv)
             first_frame_ms,
             ready_frame_ms,
             p95_interframe_ms,
+            active_span_ms,
+            last_frame_age_ms,
+            active_time_buckets,
+            ACTIVITY_BUCKET_COUNT,
             state.invalidations,
             state.frame_bytes,
             (double)state.frame_copy_us / 1000.0,

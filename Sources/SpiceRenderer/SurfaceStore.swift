@@ -95,15 +95,42 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let poolExhaustions: UInt64
     package let inFlightLeases: Int
     package let revisionedBackingEnabled: Bool
+    package let metal2DRendererEnabled: Bool
     package let revisionedAllocatedFrames: Int
     package let revisionedAllocatedBytes: Int
     package let gpuCopyBytes: UInt64
+    package let revisionGPUCopyBytes: UInt64
+    package let metal2DBatchSeedGPUCopyBytes: UInt64
+    package let metal2DBatchSeedCPUCopyBytes: UInt64
+    package let snapshotCatchUpCPUCopyBytes: UInt64
     package let gpuErrors: UInt64
     package let compositorErrors: UInt64
     package let recommendedMaximumWorkingSetSize: UInt64
     package let currentMetalAllocatedSize: UInt64
     package let nativeVideoFrames: UInt64
     package let nativeVideoFallbacks: UInt64
+    package let metal2DCommandBuffers: UInt64
+    package let metal2DCommands: UInt64
+    package let metal2DUploadedBytes: UInt64
+    package let metal2DBlitBytes: UInt64
+    package let metal2DGPUTimeNanoseconds: UInt64
+    package let metal2DFillCommands: UInt64
+    package let metal2DBitmapCopyCommands: UInt64
+    package let metal2DCopyBitsCommands: UInt64
+    package let metal2DSurfaceCopyCommands: UInt64
+    package let metal2DCPUFallbackOperations: UInt64
+    package let metal2DUploadBufferAllocations: UInt64
+    package let metal2DUploadBufferReuses: UInt64
+    package let cpuFillOperations: UInt64
+    package let cpuFillNanoseconds: UInt64
+    package let cpuCopyBitsOperations: UInt64
+    package let cpuCopyBitsNanoseconds: UInt64
+    package let cpuBitmapCopyOperations: UInt64
+    package let cpuBitmapCopyNanoseconds: UInt64
+    package let cpuSurfaceCopyOperations: UInt64
+    package let cpuSurfaceCopyNanoseconds: UInt64
+    package let cpuScaledCopyOperations: UInt64
+    package let cpuScaledCopyNanoseconds: UInt64
 }
 
 package final class FramePixelStorage: @unchecked Sendable {
@@ -305,6 +332,33 @@ extension SurfaceVideoCompositionError: CustomStringConvertible {
 }
 
 package actor SurfaceStore {
+    private enum PendingMetalCommand: Sendable {
+        case fill(rectangle: PixelRect, colorARGB: UInt32)
+        case bitmapCopy(
+            destination: PixelRect,
+            bitmap: RawBitmap,
+            source: PixelRect
+        )
+        case copyBits(destination: PixelRect, sourceX: Int, sourceY: Int)
+        case surfaceCopy(
+            destination: PixelRect,
+            sourceFrame: IOSurfaceFrame,
+            source: PixelRect,
+            preservesAlpha: Bool
+        )
+    }
+
+    private struct PendingMetalBatch: @unchecked Sendable {
+        let lifecycleGeneration: UInt64
+        let baseRevision: UInt64
+        var targetRevision: UInt64
+        let baseCanonical: RevisionedIOSurfaceRevision?
+        let writable: RevisionedIOSurfaceWritableFrame
+        let batch: SpiceMetal2DBatch
+        var commands: [PendingMetalCommand]
+        var damage: SurfaceDamageJournal
+    }
+
     private struct Surface: Sendable {
         let id: UInt32
         let width: Int
@@ -327,17 +381,31 @@ package actor SurfaceStore {
         }
     }
 
+    private enum CPUOperationKind {
+        case fill
+        case copyBits
+        case bitmapCopy
+        case surfaceCopy
+        case scaledCopy
+    }
+
     private let limits: RenderLimits
     private let framePool: IOSurfaceFramePool
     private let memoryBudget: SurfaceMemoryBudget
     private let revisionedFramePool: RevisionedIOSurfacePool?
     private let revisionedNamespace = RevisionedIOSurfaceNamespace()
     private let metalCompositor: SpiceMetalCompositor?
+    private let metal2DRenderer: SpiceMetal2DRenderer?
+    private let metal2DRendererRequested: Bool
     private let metalCompositorInitializationError: SpiceMetalCompositorError?
     private let compositorFailureForAttempt: @Sendable (Int) -> SpiceMetalCompositorError?
     private var compositorAttempt = 0
+    private let metal2DBatchFailureForAttempt:
+        @Sendable (Int) -> SpiceMetalCompositorError?
+    private var metal2DBatchAttempt = 0
     private let materializationMetrics = FrameMaterializationMetrics()
     private var surfaces: [UInt32: Surface] = [:]
+    private var pendingMetalBatches: [UInt32: PendingMetalBatch] = [:]
     /// One shared lazy readback cache for the current IOSurface revision. Every
     /// snapshot of that revision reuses the same cache and lease; the cache is
     /// dropped when the revision stops being canonical.
@@ -356,7 +424,23 @@ package actor SurfaceStore {
     private var nativeVideoFallbacks: UInt64 = 0
     private var compositorErrors: UInt64 = 0
     private var gpuCopyBytes: UInt64 = 0
+    private var revisionGPUCopyBytes: UInt64 = 0
+    private var metal2DBatchSeedGPUCopyBytes: UInt64 = 0
+    private var metal2DBatchSeedCPUCopyBytes: UInt64 = 0
+    private var snapshotCatchUpCPUCopyBytes: UInt64 = 0
     private var revisionedGPUErrors: UInt64 = 0
+    private var metal2DCPUFallbackOperations: UInt64 = 0
+    private let diagnosticsClock = ContinuousClock()
+    private var cpuFillOperations: UInt64 = 0
+    private var cpuFillNanoseconds: UInt64 = 0
+    private var cpuCopyBitsOperations: UInt64 = 0
+    private var cpuCopyBitsNanoseconds: UInt64 = 0
+    private var cpuBitmapCopyOperations: UInt64 = 0
+    private var cpuBitmapCopyNanoseconds: UInt64 = 0
+    private var cpuSurfaceCopyOperations: UInt64 = 0
+    private var cpuSurfaceCopyNanoseconds: UInt64 = 0
+    private var cpuScaledCopyOperations: UInt64 = 0
+    private var cpuScaledCopyNanoseconds: UInt64 = 0
     private var activeSurfaceOperations: Set<UInt32> = []
     private var surfaceOperationWaiters: [UInt32: [CheckedContinuation<Void, Never>]] = [:]
     private var rejectsNewOperations = false
@@ -368,9 +452,12 @@ package actor SurfaceStore {
         framePool: IOSurfaceFramePool = .shared,
         memoryBudget: SurfaceMemoryBudget? = nil,
         backingPolicy: SurfaceBackingPolicy = .automatic,
+        enableMetal2DRenderer: Bool = false,
         compositorFailureForAttempt: @escaping @Sendable (Int) -> SpiceMetalCompositorError? = {
             _ in nil
-        }
+        },
+        metal2DBatchFailureForAttempt:
+            @escaping @Sendable (Int) -> SpiceMetalCompositorError? = { _ in nil }
     ) {
         self.limits = limits
         self.framePool = framePool
@@ -378,6 +465,8 @@ package actor SurfaceStore {
             maximumBytes: limits.maximumTotalSurfaceBytes
         )
         self.compositorFailureForAttempt = compositorFailureForAttempt
+        self.metal2DBatchFailureForAttempt = metal2DBatchFailureForAttempt
+        metal2DRendererRequested = enableMetal2DRenderer
         let selectedRevisionedPool: RevisionedIOSurfacePool?
         switch backingPolicy {
         case .automatic:
@@ -396,9 +485,13 @@ package actor SurfaceStore {
                 metalCompositor = nil
                 metalCompositorInitializationError = error
             }
+            metal2DRenderer = enableMetal2DRenderer
+                ? try? SpiceMetal2DRenderer()
+                : nil
         } else {
             metalCompositor = nil
             metalCompositorInitializationError = nil
+            metal2DRenderer = nil
         }
     }
 
@@ -457,6 +550,7 @@ package actor SurfaceStore {
         guard let surface = surfaces[id] else {
             throw .unknownSurface(id)
         }
+        cancelPendingMetalBatch(surfaceID: id)
         let lifecycleGeneration = try nextLifecycleGeneration(for: id)
         surfaces.removeValue(forKey: id)
         currentFramePixelStorage[id] = nil
@@ -477,6 +571,7 @@ package actor SurfaceStore {
             return
         }
         rejectsNewOperations = true
+        cancelAllPendingMetalBatches()
         let surfaceIDs = surfaces.keys.sorted()
         for surfaceID in surfaceIDs {
             await acquireSurfaceOperationUnconditionally(surfaceID: surfaceID)
@@ -509,6 +604,14 @@ package actor SurfaceStore {
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
         try validate(rectangle, in: surface)
+        if metal2DRenderer != nil, let revision = try await enqueueMetalFill(
+            surface: &surface,
+            rectangle: rectangle,
+            colorARGB: colorARGB
+        ) {
+            return revision
+        }
+        recordMetal2DCPUFallback()
         let blue = UInt8(truncatingIfNeeded: colorARGB)
         let green = UInt8(truncatingIfNeeded: colorARGB >> 8)
         let red = UInt8(truncatingIfNeeded: colorARGB >> 16)
@@ -519,6 +622,7 @@ package actor SurfaceStore {
             | UInt32(green) << 8
             | UInt32(red) << 16
             | UInt32(alpha) << 24
+        let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
@@ -539,6 +643,10 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(rectangle)
+        recordCPUOperation(
+            startedAt: cpuStart,
+            kind: .fill
+        )
         return surfaceRevision(of: surface)
     }
 
@@ -551,6 +659,24 @@ package actor SurfaceStore {
     ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+        var surface = try surface(id: surfaceID)
+        try validate(destination, in: surface)
+        let source = PixelRect(
+            x: sourceX,
+            y: sourceY,
+            width: destination.width,
+            height: destination.height
+        )
+        try validate(source, in: surface)
+        if metal2DRenderer != nil, let revision = try await enqueueMetalCopyBits(
+            surface: &surface,
+            destination: destination,
+            sourceX: sourceX,
+            sourceY: sourceY
+        ) {
+            return revision
+        }
+        recordMetal2DCPUFallback()
         return try copyBitsUnlocked(
             surfaceID: surfaceID,
             destination: destination,
@@ -574,6 +700,7 @@ package actor SurfaceStore {
             height: destination.height
         )
         try validate(source, in: surface)
+        let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
 
@@ -596,6 +723,10 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(destination)
+        recordCPUOperation(
+            startedAt: cpuStart,
+            kind: .copyBits
+        )
         return surfaceRevision(of: surface)
     }
 
@@ -640,6 +771,17 @@ package actor SurfaceStore {
             throw .invalidBitmap
         }
 
+        if metal2DRenderer != nil, let revision = try await enqueueMetalBitmapCopy(
+            surface: &surface,
+            destination: destination,
+            bitmap: bitmap,
+            source: source
+        ) {
+            return revision
+        }
+        recordMetal2DCPUFallback()
+
+        let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         let destinationBytesPerRow = surface.bytesPerRow
@@ -692,6 +834,10 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
         recordDamage(destination)
+        recordCPUOperation(
+            startedAt: cpuStart,
+            kind: .bitmapCopy
+        )
         return surfaceRevision(of: surface)
     }
 
@@ -703,14 +849,12 @@ package actor SurfaceStore {
         source sourceRectangle: PixelRect
     ) async throws(RenderError) -> SurfaceRevision {
         if sourceSurfaceID == surfaceID {
-            try await acquireSurfaceOperation(surfaceID: surfaceID)
-            defer { releaseSurfaceOperation(surfaceID: surfaceID) }
             guard destination.width == sourceRectangle.width,
                   destination.height == sourceRectangle.height
             else {
                 throw .invalidRectangle
             }
-            return try copyBitsUnlocked(
+            return try await copyBits(
                 surfaceID: surfaceID,
                 destination: destination,
                 sourceX: sourceRectangle.x,
@@ -735,6 +879,18 @@ package actor SurfaceStore {
                 releaseSurfaceOperation(surfaceID: operationSurfaceID)
             }
         }
+        if pendingMetalBatches[sourceSurfaceID] != nil {
+            try await flushMetalBatch(
+                surfaceID: sourceSurfaceID,
+                surfaceOperationAlreadyAcquired: true
+            )
+        }
+        if pendingMetalBatches[surfaceID] != nil {
+            try await flushMetalBatch(
+                surfaceID: surfaceID,
+                surfaceOperationAlreadyAcquired: true
+            )
+        }
         var destinationSurface = try surface(id: surfaceID)
         var sourceSurface = try surface(id: sourceSurfaceID)
         try validate(destination, in: destinationSurface)
@@ -744,6 +900,25 @@ package actor SurfaceStore {
         else {
             throw .invalidRectangle
         }
+        if metal2DRenderer != nil,
+           let sourceBacking = sourceSurface.storage.unifiedBacking,
+           sourceBacking.damageJournal.isEmpty,
+           let sourceRevision = sourceBacking.current,
+           sourceRevision.revision == sourceSurface.revision,
+           let sourceFrame = sourceRevision.makeLease(),
+           let revision = try await enqueueMetalSurfaceCopy(
+               surface: &destinationSurface,
+               destination: destination,
+               sourceFrame: sourceFrame,
+               source: sourceRectangle,
+               preservesAlpha: destinationSurface.format == .argb8888
+                   && sourceSurface.format == .argb8888
+           )
+        {
+            return revision
+        }
+        recordMetal2DCPUFallback()
+        let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(destinationSurface.revision)
         try prepareForCrossSurfaceCopy(
             destination: &destinationSurface,
@@ -773,6 +948,10 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = destinationSurface
         recordDamage(destination)
+        recordCPUOperation(
+            startedAt: cpuStart,
+            kind: .surfaceCopy
+        )
         return surfaceRevision(of: destinationSurface)
     }
 
@@ -786,6 +965,12 @@ package actor SurfaceStore {
     ) async throws(RenderError) -> SurfaceRevision? {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+        if pendingMetalBatches[surfaceID] != nil {
+            try await flushMetalBatch(
+                surfaceID: surfaceID,
+                surfaceOperationAlreadyAcquired: true
+            )
+        }
         var surface = try surface(id: surfaceID)
         try validate(destination, in: surface)
         guard source.x >= 0, source.y >= 0,
@@ -831,6 +1016,7 @@ package actor SurfaceStore {
             return nil
         }
 
+        let cpuStart = diagnosticsClock.now
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
@@ -875,6 +1061,10 @@ package actor SurfaceStore {
         }
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
+        recordCPUOperation(
+            startedAt: cpuStart,
+            kind: .scaledCopy
+        )
         return surfaceRevision(of: surface)
     }
 
@@ -899,6 +1089,14 @@ package actor SurfaceStore {
             throw .render(error)
         }
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+        do {
+            try await flushMetalBatch(
+                surfaceID: surfaceID,
+                surfaceOperationAlreadyAcquired: true
+            )
+        } catch {
+            throw .render(error)
+        }
         guard let surface = surfaces[surfaceID] else {
             throw .staleSurface
         }
@@ -977,6 +1175,7 @@ package actor SurfaceStore {
             }
             if synchronizesRevision {
                 gpuCopyBytes &+= UInt64(surface.width * surface.height * 4)
+                revisionGPUCopyBytes &+= UInt64(surface.width * surface.height * 4)
             }
             guard isCurrent(requested) else {
                 throw .staleSurface
@@ -1082,6 +1281,9 @@ package actor SurfaceStore {
         guard !rejectsNewOperations else {
             throw .storeClosed
         }
+        if pendingMetalBatches[surfaceID] != nil {
+            try await flushMetalBatch(surfaceID: surfaceID)
+        }
         while true {
             let surface = try surface(id: surfaceID)
             if let snapshot = await makeSnapshot(
@@ -1098,6 +1300,9 @@ package actor SurfaceStore {
     /// display publication uses `snapshot(atLeast:)` so a newer immutable frame
     /// can safely satisfy an older request.
     package func snapshot(matching requested: SurfaceRevision) async -> FrameSnapshot? {
+        if pendingMetalBatches[requested.surfaceID] != nil {
+            try? await flushMetalBatch(surfaceID: requested.surfaceID)
+        }
         guard !rejectsNewOperations,
               let surface = surfaces[requested.surfaceID],
               surface.lifecycleGeneration == requested.lifecycleGeneration,
@@ -1113,6 +1318,9 @@ package actor SurfaceStore {
     /// held while selecting and constructing the candidate, so concurrent
     /// draws cannot make the snapshot chase a moving exact revision.
     package func snapshot(atLeast requested: SurfaceRevision) async -> FrameSnapshot? {
+        if pendingMetalBatches[requested.surfaceID] != nil {
+            try? await flushMetalBatch(surfaceID: requested.surfaceID)
+        }
         guard !rejectsNewOperations,
               let eligible = surfaces[requested.surfaceID],
               eligible.lifecycleGeneration == requested.lifecycleGeneration,
@@ -1159,6 +1367,7 @@ package actor SurfaceStore {
         let materializations = materializationMetrics.snapshot()
         let poolMetrics = framePool.metrics()
         let revisionedMetrics = revisionedFramePool?.metrics()
+        let metal2DMetrics = metal2DRenderer?.metrics()
         return SurfaceStoreMetrics(
             damageOperations: damageOperations,
             damageBytes: damageBytes,
@@ -1171,16 +1380,547 @@ package actor SurfaceStore {
             inFlightLeases: poolMetrics.inUseFrames
                 + (revisionedMetrics?.inFlightLeases ?? 0),
             revisionedBackingEnabled: revisionedFramePool != nil,
+            metal2DRendererEnabled: metal2DRenderer != nil,
             revisionedAllocatedFrames: revisionedMetrics?.allocatedFrames ?? 0,
             revisionedAllocatedBytes: revisionedMetrics?.allocatedBytes ?? 0,
             gpuCopyBytes: gpuCopyBytes,
+            revisionGPUCopyBytes: revisionGPUCopyBytes,
+            metal2DBatchSeedGPUCopyBytes: metal2DBatchSeedGPUCopyBytes,
+            metal2DBatchSeedCPUCopyBytes: metal2DBatchSeedCPUCopyBytes,
+            snapshotCatchUpCPUCopyBytes: snapshotCatchUpCPUCopyBytes,
             gpuErrors: revisionedGPUErrors &+ compositorErrors,
             compositorErrors: compositorErrors,
             recommendedMaximumWorkingSetSize:
                 revisionedMetrics?.recommendedMaximumWorkingSetSize ?? 0,
             currentMetalAllocatedSize: revisionedMetrics?.currentMetalAllocatedSize ?? 0,
             nativeVideoFrames: nativeVideoFrames,
-            nativeVideoFallbacks: nativeVideoFallbacks
+            nativeVideoFallbacks: nativeVideoFallbacks,
+            metal2DCommandBuffers: metal2DMetrics?.commandBuffers ?? 0,
+            metal2DCommands: metal2DMetrics?.commands ?? 0,
+            metal2DUploadedBytes: metal2DMetrics?.uploadedBytes ?? 0,
+            metal2DBlitBytes: metal2DMetrics?.blitBytes ?? 0,
+            metal2DGPUTimeNanoseconds: metal2DMetrics?.gpuNanoseconds ?? 0,
+            metal2DFillCommands: metal2DMetrics?.fillCommands ?? 0,
+            metal2DBitmapCopyCommands: metal2DMetrics?.bitmapCopyCommands ?? 0,
+            metal2DCopyBitsCommands: metal2DMetrics?.copyBitsCommands ?? 0,
+            metal2DSurfaceCopyCommands: metal2DMetrics?.surfaceCopyCommands ?? 0,
+            metal2DCPUFallbackOperations: metal2DCPUFallbackOperations,
+            metal2DUploadBufferAllocations:
+                metal2DMetrics?.uploadBufferAllocations ?? 0,
+            metal2DUploadBufferReuses: metal2DMetrics?.uploadBufferReuses ?? 0,
+            cpuFillOperations: cpuFillOperations,
+            cpuFillNanoseconds: cpuFillNanoseconds,
+            cpuCopyBitsOperations: cpuCopyBitsOperations,
+            cpuCopyBitsNanoseconds: cpuCopyBitsNanoseconds,
+            cpuBitmapCopyOperations: cpuBitmapCopyOperations,
+            cpuBitmapCopyNanoseconds: cpuBitmapCopyNanoseconds,
+            cpuSurfaceCopyOperations: cpuSurfaceCopyOperations,
+            cpuSurfaceCopyNanoseconds: cpuSurfaceCopyNanoseconds,
+            cpuScaledCopyOperations: cpuScaledCopyOperations,
+            cpuScaledCopyNanoseconds: cpuScaledCopyNanoseconds
+        )
+    }
+
+    private func enqueueMetalFill(
+        surface: inout Surface,
+        rectangle: PixelRect,
+        colorARGB: UInt32
+    ) async throws(RenderError) -> SurfaceRevision? {
+        let blue = Float(UInt8(truncatingIfNeeded: colorARGB)) / 255
+        let green = Float(UInt8(truncatingIfNeeded: colorARGB >> 8)) / 255
+        let red = Float(UInt8(truncatingIfNeeded: colorARGB >> 16)) / 255
+        let alpha = surface.format == .argb8888
+            ? Float(UInt8(truncatingIfNeeded: colorARGB >> 24)) / 255
+            : 1
+        let command = PendingMetalCommand.fill(
+            rectangle: rectangle,
+            colorARGB: colorARGB
+        )
+        return try await enqueueMetalCommand(
+            surface: &surface,
+            command: command,
+            damage: rectangle,
+            uploadBytes: 0
+        ) { batch in
+            try batch.encodeFill(
+                rectangle: metalRectangle(rectangle),
+                colorRGBA: SIMD4(red, green, blue, alpha)
+            )
+        }
+    }
+
+    private func enqueueMetalBitmapCopy(
+        surface: inout Surface,
+        destination: PixelRect,
+        bitmap: RawBitmap,
+        source: PixelRect
+    ) async throws(RenderError) -> SurfaceRevision? {
+        let command = PendingMetalCommand.bitmapCopy(
+            destination: destination,
+            bitmap: bitmap,
+            source: source
+        )
+        let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
+        return try await enqueueMetalCommand(
+            surface: &surface,
+            command: command,
+            damage: destination,
+            uploadBytes: bitmap.pixels.count
+        ) { batch in
+            try batch.encodeBitmapCopy(
+                pixels: bitmap.pixels,
+                bitmapWidth: bitmap.width,
+                bitmapHeight: bitmap.height,
+                sourceStride: bitmap.stride,
+                topDown: bitmap.topDown,
+                source: metalRectangle(source),
+                destination: metalRectangle(destination),
+                preservesAlpha: preservesAlpha
+            )
+        }
+    }
+
+    private func enqueueMetalCopyBits(
+        surface: inout Surface,
+        destination: PixelRect,
+        sourceX: Int,
+        sourceY: Int
+    ) async throws(RenderError) -> SurfaceRevision? {
+        let source = PixelRect(
+            x: sourceX,
+            y: sourceY,
+            width: destination.width,
+            height: destination.height
+        )
+        let command = PendingMetalCommand.copyBits(
+            destination: destination,
+            sourceX: sourceX,
+            sourceY: sourceY
+        )
+        return try await enqueueMetalCommand(
+            surface: &surface,
+            command: command,
+            damage: destination,
+            uploadBytes: 0
+        ) { batch in
+            try batch.encodeCopyBits(
+                source: metalRectangle(source),
+                destination: metalRectangle(destination)
+            )
+        }
+    }
+
+    private func enqueueMetalSurfaceCopy(
+        surface: inout Surface,
+        destination: PixelRect,
+        sourceFrame: IOSurfaceFrame,
+        source: PixelRect,
+        preservesAlpha: Bool
+    ) async throws(RenderError) -> SurfaceRevision? {
+        let command = PendingMetalCommand.surfaceCopy(
+            destination: destination,
+            sourceFrame: sourceFrame,
+            source: source,
+            preservesAlpha: preservesAlpha
+        )
+        return try await enqueueMetalCommand(
+            surface: &surface,
+            command: command,
+            damage: destination,
+            uploadBytes: 0
+        ) { batch in
+            try batch.encodeSurfaceCopy(
+                sourceFrame: sourceFrame,
+                source: metalRectangle(source),
+                destination: metalRectangle(destination),
+                preservesAlpha: preservesAlpha
+            )
+        }
+    }
+
+    private func enqueueMetalCommand(
+        surface: inout Surface,
+        command: PendingMetalCommand,
+        damage: PixelRect,
+        uploadBytes: Int,
+        encode: (SpiceMetal2DBatch) throws -> Void
+    ) async throws(RenderError) -> SurfaceRevision? {
+        guard metal2DRenderer != nil,
+              surface.storage.unifiedBacking != nil
+        else {
+            return nil
+        }
+        guard var pending = try await pendingMetalBatch(for: &surface) else {
+            return nil
+        }
+        let nextRevision = try advancedRevision(pending.targetRevision)
+        pending.targetRevision = nextRevision
+        pending.commands.append(command)
+        pending.damage.append(damage)
+        surface.revision = nextRevision
+        do {
+            try encode(pending.batch)
+        } catch {
+            pendingMetalBatches[surface.id] = nil
+            pending.batch.cancel()
+            try replayMetalBatch(pending, onto: &surface)
+            surfaces[surface.id] = surface
+            revisionedGPUErrors &+= 1
+            recordDamage(damage)
+            return surfaceRevision(of: surface)
+        }
+
+        pendingMetalBatches[surface.id] = pending
+        currentFramePixelStorage[surface.id] = nil
+        surfaces[surface.id] = surface
+        recordDamage(damage)
+        if pending.batch.commandCount >= 512
+            || pending.batch.uploadedBytes >= 16 * 1_024 * 1_024
+            || uploadBytes > 16 * 1_024 * 1_024
+        {
+            try await flushMetalBatch(
+                surfaceID: surface.id,
+                surfaceOperationAlreadyAcquired: true
+            )
+            surface = try self.surface(id: surface.id)
+        }
+        return surfaceRevision(of: surface)
+    }
+
+    private func pendingMetalBatch(
+        for surface: inout Surface
+    ) async throws(RenderError) -> PendingMetalBatch? {
+        if let pending = pendingMetalBatches[surface.id] {
+            return pending
+        }
+        guard let renderer = metal2DRenderer,
+              var unified = surface.storage.unifiedBacking
+        else {
+            return nil
+        }
+        guard let writable = unified.pool.checkoutWritable(
+            namespace: unified.namespace,
+            surfaceID: surface.id,
+            width: surface.width,
+            height: surface.height,
+            source: unified.current
+        ) else {
+            poolExhaustions &+= 1
+            return nil
+        }
+
+        if unified.current != nil {
+            guard await writable.synchronizeFromSource() else {
+                revisionedGPUErrors &+= 1
+                return nil
+            }
+            gpuCopyBytes &+= UInt64(surface.width * surface.height * 4)
+            revisionGPUCopyBytes &+= UInt64(surface.width * surface.height * 4)
+            metal2DBatchSeedGPUCopyBytes &+= UInt64(surface.width * surface.height * 4)
+        }
+        if unified.current == nil || !unified.damageJournal.isEmpty {
+            let rectangles = unified.current == nil
+                ? [IOSurfaceCopyRectangle(
+                    x: 0,
+                    y: 0,
+                    width: surface.width,
+                    height: surface.height
+                )]
+                : unified.damageJournal.copyRectangles.map {
+                    IOSurfaceCopyRectangle(
+                        x: $0.x,
+                        y: $0.y,
+                        width: $0.width,
+                        height: $0.height
+                    )
+                }
+            guard let copiedBytes = writable.copyPackedPixels(
+                surface.pixels,
+                sourceBytesPerRow: surface.bytesPerRow,
+                rectangles: rectangles
+            ) else {
+                return nil
+            }
+            if unified.current == nil || unified.damageJournal.isFullFrame {
+                fullFrameCopyBytes &+= copiedBytes
+            } else {
+                partialFrameCopyBytes &+= copiedBytes
+            }
+            metal2DBatchSeedCPUCopyBytes &+= copiedBytes
+        }
+        let batch: SpiceMetal2DBatch
+        do {
+            batch = try writable.withIOSurface { destination in
+                try renderer.makeBatch(destination: destination)
+            }
+        } catch {
+            revisionedGPUErrors &+= 1
+            return nil
+        }
+        let baseRevision = surface.revision
+        let damage = SurfaceDamageJournal(width: surface.width, height: surface.height)
+        unified.damageJournal.clear()
+        surface.storage.unifiedBacking = unified
+        return PendingMetalBatch(
+            lifecycleGeneration: surface.lifecycleGeneration,
+            baseRevision: baseRevision,
+            targetRevision: baseRevision,
+            baseCanonical: unified.current,
+            writable: writable,
+            batch: batch,
+            commands: [],
+            damage: damage
+        )
+    }
+
+    private func flushMetalBatch(
+        surfaceID: UInt32,
+        surfaceOperationAlreadyAcquired: Bool = false
+    ) async throws(RenderError) {
+        guard pendingMetalBatches[surfaceID] != nil else { return }
+        var acquired = false
+        if !surfaceOperationAlreadyAcquired {
+            try await acquireSurfaceOperation(surfaceID: surfaceID)
+            acquired = true
+        }
+        defer {
+            if acquired {
+                releaseSurfaceOperation(surfaceID: surfaceID)
+            }
+        }
+        guard let pending = pendingMetalBatches.removeValue(forKey: surfaceID) else {
+            return
+        }
+        guard var surface = surfaces[surfaceID],
+              surface.lifecycleGeneration == pending.lifecycleGeneration,
+              surface.revision == pending.targetRevision
+        else {
+            pending.batch.cancel()
+            return
+        }
+        do {
+            metal2DBatchAttempt &+= 1
+            if let injected = metal2DBatchFailureForAttempt(metal2DBatchAttempt) {
+                throw injected
+            }
+            try await pending.batch.commit()
+            guard let committed = pending.writable.finish(revision: pending.targetRevision),
+                  var unified = surface.storage.unifiedBacking
+            else {
+                throw RenderError.backingMaterializationFailed
+            }
+            unified.current = committed
+            unified.damageJournal.clear()
+            unified.damageHistory.reset(at: pending.targetRevision)
+            surface.storage.unifiedBacking = unified
+            currentFramePixelStorage[surfaceID] = nil
+            surfaces[surfaceID] = surface
+        } catch {
+            pending.batch.cancel()
+            try replayMetalBatch(pending, onto: &surface)
+            currentFramePixelStorage[surfaceID] = nil
+            surfaces[surfaceID] = surface
+            revisionedGPUErrors &+= 1
+        }
+    }
+
+    private func cancelPendingMetalBatch(surfaceID: UInt32) {
+        pendingMetalBatches.removeValue(forKey: surfaceID)?.batch.cancel()
+    }
+
+    private func cancelAllPendingMetalBatches() {
+        let pending = pendingMetalBatches.values
+        pendingMetalBatches.removeAll(keepingCapacity: false)
+        for transaction in pending {
+            transaction.batch.cancel()
+        }
+    }
+
+    private func replayMetalBatch(
+        _ pending: PendingMetalBatch,
+        onto surface: inout Surface
+    ) throws(RenderError) {
+        recordMetal2DCPUFallback(count: pending.commands.count)
+        let basePixels: Data
+        if let baseCanonical = pending.baseCanonical {
+            guard let pixels = baseCanonical.copyPixels(),
+                  pixels.count == surface.bytesPerRow * surface.height
+            else {
+                throw .backingMaterializationFailed
+            }
+            basePixels = pixels
+            materializationMetrics.record(bytes: pixels.count)
+        } else {
+            guard surface.storage.dataRevision == pending.baseRevision else {
+                throw .backingMaterializationFailed
+            }
+            basePixels = surface.pixels
+        }
+        surface.storage.pixels = basePixels
+        for command in pending.commands {
+            switch command {
+            case let .fill(rectangle, colorARGB):
+                applyCPUFill(to: &surface, rectangle: rectangle, colorARGB: colorARGB)
+            case let .bitmapCopy(destination, bitmap, source):
+                applyCPUBitmapCopy(
+                    to: &surface,
+                    destination: destination,
+                    bitmap: bitmap,
+                    source: source
+                )
+            case let .copyBits(destination, sourceX, sourceY):
+                applyCPUCopyBits(
+                    to: &surface,
+                    destination: destination,
+                    sourceX: sourceX,
+                    sourceY: sourceY
+                )
+            case let .surfaceCopy(destination, sourceFrame, source, preservesAlpha):
+                guard let sourcePixels = sourceFrame.copyPixels() else {
+                    throw RenderError.backingMaterializationFailed
+                }
+                applyCPUSurfaceCopy(
+                    to: &surface,
+                    destination: destination,
+                    sourcePixels: sourcePixels,
+                    sourceBytesPerRow: sourceFrame.width * 4,
+                    source: source,
+                    preservesAlpha: preservesAlpha
+                )
+            }
+        }
+        surface.revision = pending.targetRevision
+        surface.storage.dataRevision = pending.targetRevision
+        surface.storage.unifiedBacking?.damageJournal.markFull()
+    }
+
+    private func applyCPUFill(
+        to surface: inout Surface,
+        rectangle: PixelRect,
+        colorARGB: UInt32
+    ) {
+        let blue = UInt8(truncatingIfNeeded: colorARGB)
+        let green = UInt8(truncatingIfNeeded: colorARGB >> 8)
+        let red = UInt8(truncatingIfNeeded: colorARGB >> 16)
+        let alpha = surface.format == .argb8888
+            ? UInt8(truncatingIfNeeded: colorARGB >> 24)
+            : 255
+        let colorBGRA = UInt32(blue)
+            | UInt32(green) << 8
+            | UInt32(red) << 16
+            | UInt32(alpha) << 24
+        let bytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            for y in rectangle.y..<(rectangle.y + rectangle.height) {
+                var pixel = baseAddress.advanced(by: y * bytesPerRow + rectangle.x * 4)
+                for _ in 0..<rectangle.width {
+                    pixel.storeBytes(of: colorBGRA, as: UInt32.self)
+                    pixel = pixel.advanced(by: 4)
+                }
+            }
+        }
+    }
+
+    private func applyCPUCopyBits(
+        to surface: inout Surface,
+        destination: PixelRect,
+        sourceX: Int,
+        sourceY: Int
+    ) {
+        let rowBytes = destination.width * 4
+        var copied = Data(capacity: rowBytes * destination.height)
+        for row in 0..<destination.height {
+            let start = (sourceY + row) * surface.bytesPerRow + sourceX * 4
+            copied.append(surface.pixels[start..<(start + rowBytes)])
+        }
+        for row in 0..<destination.height {
+            let sourceStart = row * rowBytes
+            let destinationStart = (destination.y + row) * surface.bytesPerRow
+                + destination.x * 4
+            surface.pixels.replaceSubrange(
+                destinationStart..<(destinationStart + rowBytes),
+                with: copied[sourceStart..<(sourceStart + rowBytes)]
+            )
+        }
+    }
+
+    private func applyCPUBitmapCopy(
+        to surface: inout Surface,
+        destination: PixelRect,
+        bitmap: RawBitmap,
+        source: PixelRect
+    ) {
+        let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
+        let bytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { destinationBytes in
+            bitmap.pixels.withUnsafeBytes { sourceBytes in
+                guard let destinationBase = destinationBytes.baseAddress,
+                      let sourceBase = sourceBytes.baseAddress
+                else { return }
+                for destinationRow in 0..<source.height {
+                    let logicalSourceRow = source.y + destinationRow
+                    let sourceRow = bitmap.topDown
+                        ? logicalSourceRow
+                        : bitmap.height - 1 - logicalSourceRow
+                    for column in 0..<source.width {
+                        let sourcePixel = sourceBase.advanced(
+                            by: sourceRow * bitmap.stride + (source.x + column) * 4
+                        )
+                        let destinationPixel = destinationBase.advanced(
+                            by: (destination.y + destinationRow) * bytesPerRow
+                                + (destination.x + column) * 4
+                        )
+                        let value = sourcePixel.loadUnaligned(as: UInt32.self)
+                        destinationPixel.storeBytes(
+                            of: preservesAlpha ? value : value | 0xff00_0000,
+                            as: UInt32.self
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyCPUSurfaceCopy(
+        to surface: inout Surface,
+        destination: PixelRect,
+        sourcePixels: Data,
+        sourceBytesPerRow: Int,
+        source: PixelRect,
+        preservesAlpha: Bool
+    ) {
+        let destinationBytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { destinationBytes in
+            sourcePixels.withUnsafeBytes { sourceBytes in
+                guard let destinationBase = destinationBytes.baseAddress,
+                      let sourceBase = sourceBytes.baseAddress
+                else { return }
+                for row in 0..<source.height {
+                    for column in 0..<source.width {
+                        let value = sourceBase.advanced(
+                            by: (source.y + row) * sourceBytesPerRow
+                                + (source.x + column) * 4
+                        ).loadUnaligned(as: UInt32.self)
+                        destinationBase.advanced(
+                            by: (destination.y + row) * destinationBytesPerRow
+                                + (destination.x + column) * 4
+                        ).storeBytes(
+                            of: preservesAlpha ? value : value | 0xff00_0000,
+                            as: UInt32.self
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func metalRectangle(_ rectangle: PixelRect) -> SpiceMetal2DRectangle {
+        SpiceMetal2DRectangle(
+            x: rectangle.x,
+            y: rectangle.y,
+            width: rectangle.width,
+            height: rectangle.height
         )
     }
 
@@ -1304,6 +2044,7 @@ package actor SurfaceStore {
         } else {
             partialFrameCopyBytes &+= copiedBytes
         }
+        snapshotCatchUpCPUCopyBytes &+= copiedBytes
         guard let snapshot = makeRevisionedSnapshot(
             from: liveSurface,
             revision: committed
@@ -1604,5 +2345,37 @@ package actor SurfaceStore {
         let bytes = UInt64(rectangle.width) * UInt64(rectangle.height) * 4
         damageOperations &+= 1
         damageBytes &+= bytes
+    }
+
+    private func recordMetal2DCPUFallback(count: Int = 1) {
+        guard metal2DRendererRequested, count > 0 else { return }
+        metal2DCPUFallbackOperations &+= UInt64(count)
+    }
+
+    private func recordCPUOperation(
+        startedAt: ContinuousClock.Instant,
+        kind: CPUOperationKind
+    ) {
+        let duration = startedAt.duration(to: diagnosticsClock.now).components
+        let seconds = UInt64(max(0, duration.seconds))
+        let nanoseconds = seconds &* 1_000_000_000
+            &+ UInt64(max(0, duration.attoseconds / 1_000_000_000))
+        switch kind {
+        case .fill:
+            cpuFillOperations &+= 1
+            cpuFillNanoseconds &+= nanoseconds
+        case .copyBits:
+            cpuCopyBitsOperations &+= 1
+            cpuCopyBitsNanoseconds &+= nanoseconds
+        case .bitmapCopy:
+            cpuBitmapCopyOperations &+= 1
+            cpuBitmapCopyNanoseconds &+= nanoseconds
+        case .surfaceCopy:
+            cpuSurfaceCopyOperations &+= 1
+            cpuSurfaceCopyNanoseconds &+= nanoseconds
+        case .scaledCopy:
+            cpuScaledCopyOperations &+= 1
+            cpuScaledCopyNanoseconds &+= nanoseconds
+        }
     }
 }

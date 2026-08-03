@@ -24,10 +24,24 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - Close audible Playback and physical microphone Record behavior.
 - Validate real Smartcard and redirected USB devices.
 - Exercise live semi-seamless and seamless migration.
-- Reduce the corrected five-second CPU-per-frame ratio from the current
-  1.203073 to at most 1.10 while preserving the passing fps, ready-frame, p95,
-  RSS, and zero-stale Publisher results. Only then run ten paired 30-second
-  bootstrap measurements.
+- Replace or repair the persistent downstream xterm/Xorg fixture path, add X11
+  Present/Damage evidence, and require 20/20 activity-valid full-duration
+  preflight samples at both 1280x720 and 3840x2160. Then rerun both the
+  ten-pair, 30-second `cpu` versus GLib reference and the direct
+  `cpu-iosurface` versus `metal` comparison under one epoch, reset, and order
+  schedule. The direct runner/analyzer are implemented and were exercised at
+  `bb3b176`, but both complete batches were rejected after late downstream
+  activity stalls even though guest generator telemetry continued.
+- Before production-enabling Metal 2D, eliminate the per-publication full-frame
+  seed and serial seed/draw completion waits, preserve partial damage history,
+  avoid scratch for non-overlapping COPY_BITS, deduplicate clipped bitmap
+  uploads, and bound resident upload/scratch pools.
+- Reduce direct Metal CPU per published frame to at most 1.10x
+  `cpu-iosurface` while preserving fps, ready-frame, p95, lifecycle, and
+  GPU-evidence gates. The activity-valid diagnostic prefixes measured 1.730965
+  at 720p and 1.754194 at 4K; 4K Metal must also reduce its 1.340859 RSS ratio
+  to at most 1.15. Retain the separate selected-renderer versus GLib reference
+  gate rather than combining its samples with the direct A/B.
 - Complete Developer ID signing, notarization, Gatekeeper acceptance, and launch
   on a clean Apple Silicon macOS 26 host.
 - Restore the custom KVM kernel and local QEMU image before rerunning the current

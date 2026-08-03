@@ -1,10 +1,11 @@
 #!/bin/sh
 
-exec xterm \
+exec setsid xterm \
     -fullscreen \
     -bg black \
     -fg white \
     -fa 'DejaVu Sans Mono' \
     -fs 12 \
     -title 'SwiftSpice deterministic animation' \
-    -e /usr/local/bin/animation-generator.sh
+    -e /bin/sh -c \
+        'echo "$$" > /run/perf-animation-generator.pid; exec /usr/local/bin/animation-generator.sh'

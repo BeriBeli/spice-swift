@@ -10,7 +10,7 @@ struct SpiceProbe {
             let configuration = try parseArguments()
             let password = ProcessInfo.processInfo.environment["SPICE_PASSWORD"] ?? ""
             let credentials = SpiceCredentials(password: password)
-            let session = SpiceSession()
+            let session = SpiceSession(renderingBackend: configuration.rendererBackend)
             var webDAVRoot: URL?
             var webDAVEventTask: Task<Void, Never>?
             defer {
@@ -88,6 +88,7 @@ struct SpiceProbe {
                     seconds: seconds,
                     exerciseInput: configuration.exerciseInput,
                     requireNativeVideo: configuration.requireNativeVideo,
+                    rendererBackend: configuration.rendererBackend,
                     benchmarkJSON: configuration.benchmarkJSON,
                     connectMilliseconds: connectMilliseconds
                 )
@@ -129,6 +130,7 @@ struct SpiceProbe {
         guard !(exercisesPlayback && exercisesSyntheticRecord) else {
             throw ProbeError.usage
         }
+        let rendererBackend = try rendererBackend(in: arguments)
         return Configuration(
             endpoint: SpiceEndpoint(
                 host: arguments[0],
@@ -149,6 +151,7 @@ struct SpiceProbe {
             exerciseWebDAV: arguments.contains("--exercise-webdav"),
             exercisePlayback: exercisesPlayback,
             exerciseSyntheticRecord: exercisesSyntheticRecord,
+            rendererBackend: rendererBackend,
             benchmarkJSON: arguments.contains("--benchmark-json")
         )
     }
@@ -477,15 +480,30 @@ struct SpiceProbe {
         return value
     }
 
+    private static func rendererBackend(
+        in arguments: [String]
+    ) throws -> SpiceRenderingBackend {
+        guard let index = arguments.firstIndex(of: "--renderer") else {
+            return .automatic
+        }
+        guard arguments.indices.contains(index + 1),
+              let backend = SpiceRenderingBackend(rawValue: arguments[index + 1])
+        else {
+            throw ProbeError.usage
+        }
+        return backend
+    }
+
     private static func observe(
         session: SpiceSession,
         seconds: UInt64,
         exerciseInput: Bool,
         requireNativeVideo: Bool,
+        rendererBackend: SpiceRenderingBackend,
         benchmarkJSON: Bool,
         connectMilliseconds: Double
     ) async throws {
-        let observations = ProbeObservations()
+        let observations = ProbeObservations(observeSeconds: seconds)
         let observationCPUStart = processCPUSeconds()
         let eventTask = Task {
             for await event in session.events {
@@ -512,9 +530,22 @@ struct SpiceProbe {
         if let sessionFailure = summary.sessionFailure {
             throw ProbeError.sessionFailed(sessionFailure)
         }
+        if rendererBackend.requiresRevisionedBacking,
+           !diagnostics.revisionedBackingEnabled {
+            throw ProbeError.missingObservation("revisioned IOSurface backing")
+        }
+        if !rendererBackend.usesRevisionedIOSurfaceBacking,
+           diagnostics.revisionedBackingEnabled {
+            throw ProbeError.missingObservation("data-only backing")
+        }
+        if diagnostics.metal2DRendererEnabled
+            != rendererBackend.enablesMetal2DRenderer {
+            throw ProbeError.missingObservation("requested 2D renderer")
+        }
         if benchmarkJSON {
             let report = ProbeBenchmarkReport(
                 client: "swiftspice",
+                renderer: rendererBackend.rawValue,
                 connectMilliseconds: connectMilliseconds,
                 observeSeconds: seconds,
                 frames: summary.frames,
@@ -524,6 +555,10 @@ struct SpiceProbe {
                     connectMilliseconds + $0
                 },
                 p95InterframeMilliseconds: summary.p95InterframeMilliseconds,
+                activeSpanMilliseconds: summary.activeSpanMilliseconds,
+                lastFrameAgeMilliseconds: summary.lastFrameAgeMilliseconds,
+                activeTimeBuckets: summary.activeTimeBuckets,
+                expectedTimeBuckets: summary.expectedTimeBuckets,
                 observationCPUSeconds: observationCPUSeconds,
                 frameBytes: summary.frameBytes,
                 cursors: summary.cursors,
@@ -742,6 +777,7 @@ private struct Configuration {
     let exerciseWebDAV: Bool
     let exercisePlayback: Bool
     let exerciseSyntheticRecord: Bool
+    let rendererBackend: SpiceRenderingBackend
     let benchmarkJSON: Bool
 }
 
@@ -966,10 +1002,14 @@ private actor DisplaySupportObservations {
 }
 
 private actor ProbeObservations {
+    private static let expectedTimeBuckets = 10
     private let start = ContinuousClock().now
+    private let observeMilliseconds: Double
     private var frames = 0
     private var frameBytes = 0
     private var firstFrameMilliseconds: Double?
+    private var lastFrameMilliseconds: Double?
+    private var activeBuckets = Set<Int>()
     private var previousFrameInstant: ContinuousClock.Instant?
     private var interframeMilliseconds: [Double] = []
     private var cursors = 0
@@ -977,15 +1017,27 @@ private actor ProbeObservations {
     private var motionAcknowledgements = 0
     private var sessionFailure: String?
 
+    init(observeSeconds: UInt64) {
+        observeMilliseconds = Double(observeSeconds) * 1_000
+    }
+
     func record(_ event: SpiceSessionEvent) {
         switch event {
         case let .frame(frame):
             let now = ContinuousClock().now
+            let elapsedMilliseconds = Self.milliseconds(from: start.duration(to: now))
             frames += 1
             frameBytes += frame.bytesPerRow * frame.height
             if firstFrameMilliseconds == nil {
-                firstFrameMilliseconds = Self.milliseconds(from: start.duration(to: now))
+                firstFrameMilliseconds = elapsedMilliseconds
             }
+            lastFrameMilliseconds = elapsedMilliseconds
+            let bucket = min(
+                Self.expectedTimeBuckets - 1,
+                max(0, Int(elapsedMilliseconds / observeMilliseconds
+                    * Double(Self.expectedTimeBuckets)))
+            )
+            activeBuckets.insert(bucket)
             if let previousFrameInstant {
                 interframeMilliseconds.append(
                     Self.milliseconds(from: previousFrameInstant.duration(to: now))
@@ -1006,16 +1058,30 @@ private actor ProbeObservations {
     }
 
     func summary() -> ProbeObservationSummary {
-        ProbeObservationSummary(
+        let elapsedMilliseconds = Self.milliseconds(
+            from: start.duration(to: ContinuousClock().now)
+        )
+        return ProbeObservationSummary(
             frames: frames,
             frameBytes: frameBytes,
             firstFrameMilliseconds: firstFrameMilliseconds,
             p95InterframeMilliseconds: Self.percentile95(interframeMilliseconds),
+            activeSpanMilliseconds: activeSpanMilliseconds,
+            lastFrameAgeMilliseconds: lastFrameMilliseconds.map {
+                max(0, elapsedMilliseconds - $0)
+            },
+            activeTimeBuckets: activeBuckets.count,
+            expectedTimeBuckets: Self.expectedTimeBuckets,
             cursors: cursors,
             keyboardEvents: keyboardEvents,
             motionAcknowledgements: motionAcknowledgements,
             sessionFailure: sessionFailure
         )
+    }
+
+    private var activeSpanMilliseconds: Double? {
+        guard let firstFrameMilliseconds, let lastFrameMilliseconds else { return nil }
+        return max(0, lastFrameMilliseconds - firstFrameMilliseconds)
     }
 
     private static func milliseconds(from duration: Duration) -> Double {
@@ -1037,6 +1103,10 @@ private struct ProbeObservationSummary {
     let frameBytes: Int
     let firstFrameMilliseconds: Double?
     let p95InterframeMilliseconds: Double?
+    let activeSpanMilliseconds: Double?
+    let lastFrameAgeMilliseconds: Double?
+    let activeTimeBuckets: Int
+    let expectedTimeBuckets: Int
     let cursors: Int
     let keyboardEvents: Int
     let motionAcknowledgements: Int
@@ -1045,6 +1115,7 @@ private struct ProbeObservationSummary {
 
 private struct ProbeBenchmarkReport: Codable {
     let client: String
+    let renderer: String
     let connectMilliseconds: Double
     let observeSeconds: UInt64
     let frames: Int
@@ -1052,6 +1123,10 @@ private struct ProbeBenchmarkReport: Codable {
     let firstFrameMilliseconds: Double?
     let readyFrameMilliseconds: Double?
     let p95InterframeMilliseconds: Double?
+    let activeSpanMilliseconds: Double?
+    let lastFrameAgeMilliseconds: Double?
+    let activeTimeBuckets: Int
+    let expectedTimeBuckets: Int
     let observationCPUSeconds: Double
     let frameBytes: Int
     let cursors: Int
@@ -1068,13 +1143,40 @@ private struct ProbeBenchmarkReport: Codable {
     let poolExhaustions: UInt64
     let inFlightLeases: Int
     let revisionedBackingEnabled: Bool
+    let metal2DRendererEnabled: Bool
     let revisionedAllocatedFrames: Int
     let revisionedAllocatedBytes: Int
     let totalIOSurfaceAllocatedBytes: Int
     let gpuCopyBytes: UInt64
+    let revisionGPUCopyBytes: UInt64
+    let metal2DBatchSeedGPUCopyBytes: UInt64
+    let metal2DBatchSeedCPUCopyBytes: UInt64
+    let snapshotCatchUpCPUCopyBytes: UInt64
     let gpuErrors: UInt64
     let nativeVideoFrames: UInt64
     let nativeVideoFallbacks: UInt64
+    let metal2DCommandBuffers: UInt64
+    let metal2DCommands: UInt64
+    let metal2DUploadedBytes: UInt64
+    let metal2DBlitBytes: UInt64
+    let metal2DGPUTimeNanoseconds: UInt64
+    let metal2DFillCommands: UInt64
+    let metal2DBitmapCopyCommands: UInt64
+    let metal2DCopyBitsCommands: UInt64
+    let metal2DSurfaceCopyCommands: UInt64
+    let metal2DCPUFallbackOperations: UInt64
+    let metal2DUploadBufferAllocations: UInt64
+    let metal2DUploadBufferReuses: UInt64
+    let cpuFillOperations: UInt64
+    let cpuFillNanoseconds: UInt64
+    let cpuCopyBitsOperations: UInt64
+    let cpuCopyBitsNanoseconds: UInt64
+    let cpuBitmapCopyOperations: UInt64
+    let cpuBitmapCopyNanoseconds: UInt64
+    let cpuSurfaceCopyOperations: UInt64
+    let cpuSurfaceCopyNanoseconds: UInt64
+    let cpuScaledCopyOperations: UInt64
+    let cpuScaledCopyNanoseconds: UInt64
     let recommendedMaximumWorkingSetSize: UInt64
     let currentMetalAllocatedSize: UInt64
     let publisherSubmissions: UInt64
@@ -1098,6 +1200,7 @@ private struct ProbeBenchmarkReport: Codable {
 
     init(
         client: String,
+        renderer: String,
         connectMilliseconds: Double,
         observeSeconds: UInt64,
         frames: Int,
@@ -1105,6 +1208,10 @@ private struct ProbeBenchmarkReport: Codable {
         firstFrameMilliseconds: Double?,
         readyFrameMilliseconds: Double?,
         p95InterframeMilliseconds: Double?,
+        activeSpanMilliseconds: Double?,
+        lastFrameAgeMilliseconds: Double?,
+        activeTimeBuckets: Int,
+        expectedTimeBuckets: Int,
         observationCPUSeconds: Double,
         frameBytes: Int,
         cursors: Int,
@@ -1113,6 +1220,7 @@ private struct ProbeBenchmarkReport: Codable {
         diagnostics: SpiceSessionDiagnostics
     ) {
         self.client = client
+        self.renderer = renderer
         self.connectMilliseconds = connectMilliseconds
         self.observeSeconds = observeSeconds
         self.frames = frames
@@ -1120,6 +1228,10 @@ private struct ProbeBenchmarkReport: Codable {
         self.firstFrameMilliseconds = firstFrameMilliseconds
         self.readyFrameMilliseconds = readyFrameMilliseconds
         self.p95InterframeMilliseconds = p95InterframeMilliseconds
+        self.activeSpanMilliseconds = activeSpanMilliseconds
+        self.lastFrameAgeMilliseconds = lastFrameAgeMilliseconds
+        self.activeTimeBuckets = activeTimeBuckets
+        self.expectedTimeBuckets = expectedTimeBuckets
         self.observationCPUSeconds = observationCPUSeconds
         self.frameBytes = frameBytes
         self.cursors = cursors
@@ -1136,13 +1248,40 @@ private struct ProbeBenchmarkReport: Codable {
         poolExhaustions = diagnostics.poolExhaustions
         inFlightLeases = diagnostics.inFlightLeases
         revisionedBackingEnabled = diagnostics.revisionedBackingEnabled
+        metal2DRendererEnabled = diagnostics.metal2DRendererEnabled
         revisionedAllocatedFrames = diagnostics.revisionedAllocatedFrames
         revisionedAllocatedBytes = diagnostics.revisionedAllocatedBytes
         totalIOSurfaceAllocatedBytes = diagnostics.totalIOSurfaceAllocatedBytes
         gpuCopyBytes = diagnostics.gpuCopyBytes
+        revisionGPUCopyBytes = diagnostics.revisionGPUCopyBytes
+        metal2DBatchSeedGPUCopyBytes = diagnostics.metal2DBatchSeedGPUCopyBytes
+        metal2DBatchSeedCPUCopyBytes = diagnostics.metal2DBatchSeedCPUCopyBytes
+        snapshotCatchUpCPUCopyBytes = diagnostics.snapshotCatchUpCPUCopyBytes
         gpuErrors = diagnostics.gpuErrors
         nativeVideoFrames = diagnostics.nativeVideoFrames
         nativeVideoFallbacks = diagnostics.nativeVideoFallbacks
+        metal2DCommandBuffers = diagnostics.metal2DCommandBuffers
+        metal2DCommands = diagnostics.metal2DCommands
+        metal2DUploadedBytes = diagnostics.metal2DUploadedBytes
+        metal2DBlitBytes = diagnostics.metal2DBlitBytes
+        metal2DGPUTimeNanoseconds = diagnostics.metal2DGPUTimeNanoseconds
+        metal2DFillCommands = diagnostics.metal2DFillCommands
+        metal2DBitmapCopyCommands = diagnostics.metal2DBitmapCopyCommands
+        metal2DCopyBitsCommands = diagnostics.metal2DCopyBitsCommands
+        metal2DSurfaceCopyCommands = diagnostics.metal2DSurfaceCopyCommands
+        metal2DCPUFallbackOperations = diagnostics.metal2DCPUFallbackOperations
+        metal2DUploadBufferAllocations = diagnostics.metal2DUploadBufferAllocations
+        metal2DUploadBufferReuses = diagnostics.metal2DUploadBufferReuses
+        cpuFillOperations = diagnostics.cpuFillOperations
+        cpuFillNanoseconds = diagnostics.cpuFillNanoseconds
+        cpuCopyBitsOperations = diagnostics.cpuCopyBitsOperations
+        cpuCopyBitsNanoseconds = diagnostics.cpuCopyBitsNanoseconds
+        cpuBitmapCopyOperations = diagnostics.cpuBitmapCopyOperations
+        cpuBitmapCopyNanoseconds = diagnostics.cpuBitmapCopyNanoseconds
+        cpuSurfaceCopyOperations = diagnostics.cpuSurfaceCopyOperations
+        cpuSurfaceCopyNanoseconds = diagnostics.cpuSurfaceCopyNanoseconds
+        cpuScaledCopyOperations = diagnostics.cpuScaledCopyOperations
+        cpuScaledCopyNanoseconds = diagnostics.cpuScaledCopyNanoseconds
         recommendedMaximumWorkingSetSize = diagnostics.recommendedMaximumWorkingSetSize
         currentMetalAllocatedSize = diagnostics.currentMetalAllocatedSize
         publisherSubmissions = diagnostics.publisherSubmissions
@@ -1167,6 +1306,7 @@ private struct ProbeBenchmarkReport: Codable {
 
     enum CodingKeys: String, CodingKey {
         case client
+        case renderer
         case connectMilliseconds = "connect_ms"
         case observeSeconds = "observe_seconds"
         case frames
@@ -1174,6 +1314,10 @@ private struct ProbeBenchmarkReport: Codable {
         case firstFrameMilliseconds = "first_frame_ms"
         case readyFrameMilliseconds = "ready_frame_ms"
         case p95InterframeMilliseconds = "p95_interframe_ms"
+        case activeSpanMilliseconds = "active_span_ms"
+        case lastFrameAgeMilliseconds = "last_frame_age_ms"
+        case activeTimeBuckets = "active_time_buckets"
+        case expectedTimeBuckets = "expected_time_buckets"
         case observationCPUSeconds = "observe_cpu_seconds"
         case frameBytes = "frame_bytes"
         case cursors
@@ -1190,13 +1334,40 @@ private struct ProbeBenchmarkReport: Codable {
         case poolExhaustions = "pool_exhaustions"
         case inFlightLeases = "in_flight_leases"
         case revisionedBackingEnabled = "revisioned_backing_enabled"
+        case metal2DRendererEnabled = "metal_2d_renderer_enabled"
         case revisionedAllocatedFrames = "revisioned_allocated_frames"
         case revisionedAllocatedBytes = "revisioned_allocated_bytes"
         case totalIOSurfaceAllocatedBytes = "iosurface_allocated_bytes"
         case gpuCopyBytes = "gpu_copy_bytes"
+        case revisionGPUCopyBytes = "revision_gpu_copy_bytes"
+        case metal2DBatchSeedGPUCopyBytes = "metal_2d_batch_seed_gpu_copy_bytes"
+        case metal2DBatchSeedCPUCopyBytes = "metal_2d_batch_seed_cpu_copy_bytes"
+        case snapshotCatchUpCPUCopyBytes = "snapshot_catch_up_cpu_copy_bytes"
         case gpuErrors = "gpu_errors"
         case nativeVideoFrames = "native_video_frames"
         case nativeVideoFallbacks = "native_video_fallbacks"
+        case metal2DCommandBuffers = "metal_2d_command_buffers"
+        case metal2DCommands = "metal_2d_commands"
+        case metal2DUploadedBytes = "metal_2d_uploaded_bytes"
+        case metal2DBlitBytes = "metal_2d_blit_bytes"
+        case metal2DGPUTimeNanoseconds = "metal_2d_gpu_time_ns"
+        case metal2DFillCommands = "metal_2d_fill_commands"
+        case metal2DBitmapCopyCommands = "metal_2d_bitmap_copy_commands"
+        case metal2DCopyBitsCommands = "metal_2d_copy_bits_commands"
+        case metal2DSurfaceCopyCommands = "metal_2d_surface_copy_commands"
+        case metal2DCPUFallbackOperations = "metal_2d_cpu_fallback_operations"
+        case metal2DUploadBufferAllocations = "metal_2d_upload_buffer_allocations"
+        case metal2DUploadBufferReuses = "metal_2d_upload_buffer_reuses"
+        case cpuFillOperations = "cpu_fill_operations"
+        case cpuFillNanoseconds = "cpu_fill_ns"
+        case cpuCopyBitsOperations = "cpu_copy_bits_operations"
+        case cpuCopyBitsNanoseconds = "cpu_copy_bits_ns"
+        case cpuBitmapCopyOperations = "cpu_bitmap_copy_operations"
+        case cpuBitmapCopyNanoseconds = "cpu_bitmap_copy_ns"
+        case cpuSurfaceCopyOperations = "cpu_surface_copy_operations"
+        case cpuSurfaceCopyNanoseconds = "cpu_surface_copy_ns"
+        case cpuScaledCopyOperations = "cpu_scaled_copy_operations"
+        case cpuScaledCopyNanoseconds = "cpu_scaled_copy_ns"
         case recommendedMaximumWorkingSetSize = "metal_recommended_working_set_bytes"
         case currentMetalAllocatedSize = "metal_current_allocated_bytes"
         case publisherSubmissions = "publisher_submissions"
@@ -1239,7 +1410,8 @@ private enum ProbeError: Error, CustomStringConvertible {
                 + "[--exercise-monitor-config] [--exercise-webdav] "
                 + "[--exercise-playback|--exercise-record-synthetic] "
                 + "[--benchmark-json] [--enable-h264|--enable-h265] "
-                + "[--require-native-video]; "
+                + "[--require-native-video] "
+                + "[--renderer automatic|cpu|cpu-iosurface|metal]; "
                 + "password is read from SPICE_PASSWORD"
         case let .missingObservation(name):
             "missing required live observation: \(name)"

@@ -31,6 +31,11 @@ struct SurfaceStoreTests {
         #expect(pixel(snapshot, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(snapshot, x: 1, y: 1) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(snapshot, x: 2, y: 1) == [0x33, 0x22, 0x11, 0xff])
+        let metrics = await store.metrics()
+        #expect(!metrics.metal2DRendererEnabled)
+        #expect(metrics.metal2DCommandBuffers == 0)
+        #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.cpuCopyBitsOperations == 1)
 
         try await store.destroy(id: 7)
         await #expect(throws: RenderError.unknownSurface(7)) {
@@ -540,7 +545,10 @@ struct SurfaceStoreTests {
         else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
+        )
         try await store.create(id: 20, width: 4, height: 2, format: 32)
         try await store.fill(
             surfaceID: 20,
@@ -591,7 +599,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let unified = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let unified = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
+        )
         let data = SurfaceStore(
             framePool: IOSurfaceFramePool(limits: .init(maximumFrames: 0)),
             backingPolicy: .dataOnly
@@ -638,7 +649,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
+        )
         try await store.create(id: 25, width: 4, height: 2, format: 32)
         try await store.fill(
             surfaceID: 25,
@@ -715,7 +729,8 @@ struct SurfaceStoreTests {
                 limits: .init(maximumFrames: 0, maximumBytes: 0)
             ),
             memoryBudget: budget,
-            backingPolicy: .revisionedIOSurface(pool)
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
         )
         try await store.create(id: 42, width: 2, height: 2, format: 32)
         try await store.create(id: 43, width: 2, height: 2, format: 32)
@@ -996,6 +1011,52 @@ struct SurfaceStoreTests {
         #expect(pool.metrics().allocatedFrames == 0)
     }
 
+    @Test func closingStoreCancelsRecordingMetalBatch() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 45, width: 2, height: 2, format: 32)
+        try await store.fill(
+            surfaceID: 45,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 2),
+            colorARGB: 0x0011_2233
+        )
+        #expect(await store.metrics().metal2DCommandBuffers == 0)
+
+        await store.close()
+
+        #expect(pool.metrics().allocatedFrames == 0)
+    }
+
+    @Test func destroyingSurfaceCancelsRecordingMetalBatch() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 46, width: 2, height: 2, format: 32)
+        try await store.fill(
+            surfaceID: 46,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 2),
+            colorARGB: 0x0011_2233
+        )
+        #expect(await store.metrics().metal2DCommandBuffers == 0)
+
+        try await store.destroy(id: 46)
+
+        #expect(pool.metrics().allocatedFrames == 0)
+    }
+
     @Test func closingStoreIsTerminalAndReleasesItsSurfaceBudget() async throws {
         let budget = SurfaceMemoryBudget(maximumBytes: 64)
         let store = SurfaceStore(memoryBudget: budget, backingPolicy: .dataOnly)
@@ -1106,7 +1167,10 @@ struct SurfaceStoreTests {
         ) else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
+        )
         try await store.create(id: 27, width: 16, height: 16, format: 32)
         var initial: FrameSnapshot? = try await store.snapshot(surfaceID: 27)
         #expect(initial?.ioSurfaceFrame != nil)
@@ -1135,7 +1199,10 @@ struct SurfaceStoreTests {
         else {
             return
         }
-        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: false
+        )
         try await store.create(id: 22, width: 4, height: 4, format: 32)
         try await store.fill(
             surfaceID: 22,
@@ -1265,6 +1332,312 @@ struct SurfaceStoreTests {
         let newFrame = try await store.snapshot(surfaceID: 26)
         #expect(pixel(oldFrame, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(newFrame, x: 0, y: 0).allSatisfy { $0 >= 254 })
+    }
+
+    @Test func metal2DBatchMatchesCPUReferenceAndCommitsOnce() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let gpu = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        let cpu = SurfaceStore(backingPolicy: .dataOnly)
+        for store in [gpu, cpu] {
+            try await store.create(id: 30, width: 4, height: 2, format: 32)
+            try await store.fill(
+                surfaceID: 30,
+                rectangle: PixelRect(x: 0, y: 0, width: 4, height: 2),
+                colorARGB: 0x0010_2030
+            )
+            try await store.fill(
+                surfaceID: 30,
+                rectangle: PixelRect(x: 1, y: 0, width: 2, height: 1),
+                colorARGB: 0x00aa_bbcc
+            )
+            try await store.drawCopy(
+                surfaceID: 30,
+                destination: PixelRect(x: 0, y: 1, width: 2, height: 1),
+                bitmap: RawBitmap(
+                    format: .argb8888,
+                    width: 2,
+                    height: 1,
+                    stride: 8,
+                    topDown: true,
+                    pixels: Data([
+                        0x01, 0x02, 0x03, 0x04,
+                        0x11, 0x12, 0x13, 0x14,
+                    ])
+                )
+            )
+            try await store.copyBits(
+                surfaceID: 30,
+                destination: PixelRect(x: 2, y: 1, width: 2, height: 1),
+                sourceX: 0,
+                sourceY: 1
+            )
+        }
+
+        #expect(await gpu.metrics().metal2DCommandBuffers == 0)
+        let gpuFrame = try await gpu.snapshot(surfaceID: 30)
+        let cpuFrame = try await cpu.snapshot(surfaceID: 30)
+        #expect(gpuFrame.pixels == cpuFrame.pixels)
+        let metrics = await gpu.metrics()
+        #expect(metrics.metal2DCommandBuffers == 1)
+        #expect(metrics.metal2DCommands == 4)
+        #expect(metrics.metal2DUploadedBytes == 8)
+        #expect(metrics.metal2DFillCommands == 2)
+        #expect(metrics.metal2DBitmapCopyCommands == 1)
+        #expect(metrics.metal2DCopyBitsCommands == 1)
+        #expect(metrics.metal2DSurfaceCopyCommands == 0)
+        #expect(metrics.metal2DUploadBufferAllocations == 1)
+        #expect(metrics.metal2DUploadBufferReuses == 0)
+        #expect(metrics.metal2DBatchSeedCPUCopyBytes == 32)
+        #expect(metrics.metal2DBatchSeedGPUCopyBytes == 0)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 0)
+        #expect(metrics.gpuErrors == 0)
+        #expect(metrics.metal2DCPUFallbackOperations == 0)
+    }
+
+    @Test func metal2DUploadBuffersAreReusedAcrossCommittedBatches() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 34, width: 2, height: 1, format: 96)
+        let rectangle = PixelRect(x: 0, y: 0, width: 2, height: 1)
+        for seed in [UInt8(1), UInt8(9)] {
+            try await store.drawCopy(
+                surfaceID: 34,
+                destination: rectangle,
+                bitmap: RawBitmap(
+                    format: .argb8888,
+                    width: 2,
+                    height: 1,
+                    stride: 8,
+                    topDown: true,
+                    pixels: Data([seed, 2, 3, 4, seed, 6, 7, 8])
+                )
+            )
+            _ = try await store.snapshot(surfaceID: 34)
+        }
+
+        let metrics = await store.metrics()
+        #expect(metrics.metal2DCommandBuffers == 2)
+        #expect(metrics.metal2DBitmapCopyCommands == 2)
+        #expect(metrics.metal2DUploadBufferAllocations == 1)
+        #expect(metrics.metal2DUploadBufferReuses == 1)
+        #expect(metrics.metal2DBatchSeedCPUCopyBytes == 8)
+        #expect(metrics.metal2DBatchSeedGPUCopyBytes == 8)
+        #expect(metrics.revisionGPUCopyBytes == 8)
+    }
+
+    @Test func metal2DPoolExhaustionKeepsStaleCanonicalOutOfSurfaceCopies() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 1, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 35, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 35,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        _ = try await store.snapshot(surfaceID: 35)
+
+        try await store.fill(
+            surfaceID: 35,
+            rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
+            colorARGB: 0x00aa_bbcc
+        )
+        try await store.create(id: 41, width: 2, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 41,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 35,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+        let copied = try await store.snapshot(surfaceID: 41)
+        #expect(pixel(copied, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
+
+        let metrics = await store.metrics()
+        #expect(metrics.metal2DCommandBuffers == 1)
+        #expect(metrics.metal2DCommands == 1)
+        #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
+        #expect(metrics.poolExhaustions == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 2)
+    }
+
+    @Test func requestedMetalCountsEverySupportedCPUFallback() async throws {
+        let store = SurfaceStore(
+            backingPolicy: .dataOnly,
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 36, width: 2, height: 1, format: 32)
+        try await store.create(id: 37, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 36,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        try await store.drawCopy(
+            surfaceID: 36,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            bitmap: RawBitmap(
+                format: .argb8888,
+                width: 2,
+                height: 1,
+                stride: 8,
+                topDown: true,
+                pixels: Data([1, 2, 3, 4, 5, 6, 7, 8])
+            )
+        )
+        try await store.copyBits(
+            surfaceID: 36,
+            destination: PixelRect(x: 1, y: 0, width: 1, height: 1),
+            sourceX: 0,
+            sourceY: 0
+        )
+        try await store.drawCopy(
+            surfaceID: 37,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 36,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+
+        let metrics = await store.metrics()
+        #expect(!metrics.metal2DRendererEnabled)
+        #expect(metrics.metal2DCPUFallbackOperations == 4)
+        #expect(metrics.cpuFillOperations == 1)
+        #expect(metrics.cpuBitmapCopyOperations == 1)
+        #expect(metrics.cpuCopyBitsOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
+        #expect(metrics.gpuErrors == 0)
+        #expect(metrics.poolExhaustions == 0)
+    }
+
+    @Test func metalEvidenceExposesMissingCanonicalSourceFallback() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 38, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 38,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        _ = try await store.snapshot(surfaceID: 38)
+
+        try await store.create(id: 39, width: 2, height: 1, format: 32)
+        try await store.create(id: 40, width: 2, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 40,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 39,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+        _ = try await store.snapshot(surfaceID: 40)
+
+        let metrics = await store.metrics()
+        #expect(metrics.metal2DCommandBuffers == 1)
+        #expect(metrics.metal2DCommands == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 1)
+        #expect(metrics.cpuSurfaceCopyOperations == 1)
+        #expect(metrics.cpuMaterializations == 0)
+        #expect(metrics.gpuErrors == 0)
+        #expect(metrics.poolExhaustions == 0)
+    }
+
+    @Test func failedMetal2DBatchReplaysAtomicallyOnCPU() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true,
+            metal2DBatchFailureForAttempt: { attempt in
+                attempt == 1 ? .commandExecutionFailed("injected 2D batch failure") : nil
+            }
+        )
+        try await store.create(id: 31, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 31,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        try await store.copyBits(
+            surfaceID: 31,
+            destination: PixelRect(x: 1, y: 0, width: 1, height: 1),
+            sourceX: 0,
+            sourceY: 0
+        )
+
+        let frame = try await store.snapshot(surfaceID: 31)
+        #expect(frame.pixels == Data([
+            0x33, 0x22, 0x11, 0xff,
+            0x33, 0x22, 0x11, 0xff,
+        ]))
+        let metrics = await store.metrics()
+        #expect(metrics.gpuErrors == 1)
+        #expect(metrics.metal2DCPUFallbackOperations == 2)
+        #expect(metrics.metal2DCommandBuffers == 0)
+        #expect(metrics.snapshots == 1)
+    }
+
+    @Test func metal2DCrossSurfaceCopyAvoidsCPUReadback() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            enableMetal2DRenderer: true
+        )
+        try await store.create(id: 32, width: 2, height: 1, format: 96)
+        try await store.create(id: 33, width: 2, height: 1, format: 96)
+        try await store.fill(
+            surfaceID: 32,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x7f11_2233
+        )
+        try await store.drawCopy(
+            surfaceID: 33,
+            destination: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            sourceSurfaceID: 32,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 1)
+        )
+        let destination = try await store.snapshot(surfaceID: 33)
+        let metricsBeforeReadback = await store.metrics()
+        #expect(metricsBeforeReadback.metal2DCommandBuffers == 2)
+        #expect(metricsBeforeReadback.metal2DCommands == 2)
+        #expect(metricsBeforeReadback.metal2DCPUFallbackOperations == 0)
+        #expect(metricsBeforeReadback.cpuMaterializations == 0)
+        #expect(destination.pixels == Data([
+            0x33, 0x22, 0x11, 0x7f,
+            0x33, 0x22, 0x11, 0x7f,
+        ]))
     }
 
     private func pixel(_ snapshot: FrameSnapshot, x: Int, y: Int) -> [UInt8] {

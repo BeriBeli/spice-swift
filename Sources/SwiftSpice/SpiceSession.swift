@@ -123,12 +123,47 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
     }
 }
 
+package enum SpiceRenderingBackend: String, Sendable {
+    case automatic
+    case cpu
+    case cpuIOSurface = "cpu-iosurface"
+    case metal
+
+    package var usesRevisionedIOSurfaceBacking: Bool {
+        switch self {
+        case .automatic, .cpuIOSurface, .metal:
+            true
+        case .cpu:
+            false
+        }
+    }
+
+    package var enablesMetal2DRenderer: Bool {
+        switch self {
+        case .metal:
+            true
+        case .automatic, .cpu, .cpuIOSurface:
+            false
+        }
+    }
+
+    package var requiresRevisionedBacking: Bool {
+        switch self {
+        case .cpuIOSurface, .metal:
+            true
+        case .automatic, .cpu:
+            false
+        }
+    }
+}
+
 public actor SpiceSession {
     package typealias TransportFactory = @Sendable (SpiceEndpoint) -> any SpiceTransport
 
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
+    private let renderingBackend: SpiceRenderingBackend
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
@@ -189,6 +224,10 @@ public actor SpiceSession {
     }
 
     public init() {
+        self.init(renderingBackend: .automatic)
+    }
+
+    package init(renderingBackend: SpiceRenderingBackend) {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
         events = AsyncStream(unfolding: { await eventMailbox.next() })
@@ -231,12 +270,14 @@ public actor SpiceSession {
         transportFactory = Self.makeNetworkTransport
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
+        self.renderingBackend = renderingBackend
     }
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
-        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
+        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
+        renderingBackend: SpiceRenderingBackend = .automatic
     ) {
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
@@ -280,6 +321,7 @@ public actor SpiceSession {
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
+        self.renderingBackend = renderingBackend
     }
 
     deinit {
@@ -363,7 +405,8 @@ public actor SpiceSession {
                     connection: connected,
                     glzDecoder: glzDecoder,
                     multimediaClock: multimediaClock,
-                    surfaceMemoryBudget: surfaceMemoryBudget
+                    surfaceMemoryBudget: surfaceMemoryBudget,
+                    renderingBackend: renderingBackend
                 )
             }
             try Task.checkCancellation()
@@ -1500,7 +1543,8 @@ public actor SpiceSession {
                     connection: connected,
                     glzDecoder: glzDecoder,
                     multimediaClock: multimediaClock,
-                    surfaceMemoryBudget: surfaceMemoryBudget
+                    surfaceMemoryBudget: surfaceMemoryBudget,
+                    renderingBackend: renderingBackend
                 )
             }
             try Task.checkCancellation()
@@ -1915,13 +1959,20 @@ public actor SpiceSession {
         connection: ChannelConnection,
         glzDecoder: SpiceGLZDecoder,
         multimediaClock: any MultimediaClockScheduling,
-        surfaceMemoryBudget: SurfaceMemoryBudget
+        surfaceMemoryBudget: SurfaceMemoryBudget,
+        renderingBackend: SpiceRenderingBackend
     ) -> any SpiceManagedChannel {
         switch SpiceChannelKind(rawValue: key.type) {
         case .display:
             DisplayChannel(
                 connection: connection,
-                surfaces: SurfaceStore(memoryBudget: surfaceMemoryBudget),
+                surfaces: SurfaceStore(
+                    memoryBudget: surfaceMemoryBudget,
+                    backingPolicy: renderingBackend.usesRevisionedIOSurfaceBacking
+                        ? .automatic
+                        : .dataOnly,
+                    enableMetal2DRenderer: renderingBackend.enablesMetal2DRenderer
+                ),
                 glzDecoder: glzDecoder,
                 multimediaClock: multimediaClock
             )
