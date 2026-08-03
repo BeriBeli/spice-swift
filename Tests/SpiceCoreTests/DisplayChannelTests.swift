@@ -1,6 +1,7 @@
 import Foundation
 import SpiceCodecs
 import SpiceTestSupport
+import Synchronization
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
@@ -9,8 +10,215 @@ import Testing
 @testable import SpiceRenderer
 @testable import SpiceWire
 
+private final class DisplayDiagnosticClock: Sendable {
+    private struct State: Sendable {
+        var next: UInt64 = 0
+        var reads = 0
+    }
+
+    private let state = Mutex(State())
+    private let step: UInt64
+
+    init(step: UInt64) {
+        self.step = step
+    }
+
+    func read() -> UInt64 {
+        state.withLock { state in
+            defer {
+                state.next &+= step
+                state.reads += 1
+            }
+            return state.next
+        }
+    }
+
+    var readCount: Int {
+        state.withLock { $0.reads }
+    }
+}
+
 @Suite("Display Channel wire execution")
 struct DisplayChannelTests {
+    @Test func samplesDisplayPhasesWithDeterministicClock() async throws {
+        let clock = DisplayDiagnosticClock(step: 10)
+        let transport = FakeTransport(inbound: try [
+            .success(encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 4,
+                height: 4,
+                format: 32,
+                flags: 1
+            ))),
+            .success(encodeMini(id: 304, body: drawCopyBody())),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: SurfaceStore(backingPolicy: .dataOnly),
+            framePublicationInterval: .seconds(10),
+            diagnosticsMode: .sampled(commandPeriod: 1),
+            diagnosticsClock: clock.read
+        )
+
+        await #expect(throws: ChannelError.self) {
+            try await channel.run { _ in }
+        }
+        let diagnostics = await channel.diagnosticsSnapshot()
+
+        #expect(diagnostics.messageHandlingTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 2,
+            sampledNanoseconds: 80
+        ))
+        #expect(diagnostics.messageDecodeTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 2,
+            sampledNanoseconds: 20
+        ))
+        #expect(diagnostics.bitmapSurfaceStoreRoundTripTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(diagnostics.publisherSubmitRoundTripTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(diagnostics.publisher.frameEmitTiming == RenderPhaseMetrics(
+            samplePeriod: 1
+        ))
+        #expect(clock.readCount == 12)
+    }
+
+    @Test func disabledDisplayPhasesDoNotReadInjectedClock() async throws {
+        let clock = DisplayDiagnosticClock(step: 10)
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 0xffff, body: Data())),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            diagnosticsClock: clock.read
+        )
+
+        _ = try await channel.processNext()
+        let diagnostics = await channel.diagnosticsSnapshot()
+
+        #expect(diagnostics.messageHandlingTiming == RenderPhaseMetrics())
+        #expect(diagnostics.messageDecodeTiming == RenderPhaseMetrics())
+        #expect(diagnostics.bitmapSurfaceStoreRoundTripTiming == RenderPhaseMetrics())
+        #expect(diagnostics.publisherSubmitRoundTripTiming == RenderPhaseMetrics())
+        #expect(clock.readCount == 0)
+    }
+
+    @Test func diagnosticConnectionMetricsSurviveMigration() async throws {
+        let connectionClock = DisplayDiagnosticClock(step: 10)
+        let channelClock = DisplayDiagnosticClock(step: 10)
+        var first: ChannelConnection? = try await diagnosticConnection(
+            clock: connectionClock
+        )
+        weak let retiredConnection = first
+        let channel = DisplayChannel(
+            connection: first!,
+            diagnosticsMode: .sampled(commandPeriod: 1),
+            diagnosticsClock: channelClock.read
+        )
+        first = nil
+        _ = try await channel.processNext()
+        let second = try await diagnosticConnection(clock: connectionClock)
+        _ = try await channel.replaceConnection(with: second)
+        #expect(retiredConnection == nil)
+        _ = try await channel.processNext()
+
+        let metrics = await channel.diagnosticsSnapshot().connection
+        #expect(metrics.framerNextTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 4,
+            sampledNanoseconds: 40
+        ))
+        #expect(metrics.framerAppendTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 2,
+            sampledNanoseconds: 20
+        ))
+    }
+
+    @Test func disabledDiagnosticsDoNotRetainMigratedConnectionMetrics() async throws {
+        let clock = DisplayDiagnosticClock(step: 10)
+        let first = try await diagnosticConnection(clock: clock)
+        let channel = DisplayChannel(connection: first)
+        _ = try await channel.processNext()
+
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 0xffff, body: Data())),
+        ])
+        try await transport.connect()
+        let replacement = ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: transport,
+            headerMode: .mini
+        )
+        _ = try await channel.replaceConnection(with: replacement)
+        _ = try await channel.processNext()
+
+        #expect(await channel.diagnosticsSnapshot().connection == ChannelConnectionMetrics())
+    }
+
+    @Test func diagnosticMigrationRollbackDoesNotCountRestoredHistoryTwice() async throws {
+        let connectionClock = DisplayDiagnosticClock(step: 10)
+        let channelClock = DisplayDiagnosticClock(step: 10)
+        let first = try await diagnosticConnection(clock: connectionClock)
+        let channel = DisplayChannel(
+            connection: first,
+            diagnosticsMode: .sampled(commandPeriod: 1),
+            diagnosticsClock: channelClock.read
+        )
+        _ = try await channel.processNext()
+
+        let second = try await diagnosticConnection(clock: connectionClock)
+        let retiredFirst = try await channel.replaceConnection(with: second)
+        _ = try await channel.processNext()
+        _ = try await channel.replaceConnection(with: retiredFirst)
+
+        let metrics = await channel.diagnosticsSnapshot().connection
+        #expect(metrics.framerNextTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 4,
+            sampledNanoseconds: 40
+        ))
+        #expect(metrics.framerAppendTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 2,
+            sampledNanoseconds: 20
+        ))
+    }
+
+    private func diagnosticConnection(
+        clock: DisplayDiagnosticClock
+    ) async throws -> ChannelConnection {
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 0xffff, body: Data())),
+        ])
+        try await transport.connect()
+        return ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: transport,
+            headerMode: .mini,
+            diagnosticsMode: .sampled(commandPeriod: 1),
+            diagnosticsClock: clock.read
+        )
+    }
+
     @Test func sendsDisplayInitializationBeforeReceivingServerMessages() async throws {
         let transport = FakeTransport(inbound: [.failure(.connectionClosed)])
         try await transport.connect()

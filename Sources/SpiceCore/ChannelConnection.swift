@@ -3,6 +3,33 @@ import SpiceProtocol
 import SpiceTransport
 import SpiceWire
 
+package struct ChannelConnectionMetrics: Sendable, Equatable {
+    package var framerNextTiming: RenderPhaseMetrics
+    package var framerAppendTiming: RenderPhaseMetrics
+
+    package init(
+        framerNextTiming: RenderPhaseMetrics = RenderPhaseMetrics(),
+        framerAppendTiming: RenderPhaseMetrics = RenderPhaseMetrics()
+    ) {
+        self.framerNextTiming = framerNextTiming
+        self.framerAppendTiming = framerAppendTiming
+    }
+
+    package mutating func accumulate(_ other: Self) {
+        framerNextTiming = framerNextTiming.accumulating(other.framerNextTiming)
+        framerAppendTiming = framerAppendTiming.accumulating(other.framerAppendTiming)
+    }
+
+    package func subtracting(_ earlier: Self) -> Self {
+        Self(
+            framerNextTiming: framerNextTiming.subtracting(earlier.framerNextTiming),
+            framerAppendTiming: framerAppendTiming.subtracting(
+                earlier.framerAppendTiming
+            )
+        )
+    }
+}
+
 package actor ChannelConnection {
     package nonisolated let key: ChannelKey
 
@@ -12,18 +39,33 @@ package actor ChannelConnection {
     private var nextClientSerial: UInt64 = 1
     private var nextImplicitServerSerial: UInt64 = 1
     private var isMigrating = false
+    private let diagnosticsEnabled: Bool
+    private var framerNextTiming: RenderPhaseRecorder
+    private var framerAppendTiming: RenderPhaseRecorder
 
     package init(
         key: ChannelKey,
         transport: any SpiceTransport,
         headerMode: HeaderMode,
         serialBarrier: ChannelSerialBarrier = ChannelSerialBarrier(),
-        limits: WireLimits = .init()
+        limits: WireLimits = .init(),
+        diagnosticsMode: RenderDiagnosticsMode = .disabled,
+        diagnosticsClock: @escaping RenderPhaseRecorder.Clock =
+            RenderPhaseRecorder.systemClock
     ) {
         self.key = key
         self.transport = transport
         self.serialBarrier = serialBarrier
+        diagnosticsEnabled = diagnosticsMode.normalizedCommandPeriod != nil
         framer = MessageFramer(mode: headerMode, limits: limits)
+        framerNextTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        framerAppendTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
     }
 
     package func receive() async throws(ChannelError) -> FramedMessage {
@@ -78,7 +120,13 @@ package actor ChannelConnection {
         while true {
             let framedMessage: FramedMessage?
             do {
-                framedMessage = try framer.nextMessage()
+                if diagnosticsEnabled {
+                    var timingSample = framerNextTiming.beginCommand()
+                    defer { framerNextTiming.finishCommand(&timingSample) }
+                    framedMessage = try framer.nextMessage()
+                } else {
+                    framedMessage = try framer.nextMessage()
+                }
             } catch let error {
                 throw .wire(error)
             }
@@ -94,7 +142,7 @@ package actor ChannelConnection {
                     }
                     nextImplicitServerSerial = next
                 }
-                await serialBarrier.record(key: key, serial: serial)
+                serialBarrier.record(key: key, serial: serial)
                 return message
             }
 
@@ -108,11 +156,24 @@ package actor ChannelConnection {
                 throw .transport(.connectionClosed)
             }
             do {
-                try framer.append(bytes)
+                if diagnosticsEnabled {
+                    var timingSample = framerAppendTiming.beginCommand()
+                    defer { framerAppendTiming.finishCommand(&timingSample) }
+                    try framer.append(bytes)
+                } else {
+                    try framer.append(bytes)
+                }
             } catch let error {
                 throw .wire(error)
             }
         }
+    }
+
+    package func metrics() -> ChannelConnectionMetrics {
+        ChannelConnectionMetrics(
+            framerNextTiming: framerNextTiming.metrics,
+            framerAppendTiming: framerAppendTiming.metrics
+        )
     }
 
     package func send<Message: SpiceGeneratedMessage>(

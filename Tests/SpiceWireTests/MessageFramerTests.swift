@@ -22,18 +22,46 @@ struct MessageFramerTests {
             }
             #expect(message?.type == 103)
             #expect(message?.body == body)
+            #expect(message?.serial == (mode == .full ? 1 : nil))
+            #expect(message?.subListOffset == (mode == .full ? 0 : nil))
             #expect(framer.bufferedByteCount == 0)
         }
     }
 
-    @Test func returnsMultipleMessagesFromOneAppend() throws {
-        let first = makeMessage(mode: .mini, type: 3, body: Data([1]))
-        let second = makeMessage(mode: .mini, type: 4, body: Data([2, 3]))
-        var framer = MessageFramer(mode: .mini)
+    @Test(arguments: [HeaderMode.full, .mini])
+    func returnsMultipleMessagesFromOneAppend(mode: HeaderMode) throws {
+        let firstBody = Data([1])
+        let secondBody = Data([2, 3])
+        let first = makeMessage(
+            mode: mode,
+            type: 3,
+            body: firstBody,
+            serial: 11,
+            subListOffset: 1
+        )
+        let second = makeMessage(
+            mode: mode,
+            type: 4,
+            body: secondBody,
+            serial: 12,
+            subListOffset: 2
+        )
+        var framer = MessageFramer(mode: mode)
 
         try framer.append(first + second)
-        #expect(try framer.nextMessage()?.type == 3)
-        #expect(try framer.nextMessage()?.type == 4)
+        let framedFirst = try framer.nextMessage()
+        let firstMessage = try #require(framedFirst)
+        #expect(firstMessage.type == 3)
+        #expect(firstMessage.body == firstBody)
+        #expect(firstMessage.serial == (mode == .full ? 11 : nil))
+        #expect(firstMessage.subListOffset == (mode == .full ? 1 : nil))
+
+        let framedSecond = try framer.nextMessage()
+        let secondMessage = try #require(framedSecond)
+        #expect(secondMessage.type == 4)
+        #expect(secondMessage.body == secondBody)
+        #expect(secondMessage.serial == (mode == .full ? 12 : nil))
+        #expect(secondMessage.subListOffset == (mode == .full ? 2 : nil))
         #expect(try framer.nextMessage() == nil)
     }
 
@@ -52,15 +80,21 @@ struct MessageFramerTests {
         }
     }
 
-    private func makeMessage(mode: HeaderMode, type: UInt16, body: Data) -> Data {
+    private func makeMessage(
+        mode: HeaderMode,
+        type: UInt16,
+        body: Data,
+        serial: UInt64 = 1,
+        subListOffset: UInt32 = 0
+    ) -> Data {
         var writer = ByteWriter()
         if mode == .full {
-            writer.writeUInt64LE(1)
+            writer.writeUInt64LE(serial)
         }
         writer.writeUInt16LE(type)
         writer.writeUInt32LE(UInt32(body.count))
         if mode == .full {
-            writer.writeUInt32LE(0)
+            writer.writeUInt32LE(subListOffset)
         }
         writer.writeBytes(body)
         return writer.data

@@ -23,7 +23,7 @@ package protocol SpiceManagedChannel: Actor {
     ) async throws(ChannelError)
     func replaceConnection(
         with connection: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection
+    ) async throws(ChannelError) -> ChannelConnection
     func close() async
 }
 

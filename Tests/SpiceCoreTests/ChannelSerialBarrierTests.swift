@@ -16,10 +16,20 @@ struct ChannelSerialBarrierTests {
             ])
         }
 
-        await barrier.record(key: display0, serial: 3)
-        await barrier.record(key: display1, serial: 1)
-        await barrier.record(key: display1, serial: 2)
+        barrier.record(key: display0, serial: 3)
+        barrier.record(key: display1, serial: 1)
+        barrier.record(key: display1, serial: 2)
         try await waiter.value
+    }
+
+    @Test func ignoresOutOfOrderOlderSerials() async throws {
+        let barrier = ChannelSerialBarrier()
+        let display = ChannelKey(type: 2, id: 0)
+
+        barrier.record(key: display, serial: 5)
+        barrier.record(key: display, serial: 3)
+
+        try await barrier.wait(for: [.init(key: display, serial: 5)])
     }
 
     @Test func cancellationRemovesSuspendedWaiter() async {
@@ -32,6 +42,49 @@ struct ChannelSerialBarrierTests {
         waiter.cancel()
         await #expect(throws: CancellationError.self) {
             try await waiter.value
+        }
+    }
+
+    @Test func cancellationBeforeRegistrationCannotBeLost() async {
+        let barrier = ChannelSerialBarrier()
+        let requirement = ChannelSerialBarrier.Requirement(
+            key: ChannelKey(type: 2, id: 1),
+            serial: 99
+        )
+
+        for _ in 0..<1_000 {
+            let waiter = Task {
+                try await barrier.wait(for: [requirement])
+            }
+            waiter.cancel()
+            await #expect(throws: CancellationError.self) {
+                try await waiter.value
+            }
+        }
+    }
+
+    @Test func concurrentRecordAndCancellationAlwaysResolveOnce() async {
+        let key = ChannelKey(type: 2, id: 1)
+        let barrier = ChannelSerialBarrier()
+
+        for serial in 1...1_000 {
+            let waiter = Task {
+                try await barrier.wait(for: [
+                    .init(key: key, serial: UInt64(serial)),
+                ])
+            }
+            let recorder = Task.detached {
+                barrier.record(key: key, serial: UInt64(serial))
+            }
+            waiter.cancel()
+            await recorder.value
+            do {
+                try await waiter.value
+            } catch is CancellationError {
+                // Cancellation and satisfaction are intentionally racing.
+            } catch {
+                Issue.record("unexpected barrier error: \(error)")
+            }
         }
     }
 

@@ -80,3 +80,11 @@ This headless gate covers connection, wire processing, codec execution, Surface
 mutation, snapshot publication, and coalescing. It does not cover AppKit/GTK
 window composition, actual drawable presentation, audio-device latency, or
 input-to-photon latency; those remain separate real-window gates.
+
+For deterministic local profiling of the CPU display chain without a Rocky/QEMU
+fixture, see [`CPU_HOT_PATH_LOCAL.md`](CPU_HOT_PATH_LOCAL.md). That benchmark is
+environment-gated and separately exercises Data-only and revisioned-IOSurface
+publication through real mini-header channel processing. Its separate opt-in
+diagnostic mode reports sampled wire, decode, message handling, SurfaceStore
+actor round-trip, publisher submit/emit, renderer, snapshot, and damage-plan
+phases without adding clock reads to the default disabled path.

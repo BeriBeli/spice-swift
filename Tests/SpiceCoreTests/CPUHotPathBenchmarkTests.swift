@@ -16,16 +16,18 @@ struct CPUHotPathBenchmarkTests {
     private static let backendEnvironment = "SWIFTSPICE_CPU_HOTPATH_BACKEND"
     private static let resolutionEnvironment = "SWIFTSPICE_CPU_HOTPATH_RESOLUTION"
     private static let frameCountEnvironment = "SWIFTSPICE_CPU_HOTPATH_FRAMES"
+    private static let diagnosticsEnvironment = "SWIFTSPICE_CPU_HOTPATH_DIAGNOSTICS"
 
     private static let commandsPerFrame = 57
     private static let bitmapWidth = 32
     private static let bitmapHeight = 25
     private static let bitmapPayloadBytes = bitmapWidth * bitmapHeight * 4
     private static let publicationIntervalMilliseconds: Int64 = 16
+    private static let diagnosticsCommandSamplePeriod: UInt64 = 64
     private static let defaultFrameCount = 1_500
 
-    /// This test is deliberately inert in normal `swift test` runs.
-    /// Set `SWIFTSPICE_CPU_HOTPATH_BENCHMARK=1` to opt in.
+    /// This test is deliberately inert in normal `swift test` runs. Use the
+    /// environment variables documented in Benchmarks/CPU_HOT_PATH_LOCAL.md.
     @Test func deterministicMiniHeaderDisplayPipeline() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment[Self.enableEnvironment] == "1" else {
@@ -35,6 +37,10 @@ struct CPUHotPathBenchmarkTests {
         let backend = try parseBackend(environment[Self.backendEnvironment])
         let resolution = try parseResolution(environment[Self.resolutionEnvironment])
         let frameCount = try parseFrameCount(environment[Self.frameCountEnvironment])
+        let diagnosticsEnabled = environment[Self.diagnosticsEnvironment] == "1"
+        let diagnosticsMode: RenderDiagnosticsMode = diagnosticsEnabled
+            ? .sampled(commandPeriod: Self.diagnosticsCommandSamplePeriod)
+            : .disabled
         let expectedCommandCount = frameCount * Self.commandsPerFrame
 
         // Fixture construction is intentionally outside the measured region.
@@ -70,7 +76,8 @@ struct CPUHotPathBenchmarkTests {
         case .dataOnly:
             store = SurfaceStore(
                 framePool: disabledLegacyPool,
-                backingPolicy: .dataOnly
+                backingPolicy: .dataOnly,
+                diagnosticsMode: diagnosticsMode
             )
         case .cpuIOSurface:
             guard let revisionedPool = RevisionedIOSurfacePool.makeIfSupported() else {
@@ -78,7 +85,8 @@ struct CPUHotPathBenchmarkTests {
             }
             store = SurfaceStore(
                 framePool: disabledLegacyPool,
-                backingPolicy: .revisionedIOSurface(revisionedPool)
+                backingPolicy: .revisionedIOSurface(revisionedPool),
+                diagnosticsMode: diagnosticsMode
             )
         }
 
@@ -86,10 +94,12 @@ struct CPUHotPathBenchmarkTests {
             connection: ChannelConnection(
                 key: ChannelKey(type: 2, id: 0),
                 transport: transport,
-                headerMode: .mini
+                headerMode: .mini,
+                diagnosticsMode: diagnosticsMode
             ),
             surfaces: store,
-            framePublicationInterval: .milliseconds(Self.publicationIntervalMilliseconds)
+            framePublicationInterval: .milliseconds(Self.publicationIntervalMilliseconds),
+            diagnosticsMode: diagnosticsMode
         )
         let frameSink = CPUHotPathFrameSink(
             surfaceID: 1,
@@ -184,6 +194,8 @@ struct CPUHotPathBenchmarkTests {
         let currentRSS = currentResidentBytes()
         let peakRSS = peakResidentBytes()
 
+        try #require(currentRSS > 0)
+        try #require(peakRSS >= currentRSS)
         try #require(diagnostics.publisher.submissions == UInt64(expectedCommandCount))
         try #require(diagnostics.publisher.emittedFrames == sinkMetrics.frames)
         try #require(diagnostics.publisher.emittedFrames > 0)
@@ -197,22 +209,179 @@ struct CPUHotPathBenchmarkTests {
             diagnostics.surfaces.damageBytes
                 == UInt64(expectedCommandCount * Self.bitmapPayloadBytes)
         )
+        if diagnosticsEnabled {
+            let expectedBitmapSamples = UInt64(expectedCommandCount)
+                / Self.diagnosticsCommandSamplePeriod
+            let expectedMessageSamples = UInt64(expectedCommandCount + 1)
+                / Self.diagnosticsCommandSamplePeriod
+            try #require(
+                diagnostics.connection.framerNextTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(
+                diagnostics.connection.framerNextTiming.samples
+                    >= expectedMessageSamples
+            )
+            try #require(
+                diagnostics.connection.framerAppendTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            if frameCount >= Int(Self.diagnosticsCommandSamplePeriod) {
+                try #require(diagnostics.connection.framerAppendTiming.samples > 0)
+            }
+            try #require(
+                diagnostics.messageHandlingTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(diagnostics.messageHandlingTiming.samples == expectedMessageSamples)
+            try #require(
+                diagnostics.messageDecodeTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(diagnostics.messageDecodeTiming.samples == expectedMessageSamples)
+            try #require(
+                diagnostics.bitmapSurfaceStoreRoundTripTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(
+                diagnostics.bitmapSurfaceStoreRoundTripTiming.samples
+                    == expectedBitmapSamples
+            )
+            try #require(
+                diagnostics.publisherSubmitRoundTripTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(
+                diagnostics.publisherSubmitRoundTripTiming.samples
+                    == expectedBitmapSamples
+            )
+            try #require(diagnostics.publisher.frameEmitTiming.samplePeriod == 1)
+            try #require(
+                diagnostics.publisher.frameEmitTiming.samples
+                    == diagnostics.publisher.emittedFrames
+            )
+            try #require(
+                diagnostics.surfaces.bitmapValidationTiming.samplePeriod
+                    == Self.diagnosticsCommandSamplePeriod
+            )
+            try #require(
+                diagnostics.surfaces.bitmapValidationTiming.samples
+                    == expectedBitmapSamples
+            )
+            try #require(
+                diagnostics.surfaces.bitmapMutationTiming.samples
+                    == expectedBitmapSamples
+            )
+            try #require(
+                diagnostics.surfaces.bitmapDamageJournalTiming.samples
+                    == expectedBitmapSamples
+            )
+            try #require(diagnostics.surfaces.snapshotCheckoutTiming.samplePeriod == 1)
+            try #require(diagnostics.surfaces.snapshotDamagePlanTiming.samplePeriod == 1)
+            try #require(diagnostics.surfaces.snapshotCPUCopyTiming.samplePeriod == 1)
+            try #require(diagnostics.surfaces.snapshotFinishTiming.samplePeriod == 1)
+        } else {
+            try #require(diagnostics.connection.framerNextTiming == RenderPhaseMetrics())
+            try #require(diagnostics.connection.framerAppendTiming == RenderPhaseMetrics())
+            try #require(diagnostics.messageHandlingTiming == RenderPhaseMetrics())
+            try #require(diagnostics.messageDecodeTiming == RenderPhaseMetrics())
+            try #require(
+                diagnostics.bitmapSurfaceStoreRoundTripTiming == RenderPhaseMetrics()
+            )
+            try #require(
+                diagnostics.publisherSubmitRoundTripTiming == RenderPhaseMetrics()
+            )
+            try #require(diagnostics.publisher.frameEmitTiming == RenderPhaseMetrics())
+            try #require(diagnostics.surfaces.bitmapValidationTiming.samplePeriod == nil)
+            try #require(diagnostics.surfaces.bitmapValidationTiming.samples == 0)
+            try #require(diagnostics.surfaces.bitmapMutationTiming.samples == 0)
+            try #require(diagnostics.surfaces.bitmapDamageJournalTiming.samples == 0)
+            try #require(diagnostics.surfaces.snapshotCheckoutTiming.samplePeriod == nil)
+            try #require(diagnostics.surfaces.snapshotCheckoutTiming.samples == 0)
+            try #require(diagnostics.surfaces.snapshotDamagePlanTiming.samples == 0)
+            try #require(diagnostics.surfaces.snapshotCPUCopyTiming.samples == 0)
+            try #require(diagnostics.surfaces.snapshotFinishTiming.samples == 0)
+        }
+
         switch backend {
         case .dataOnly:
             try #require(!diagnostics.surfaces.revisionedBackingEnabled)
+            try #require(diagnostics.surfaces.inFlightLeases == 0)
+            try #require(
+                diagnostics.surfaces.dataBackendSnapshots
+                    == diagnostics.surfaces.snapshots
+            )
+            try #require(diagnostics.surfaces.revisionedSnapshotUploads == 0)
             try #require(
                 diagnostics.surfaces.poolExhaustions
                     == diagnostics.surfaces.snapshots
             )
+            try #require(diagnostics.surfaces.damageRectanglesBeforeMerge == 0)
+            try #require(diagnostics.surfaces.damageRectanglesAfterMerge == 0)
+            try #require(diagnostics.surfaces.fullDamageByCount == 0)
+            try #require(diagnostics.surfaces.fullDamageByArea == 0)
+            try #require(diagnostics.surfaces.fullDamageByExplicit == 0)
+            try #require(diagnostics.surfaces.fullDamageBySurfaceInitialization == 0)
+            try #require(diagnostics.surfaces.fullDamageByNewSlot == 0)
+            try #require(diagnostics.surfaces.fullDamageByHistoryGap == 0)
+            if diagnosticsEnabled {
+                try #require(diagnostics.surfaces.snapshotCheckoutTiming.samples == 0)
+                try #require(diagnostics.surfaces.snapshotDamagePlanTiming.samples == 0)
+                try #require(diagnostics.surfaces.snapshotCPUCopyTiming.samples == 0)
+                try #require(diagnostics.surfaces.snapshotFinishTiming.samples == 0)
+            }
         case .cpuIOSurface:
             try #require(diagnostics.surfaces.revisionedBackingEnabled)
+            try #require(diagnostics.surfaces.inFlightLeases == 1)
+            try #require(
+                diagnostics.surfaces.revisionedSnapshotUploads
+                    &+ diagnostics.surfaces.revisionedSnapshotReuses
+                    == diagnostics.surfaces.snapshots
+            )
             try #require(
                 diagnostics.surfaces.revisionedAllocatedFrames
                     >= min(2, frameCount)
             )
-            try #require(diagnostics.surfaces.poolExhaustions == 0)
+            try #require(diagnostics.surfaces.dataBackendSnapshots == 0)
+            try #require(diagnostics.surfaces.revisionedSnapshotFallbacks == 0)
+            try #require(diagnostics.surfaces.unifiedBackingDisables == 0)
             try #require(diagnostics.surfaces.cpuMaterializations == 0)
+            try #require(diagnostics.surfaces.poolExhaustions == 0)
             try #require(diagnostics.surfaces.gpuErrors == 0)
+            if diagnosticsEnabled {
+                let uploads = diagnostics.surfaces.revisionedSnapshotUploads
+                try #require(
+                    diagnostics.surfaces.snapshotCheckoutTiming.samples == uploads
+                )
+                try #require(
+                    diagnostics.surfaces.snapshotDamagePlanTiming.samples == uploads
+                )
+                try #require(
+                    diagnostics.surfaces.snapshotCPUCopyTiming.samples == uploads
+                )
+                try #require(
+                    diagnostics.surfaces.snapshotFinishTiming.samples == uploads
+                )
+            }
+            let fullDamagePlans = diagnostics.surfaces.fullDamageByCount
+                &+ diagnostics.surfaces.fullDamageByArea
+                &+ diagnostics.surfaces.fullDamageByExplicit
+                &+ diagnostics.surfaces.fullDamageBySurfaceInitialization
+                &+ diagnostics.surfaces.fullDamageByNewSlot
+                &+ diagnostics.surfaces.fullDamageByHistoryGap
+            try #require(fullDamagePlans <= diagnostics.surfaces.revisionedSnapshotUploads)
+            if diagnostics.surfaces.snapshotCatchUpCPUCopyBytes == 0 {
+                try #require(diagnostics.surfaces.damageRectanglesBeforeMerge == 0)
+                try #require(diagnostics.surfaces.damageRectanglesAfterMerge == 0)
+                try #require(fullDamagePlans == 0)
+            } else {
+                try #require(diagnostics.surfaces.damageRectanglesAfterMerge > 0)
+                try #require(
+                    diagnostics.surfaces.damageRectanglesAfterMerge
+                        <= diagnostics.surfaces.damageRectanglesBeforeMerge
+                            &+ fullDamagePlans
+                )
+            }
         }
 
         // Correctness is checked after the timed/metric snapshot so this
@@ -237,6 +406,7 @@ struct CPUHotPathBenchmarkTests {
             height: resolution.height,
             frames: frameCount,
             commands: expectedCommandCount,
+            diagnosticsEnabled: diagnosticsEnabled,
             commandsPerFrame: Self.commandsPerFrame,
             bitmapWidth: Self.bitmapWidth,
             bitmapHeight: Self.bitmapHeight,
@@ -265,9 +435,22 @@ struct CPUHotPathBenchmarkTests {
             publisherPendingSurfaces: diagnostics.publisher.pendingSurfaces,
             damageOperations: diagnostics.surfaces.damageOperations,
             damageBytes: diagnostics.surfaces.damageBytes,
+            damageRectanglesBeforeMerge:
+                diagnostics.surfaces.damageRectanglesBeforeMerge,
+            damageRectanglesAfterMerge:
+                diagnostics.surfaces.damageRectanglesAfterMerge,
+            fullDamageByCount: diagnostics.surfaces.fullDamageByCount,
+            fullDamageByArea: diagnostics.surfaces.fullDamageByArea,
+            fullDamageByExplicit: diagnostics.surfaces.fullDamageByExplicit,
+            fullDamageBySurfaceInitialization:
+                diagnostics.surfaces.fullDamageBySurfaceInitialization,
+            fullDamageByNewSlot: diagnostics.surfaces.fullDamageByNewSlot,
+            fullDamageByHistoryGap: diagnostics.surfaces.fullDamageByHistoryGap,
             snapshots: diagnostics.surfaces.snapshots,
             fullFrameCopyBytes: diagnostics.surfaces.fullFrameCopyBytes,
             partialFrameCopyBytes: diagnostics.surfaces.partialFrameCopyBytes,
+            snapshotCatchUpCPUCopyBytes:
+                diagnostics.surfaces.snapshotCatchUpCPUCopyBytes,
             cpuMaterializations: diagnostics.surfaces.cpuMaterializations,
             cpuMaterializationBytes: diagnostics.surfaces.cpuMaterializationBytes,
             poolExhaustions: diagnostics.surfaces.poolExhaustions,
@@ -283,6 +466,95 @@ struct CPUHotPathBenchmarkTests {
             compositorErrors: diagnostics.surfaces.compositorErrors,
             nativeVideoFrames: diagnostics.surfaces.nativeVideoFrames,
             nativeVideoFallbacks: diagnostics.surfaces.nativeVideoFallbacks,
+            revisionedSnapshotReuses: diagnostics.surfaces.revisionedSnapshotReuses,
+            revisionedSnapshotUploads: diagnostics.surfaces.revisionedSnapshotUploads,
+            dataBackendSnapshots: diagnostics.surfaces.dataBackendSnapshots,
+            revisionedSnapshotFallbacks:
+                diagnostics.surfaces.revisionedSnapshotFallbacks,
+            unifiedBackingDisables: diagnostics.surfaces.unifiedBackingDisables,
+            wireFramerNextSamplePeriod:
+                diagnostics.connection.framerNextTiming.samplePeriod ?? 0,
+            wireFramerNextSamples:
+                diagnostics.connection.framerNextTiming.samples,
+            wireFramerNextSampledNanoseconds:
+                diagnostics.connection.framerNextTiming.sampledNanoseconds,
+            wireFramerAppendSamplePeriod:
+                diagnostics.connection.framerAppendTiming.samplePeriod ?? 0,
+            wireFramerAppendSamples:
+                diagnostics.connection.framerAppendTiming.samples,
+            wireFramerAppendSampledNanoseconds:
+                diagnostics.connection.framerAppendTiming.sampledNanoseconds,
+            displayMessageHandlingSamplePeriod:
+                diagnostics.messageHandlingTiming.samplePeriod ?? 0,
+            displayMessageHandlingSamples:
+                diagnostics.messageHandlingTiming.samples,
+            displayMessageHandlingSampledNanoseconds:
+                diagnostics.messageHandlingTiming.sampledNanoseconds,
+            displayMessageDecodeSamplePeriod:
+                diagnostics.messageDecodeTiming.samplePeriod ?? 0,
+            displayMessageDecodeSamples:
+                diagnostics.messageDecodeTiming.samples,
+            displayMessageDecodeSampledNanoseconds:
+                diagnostics.messageDecodeTiming.sampledNanoseconds,
+            bitmapSurfaceStoreRoundTripSamplePeriod:
+                diagnostics.bitmapSurfaceStoreRoundTripTiming.samplePeriod ?? 0,
+            bitmapSurfaceStoreRoundTripSamples:
+                diagnostics.bitmapSurfaceStoreRoundTripTiming.samples,
+            bitmapSurfaceStoreRoundTripSampledNanoseconds:
+                diagnostics.bitmapSurfaceStoreRoundTripTiming.sampledNanoseconds,
+            publisherSubmitRoundTripSamplePeriod:
+                diagnostics.publisherSubmitRoundTripTiming.samplePeriod ?? 0,
+            publisherSubmitRoundTripSamples:
+                diagnostics.publisherSubmitRoundTripTiming.samples,
+            publisherSubmitRoundTripSampledNanoseconds:
+                diagnostics.publisherSubmitRoundTripTiming.sampledNanoseconds,
+            frameEmitSamplePeriod:
+                diagnostics.publisher.frameEmitTiming.samplePeriod ?? 0,
+            frameEmitSamples: diagnostics.publisher.frameEmitTiming.samples,
+            frameEmitSampledNanoseconds:
+                diagnostics.publisher.frameEmitTiming.sampledNanoseconds,
+            bitmapValidationSamplePeriod:
+                diagnostics.surfaces.bitmapValidationTiming.samplePeriod ?? 0,
+            bitmapValidationSamples:
+                diagnostics.surfaces.bitmapValidationTiming.samples,
+            bitmapValidationSampledNanoseconds:
+                diagnostics.surfaces.bitmapValidationTiming.sampledNanoseconds,
+            bitmapMutationSamplePeriod:
+                diagnostics.surfaces.bitmapMutationTiming.samplePeriod ?? 0,
+            bitmapMutationSamples:
+                diagnostics.surfaces.bitmapMutationTiming.samples,
+            bitmapMutationSampledNanoseconds:
+                diagnostics.surfaces.bitmapMutationTiming.sampledNanoseconds,
+            bitmapDamageJournalSamplePeriod:
+                diagnostics.surfaces.bitmapDamageJournalTiming.samplePeriod ?? 0,
+            bitmapDamageJournalSamples:
+                diagnostics.surfaces.bitmapDamageJournalTiming.samples,
+            bitmapDamageJournalSampledNanoseconds:
+                diagnostics.surfaces.bitmapDamageJournalTiming.sampledNanoseconds,
+            snapshotCheckoutSamplePeriod:
+                diagnostics.surfaces.snapshotCheckoutTiming.samplePeriod ?? 0,
+            snapshotCheckoutSamples:
+                diagnostics.surfaces.snapshotCheckoutTiming.samples,
+            snapshotCheckoutSampledNanoseconds:
+                diagnostics.surfaces.snapshotCheckoutTiming.sampledNanoseconds,
+            snapshotDamagePlanSamplePeriod:
+                diagnostics.surfaces.snapshotDamagePlanTiming.samplePeriod ?? 0,
+            snapshotDamagePlanSamples:
+                diagnostics.surfaces.snapshotDamagePlanTiming.samples,
+            snapshotDamagePlanSampledNanoseconds:
+                diagnostics.surfaces.snapshotDamagePlanTiming.sampledNanoseconds,
+            snapshotCPUCopySamplePeriod:
+                diagnostics.surfaces.snapshotCPUCopyTiming.samplePeriod ?? 0,
+            snapshotCPUCopySamples:
+                diagnostics.surfaces.snapshotCPUCopyTiming.samples,
+            snapshotCPUCopySampledNanoseconds:
+                diagnostics.surfaces.snapshotCPUCopyTiming.sampledNanoseconds,
+            snapshotFinishSamplePeriod:
+                diagnostics.surfaces.snapshotFinishTiming.samplePeriod ?? 0,
+            snapshotFinishSamples:
+                diagnostics.surfaces.snapshotFinishTiming.samples,
+            snapshotFinishSampledNanoseconds:
+                diagnostics.surfaces.snapshotFinishTiming.sampledNanoseconds
         )
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -727,6 +999,7 @@ private struct CPUHotPathBenchmarkResult: Encodable {
     let height: Int
     let frames: Int
     let commands: Int
+    let diagnosticsEnabled: Bool
     let commandsPerFrame: Int
     let bitmapWidth: Int
     let bitmapHeight: Int
@@ -750,9 +1023,18 @@ private struct CPUHotPathBenchmarkResult: Encodable {
     let publisherPendingSurfaces: Int
     let damageOperations: UInt64
     let damageBytes: UInt64
+    let damageRectanglesBeforeMerge: UInt64
+    let damageRectanglesAfterMerge: UInt64
+    let fullDamageByCount: UInt64
+    let fullDamageByArea: UInt64
+    let fullDamageByExplicit: UInt64
+    let fullDamageBySurfaceInitialization: UInt64
+    let fullDamageByNewSlot: UInt64
+    let fullDamageByHistoryGap: UInt64
     let snapshots: UInt64
     let fullFrameCopyBytes: UInt64
     let partialFrameCopyBytes: UInt64
+    let snapshotCatchUpCPUCopyBytes: UInt64
     let cpuMaterializations: UInt64
     let cpuMaterializationBytes: UInt64
     let poolExhaustions: UInt64
@@ -767,6 +1049,53 @@ private struct CPUHotPathBenchmarkResult: Encodable {
     let compositorErrors: UInt64
     let nativeVideoFrames: UInt64
     let nativeVideoFallbacks: UInt64
+    let revisionedSnapshotReuses: UInt64
+    let revisionedSnapshotUploads: UInt64
+    let dataBackendSnapshots: UInt64
+    let revisionedSnapshotFallbacks: UInt64
+    let unifiedBackingDisables: UInt64
+    let wireFramerNextSamplePeriod: UInt64
+    let wireFramerNextSamples: UInt64
+    let wireFramerNextSampledNanoseconds: UInt64
+    let wireFramerAppendSamplePeriod: UInt64
+    let wireFramerAppendSamples: UInt64
+    let wireFramerAppendSampledNanoseconds: UInt64
+    let displayMessageHandlingSamplePeriod: UInt64
+    let displayMessageHandlingSamples: UInt64
+    let displayMessageHandlingSampledNanoseconds: UInt64
+    let displayMessageDecodeSamplePeriod: UInt64
+    let displayMessageDecodeSamples: UInt64
+    let displayMessageDecodeSampledNanoseconds: UInt64
+    let bitmapSurfaceStoreRoundTripSamplePeriod: UInt64
+    let bitmapSurfaceStoreRoundTripSamples: UInt64
+    let bitmapSurfaceStoreRoundTripSampledNanoseconds: UInt64
+    let publisherSubmitRoundTripSamplePeriod: UInt64
+    let publisherSubmitRoundTripSamples: UInt64
+    let publisherSubmitRoundTripSampledNanoseconds: UInt64
+    let frameEmitSamplePeriod: UInt64
+    let frameEmitSamples: UInt64
+    let frameEmitSampledNanoseconds: UInt64
+    let bitmapValidationSamplePeriod: UInt64
+    let bitmapValidationSamples: UInt64
+    let bitmapValidationSampledNanoseconds: UInt64
+    let bitmapMutationSamplePeriod: UInt64
+    let bitmapMutationSamples: UInt64
+    let bitmapMutationSampledNanoseconds: UInt64
+    let bitmapDamageJournalSamplePeriod: UInt64
+    let bitmapDamageJournalSamples: UInt64
+    let bitmapDamageJournalSampledNanoseconds: UInt64
+    let snapshotCheckoutSamplePeriod: UInt64
+    let snapshotCheckoutSamples: UInt64
+    let snapshotCheckoutSampledNanoseconds: UInt64
+    let snapshotDamagePlanSamplePeriod: UInt64
+    let snapshotDamagePlanSamples: UInt64
+    let snapshotDamagePlanSampledNanoseconds: UInt64
+    let snapshotCPUCopySamplePeriod: UInt64
+    let snapshotCPUCopySamples: UInt64
+    let snapshotCPUCopySampledNanoseconds: UInt64
+    let snapshotFinishSamplePeriod: UInt64
+    let snapshotFinishSamples: UInt64
+    let snapshotFinishSampledNanoseconds: UInt64
 }
 
 private func processCPUNanoseconds() -> UInt64 {

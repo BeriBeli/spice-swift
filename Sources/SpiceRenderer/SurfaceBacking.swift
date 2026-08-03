@@ -89,34 +89,80 @@ package final class SurfaceMemoryLease: Sendable {
 package struct SurfaceDamageJournal: Sendable, Equatable {
     private static let maximumRectangles = 64
 
+    package enum FullFrameReason: Sendable, Equatable {
+        case explicit
+        case rectangleCount
+        case area
+        case surfaceInitialization
+        case newSlot
+        case historyGap
+    }
+
+    package struct CopyPlan: Sendable, Equatable {
+        package let inputRectangleCount: UInt64
+        package let copyRectangles: [PixelRect]
+        package let fullFrameReason: FullFrameReason?
+
+        package var isFullFrame: Bool {
+            fullFrameReason != nil
+        }
+    }
+
     private let surfaceWidth: Int
     private let surfaceHeight: Int
     private var rectangles: [PixelRect] = []
-    private var coversFullSurface: Bool
+    private var inputRectangleCount: UInt64 = 0
+    private var forcedFullFrameReason: FullFrameReason?
 
     package init(width: Int, height: Int, initiallyFull: Bool = false) {
         surfaceWidth = width
         surfaceHeight = height
-        coversFullSurface = initiallyFull
+        forcedFullFrameReason = initiallyFull ? .surfaceInitialization : nil
     }
 
     package var isEmpty: Bool {
-        !coversFullSurface && rectangles.isEmpty
+        forcedFullFrameReason == nil && rectangles.isEmpty
+    }
+
+    /// Resolves the bounded journal into one immutable publication plan. The
+    /// exact area union is evaluated at most once for callers that consume this
+    /// plan's rectangles, count, and full-frame reason together.
+    package var copyPlan: CopyPlan {
+        let fullFrameReason: FullFrameReason?
+        if let forcedFullFrameReason {
+            fullFrameReason = forcedFullFrameReason
+        } else if coveredAreaReachesHalfSurface() {
+            fullFrameReason = .area
+        } else {
+            fullFrameReason = nil
+        }
+        let copyRectangles = if fullFrameReason == nil {
+            rectangles
+        } else {
+            [PixelRect(x: 0, y: 0, width: surfaceWidth, height: surfaceHeight)]
+        }
+        return CopyPlan(
+            inputRectangleCount: inputRectangleCount,
+            copyRectangles: copyRectangles,
+            fullFrameReason: fullFrameReason
+        )
     }
 
     package var copyRectangles: [PixelRect] {
-        if isFullFrame {
-            return [PixelRect(x: 0, y: 0, width: surfaceWidth, height: surfaceHeight)]
-        }
-        return rectangles
+        copyPlan.copyRectangles
     }
 
     package var isFullFrame: Bool {
-        coversFullSurface || coveredAreaReachesHalfSurface()
+        copyPlan.isFullFrame
     }
 
     package mutating func append(_ rectangle: PixelRect) {
-        guard !coversFullSurface else {
+        inputRectangleCount = Self.saturatingAdd(inputRectangleCount, 1)
+        appendMerged(rectangle)
+    }
+
+    private mutating func appendMerged(_ rectangle: PixelRect) {
+        guard forcedFullFrameReason == nil else {
             return
         }
 
@@ -143,28 +189,56 @@ package struct SurfaceDamageJournal: Sendable, Equatable {
         rectangles.append(merged)
 
         if rectangles.count > Self.maximumRectangles {
-            markFull()
+            markFull(reason: .rectangleCount)
         }
     }
 
     package mutating func markFull() {
-        coversFullSurface = true
+        markFull(reason: .explicit)
+    }
+
+    /// Forces the copy reason even if merged pending damage was already full.
+    /// Used when IOSurface topology, rather than the pending draw set, requires
+    /// a full upload. The pre-merge input count remains intact for diagnostics.
+    fileprivate mutating func forceFull(reason: FullFrameReason) {
+        forcedFullFrameReason = reason
+        rectangles.removeAll(keepingCapacity: false)
+    }
+
+    private mutating func markFull(reason: FullFrameReason) {
+        if forcedFullFrameReason == nil {
+            forcedFullFrameReason = reason
+        }
         rectangles.removeAll(keepingCapacity: false)
     }
 
     package mutating func clear() {
-        coversFullSurface = false
+        inputRectangleCount = 0
+        forcedFullFrameReason = nil
         rectangles.removeAll(keepingCapacity: true)
     }
 
     package mutating func merge(_ other: SurfaceDamageJournal) {
-        if other.isFullFrame {
-            markFull()
+        inputRectangleCount = Self.saturatingAdd(
+            inputRectangleCount,
+            other.inputRectangleCount
+        )
+        guard forcedFullFrameReason == nil else {
             return
         }
-        for rectangle in other.copyRectangles {
-            append(rectangle)
+        let otherPlan = other.copyPlan
+        if let fullFrameReason = otherPlan.fullFrameReason {
+            markFull(reason: fullFrameReason)
+            return
         }
+        for rectangle in otherPlan.copyRectangles {
+            appendMerged(rectangle)
+        }
+    }
+
+    private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
     }
 
     private func coveredAreaReachesHalfSurface() -> Bool {
@@ -261,8 +335,14 @@ package struct SurfaceRevisionDamageHistory: Sendable, Equatable {
         pending: SurfaceDamageJournal
     ) -> SurfaceDamageJournal {
         var result = SurfaceDamageJournal(width: surfaceWidth, height: surfaceHeight)
-        guard let candidateRevision, candidateRevision >= baseRevision else {
-            result.markFull()
+        guard let candidateRevision else {
+            result.merge(pending)
+            result.forceFull(reason: .newSlot)
+            return result
+        }
+        guard candidateRevision >= baseRevision else {
+            result.merge(pending)
+            result.forceFull(reason: .historyGap)
             return result
         }
         for record in records where record.revision > candidateRevision {

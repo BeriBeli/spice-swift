@@ -5,8 +5,10 @@ import Metal
 import SpiceCodecs
 import SpiceIOSurface
 import SpiceVideoToolbox
+import Synchronization
 import Testing
 @testable import SpiceRenderer
+@testable import SpiceWire
 
 @Suite("SurfaceStore", .serialized)
 struct SurfaceStoreTests {
@@ -533,6 +535,211 @@ struct SurfaceStoreTests {
         #expect(metrics.cpuMaterializations == 1)
     }
 
+    @Test func dataBackendSnapshotsReportTheirPath() async throws {
+        let store = SurfaceStore(
+            framePool: IOSurfaceFramePool(
+                limits: .init(maximumFrames: 0, maximumBytes: 0)
+            ),
+            backingPolicy: .dataOnly
+        )
+        try await store.create(id: 18, width: 1, height: 1, format: 32)
+
+        _ = try await store.snapshot(surfaceID: 18)
+        _ = try await store.snapshot(surfaceID: 18)
+
+        let metrics = await store.metrics()
+        #expect(metrics.snapshots == 2)
+        #expect(metrics.dataBackendSnapshots == 2)
+        #expect(metrics.revisionedSnapshotReuses == 0)
+        #expect(metrics.revisionedSnapshotUploads == 0)
+        #expect(metrics.revisionedSnapshotFallbacks == 0)
+        #expect(metrics.unifiedBackingDisables == 0)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 0)
+    }
+
+    @Test func disabledPhaseDiagnosticsDoNotReadClock() async throws {
+        let nextReading = Mutex<UInt64>(0)
+        let store = SurfaceStore(
+            backingPolicy: .dataOnly,
+            diagnosticsMode: .disabled,
+            diagnosticsClock: {
+                nextReading.withLock { reading in
+                    defer { reading += 10 }
+                    return reading
+                }
+            }
+        )
+        try await store.create(id: 44, width: 1, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 44,
+            destination: PixelRect(x: 0, y: 0, width: 1, height: 1),
+            bitmap: RawBitmap(
+                format: .xRGB8888,
+                width: 1,
+                height: 1,
+                stride: 4,
+                topDown: true,
+                pixels: Data([1, 2, 3, 0])
+            )
+        )
+        _ = try await store.snapshot(surfaceID: 44)
+
+        let metrics = await store.metrics()
+        #expect(nextReading.withLock { $0 } == 0)
+        #expect(metrics.bitmapValidationTiming == RenderPhaseMetrics())
+        #expect(metrics.bitmapMutationTiming == RenderPhaseMetrics())
+        #expect(metrics.bitmapDamageJournalTiming == RenderPhaseMetrics())
+        #expect(metrics.snapshotCheckoutTiming == RenderPhaseMetrics())
+        #expect(metrics.snapshotDamagePlanTiming == RenderPhaseMetrics())
+        #expect(metrics.snapshotCPUCopyTiming == RenderPhaseMetrics())
+        #expect(metrics.snapshotFinishTiming == RenderPhaseMetrics())
+    }
+
+    @Test func sampledBitmapAndRevisionedSnapshotPhasesReportRawTime() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let nextReading = Mutex<UInt64>(0)
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            diagnosticsMode: .sampled(commandPeriod: 2),
+            diagnosticsClock: {
+                nextReading.withLock { reading in
+                    defer { reading += 10 }
+                    return reading
+                }
+            }
+        )
+        try await store.create(id: 45, width: 1, height: 1, format: 32)
+        let destination = PixelRect(x: 0, y: 0, width: 1, height: 1)
+        let bitmap = RawBitmap(
+            format: .xRGB8888,
+            width: 1,
+            height: 1,
+            stride: 4,
+            topDown: true,
+            pixels: Data([1, 2, 3, 0])
+        )
+        try await store.drawCopy(surfaceID: 45, destination: destination, bitmap: bitmap)
+        try await store.drawCopy(surfaceID: 45, destination: destination, bitmap: bitmap)
+        _ = try await store.snapshot(surfaceID: 45)
+
+        let metrics = await store.metrics()
+        #expect(metrics.bitmapValidationTiming == RenderPhaseMetrics(
+            samplePeriod: 2,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(metrics.bitmapMutationTiming == RenderPhaseMetrics(
+            samplePeriod: 2,
+            samples: 1,
+            sampledNanoseconds: 20
+        ))
+        #expect(metrics.bitmapDamageJournalTiming == RenderPhaseMetrics(
+            samplePeriod: 2,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(metrics.snapshotCheckoutTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(metrics.snapshotDamagePlanTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(metrics.snapshotCPUCopyTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(metrics.snapshotFinishTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(nextReading.withLock { $0 } == 160)
+    }
+
+    @Test func revisionedSnapshotsReportUploadsReuseAndCatchUpBytes() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 19, width: 2, height: 1, format: 32)
+        try await store.fill(
+            surfaceID: 19,
+            rectangle: PixelRect(x: 0, y: 0, width: 2, height: 1),
+            colorARGB: 0x0001_0203
+        )
+
+        let publication = try await uploadAndReuseSnapshot(store, surfaceID: 19)
+        #expect(publication.hasIOSurface)
+        #expect(publication.reusedPixelStorage)
+
+        var metrics = await store.metrics()
+        #expect(metrics.snapshots == 2)
+        #expect(metrics.revisionedSnapshotUploads == 1)
+        #expect(metrics.revisionedSnapshotReuses == 1)
+        #expect(metrics.dataBackendSnapshots == 0)
+        #expect(metrics.revisionedSnapshotFallbacks == 0)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 8)
+
+        try await store.fill(
+            surfaceID: 19,
+            rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
+            colorARGB: 0x0011_2233
+        )
+        _ = try await store.snapshot(surfaceID: 19)
+
+        metrics = await store.metrics()
+        #expect(metrics.snapshots == 3)
+        #expect(metrics.revisionedSnapshotUploads == 2)
+        #expect(metrics.revisionedSnapshotReuses == 1)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 16)
+        #expect(metrics.fullFrameCopyBytes == 16)
+        #expect(metrics.partialFrameCopyBytes == 0)
+    }
+
+    @Test func revisionedCopyFailureReportsFallbackAndBackingDisable() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(
+            framePool: IOSurfaceFramePool(
+                limits: .init(maximumFrames: 0, maximumBytes: 0)
+            ),
+            backingPolicy: .revisionedIOSurface(pool),
+            revisionedSnapshotCopyFailureForAttempt: { $0 == 1 }
+        )
+        try await store.create(id: 23, width: 2, height: 1, format: 32)
+
+        let fallback = try await store.snapshot(surfaceID: 23)
+        #expect(fallback.ioSurfaceFrame == nil)
+        var metrics = await store.metrics()
+        #expect(metrics.snapshots == 1)
+        #expect(metrics.revisionedSnapshotFallbacks == 1)
+        #expect(metrics.unifiedBackingDisables == 1)
+        #expect(metrics.dataBackendSnapshots == 0)
+        #expect(metrics.revisionedSnapshotUploads == 0)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 0)
+
+        _ = try await store.snapshot(surfaceID: 23)
+        metrics = await store.metrics()
+        #expect(metrics.snapshots == 2)
+        #expect(metrics.dataBackendSnapshots == 1)
+        #expect(metrics.revisionedSnapshotFallbacks == 1)
+        #expect(metrics.unifiedBackingDisables == 1)
+    }
+
     @Test func revisionedBackingUsesDamageHistoryAndKeepsOldLeaseImmutable() async throws {
         guard let pool = RevisionedIOSurfacePool.makeIfSupported(
             limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
@@ -661,6 +868,8 @@ struct SurfaceStoreTests {
 
         let metrics = await store.metrics()
         #expect(metrics.revisionedAllocatedFrames == 1)
+        #expect(metrics.revisionedSnapshotUploads == 2)
+        #expect(metrics.snapshotCatchUpCPUCopyBytes == 36)
         #expect(metrics.fullFrameCopyBytes == 32)
         #expect(metrics.partialFrameCopyBytes == 4)
         #expect(metrics.gpuCopyBytes == 0)
@@ -799,12 +1008,20 @@ struct SurfaceStoreTests {
         #expect(fallback.ioSurfaceFrame == nil)
         #expect(pixel(fallback, x: 1, y: 0) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(leases[0], x: 0, y: 0) == [1, 0, 0, 0xff])
-        #expect(await store.metrics().poolExhaustions == 1)
+        var metrics = await store.metrics()
+        #expect(metrics.poolExhaustions == 1)
+        #expect(metrics.revisionedSnapshotUploads == 3)
+        #expect(metrics.revisionedSnapshotFallbacks == 1)
+        #expect(metrics.dataBackendSnapshots == 0)
+        #expect(metrics.unifiedBackingDisables == 0)
 
         leases.removeAll()
         let promoted = try await store.snapshot(surfaceID: 21)
         #expect(promoted.ioSurfaceFrame != nil)
         #expect(promoted.pixels == fallback.pixels)
+        metrics = await store.metrics()
+        #expect(metrics.revisionedSnapshotUploads == 4)
+        #expect(metrics.revisionedSnapshotFallbacks == 1)
     }
 
     @Test func revisionedWritableCandidateNeverAliasesCommittedSource() async throws {
@@ -1045,12 +1262,25 @@ struct SurfaceStoreTests {
         for _ in 0..<1_000 {
             journal.append(PixelRect(x: 1, y: 1, width: 2, height: 2))
         }
-        #expect(journal.copyRectangles == [PixelRect(x: 1, y: 1, width: 2, height: 2)])
-        #expect(!journal.isFullFrame)
+        var plan = journal.copyPlan
+        #expect(plan.inputRectangleCount == 1_000)
+        #expect(plan.copyRectangles == [PixelRect(x: 1, y: 1, width: 2, height: 2)])
+        #expect(plan.fullFrameReason == nil)
 
         journal.append(PixelRect(x: 0, y: 0, width: 10, height: 5))
-        #expect(journal.isFullFrame)
-        #expect(journal.copyRectangles == [PixelRect(x: 0, y: 0, width: 10, height: 10)])
+        plan = journal.copyPlan
+        #expect(plan.inputRectangleCount == 1_001)
+        #expect(plan.fullFrameReason == .area)
+        #expect(plan.copyRectangles == [PixelRect(x: 0, y: 0, width: 10, height: 10)])
+
+        let initialPlan = SurfaceDamageJournal(
+            width: 10,
+            height: 10,
+            initiallyFull: true
+        ).copyPlan
+        #expect(initialPlan.inputRectangleCount == 0)
+        #expect(initialPlan.fullFrameReason == .surfaceInitialization)
+        #expect(initialPlan.copyRectangles.count == 1)
     }
 
     @Test func damageJournalDoesNotInflateTouchingLShapes() {
@@ -1097,7 +1327,103 @@ struct SurfaceStoreTests {
         #expect(!sparse.isFullFrame)
         #expect(sparse.copyRectangles.count == 64)
         sparse.append(PixelRect(x: 0, y: 8, width: 1, height: 1))
-        #expect(sparse.isFullFrame)
+        let sparsePlan = sparse.copyPlan
+        #expect(sparsePlan.inputRectangleCount == 65)
+        #expect(sparsePlan.copyRectangles.count == 1)
+        #expect(sparsePlan.fullFrameReason == .rectangleCount)
+    }
+
+    @Test func damageCatchUpPlanRetainsPreMergeInputCount() {
+        var history = SurfaceRevisionDamageHistory(width: 20, height: 20)
+        var committed = SurfaceDamageJournal(width: 20, height: 20)
+        committed.append(PixelRect(x: 1, y: 1, width: 2, height: 2))
+        committed.append(PixelRect(x: 1, y: 1, width: 2, height: 2))
+        history.commit(committed, revision: 1)
+
+        var pending = SurfaceDamageJournal(width: 20, height: 20)
+        pending.append(PixelRect(x: 10, y: 10, width: 2, height: 2))
+        pending.append(PixelRect(x: 10, y: 10, width: 2, height: 2))
+
+        let plan = history.catchUpJournal(from: 0, pending: pending).copyPlan
+        #expect(plan.inputRectangleCount == 4)
+        #expect(plan.copyRectangles == [
+            PixelRect(x: 1, y: 1, width: 2, height: 2),
+            PixelRect(x: 10, y: 10, width: 2, height: 2),
+        ])
+        #expect(plan.fullFrameReason == nil)
+    }
+
+    @Test func damageCatchUpClassifiesTopologyAndRetainsPendingInputCount() {
+        var history = SurfaceRevisionDamageHistory(width: 20, height: 20)
+        var pending = SurfaceDamageJournal(width: 20, height: 20)
+        pending.append(PixelRect(x: 1, y: 1, width: 2, height: 2))
+        pending.append(PixelRect(x: 1, y: 1, width: 2, height: 2))
+
+        var plan = history.catchUpJournal(from: nil, pending: pending).copyPlan
+        #expect(plan.inputRectangleCount == 2)
+        #expect(plan.fullFrameReason == .newSlot)
+
+        var committed = SurfaceDamageJournal(width: 20, height: 20)
+        committed.append(PixelRect(x: 5, y: 5, width: 1, height: 1))
+        for revision in 1...4 {
+            history.commit(committed, revision: UInt64(revision))
+        }
+        plan = history.catchUpJournal(from: 0, pending: pending).copyPlan
+        #expect(plan.inputRectangleCount == 2)
+        #expect(plan.fullFrameReason == .historyGap)
+    }
+
+    @Test func revisionedDamageMetricsClassifyFullFrameReasons() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 2, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 28, width: 18, height: 18, format: 32)
+
+        var frame: FrameSnapshot? = try await store.snapshot(surfaceID: 28)
+        #expect(frame?.ioSurfaceFrame != nil)
+        frame = nil
+
+        try await store.fill(
+            surfaceID: 28,
+            rectangle: PixelRect(x: 0, y: 0, width: 9, height: 9),
+            colorARGB: 1
+        )
+        try await store.fill(
+            surfaceID: 28,
+            rectangle: PixelRect(x: 9, y: 9, width: 9, height: 9),
+            colorARGB: 2
+        )
+        frame = try await store.snapshot(surfaceID: 28)
+        #expect(frame?.ioSurfaceFrame != nil)
+        frame = nil
+
+        for index in 0..<65 {
+            try await store.fill(
+                surfaceID: 28,
+                rectangle: PixelRect(
+                    x: index % 9 * 2,
+                    y: index / 9 * 2,
+                    width: 1,
+                    height: 1
+                ),
+                colorARGB: UInt32(index + 3)
+            )
+        }
+        frame = try await store.snapshot(surfaceID: 28)
+        #expect(frame?.ioSurfaceFrame != nil)
+
+        let metrics = await store.metrics()
+        #expect(metrics.damageRectanglesBeforeMerge == 67)
+        #expect(metrics.damageRectanglesAfterMerge == 3)
+        #expect(metrics.fullDamageByExplicit == 0)
+        #expect(metrics.fullDamageBySurfaceInitialization == 0)
+        #expect(metrics.fullDamageByNewSlot == 1)
+        #expect(metrics.fullDamageByHistoryGap == 0)
+        #expect(metrics.fullDamageByArea == 1)
+        #expect(metrics.fullDamageByCount == 1)
     }
 
     @Test func sparseDiagonalDamageUploadsOnlyChangedPixels() async throws {
@@ -1265,6 +1591,18 @@ struct SurfaceStoreTests {
         let newFrame = try await store.snapshot(surfaceID: 26)
         #expect(pixel(oldFrame, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(newFrame, x: 0, y: 0).allSatisfy { $0 >= 254 })
+    }
+
+    private func uploadAndReuseSnapshot(
+        _ store: SurfaceStore,
+        surfaceID: UInt32
+    ) async throws -> (hasIOSurface: Bool, reusedPixelStorage: Bool) {
+        let uploaded = try await store.snapshot(surfaceID: surfaceID)
+        let reused = try await store.snapshot(surfaceID: surfaceID)
+        return (
+            uploaded.ioSurfaceFrame != nil,
+            reused.pixelStorage === uploaded.pixelStorage
+        )
     }
 
     private func pixel(_ snapshot: FrameSnapshot, x: Int, y: Int) -> [UInt8] {

@@ -1,7 +1,9 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import SpiceChannels
 @testable import SpiceRenderer
+@testable import SpiceWire
 
 @Suite("Display frame publisher")
 struct DisplayFramePublisherTests {
@@ -276,6 +278,79 @@ struct DisplayFramePublisherTests {
         #expect(await publisher.metrics().pendingEvictions == 1)
     }
 
+    @Test func samplesFrameEmitRoundTripWithInjectedClock() async {
+        let clock = PublisherDiagnosticClock(step: 10)
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            diagnosticsMode: .sampled(commandPeriod: 1),
+            diagnosticsClock: clock.read,
+            snapshot: { revision in
+                await observations.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+
+        await publisher.submit(surfaceRevision(surfaceID: 1, revision: 1))
+        await publisher.flushNow()
+
+        #expect(await publisher.metrics().frameEmitTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 1,
+            sampledNanoseconds: 10
+        ))
+        #expect(clock.readCount == 2)
+    }
+
+    @Test func disabledFrameEmitTimingDoesNotReadInjectedClock() async {
+        let clock = PublisherDiagnosticClock(step: 10)
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            diagnosticsClock: clock.read,
+            snapshot: { revision in
+                await observations.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+
+        await publisher.submit(surfaceRevision(surfaceID: 1, revision: 1))
+        await publisher.flushNow()
+
+        #expect(await publisher.metrics().frameEmitTiming == RenderPhaseMetrics())
+        #expect(clock.readCount == 0)
+    }
+
+    @Test func retiredPublisherMetricsAccumulateFrameEmitTiming() {
+        var metrics = DisplayFramePublisherMetrics(
+            emittedFrames: 1,
+            frameEmitTiming: RenderPhaseMetrics(
+                samplePeriod: 1,
+                samples: 1,
+                sampledNanoseconds: 10
+            )
+        )
+        metrics.accumulate(DisplayFramePublisherMetrics(
+            emittedFrames: 2,
+            frameEmitTiming: RenderPhaseMetrics(
+                samplePeriod: 1,
+                samples: 2,
+                sampledNanoseconds: 30
+            )
+        ))
+
+        #expect(metrics.emittedFrames == 3)
+        #expect(metrics.frameEmitTiming == RenderPhaseMetrics(
+            samplePeriod: 1,
+            samples: 3,
+            sampledNanoseconds: 40
+        ))
+    }
+
     private func makePublisher(
         observations: FramePublisherObservations,
         maximumPendingSurfaces: Int = 16
@@ -314,6 +389,34 @@ struct DisplayFramePublisherTests {
         while await observations.emitCount == 0 {
             await Task.yield()
         }
+    }
+}
+
+private final class PublisherDiagnosticClock: Sendable {
+    private struct State: Sendable {
+        var next: UInt64 = 0
+        var reads = 0
+    }
+
+    private let state = Mutex(State())
+    private let step: UInt64
+
+    init(step: UInt64) {
+        self.step = step
+    }
+
+    func read() -> UInt64 {
+        state.withLock { state in
+            defer {
+                state.next &+= step
+                state.reads += 1
+            }
+            return state.next
+        }
+    }
+
+    var readCount: Int {
+        state.withLock { $0.reads }
     }
 }
 

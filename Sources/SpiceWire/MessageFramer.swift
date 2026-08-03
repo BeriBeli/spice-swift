@@ -51,25 +51,30 @@ package struct MessageFramer: Sendable {
             return nil
         }
 
-        let headerData = storage.subdata(in: readOffset..<(readOffset + mode.wireSize))
-        var reader = try ByteReader(headerData)
-
         let serial: UInt64?
         let type: UInt16
         let bodySizeValue: UInt32
         let subListOffset: UInt32?
 
-        switch mode {
-        case .full:
-            serial = try reader.readUInt64LE()
-            type = try reader.readUInt16LE()
-            bodySizeValue = try reader.readUInt32LE()
-            subListOffset = try reader.readUInt32LE()
-        case .mini:
-            serial = nil
-            type = try reader.readUInt16LE()
-            bodySizeValue = try reader.readUInt32LE()
-            subListOffset = nil
+        let headerMode = mode
+        let headerOffset = readOffset
+        (serial, type, bodySizeValue, subListOffset) = storage.withUnsafeBytes { bytes in
+            switch headerMode {
+            case .full:
+                return (
+                    Self.readInteger(UInt64.self, from: bytes, at: headerOffset),
+                    Self.readInteger(UInt16.self, from: bytes, at: headerOffset + 8),
+                    Self.readInteger(UInt32.self, from: bytes, at: headerOffset + 10),
+                    Self.readInteger(UInt32.self, from: bytes, at: headerOffset + 14)
+                )
+            case .mini:
+                return (
+                    nil,
+                    Self.readInteger(UInt16.self, from: bytes, at: headerOffset),
+                    Self.readInteger(UInt32.self, from: bytes, at: headerOffset + 2),
+                    nil
+                )
+            }
         }
 
         guard let bodySize = Int(exactly: bodySizeValue) else {
@@ -114,5 +119,13 @@ package struct MessageFramer: Sendable {
             storage.removeSubrange(0..<readOffset)
             readOffset = 0
         }
+    }
+
+    private static func readInteger<T: FixedWidthInteger>(
+        _ type: T.Type,
+        from bytes: UnsafeRawBufferPointer,
+        at offset: Int
+    ) -> T {
+        T(littleEndian: bytes.loadUnaligned(fromByteOffset: offset, as: type))
     }
 }
