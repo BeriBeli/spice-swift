@@ -157,7 +157,11 @@ Agent behavior, including system-trusted TLS.
 - `SpiceDesktopView` is a thin `NSViewRepresentable` around one private AppKit
   framebuffer view. It performs aspect-fit BGRA drawing, alpha-cursor overlay,
   first-responder handling, physical macOS-keycode to PC-XT mapping, relative
-  or absolute pointer input, buttons, and scroll-wheel events.
+  or absolute pointer input, buttons, and scroll-wheel events. The mapping is
+  now the shared public `SpicePhysicalKey`/`SpiceKeyMap` authority used by the
+  AppKit bridge and external application commands; it distinguishes left/right
+  modifiers, main/keypad Enter, navigation, and E0 extended keys. The raw
+  scan-code input API remains available for compatibility.
 
 Inputs transports physical key transitions, not Unicode text or IME
 composition. The AppKit bridge draws the supported alpha cursor as a remote
