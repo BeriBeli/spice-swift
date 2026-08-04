@@ -84,10 +84,13 @@ input-to-photon latency; those remain separate real-window gates.
 For deterministic local profiling of the CPU display chain without a Rocky/QEMU
 fixture, see [`CPU_HOT_PATH_LOCAL.md`](CPU_HOT_PATH_LOCAL.md). That benchmark is
 environment-gated and separately exercises Data-only and revisioned-IOSurface
-publication through real mini-header channel processing. Its separate opt-in
-diagnostic mode reports sampled wire, decode, message handling, SurfaceStore
-actor round-trip, publisher submit/emit, renderer, snapshot, and damage-plan
-phases without adding clock reads to the default disabled path.
+publication through real mini-header channel processing. Its paced mode checks
+16 ms publication behavior; its complementary saturation mode removes input
+sleeps, forbids publication during ingest, and performs one final drain for
+lower-noise CPU-throughput A/B tests. A separate opt-in diagnostic mode reports
+sampled wire, decode, message handling, SurfaceStore actor round-trip,
+publisher submit/emit, renderer, snapshot, and damage-plan phases without
+adding clock reads to the default disabled path.
 The exact 2026-08-04 same-harness paired evidence, complete attempt ledger,
 bootstrap statistics, and scoped no-speedup conclusion are in
 [`CPU_HOT_PATH_RESULTS_2026-08-04.md`](CPU_HOT_PATH_RESULTS_2026-08-04.md).

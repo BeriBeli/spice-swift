@@ -399,6 +399,19 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
     }
 
+    /// Flushes publishers known to be quiescent for deterministic tests.
+    ///
+    /// This is not a general completion barrier: a publisher that is already
+    /// flushing may return before its in-flight emission completes.
+    package func flushPendingFramesForTesting() async {
+        let publishers = framePublishers.keys.sorted().compactMap {
+            framePublishers[$0]
+        }
+        for publisher in publishers {
+            await publisher.flushNow()
+        }
+    }
+
     package func close() async {
         await connection.close()
         let publishers = Array(framePublishers.values)
