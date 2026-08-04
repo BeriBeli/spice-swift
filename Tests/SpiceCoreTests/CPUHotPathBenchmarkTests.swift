@@ -17,12 +17,15 @@ struct CPUHotPathBenchmarkTests {
     private static let resolutionEnvironment = "SWIFTSPICE_CPU_HOTPATH_RESOLUTION"
     private static let frameCountEnvironment = "SWIFTSPICE_CPU_HOTPATH_FRAMES"
     private static let diagnosticsEnvironment = "SWIFTSPICE_CPU_HOTPATH_DIAGNOSTICS"
+    private static let inputModeEnvironment = "SWIFTSPICE_CPU_HOTPATH_INPUT_MODE"
 
     private static let commandsPerFrame = 57
     private static let bitmapWidth = 32
     private static let bitmapHeight = 25
     private static let bitmapPayloadBytes = bitmapWidth * bitmapHeight * 4
     private static let publicationIntervalMilliseconds: Int64 = 16
+    private static let saturationPublicationIntervalSeconds: Int64 = 10 * 60
+    private static let saturationInputTimeout: Duration = .seconds(60)
     private static let diagnosticsCommandSamplePeriod: UInt64 = 64
     private static let defaultFrameCount = 1_500
 
@@ -37,14 +40,16 @@ struct CPUHotPathBenchmarkTests {
         let backend = try parseBackend(environment[Self.backendEnvironment])
         let resolution = try parseResolution(environment[Self.resolutionEnvironment])
         let frameCount = try parseFrameCount(environment[Self.frameCountEnvironment])
+        let inputMode = try parseInputMode(environment[Self.inputModeEnvironment])
         let diagnosticsEnabled = environment[Self.diagnosticsEnvironment] == "1"
         let diagnosticsMode: RenderDiagnosticsMode = diagnosticsEnabled
             ? .sampled(commandPeriod: Self.diagnosticsCommandSamplePeriod)
             : .disabled
         let expectedCommandCount = frameCount * Self.commandsPerFrame
+        let expectedSurfaceBytes = UInt64(resolution.width * resolution.height * 4)
 
         // Fixture construction is intentionally outside the measured region.
-        // One 57-command frame is replayed by the paced transport, preserving
+        // One 57-command frame is replayed by the transport, preserving
         // the real MessageFramer copies without allocating a 280+ MiB fixture.
         let surfaceCreate = try encodeMini(SpiceMsgDisplaySurfaceCreate(
             surfaceID: 1,
@@ -54,14 +59,19 @@ struct CPUHotPathBenchmarkTests {
             flags: 1
         ))
         let frameWire = makeFrameWire(resolution: resolution)
+        let inputReadyGate = CPUHotPathCompletionGate()
+        let inputStartGate = CPUHotPathCompletionGate()
         let inputDrainedGate = CPUHotPathCompletionGate()
         let finalFrameGate = CPUHotPathCompletionGate()
         let transportFinishGate = CPUHotPathCompletionGate()
-        let transport = CPUHotPathPacedTransport(
+        let transport = CPUHotPathReplayTransport(
             prefix: surfaceCreate,
             frameWire: frameWire,
             frameCount: frameCount,
+            inputMode: inputMode,
             frameIntervalMilliseconds: Self.publicationIntervalMilliseconds,
+            inputReadyGate: inputReadyGate,
+            inputStartGate: inputStartGate,
             inputDrainedGate: inputDrainedGate,
             finishGate: transportFinishGate,
             finishTimeout: .seconds(15)
@@ -90,6 +100,21 @@ struct CPUHotPathBenchmarkTests {
             )
         }
 
+        let publisherInterval: Duration
+        let publisherIntervalNanoseconds: UInt64
+        switch inputMode {
+        case .paced:
+            publisherInterval = .milliseconds(Self.publicationIntervalMilliseconds)
+            publisherIntervalNanoseconds = UInt64(
+                Self.publicationIntervalMilliseconds * 1_000_000
+            )
+        case .saturation:
+            publisherInterval = .seconds(Self.saturationPublicationIntervalSeconds)
+            publisherIntervalNanoseconds = UInt64(
+                Self.saturationPublicationIntervalSeconds * 1_000_000_000
+            )
+        }
+
         let channel = DisplayChannel(
             connection: ChannelConnection(
                 key: ChannelKey(type: 2, id: 0),
@@ -98,7 +123,7 @@ struct CPUHotPathBenchmarkTests {
                 diagnosticsMode: diagnosticsMode
             ),
             surfaces: store,
-            framePublicationInterval: .milliseconds(Self.publicationIntervalMilliseconds),
+            framePublicationInterval: publisherInterval,
             diagnosticsMode: diagnosticsMode
         )
         let frameSink = CPUHotPathFrameSink(
@@ -107,8 +132,11 @@ struct CPUHotPathBenchmarkTests {
             finalFrameGate: finalFrameGate
         )
 
-        let wallStart = DispatchTime.now().uptimeNanoseconds
-        let cpuStart = processCPUNanoseconds()
+        // Keep the legacy process fields on their historical run-task-to-EOF
+        // boundary. Schema-v2 ingest fields below use exact transport
+        // boundaries and exclude surface setup.
+        let legacyWallStart = DispatchTime.now().uptimeNanoseconds
+        let legacyCPUStart = processCPUNanoseconds()
         let runTask = Task { () -> Result<Void, any Error> in
             do {
                 try await channel.run { event in
@@ -126,9 +154,28 @@ struct CPUHotPathBenchmarkTests {
             }
         }
 
-        let inputTimeout = Duration.milliseconds(
-            Int64(frameCount) * Self.publicationIntervalMilliseconds + 5_000
-        )
+        guard await inputReadyGate.wait(timeout: .seconds(5)) else {
+            await inputStartGate.complete()
+            await transportFinishGate.complete()
+            await transport.close()
+            runTask.cancel()
+            _ = await runTask.value
+            throw CPUHotPathBenchmarkError.surfaceSetupTimeout
+        }
+
+        // The transport cannot deliver the first bitmap frame until this gate
+        // opens. Surface allocation, capability checks, and Display init are
+        // therefore excluded from every measured interval.
+        await inputStartGate.complete()
+
+        let inputTimeout = switch inputMode {
+        case .paced:
+            Duration.milliseconds(
+                Int64(frameCount) * Self.publicationIntervalMilliseconds + 5_000
+            )
+        case .saturation:
+            Self.saturationInputTimeout
+        }
         guard await inputDrainedGate.wait(timeout: inputTimeout) else {
             await transportFinishGate.complete()
             await transport.close()
@@ -136,7 +183,87 @@ struct CPUHotPathBenchmarkTests {
             _ = await runTask.value
             throw CPUHotPathBenchmarkError.inputDrainTimeout
         }
-        let receivedFinalFrame = await finalFrameGate.wait(timeout: .seconds(5))
+        guard let inputMeasurement = await transport.inputMeasurement() else {
+            await transportFinishGate.complete()
+            await transport.close()
+            runTask.cancel()
+            _ = await runTask.value
+            throw CPUHotPathBenchmarkError.missingInputMeasurement
+        }
+        let ingestWallNanoseconds = elapsedNanoseconds(
+            from: inputMeasurement.wallStart,
+            to: inputMeasurement.wallEnd
+        )
+        let ingestProcessCPUNanoseconds = elapsedNanoseconds(
+            from: inputMeasurement.cpuStart,
+            to: inputMeasurement.cpuEnd
+        )
+
+        let receivedFinalFrame: Bool
+        var endToEndWallNanoseconds: UInt64
+        var endToEndProcessCPUNanoseconds: UInt64
+        switch inputMode {
+        case .paced:
+            receivedFinalFrame = await finalFrameGate.wait(timeout: .seconds(5))
+            // Assigned after emittedFrames catches the sink below.
+            endToEndWallNanoseconds = 0
+            endToEndProcessCPUNanoseconds = 0
+        case .saturation:
+            // The ten-minute timer cannot fire before the 60-second input
+            // timeout. Prove it did not publish opportunistically before the
+            // one explicit final drain.
+            let beforeDrain = await channel.diagnosticsSnapshot()
+            guard beforeDrain.publisher.submissions == UInt64(expectedCommandCount),
+                  beforeDrain.publisher.pendingSurfaces == 1,
+                  beforeDrain.publisher.snapshotAttempts == 0,
+                  beforeDrain.publisher.emittedFrames == 0,
+                  beforeDrain.publisher.staleSnapshots == 0,
+                  beforeDrain.publisher.pendingEvictions == 0,
+                  beforeDrain.surfaces.snapshots == 0,
+                  beforeDrain.surfaces.damageOperations == UInt64(expectedCommandCount),
+                  beforeDrain.surfaces.damageBytes
+                    == UInt64(expectedCommandCount * Self.bitmapPayloadBytes),
+                  beforeDrain.surfaces.fullFrameCopyBytes == 0,
+                  beforeDrain.surfaces.partialFrameCopyBytes == 0,
+                  beforeDrain.surfaces.snapshotCatchUpCPUCopyBytes == 0,
+                  beforeDrain.surfaces.revisionedSnapshotUploads == 0,
+                  beforeDrain.surfaces.revisionedSnapshotReuses == 0,
+                  beforeDrain.surfaces.dataBackendSnapshots == 0,
+                  beforeDrain.surfaces.revisionedSnapshotFallbacks == 0,
+                  beforeDrain.surfaces.unifiedBackingDisables == 0,
+                  beforeDrain.surfaces.cpuMaterializations == 0,
+                  beforeDrain.surfaces.cpuMaterializationBytes == 0,
+                  beforeDrain.surfaces.poolExhaustions == 0,
+                  beforeDrain.surfaces.inFlightLeases == 0,
+                  beforeDrain.surfaces.revisionedAllocatedFrames == 0,
+                  beforeDrain.surfaces.revisionedAllocatedBytes == 0,
+                  beforeDrain.surfaces.gpuCopyBytes == 0,
+                  beforeDrain.surfaces.gpuErrors == 0,
+                  beforeDrain.surfaces.compositorErrors == 0,
+                  beforeDrain.surfaces.nativeVideoFrames == 0,
+                  beforeDrain.surfaces.nativeVideoFallbacks == 0
+            else {
+                await transportFinishGate.complete()
+                await transport.close()
+                runTask.cancel()
+                _ = await runTask.value
+                throw CPUHotPathBenchmarkError.unexpectedSaturationPublication
+            }
+
+            let finalDrainWallStart = DispatchTime.now().uptimeNanoseconds
+            let finalDrainCPUStart = processCPUNanoseconds()
+            await channel.flushPendingFramesForTesting()
+            receivedFinalFrame = await finalFrameGate.wait(timeout: .seconds(5))
+            let finalDrainCPUEnd = processCPUNanoseconds()
+            let finalDrainWallEnd = DispatchTime.now().uptimeNanoseconds
+            endToEndWallNanoseconds = ingestWallNanoseconds &+ elapsedNanoseconds(
+                from: finalDrainWallStart,
+                to: finalDrainWallEnd
+            )
+            endToEndProcessCPUNanoseconds = ingestProcessCPUNanoseconds
+                &+ elapsedNanoseconds(from: finalDrainCPUStart, to: finalDrainCPUEnd)
+        }
+
         var sinkMetrics = await frameSink.metrics()
         guard receivedFinalFrame,
               sinkMetrics.lastPublishedRevision == UInt64(expectedCommandCount)
@@ -177,6 +304,19 @@ struct CPUHotPathBenchmarkTests {
             sinkMetrics = await frameSink.metrics()
         }
 
+        if inputMode == .paced {
+            let publicationCPUEnd = processCPUNanoseconds()
+            let publicationWallEnd = DispatchTime.now().uptimeNanoseconds
+            endToEndWallNanoseconds = elapsedNanoseconds(
+                from: inputMeasurement.wallStart,
+                to: publicationWallEnd
+            )
+            endToEndProcessCPUNanoseconds = elapsedNanoseconds(
+                from: inputMeasurement.cpuStart,
+                to: publicationCPUEnd
+            )
+        }
+
         await transportFinishGate.complete()
         let runResult = await runTask.value
         guard case let .failure(runError) = runResult else {
@@ -209,6 +349,22 @@ struct CPUHotPathBenchmarkTests {
             diagnostics.surfaces.damageBytes
                 == UInt64(expectedCommandCount * Self.bitmapPayloadBytes)
         )
+        if inputMode == .saturation {
+            try #require(diagnostics.publisher.snapshotAttempts == 1)
+            try #require(diagnostics.publisher.emittedFrames == 1)
+            try #require(diagnostics.surfaces.snapshots == 1)
+            try #require(sinkMetrics.frames == 1)
+            try #require(sinkMetrics.p95IntervalNanoseconds == 0)
+            try #require(diagnostics.surfaces.gpuCopyBytes == 0)
+            try #require(diagnostics.surfaces.gpuErrors == 0)
+            try #require(diagnostics.surfaces.compositorErrors == 0)
+            try #require(diagnostics.surfaces.nativeVideoFrames == 0)
+            try #require(diagnostics.surfaces.nativeVideoFallbacks == 0)
+            try #require(diagnostics.surfaces.revisionedSnapshotFallbacks == 0)
+            try #require(diagnostics.surfaces.unifiedBackingDisables == 0)
+            try #require(diagnostics.surfaces.cpuMaterializations == 0)
+            try #require(diagnostics.surfaces.cpuMaterializationBytes == 0)
+        }
         if diagnosticsEnabled {
             let expectedBitmapSamples = UInt64(expectedCommandCount)
                 / Self.diagnosticsCommandSamplePeriod
@@ -324,6 +480,17 @@ struct CPUHotPathBenchmarkTests {
             try #require(diagnostics.surfaces.fullDamageBySurfaceInitialization == 0)
             try #require(diagnostics.surfaces.fullDamageByNewSlot == 0)
             try #require(diagnostics.surfaces.fullDamageByHistoryGap == 0)
+            if inputMode == .saturation {
+                try #require(diagnostics.surfaces.dataBackendSnapshots == 1)
+                try #require(diagnostics.surfaces.poolExhaustions == 1)
+                try #require(diagnostics.surfaces.fullFrameCopyBytes == expectedSurfaceBytes)
+                try #require(diagnostics.surfaces.partialFrameCopyBytes == 0)
+                try #require(diagnostics.surfaces.snapshotCatchUpCPUCopyBytes == 0)
+                try #require(diagnostics.surfaces.cpuMaterializations == 0)
+                try #require(diagnostics.surfaces.cpuMaterializationBytes == 0)
+                try #require(diagnostics.surfaces.revisionedAllocatedFrames == 0)
+                try #require(diagnostics.surfaces.revisionedAllocatedBytes == 0)
+            }
             if diagnosticsEnabled {
                 try #require(diagnostics.surfaces.snapshotCheckoutTiming.samples == 0)
                 try #require(diagnostics.surfaces.snapshotDamagePlanTiming.samples == 0)
@@ -338,10 +505,19 @@ struct CPUHotPathBenchmarkTests {
                     &+ diagnostics.surfaces.revisionedSnapshotReuses
                     == diagnostics.surfaces.snapshots
             )
-            try #require(
-                diagnostics.surfaces.revisionedAllocatedFrames
-                    >= min(2, frameCount)
-            )
+            switch inputMode {
+            case .paced:
+                try #require(
+                    diagnostics.surfaces.revisionedAllocatedFrames
+                        >= min(2, frameCount)
+                )
+            case .saturation:
+                try #require(diagnostics.surfaces.revisionedAllocatedFrames == 1)
+                try #require(
+                    diagnostics.surfaces.revisionedAllocatedBytes
+                        == Int(expectedSurfaceBytes)
+                )
+            }
             try #require(diagnostics.surfaces.dataBackendSnapshots == 0)
             try #require(diagnostics.surfaces.revisionedSnapshotFallbacks == 0)
             try #require(diagnostics.surfaces.unifiedBackingDisables == 0)
@@ -370,6 +546,29 @@ struct CPUHotPathBenchmarkTests {
                 &+ diagnostics.surfaces.fullDamageByNewSlot
                 &+ diagnostics.surfaces.fullDamageByHistoryGap
             try #require(fullDamagePlans <= diagnostics.surfaces.revisionedSnapshotUploads)
+            if inputMode == .saturation {
+                try #require(diagnostics.surfaces.revisionedSnapshotUploads == 1)
+                try #require(diagnostics.surfaces.revisionedSnapshotReuses == 0)
+                try #require(diagnostics.surfaces.fullFrameCopyBytes == expectedSurfaceBytes)
+                try #require(diagnostics.surfaces.partialFrameCopyBytes == 0)
+                try #require(
+                    diagnostics.surfaces.snapshotCatchUpCPUCopyBytes
+                        == expectedSurfaceBytes
+                )
+                try #require(
+                    diagnostics.surfaces.damageRectanglesBeforeMerge
+                        == UInt64(expectedCommandCount)
+                )
+                try #require(diagnostics.surfaces.damageRectanglesAfterMerge == 1)
+                try #require(diagnostics.surfaces.fullDamageByCount == 0)
+                try #require(diagnostics.surfaces.fullDamageByArea == 0)
+                try #require(diagnostics.surfaces.fullDamageByExplicit == 0)
+                try #require(
+                    diagnostics.surfaces.fullDamageBySurfaceInitialization == 0
+                )
+                try #require(diagnostics.surfaces.fullDamageByNewSlot == 1)
+                try #require(diagnostics.surfaces.fullDamageByHistoryGap == 0)
+            }
             if diagnostics.surfaces.snapshotCatchUpCPUCopyBytes == 0 {
                 try #require(diagnostics.surfaces.damageRectanglesBeforeMerge == 0)
                 try #require(diagnostics.surfaces.damageRectanglesAfterMerge == 0)
@@ -397,10 +596,12 @@ struct CPUHotPathBenchmarkTests {
         try #require(pixel(finalSnapshot, x: 0, y: 0) == [1, 0x22, 0x33, 0xff])
         await channel.close()
 
-        let wallNanoseconds = wallEnd >= wallStart ? wallEnd - wallStart : 0
-        let cpuNanoseconds = cpuEnd >= cpuStart ? cpuEnd - cpuStart : 0
+        let wallNanoseconds = elapsedNanoseconds(from: legacyWallStart, to: wallEnd)
+        let cpuNanoseconds = elapsedNanoseconds(from: legacyCPUStart, to: cpuEnd)
         let result = CPUHotPathBenchmarkResult(
             backend: backend.rawValue,
+            inputMode: inputMode.rawValue,
+            benchmarkProcessID: ProcessInfo.processInfo.processIdentifier,
             resolution: resolution.rawValue,
             width: resolution.width,
             height: resolution.height,
@@ -411,9 +612,19 @@ struct CPUHotPathBenchmarkTests {
             bitmapWidth: Self.bitmapWidth,
             bitmapHeight: Self.bitmapHeight,
             bitmapPayloadBytes: Self.bitmapPayloadBytes,
-            publisherIntervalNanoseconds: UInt64(
-                Self.publicationIntervalMilliseconds * 1_000_000
-            ),
+            publisherIntervalNanoseconds: publisherIntervalNanoseconds,
+            ingestWallNanoseconds: ingestWallNanoseconds,
+            ingestProcessCPUNanoseconds: ingestProcessCPUNanoseconds,
+            ingestCPUNanosecondsPerFrame:
+                ingestProcessCPUNanoseconds / UInt64(frameCount),
+            ingestCPUNanosecondsPerCommand:
+                ingestProcessCPUNanoseconds / UInt64(expectedCommandCount),
+            endToEndWallNanoseconds: endToEndWallNanoseconds,
+            endToEndProcessCPUNanoseconds: endToEndProcessCPUNanoseconds,
+            endToEndCPUNanosecondsPerFrame:
+                endToEndProcessCPUNanoseconds / UInt64(frameCount),
+            endToEndCPUNanosecondsPerCommand:
+                endToEndProcessCPUNanoseconds / UInt64(expectedCommandCount),
             wallNanoseconds: wallNanoseconds,
             processCPUNanoseconds: cpuNanoseconds,
             cpuNanosecondsPerFrame: cpuNanoseconds / UInt64(frameCount),
@@ -595,6 +806,17 @@ struct CPUHotPathBenchmarkTests {
         return frameCount
     }
 
+    private func parseInputMode(_ value: String?) throws -> CPUHotPathInputMode {
+        switch value ?? CPUHotPathInputMode.paced.rawValue {
+        case "paced":
+            return .paced
+        case "saturation", "unpaced":
+            return .saturation
+        case let value:
+            throw CPUHotPathBenchmarkError.invalidInputMode(value)
+        }
+    }
+
     private func makeFrameWire(resolution: CPUHotPathResolution) -> Data {
         let columns = resolution.width / Self.bitmapWidth
         let rows = resolution.height / Self.bitmapHeight
@@ -725,6 +947,11 @@ private enum CPUHotPathBackend: String {
     case cpuIOSurface = "cpu-iosurface"
 }
 
+private enum CPUHotPathInputMode: String, Sendable, Equatable {
+    case paced
+    case saturation
+}
+
 private enum CPUHotPathResolution: String {
     case p720 = "720p"
     case p4K = "4k"
@@ -746,18 +973,24 @@ private enum CPUHotPathResolution: String {
 
 private enum CPUHotPathBenchmarkError: Error, CustomStringConvertible {
     case invalidBackend(String)
+    case invalidInputMode(String)
     case invalidResolution(String)
     case invalidFrameCount(String)
     case missingMessageID
     case revisionedIOSurfaceUnavailable
+    case surfaceSetupTimeout
     case inputDrainTimeout
+    case missingInputMeasurement
     case publisherCompletionTimeout
+    case unexpectedSaturationPublication
     case unexpectedTransportCompletion
 
     var description: String {
         switch self {
         case let .invalidBackend(value):
             "invalid CPU hot-path backend: \(value)"
+        case let .invalidInputMode(value):
+            "invalid CPU hot-path input mode: \(value)"
         case let .invalidResolution(value):
             "invalid CPU hot-path resolution: \(value)"
         case let .invalidFrameCount(value):
@@ -766,12 +999,18 @@ private enum CPUHotPathBenchmarkError: Error, CustomStringConvertible {
             "surface-create message has no wire ID"
         case .revisionedIOSurfaceUnavailable:
             "revisioned IOSurface is unavailable on this host"
+        case .surfaceSetupTimeout:
+            "benchmark surface setup did not complete before timeout"
         case .inputDrainTimeout:
-            "paced benchmark input did not drain before timeout"
+            "benchmark input did not drain before timeout"
+        case .missingInputMeasurement:
+            "benchmark transport did not publish exact input timing boundaries"
         case .publisherCompletionTimeout:
             "publisher did not complete the final benchmark revision before timeout"
+        case .unexpectedSaturationPublication:
+            "saturation publisher emitted before the explicit final drain"
         case .unexpectedTransportCompletion:
-            "paced benchmark transport unexpectedly completed without EOF"
+            "benchmark transport unexpectedly completed without EOF"
         }
     }
 }
@@ -815,16 +1054,39 @@ private actor CPUHotPathCompletionGate {
         }
     }
 
+    func wait() async {
+        guard !isComplete else {
+            return
+        }
+        let _: Bool = await withCheckedContinuation { continuation in
+            if isComplete {
+                continuation.resume(returning: true)
+            } else {
+                waiters[UUID()] = continuation
+            }
+        }
+    }
+
     private func timeOut(id: UUID) {
         waiters.removeValue(forKey: id)?.resume(returning: false)
     }
 }
 
-private actor CPUHotPathPacedTransport: SpiceTransport {
+private struct CPUHotPathInputMeasurement: Sendable {
+    let wallStart: UInt64
+    let wallEnd: UInt64
+    let cpuStart: UInt64
+    let cpuEnd: UInt64
+}
+
+private actor CPUHotPathReplayTransport: SpiceTransport {
     private let prefix: Data
     private let frameWire: Data
     private let frameCount: Int
+    private let inputMode: CPUHotPathInputMode
     private let frameIntervalMilliseconds: Int64
+    private let inputReadyGate: CPUHotPathCompletionGate
+    private let inputStartGate: CPUHotPathCompletionGate
     private let inputDrainedGate: CPUHotPathCompletionGate
     private let finishGate: CPUHotPathCompletionGate
     private let finishTimeout: Duration
@@ -834,7 +1096,9 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
     private var frameOffset = 0
     private var completedFrames = 0
     private var firstFrameStart: ContinuousClock.Instant?
+    private var didAwaitInputStart = false
     private var didAwaitFinish = false
+    private var measuredInput: CPUHotPathInputMeasurement?
     private var isConnected = false
     private var isClosed = false
     private(set) var writtenBytes = 0
@@ -843,7 +1107,10 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
         prefix: Data,
         frameWire: Data,
         frameCount: Int,
+        inputMode: CPUHotPathInputMode,
         frameIntervalMilliseconds: Int64,
+        inputReadyGate: CPUHotPathCompletionGate,
+        inputStartGate: CPUHotPathCompletionGate,
         inputDrainedGate: CPUHotPathCompletionGate,
         finishGate: CPUHotPathCompletionGate,
         finishTimeout: Duration
@@ -851,7 +1118,10 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
         self.prefix = prefix
         self.frameWire = frameWire
         self.frameCount = frameCount
+        self.inputMode = inputMode
         self.frameIntervalMilliseconds = frameIntervalMilliseconds
+        self.inputReadyGate = inputReadyGate
+        self.inputStartGate = inputStartGate
         self.inputDrainedGate = inputDrainedGate
         self.finishGate = finishGate
         self.finishTimeout = finishTimeout
@@ -880,7 +1150,20 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
         }
 
         if completedFrames < frameCount {
-            if frameOffset == 0 {
+            if !didAwaitInputStart {
+                didAwaitInputStart = true
+                await inputReadyGate.complete()
+                await inputStartGate.wait()
+                let wallStart = DispatchTime.now().uptimeNanoseconds
+                let cpuStart = processCPUNanoseconds()
+                measuredInput = CPUHotPathInputMeasurement(
+                    wallStart: wallStart,
+                    wallEnd: 0,
+                    cpuStart: cpuStart,
+                    cpuEnd: 0
+                )
+            }
+            if inputMode == .paced, frameOffset == 0 {
                 let start: ContinuousClock.Instant
                 if let firstFrameStart {
                     start = firstFrameStart
@@ -908,6 +1191,16 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
 
         if !didAwaitFinish {
             didAwaitFinish = true
+            let cpuEnd = processCPUNanoseconds()
+            let wallEnd = DispatchTime.now().uptimeNanoseconds
+            if let measurement = measuredInput {
+                measuredInput = CPUHotPathInputMeasurement(
+                    wallStart: measurement.wallStart,
+                    wallEnd: wallEnd,
+                    cpuStart: measurement.cpuStart,
+                    cpuEnd: cpuEnd
+                )
+            }
             await inputDrainedGate.complete()
             guard await finishGate.wait(timeout: finishTimeout) else {
                 throw .timeout
@@ -926,6 +1219,16 @@ private actor CPUHotPathPacedTransport: SpiceTransport {
     func close() async {
         isClosed = true
         isConnected = false
+    }
+
+    func inputMeasurement() -> CPUHotPathInputMeasurement? {
+        guard let measuredInput,
+              measuredInput.wallEnd != 0,
+              measuredInput.cpuEnd != 0
+        else {
+            return nil
+        }
+        return measuredInput
     }
 
     private func waitUntil(_ deadline: ContinuousClock.Instant) async throws(TransportError) {
@@ -992,8 +1295,10 @@ private actor CPUHotPathFrameSink {
 }
 
 private struct CPUHotPathBenchmarkResult: Encodable {
-    let schemaVersion = 1
+    let schemaVersion = 2
     let backend: String
+    let inputMode: String
+    let benchmarkProcessID: Int32
     let resolution: String
     let width: Int
     let height: Int
@@ -1005,6 +1310,14 @@ private struct CPUHotPathBenchmarkResult: Encodable {
     let bitmapHeight: Int
     let bitmapPayloadBytes: Int
     let publisherIntervalNanoseconds: UInt64
+    let ingestWallNanoseconds: UInt64
+    let ingestProcessCPUNanoseconds: UInt64
+    let ingestCPUNanosecondsPerFrame: UInt64
+    let ingestCPUNanosecondsPerCommand: UInt64
+    let endToEndWallNanoseconds: UInt64
+    let endToEndProcessCPUNanoseconds: UInt64
+    let endToEndCPUNanosecondsPerFrame: UInt64
+    let endToEndCPUNanosecondsPerCommand: UInt64
     let wallNanoseconds: UInt64
     let processCPUNanoseconds: UInt64
     let cpuNanosecondsPerFrame: UInt64
@@ -1100,6 +1413,10 @@ private struct CPUHotPathBenchmarkResult: Encodable {
 
 private func processCPUNanoseconds() -> UInt64 {
     clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)
+}
+
+private func elapsedNanoseconds(from start: UInt64, to end: UInt64) -> UInt64 {
+    end >= start ? end - start : 0
 }
 
 private func currentResidentBytes() -> UInt64 {

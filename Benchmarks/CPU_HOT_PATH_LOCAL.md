@@ -10,8 +10,16 @@ uv run --no-project Benchmarks/analyze_cpu_hotpath.py \
   Benchmarks/Results/CPUHotPath_2026-08-04 --check
 ```
 
+The complementary same-day CPU-saturation A/B, which isolates the
+`ChannelSerialBarrier.record()` empty-waiter fast path, is documented in
+[`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
+Two independent batches find no reliable 720p or RSS change. The 4K rerun
+detects a small CPU decrease that the original batch did not, so it is not
+reported as a replicated production-speedup result.
+
 `CPUHotPathBenchmarkTests` is an opt-in, host-only Swift Testing benchmark for
-the production CPU display path. It is inert unless
+the production CPU display path. It provides paced publication and unpaced
+CPU-saturation modes. It is inert unless
 `SWIFTSPICE_CPU_HOTPATH_BENCHMARK=1` is present, so a normal `swift test` does
 not allocate a large surface, create an IOSurface, or wait for benchmark
 cadence.
@@ -51,6 +59,27 @@ Fixture construction happens before timing starts. A single 57-command wire
 template is reused rather than allocating the roughly 280 MiB required to hold
 all 85,500 formal commands at once. Destination rectangles and pixels are
 fixed, not random.
+
+## Input modes
+
+- `paced` is the default. It replays one 57-command input frame every 16 ms and
+  leaves the 16 ms publisher active. This mode measures product-like
+  publication cadence, coalescing, snapshot behavior, and end-to-end process
+  cost, but its low CPU duty cycle is noisy for small throughput changes.
+- `saturation` (alias `unpaced`) replays the same commands without sleeping,
+  sets the automatic publisher deadline to ten minutes, proves that no
+  snapshot or IOSurface allocation occurred during ingest, then performs
+  exactly one explicit final publication. It is intended for commit-to-commit
+  CPU hot-path comparisons, not latency or published-FPS claims.
+
+Both modes use a transport start gate after surface creation. Schema-v2 output
+adds `input_mode`, `ingest_*`, and `end_to_end_*` fields. Exact ingest
+timestamps are captured immediately before the first bitmap wire byte and when
+the channel requests input after processing the final command. Saturation
+end-to-end fields add the one final drain to ingest; pre-drain auditing and EOF
+cleanup are excluded. The legacy process fields retain their earlier
+run-task-to-EOF boundary for continuity, but populations from different input
+modes must never be mixed.
 
 ## Backends
 
@@ -96,6 +125,14 @@ The timed run is followed by an untimed revision and pixel check. This keeps
 the correctness readback out of CPU, RSS, snapshot, and materialization
 measurements.
 
+To smoke the CPU-saturation path, add
+`SWIFTSPICE_CPU_HOTPATH_INPUT_MODE=saturation`. A valid saturation sample must
+report one snapshot and one emitted frame. CPU-IOSurface must allocate one
+surface-sized revision, upload one full frame, and retain one lease; Data-only
+must perform one full Data snapshot and report the deliberately disabled legacy
+pool once. Both paths reject pre-drain publication, GPU/video activity,
+materialization, revisioned fallback, and stale or pending output.
+
 ## Single-commit sampling matrix
 
 The default is 1,500 input frames, approximately 24 seconds at the fixed input
@@ -139,6 +176,56 @@ retains every attempt, and requires both builds to use byte-identical benchmark
 source. The checked-in 2026-08-04 evidence used a baseline-compatible harness
 for that purpose. The enhanced HEAD harness was then run separately with
 diagnostics enabled; those populations are not mixed.
+
+## Formal CPU-saturation commit A/B
+
+The saturation protocol fixes the workload at 6,000 input frames (342,000
+commands), 10 pairs per resolution, alternating baseline-first and
+optimized-first order, and four discarded balanced warmups. The 6,000-frame
+count was predeclared before the formal run: a two-frame host smoke measured
+about 0.33 ms of ingest process CPU for 114 commands, which projects to about
+one CPU second per formal sample. The analyzer will reject any other frame or
+attempt count.
+
+Run the paired protocol outside the Codex sandbox from a clean repository. The
+runner creates detached worktrees and independent Release build/module caches,
+requires a byte-identical benchmark harness at both commits, launches a fresh
+`swift test` process for every attempt, and stops without replacement if any
+attempt fails:
+
+```sh
+uv run --no-project Benchmarks/run_cpu_saturation_ab.py \
+  --baseline <exact-baseline-commit> \
+  --optimized <exact-optimized-commit> \
+  --output Benchmarks/Results/CPUSaturation_<YYYY-MM-DD> \
+  --host-execution-confirmed
+```
+
+Recompute the paired medians and deterministic 95% bootstrap intervals with:
+
+```sh
+uv run --no-project Benchmarks/analyze_cpu_saturation.py \
+  Benchmarks/Results/CPUSaturation_<YYYY-MM-DD> --check
+```
+
+The primary metric is `ingest_cpu_nanoseconds_per_command`. End-to-end CPU,
+current RSS, and peak RSS are secondary characterization metrics; saturation
+published FPS and p95 interval are not performance claims. The analyzer accepts
+only schema-v2 CPU-IOSurface saturation samples with exactly one final
+snapshot, zero diagnostic clocks, zero fallback/GPU/video activity, complete
+revision and copy-byte accounting, exact AB/BA order, and an unbroken attempt
+ledger. It also re-extracts the sample from every retained process log and
+validates the canonical 54-file `SHA256SUMS` manifest, including the exact
+runner and analyzer copies used for the run.
+
+Runner and analyzer bytes are recorded and locked by SHA-256. Revalidate old
+evidence with the scripts from its source commit; changing either tool creates
+a new evidence protocol implementation rather than silently reinterpreting an
+old archive.
+
+The exact original and independent-rerun 2026-08-04 saturation evidence,
+commit boundary, statistics, validation results, and artifact links are in
+[`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
 
 ## Diagnostic matrix
 

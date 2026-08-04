@@ -62,6 +62,9 @@ package final class ChannelSerialBarrier: Sendable {
         let continuations = state.withLock {
             state -> [CheckedContinuation<Void, any Error>] in
             state.latestSerials[key] = max(state.latestSerials[key] ?? 0, serial)
+            guard !state.waiters.isEmpty else {
+                return []
+            }
             let ready = state.waiters.compactMap { id, waiter in
                 Self.isSatisfied(
                     waiter.requirements,

@@ -1,6 +1,7 @@
 import Foundation
 import SpiceCodecs
 import SpiceTestSupport
+import SpiceTransport
 import Synchronization
 import Testing
 @testable import SpiceChannels
@@ -119,6 +120,69 @@ struct DisplayChannelTests {
         #expect(diagnostics.bitmapSurfaceStoreRoundTripTiming == RenderPhaseMetrics())
         #expect(diagnostics.publisherSubmitRoundTripTiming == RenderPhaseMetrics())
         #expect(clock.readCount == 0)
+    }
+
+    @Test func explicitlyFlushesPendingFramesForEverySurface() async throws {
+        let messages = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 4,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2,
+                width: 4,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 302, body: drawFillBody(surfaceID: 1)),
+            encodeMini(id: 302, body: drawFillBody(surfaceID: 2)),
+        ]
+        let inbound = messages.reduce(into: Data()) { $0.append($1) }
+        let transport = DisplayBlockingTransport(initial: inbound)
+        try await transport.connect()
+        let collector = DisplayFrameCollector()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: SurfaceStore(backingPolicy: .dataOnly),
+            framePublicationInterval: .seconds(3_600)
+        )
+        let runTask = Task {
+            try await channel.run { event in
+                await collector.record(event)
+            }
+        }
+
+        await transport.waitUntilAwaitingMoreInput()
+        let pending = await channel.diagnosticsSnapshot().publisher
+        #expect(pending.submissions == 2)
+        #expect(pending.snapshotAttempts == 0)
+        #expect(pending.emittedFrames == 0)
+        #expect(pending.pendingSurfaces == 2)
+
+        await channel.flushPendingFramesForTesting()
+
+        let flushed = await channel.diagnosticsSnapshot().publisher
+        #expect(flushed.submissions == 2)
+        #expect(flushed.snapshotAttempts == 2)
+        #expect(flushed.emittedFrames == 2)
+        #expect(flushed.staleSnapshots == 0)
+        #expect(flushed.pendingSurfaces == 0)
+        let frames = await collector.frames
+        #expect(frames.map(\.surfaceID) == [1, 2])
+        #expect(frames.map(\.revision) == [1, 1])
+
+        await channel.close()
+        await #expect(throws: ChannelError.transport(.connectionClosed)) {
+            try await runTask.value
+        }
     }
 
     @Test func diagnosticConnectionMetricsSurviveMigration() async throws {
@@ -2030,6 +2094,7 @@ struct DisplayChannelTests {
     }
 
     private func drawFillBody(
+        surfaceID: UInt32 = 1,
         clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)] = [
             (top: 0, left: 0, bottom: 2, right: 2),
         ]
@@ -2037,7 +2102,7 @@ struct DisplayChannelTests {
         var writer = ByteWriter()
         writeBase(
             to: &writer,
-            surfaceID: 1,
+            surfaceID: surfaceID,
             box: (top: 0, left: 0, bottom: 2, right: 4),
             clipRectangles: clipRectangles
         )
@@ -2479,6 +2544,77 @@ struct DisplayChannelTests {
             lifecycleGeneration: 1,
             revision: revision
         ))
+    }
+}
+
+private actor DisplayFrameCollector {
+    private(set) var frames: [FrameSnapshot] = []
+
+    func record(_ event: SpiceChannelEvent) {
+        if case let .frame(frame) = event {
+            frames.append(frame)
+        }
+    }
+}
+
+private actor DisplayBlockingTransport: SpiceTransport {
+    private let inbound: AsyncStream<Data>
+    private let continuation: AsyncStream<Data>.Continuation
+    private var isConnected = false
+    private var readCount = 0
+    private var blockedReadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(initial: Data) {
+        let pipe = AsyncStream.makeStream(of: Data.self)
+        inbound = pipe.stream
+        continuation = pipe.continuation
+        pipe.continuation.yield(initial)
+    }
+
+    func connect() async throws(TransportError) {
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected else {
+            throw .connectionClosed
+        }
+        readCount += 1
+        if readCount >= 2 {
+            let waiters = blockedReadWaiters
+            blockedReadWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        for await data in inbound {
+            guard data.count >= minimum, data.count <= maximum else {
+                throw .connectionFailed("fixture exceeds requested read bounds")
+            }
+            return data
+        }
+        throw .connectionClosed
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected else {
+            throw .connectionClosed
+        }
+        _ = data
+    }
+
+    func close() async {
+        isConnected = false
+        continuation.finish()
+    }
+
+    func waitUntilAwaitingMoreInput() async {
+        guard readCount < 2 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            blockedReadWaiters.append(continuation)
+        }
     }
 }
 

@@ -1,0 +1,696 @@
+{
+  "attempt_audit": {
+    "ab_ba_alternation": true,
+    "attempts": 44,
+    "failures": 0,
+    "formal": 40,
+    "fresh_processes": true,
+    "schema_2_saturation_only": true,
+    "warmups": 4
+  },
+  "host": {
+    "boot_epoch_seconds": 1785654095,
+    "boot_time_utc": "2026-08-02T07:01:35.000Z",
+    "collected_at_utc": "2026-08-04T08:51:26.011Z",
+    "cpu_brand": "Apple M4 Pro",
+    "hardware_model": "Mac16,8",
+    "machine": "arm64",
+    "os_build": "25G72",
+    "os_version": "26.6",
+    "swift": "swift-driver version: 1.148.6 Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)\nTarget: arm64-apple-macosx26.0",
+    "system": "Darwin",
+    "xcode": "Xcode 26.6\nBuild version 17F113"
+  },
+  "method": "paired optimized/baseline ratios; median; deterministic percentile bootstrap",
+  "primary_metric": "ingest_cpu_nanoseconds_per_command",
+  "protocol": "cpu-saturation-commit-ab-v1",
+  "provenance": {
+    "baseline_commit": "932a4e575df4252f16276ce7985db022f6e2e21b",
+    "common_harness_sha256": "6556add72637b01bb710c2a73df32e05d9ce67c8f0467dff12fbe295bdbfc886",
+    "optimized_commit": "91ec86784bba19b1971bbdc5fd11ffc76b9f1118",
+    "tool_commit": "91ec86784bba19b1971bbdc5fd11ffc76b9f1118",
+    "tool_files": {
+      "analyzer": {
+        "evidence_path": "tools/analyze_cpu_saturation.py",
+        "repository_path": "Benchmarks/analyze_cpu_saturation.py",
+        "sha256": "935e25a0069f0079d95b75e0f7e760196f6bc73c24463befb0284c2492744078"
+      },
+      "runner": {
+        "evidence_path": "tools/run_cpu_saturation_ab.py",
+        "repository_path": "Benchmarks/run_cpu_saturation_ab.py",
+        "sha256": "5eef2c6d04f9a15798aeeeb1be1873783e9675c2b90adbe03763f3828572caf0"
+      }
+    }
+  },
+  "resolution_4k": {
+    "pair_table": [
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1645,
+        "baseline_resident_bytes": 98222080,
+        "ingest_cpu_ratio": 1.001823708206687,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1648,
+        "optimized_resident_bytes": 98287616,
+        "order": "baseline-then-optimized",
+        "pair": 1,
+        "resident_bytes_ratio": 1.0006672226855713
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1641,
+        "baseline_resident_bytes": 98009088,
+        "ingest_cpu_ratio": 0.9969530773918343,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1636,
+        "optimized_resident_bytes": 98123776,
+        "order": "optimized-then-baseline",
+        "pair": 2,
+        "resident_bytes_ratio": 1.0011701771982615
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1634,
+        "baseline_resident_bytes": 98140160,
+        "ingest_cpu_ratio": 1.0024479804161566,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1638,
+        "optimized_resident_bytes": 98140160,
+        "order": "baseline-then-optimized",
+        "pair": 3,
+        "resident_bytes_ratio": 1
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1643,
+        "baseline_resident_bytes": 98189312,
+        "ingest_cpu_ratio": 0.995739500912964,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1636,
+        "optimized_resident_bytes": 98107392,
+        "order": "optimized-then-baseline",
+        "pair": 4,
+        "resident_bytes_ratio": 0.9991656933088603
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1644,
+        "baseline_resident_bytes": 98107392,
+        "ingest_cpu_ratio": 1,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1644,
+        "optimized_resident_bytes": 98222080,
+        "order": "baseline-then-optimized",
+        "pair": 5,
+        "resident_bytes_ratio": 1.0011690046760187
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1635,
+        "baseline_resident_bytes": 98254848,
+        "ingest_cpu_ratio": 1.000611620795107,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1636,
+        "optimized_resident_bytes": 98156544,
+        "order": "optimized-then-baseline",
+        "pair": 6,
+        "resident_bytes_ratio": 0.9989994997498749
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1639,
+        "baseline_resident_bytes": 98172928,
+        "ingest_cpu_ratio": 1.0012202562538133,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1641,
+        "optimized_resident_bytes": 98091008,
+        "order": "baseline-then-optimized",
+        "pair": 7,
+        "resident_bytes_ratio": 0.9991655540720962
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1652,
+        "baseline_resident_bytes": 98418688,
+        "ingest_cpu_ratio": 0.988498789346247,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1633,
+        "optimized_resident_bytes": 98222080,
+        "order": "optimized-then-baseline",
+        "pair": 8,
+        "resident_bytes_ratio": 0.9980023306142833
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1657,
+        "baseline_resident_bytes": 98156544,
+        "ingest_cpu_ratio": 0.9855159927579964,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1633,
+        "optimized_resident_bytes": 98238464,
+        "order": "baseline-then-optimized",
+        "pair": 9,
+        "resident_bytes_ratio": 1.00083458521115
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1644,
+        "baseline_resident_bytes": 98189312,
+        "ingest_cpu_ratio": 0.9939172749391727,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1634,
+        "optimized_resident_bytes": 98172928,
+        "order": "optimized-then-baseline",
+        "pair": 10,
+        "resident_bytes_ratio": 0.999833138661772
+      }
+    ],
+    "pairs": 10,
+    "rows": [
+      {
+        "baseline_median": 1643.5,
+        "ci95": {
+          "high": 1.0012202562538133,
+          "low": 0.9921191451296055,
+          "resamples": 100000,
+          "seed": 420260804,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "ingest_cpu_nanoseconds_per_command",
+        "optimized_median": 1636,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1.0012202562538133,
+            "paired_ratios": [
+              1.001823708206687,
+              1.0024479804161566,
+              1,
+              1.0012202562538133,
+              0.9855159927579964
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.995739500912964,
+            "paired_ratios": [
+              0.9969530773918343,
+              0.995739500912964,
+              1.000611620795107,
+              0.988498789346247,
+              0.9939172749391727
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9984765386959171,
+        "paired_ratios": [
+          1.001823708206687,
+          0.9969530773918343,
+          1.0024479804161566,
+          0.995739500912964,
+          1,
+          1.000611620795107,
+          1.0012202562538133,
+          0.988498789346247,
+          0.9855159927579964,
+          0.9939172749391727
+        ],
+        "role": "primary"
+      },
+      {
+        "baseline_median": 1652,
+        "ci95": {
+          "high": 1.000301748161863,
+          "low": 0.992761232695774,
+          "resamples": 100000,
+          "seed": 420260805,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "end_to_end_cpu_nanoseconds_per_command",
+        "optimized_median": 1645.5,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1,
+            "paired_ratios": [
+              1.0012091898428053,
+              1.0036540803897687,
+              1,
+              0.9993943064809206,
+              0.9861861861861861
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.9963658388855239,
+            "paired_ratios": [
+              0.9963658388855239,
+              0.9963680387409201,
+              0.9993920972644377,
+              0.9891566265060241,
+              0.9933414043583535
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9978800680026789,
+        "paired_ratios": [
+          1.0012091898428053,
+          0.9963658388855239,
+          1.0036540803897687,
+          0.9963680387409201,
+          1,
+          0.9993920972644377,
+          0.9993943064809206,
+          0.9891566265060241,
+          0.9861861861861861,
+          0.9933414043583535
+        ],
+        "role": "secondary"
+      },
+      {
+        "baseline_median": 98181120,
+        "ci95": {
+          "high": 1.000918113680795,
+          "low": 0.9990825965293676,
+          "resamples": 100000,
+          "seed": 420260806,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "resident_bytes",
+        "optimized_median": 98164736,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1.0006672226855713,
+            "paired_ratios": [
+              1.0006672226855713,
+              1,
+              1.0011690046760187,
+              0.9991655540720962,
+              1.00083458521115
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.9991656933088603,
+            "paired_ratios": [
+              1.0011701771982615,
+              0.9991656933088603,
+              0.9989994997498749,
+              0.9980023306142833,
+              0.999833138661772
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.999916569330886,
+        "paired_ratios": [
+          1.0006672226855713,
+          1.0011701771982615,
+          1,
+          0.9991656933088603,
+          1.0011690046760187,
+          0.9989994997498749,
+          0.9991655540720962,
+          0.9980023306142833,
+          1.00083458521115,
+          0.999833138661772
+        ],
+        "role": "secondary"
+      },
+      {
+        "baseline_median": 98181120,
+        "ci95": {
+          "high": 1.000918113680795,
+          "low": 0.9990825965293676,
+          "resamples": 100000,
+          "seed": 420260807,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "peak_resident_bytes",
+        "optimized_median": 98164736,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1.0006672226855713,
+            "paired_ratios": [
+              1.0006672226855713,
+              1,
+              1.0011690046760187,
+              0.9991655540720962,
+              1.00083458521115
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.9991656933088603,
+            "paired_ratios": [
+              1.0011701771982615,
+              0.9991656933088603,
+              0.9989994997498749,
+              0.9980023306142833,
+              0.999833138661772
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.999916569330886,
+        "paired_ratios": [
+          1.0006672226855713,
+          1.0011701771982615,
+          1,
+          0.9991656933088603,
+          1.0011690046760187,
+          0.9989994997498749,
+          0.9991655540720962,
+          0.9980023306142833,
+          1.00083458521115,
+          0.999833138661772
+        ],
+        "role": "secondary"
+      }
+    ]
+  },
+  "resolution_720p": {
+    "pair_table": [
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1626,
+        "baseline_resident_bytes": 38944768,
+        "ingest_cpu_ratio": 1.01230012300123,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1646,
+        "optimized_resident_bytes": 39157760,
+        "order": "baseline-then-optimized",
+        "pair": 1,
+        "resident_bytes_ratio": 1.005469078670593
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1642,
+        "baseline_resident_bytes": 39157760,
+        "ingest_cpu_ratio": 0.9829476248477467,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1614,
+        "optimized_resident_bytes": 39174144,
+        "order": "optimized-then-baseline",
+        "pair": 2,
+        "resident_bytes_ratio": 1.000418410041841
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1639,
+        "baseline_resident_bytes": 39305216,
+        "ingest_cpu_ratio": 0.9938987187309335,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1629,
+        "optimized_resident_bytes": 39026688,
+        "order": "baseline-then-optimized",
+        "pair": 3,
+        "resident_bytes_ratio": 0.9929137140475198
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1634,
+        "baseline_resident_bytes": 39174144,
+        "ingest_cpu_ratio": 1.0018359853121175,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1637,
+        "optimized_resident_bytes": 39124992,
+        "order": "optimized-then-baseline",
+        "pair": 4,
+        "resident_bytes_ratio": 0.998745294855709
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1633,
+        "baseline_resident_bytes": 39256064,
+        "ingest_cpu_ratio": 0.9957134109001837,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1626,
+        "optimized_resident_bytes": 39272448,
+        "order": "baseline-then-optimized",
+        "pair": 5,
+        "resident_bytes_ratio": 1.0004173622704509
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1624,
+        "baseline_resident_bytes": 39370752,
+        "ingest_cpu_ratio": 1.001231527093596,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1626,
+        "optimized_resident_bytes": 39124992,
+        "order": "optimized-then-baseline",
+        "pair": 6,
+        "resident_bytes_ratio": 0.9937578027465668
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1625,
+        "baseline_resident_bytes": 39206912,
+        "ingest_cpu_ratio": 0.9846153846153847,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1600,
+        "optimized_resident_bytes": 39419904,
+        "order": "baseline-then-optimized",
+        "pair": 7,
+        "resident_bytes_ratio": 1.0054325114918512
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1631,
+        "baseline_resident_bytes": 39206912,
+        "ingest_cpu_ratio": 0.9957081545064378,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1624,
+        "optimized_resident_bytes": 39092224,
+        "order": "optimized-then-baseline",
+        "pair": 8,
+        "resident_bytes_ratio": 0.9970748015043878
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1620,
+        "baseline_resident_bytes": 39206912,
+        "ingest_cpu_ratio": 0.9962962962962963,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1614,
+        "optimized_resident_bytes": 39321600,
+        "order": "baseline-then-optimized",
+        "pair": 9,
+        "resident_bytes_ratio": 1.0029251984956122
+      },
+      {
+        "baseline_ingest_cpu_nanoseconds_per_command": 1627,
+        "baseline_resident_bytes": 39075840,
+        "ingest_cpu_ratio": 0.9950829748002459,
+        "optimized_ingest_cpu_nanoseconds_per_command": 1619,
+        "optimized_resident_bytes": 39043072,
+        "order": "optimized-then-baseline",
+        "pair": 10,
+        "resident_bytes_ratio": 0.9991614255765199
+      }
+    ],
+    "pairs": 10,
+    "rows": [
+      {
+        "baseline_median": 1629,
+        "ci95": {
+          "high": 1.001231527093596,
+          "low": 0.9898491797078153,
+          "resamples": 100000,
+          "seed": 720202604,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "ingest_cpu_nanoseconds_per_command",
+        "optimized_median": 1625,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 0.9957134109001837,
+            "paired_ratios": [
+              1.01230012300123,
+              0.9938987187309335,
+              0.9957134109001837,
+              0.9846153846153847,
+              0.9962962962962963
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.9957081545064378,
+            "paired_ratios": [
+              0.9829476248477467,
+              1.0018359853121175,
+              1.001231527093596,
+              0.9957081545064378,
+              0.9950829748002459
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9957107827033107,
+        "paired_ratios": [
+          1.01230012300123,
+          0.9829476248477467,
+          0.9938987187309335,
+          1.0018359853121175,
+          0.9957134109001837,
+          1.001231527093596,
+          0.9846153846153847,
+          0.9957081545064378,
+          0.9962962962962963,
+          0.9950829748002459
+        ],
+        "role": "primary"
+      },
+      {
+        "baseline_median": 1631,
+        "ci95": {
+          "high": 1.0006150061500616,
+          "low": 0.9895732456863597,
+          "resamples": 100000,
+          "seed": 720202605,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "end_to_end_cpu_nanoseconds_per_command",
+        "optimized_median": 1626.5,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 0.9962985811227637,
+            "paired_ratios": [
+              1.0129071911493546,
+              0.9945121951219512,
+              0.996328029375765,
+              0.9846342962507683,
+              0.9962985811227637
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.9957134109001837,
+            "paired_ratios": [
+              0.9835666463785758,
+              1.0012224938875305,
+              1.0006150061500616,
+              0.9957134109001837,
+              0.994475138121547
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9960059960114738,
+        "paired_ratios": [
+          1.0129071911493546,
+          0.9835666463785758,
+          0.9945121951219512,
+          1.0012224938875305,
+          0.996328029375765,
+          1.0006150061500616,
+          0.9846342962507683,
+          0.9957134109001837,
+          0.9962985811227637,
+          0.994475138121547
+        ],
+        "role": "secondary"
+      },
+      {
+        "baseline_median": 39206912,
+        "ci95": {
+          "high": 1.002925460766846,
+          "low": 0.9962515488011379,
+          "resamples": 100000,
+          "seed": 720202606,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "resident_bytes",
+        "optimized_median": 39141376,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1.0029251984956122,
+            "paired_ratios": [
+              1.005469078670593,
+              0.9929137140475198,
+              1.0004173622704509,
+              1.0054325114918512,
+              1.0029251984956122
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.998745294855709,
+            "paired_ratios": [
+              1.000418410041841,
+              0.998745294855709,
+              0.9937578027465668,
+              0.9970748015043878,
+              0.9991614255765199
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9997893939234854,
+        "paired_ratios": [
+          1.005469078670593,
+          1.000418410041841,
+          0.9929137140475198,
+          0.998745294855709,
+          1.0004173622704509,
+          0.9937578027465668,
+          1.0054325114918512,
+          0.9970748015043878,
+          1.0029251984956122,
+          0.9991614255765199
+        ],
+        "role": "secondary"
+      },
+      {
+        "baseline_median": 39206912,
+        "ci95": {
+          "high": 1.002925460766846,
+          "low": 0.9962515488011379,
+          "resamples": 100000,
+          "seed": 720202607,
+          "sorted_indices": [
+            2500,
+            97500
+          ]
+        },
+        "metric": "peak_resident_bytes",
+        "optimized_median": 39141376,
+        "order_specific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "paired_median_ratio": 1.0029251984956122,
+            "paired_ratios": [
+              1.005469078670593,
+              0.9929137140475198,
+              1.0004173622704509,
+              1.0054325114918512,
+              1.0029251984956122
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "paired_median_ratio": 0.998745294855709,
+            "paired_ratios": [
+              1.000418410041841,
+              0.998745294855709,
+              0.9937578027465668,
+              0.9970748015043878,
+              0.9991614255765199
+            ]
+          }
+        },
+        "outcome": "no-reliable-change",
+        "paired_median_ratio": 0.9997893939234854,
+        "paired_ratios": [
+          1.005469078670593,
+          1.000418410041841,
+          0.9929137140475198,
+          0.998745294855709,
+          1.0004173622704509,
+          0.9937578027465668,
+          1.0054325114918512,
+          0.9970748015043878,
+          1.0029251984956122,
+          0.9991614255765199
+        ],
+        "role": "secondary"
+      }
+    ]
+  },
+  "run_window_utc": {
+    "finished": "2026-08-04T08:53:32.899Z",
+    "started": "2026-08-04T08:52:46.050Z"
+  },
+  "schema_version": 2
+}
