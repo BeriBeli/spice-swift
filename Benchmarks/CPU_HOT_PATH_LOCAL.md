@@ -13,7 +13,9 @@ uv run --no-project Benchmarks/analyze_cpu_hotpath.py \
 The complementary same-day CPU-saturation A/B, which isolates the
 `ChannelSerialBarrier.record()` empty-waiter fast path, is documented in
 [`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
-It finds no reliable CPU or RSS change at either resolution.
+Two independent batches find no reliable 720p or RSS change. The 4K rerun
+detects a small CPU decrease that the original batch did not, so it is not
+reported as a replicated production-speedup result.
 
 `CPUHotPathBenchmarkTests` is an opt-in, host-only Swift Testing benchmark for
 the production CPU display path. It provides paced publication and unpaced
@@ -221,8 +223,8 @@ evidence with the scripts from its source commit; changing either tool creates
 a new evidence protocol implementation rather than silently reinterpreting an
 old archive.
 
-The exact 2026-08-04 checked-in saturation evidence, commit boundary,
-statistics, validation results, and artifact links are recorded in
+The exact original and independent-rerun 2026-08-04 saturation evidence,
+commit boundary, statistics, validation results, and artifact links are in
 [`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
 
 ## Diagnostic matrix

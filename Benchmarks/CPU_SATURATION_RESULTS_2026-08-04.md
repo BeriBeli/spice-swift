@@ -2,39 +2,55 @@
 
 ## Decision
 
-The formal same-harness A/B does **not** detect a reliable CPU or RSS change
-from the `ChannelSerialBarrier.record()` empty-waiter fast path at either
-resolution. The change must not be described as a production speedup or memory
-reduction.
+Two independently collected formal same-harness batches do **not** justify a
+general CPU-speedup or memory-reduction claim for the
+`ChannelSerialBarrier.record()` empty-waiter fast path. The independent rerun
+does detect a narrow 4K CPU decrease, but the original 4K batch did not. At
+720p, neither batch detects a reliable change and their point estimates have
+opposite directions. RSS is unchanged within uncertainty in both batches.
+
+The 4K rerun is therefore evidence of a possible small benefit that still
+needs an independent confirming batch before it is described as replicated.
+It is not evidence of a production GUI speedup.
 
 The primary metric is ingest process CPU per command. Ratios are paired
 optimized/baseline ratios, so a value below 1 favors the optimized commit.
 
-| Resolution | Baseline median | Optimized median | Paired median ratio | 95% bootstrap CI | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 720p | 1,629 ns/command | 1,625 ns/command | 0.9957108 | [0.9898492, 1.0012315] | No reliable change |
-| 4K | 1,643.5 ns/command | 1,636 ns/command | 0.9984765 | [0.9921191, 1.0012203] | No reliable change |
+| Batch | Resolution | Baseline median | Optimized median | Paired median ratio | 95% bootstrap CI | Result |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Original | 720p | 1,629 ns/command | 1,625 ns/command | 0.9957108 | [0.9898492, 1.0012315] | No reliable change |
+| Rerun | 720p | 1,683 ns/command | 1,687.5 ns/command | 1.0035642 | [0.9946524, 1.0074608] | No reliable change |
+| Original | 4K | 1,643.5 ns/command | 1,636 ns/command | 0.9984765 | [0.9921191, 1.0012203] | No reliable change |
+| Rerun | 4K | 1,699.5 ns/command | 1,684.5 ns/command | 0.9905715 | [0.9868002, 0.9952964] | Decrease detected |
 
-The 720p point estimate is 0.43% lower and the 4K point estimate is 0.15%
-lower, but both confidence intervals include 1. The data therefore supports
-neither a CPU reduction nor a CPU regression. The median of the paired ratios
-is the decision statistic; it is not the ratio of the two unpaired medians.
+The original 720p point estimate is 0.43% lower, while the rerun is 0.36%
+higher; both intervals include 1. The original 4K point estimate is 0.15%
+lower with an interval that includes 1, while the rerun is 0.94% lower with an
+interval wholly below 1. Both 4K point estimates favor the optimized commit,
+but only one batch crosses the decision threshold. No post-hoc pooled interval
+is used: each predeclared ten-pair batch stands on its own. The median of the
+paired ratios is the decision statistic; it is not the ratio of the two
+unpaired medians.
 
 End-to-end CPU, which includes the single final publication drain, reaches the
 same conclusion:
 
-| Resolution | Paired median ratio | 95% bootstrap CI | Result |
-| --- | ---: | ---: | --- |
-| 720p | 0.9960060 | [0.9895732, 1.0006150] | No reliable change |
-| 4K | 0.9978801 | [0.9927612, 1.0003017] | No reliable change |
+| Batch | Resolution | Paired median ratio | 95% bootstrap CI | Result |
+| --- | --- | ---: | ---: | --- |
+| Original | 720p | 0.9960060 | [0.9895732, 1.0006150] | No reliable change |
+| Rerun | 720p | 1.0038590 | [0.9952494, 1.0071557] | No reliable change |
+| Original | 4K | 0.9978801 | [0.9927612, 1.0003017] | No reliable change |
+| Rerun | 4K | 0.9911893 | [0.9868542, 0.9956140] | Decrease detected |
 
 Current and peak RSS were identical within each sample and also show no
 reliable change:
 
-| Resolution | Baseline RSS median | Optimized RSS median | Paired median ratio | 95% bootstrap CI | Result |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 720p | 37.390625 MiB | 37.328125 MiB | 0.9997894 | [0.9962515, 1.0029255] | No reliable change |
-| 4K | 93.632813 MiB | 93.617188 MiB | 0.9999166 | [0.9990826, 1.0009181] | No reliable change |
+| Batch | Resolution | Baseline RSS median | Optimized RSS median | Paired median ratio | 95% bootstrap CI | Result |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Original | 720p | 37.390625 MiB | 37.328125 MiB | 0.9997894 | [0.9962515, 1.0029255] | No reliable change |
+| Rerun | 720p | 37.492188 MiB | 37.468750 MiB | 1.0000001 | [0.9972936, 1.0012542] | No reliable change |
+| Original | 4K | 93.632813 MiB | 93.617188 MiB | 0.9999166 | [0.9990826, 1.0009181] | No reliable change |
+| Rerun | 4K | 93.695313 MiB | 93.656250 MiB | 0.9996666 | [0.9988330, 1.0005841] | No reliable change |
 
 These process-level saturation measurements do not establish the memory or
 latency effect of a production GUI session.
@@ -55,7 +71,8 @@ latency effect of a production GUI session.
 - Toolchain: Xcode 26.6 (17F113), Swift 6.3.3
   (swiftlang 6.3.3.1.3, clang 2100.1.1.101)
 - Host boot: epoch `1785654095`, 2026-08-02 07:01:35 UTC
-- Formal run window: 2026-08-04 08:52:46–08:53:32 UTC
+- Original run window: 2026-08-04 08:52:46–08:53:32 UTC
+- Independent rerun window: 2026-08-04 14:41:37–14:42:26 UTC
 
 The baseline and optimized commits use the byte-identical benchmark harness
 above. Their only source difference is the three-line early return after
@@ -66,10 +83,12 @@ PR.
 
 ## Protocol and acceptance gates
 
-The continuous attempt ledger contains 44 fresh Release processes with zero
-failures: four balanced warm-up attempts followed by 40 formal samples. Each
-resolution has ten pairs, split evenly between baseline-first and
-optimized-first order. No attempt was omitted or replaced.
+Each batch has its own continuous attempt ledger containing 44 fresh Release
+processes with zero failures: four balanced warm-up attempts followed by 40
+formal samples. Across both batches this is 88 attempts, 80 formal samples,
+and eight discarded warm-ups. In each batch, each resolution has ten pairs,
+split evenly between baseline-first and optimized-first order. No attempt was
+omitted or replaced.
 
 Every sample uses:
 
@@ -101,8 +120,8 @@ swift test --disable-sandbox -Xswiftc -warnings-as-errors
 
 Result: 376 tests in 71 suites passed.
 
-The Python analyzer unit suite passed 12 tests. The evidence analyzer also
-re-extracted every sample from its retained process log, validated the
+The Python analyzer unit suite passed 12 tests. Each evidence analyzer also
+re-extracted every sample from its retained process log, validated its
 continuous attempt ledger and canonical 54-file SHA-256 manifest, and
 recomputed `stats.json` successfully:
 
@@ -110,6 +129,10 @@ recomputed `stats.json` successfully:
 uv run --no-project \
   Benchmarks/Results/CPUSaturation_2026-08-04/tools/analyze_cpu_saturation.py \
   Benchmarks/Results/CPUSaturation_2026-08-04 --check
+
+uv run --no-project \
+  Benchmarks/Results/CPUSaturation_2026-08-04-rerun/tools/analyze_cpu_saturation.py \
+  Benchmarks/Results/CPUSaturation_2026-08-04-rerun --check
 ```
 
 ## Scope and next step
@@ -119,13 +142,14 @@ This saturation A/B targets fixed per-command CPU overhead. It does not measure
 SPICE session, GLib, Metal rendering, native video, or VideoToolbox. The
 single final drain is included only in the secondary end-to-end metric.
 
-The result says that skipping the waiter scan when the waiter dictionary is
-empty is semantically useful but too small to demonstrate a reliable process
-effect with this protocol. The next CPU work should remain focused on larger
-sites: publisher coalescing/timer lifetime, SurfaceStore actor and ownership
-costs, and direct batched IOSurface mutation.
+The two batches bound this fast path as a small and resolution-dependent
+effect. The 4K rerun is worth retaining as a signal, but the lack of a crossing
+interval in the original 4K batch and the unreplicated 720p result rule out a
+general speedup claim. The next CPU work should remain focused on larger sites:
+publisher coalescing/timer lifetime, SurfaceStore actor and ownership costs,
+and direct batched IOSurface mutation.
 
-## Artifacts
+## Original artifacts
 
 - [all 44 attempts](Results/CPUSaturation_2026-08-04/attempts.jsonl)
 - [four discarded warm-ups](Results/CPUSaturation_2026-08-04/warmups.jsonl)
@@ -136,3 +160,15 @@ costs, and direct batched IOSurface mutation.
 - [canonical 54-file SHA-256 manifest](Results/CPUSaturation_2026-08-04/SHA256SUMS)
 - [exact analyzer used for the run](Results/CPUSaturation_2026-08-04/tools/analyze_cpu_saturation.py)
 - [exact runner used for the run](Results/CPUSaturation_2026-08-04/tools/run_cpu_saturation_ab.py)
+
+## Independent rerun artifacts
+
+- [all 44 rerun attempts](Results/CPUSaturation_2026-08-04-rerun/attempts.jsonl)
+- [four discarded rerun warm-ups](Results/CPUSaturation_2026-08-04-rerun/warmups.jsonl)
+- [rerun 720p formal samples](Results/CPUSaturation_2026-08-04-rerun/formal_720p.jsonl)
+- [rerun 4K formal samples](Results/CPUSaturation_2026-08-04-rerun/formal_4k.jsonl)
+- [rerun metadata](Results/CPUSaturation_2026-08-04-rerun/metadata.json)
+- [rerun paired statistics and attempt audit](Results/CPUSaturation_2026-08-04-rerun/stats.json)
+- [rerun canonical 54-file SHA-256 manifest](Results/CPUSaturation_2026-08-04-rerun/SHA256SUMS)
+- [exact rerun analyzer](Results/CPUSaturation_2026-08-04-rerun/tools/analyze_cpu_saturation.py)
+- [exact rerun runner](Results/CPUSaturation_2026-08-04-rerun/tools/run_cpu_saturation_ab.py)

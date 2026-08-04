@@ -97,4 +97,6 @@ bootstrap statistics, and scoped no-speedup conclusion are in
 The complementary 2026-08-04 CPU-saturation commit A/B for the isolated
 `ChannelSerialBarrier.record()` empty-waiter fast path is in
 [`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
-It finds no reliable CPU or RSS change at 720p or 4K.
+Two independent batches find no reliable 720p or RSS change. The 4K rerun
+detects a small CPU decrease that the original batch did not, so the report
+treats it as a signal rather than a replicated production-speedup claim.
