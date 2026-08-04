@@ -167,6 +167,12 @@ Agent behavior, including system-trusted TLS.
   resignation, close, responder loss, and dismantle produce deterministic
   human-only cleanup without creating a second activity signal. The original
   `onInput` initializer and public callback property remain source compatible.
+  `spice-probe --appkit-input-focus-gate` is a no-network host gate that runs
+  the production SwiftUI/AppKit bridge in its own `NSApplication`: the probe
+  requires a real key window, holds one human mouse button and physical key,
+  resigns the window, and verifies two ordered `focusCleanup` releases. Keeping
+  the AppKit event loop in a standalone process avoids polluting SwiftPM's
+  parallel graphical test runner.
 
 Inputs transports physical key transitions, not Unicode text or IME
 composition. The AppKit bridge draws the supported alpha cursor as a remote
