@@ -161,7 +161,12 @@ Agent behavior, including system-trusted TLS.
   now the shared public `SpicePhysicalKey`/`SpiceKeyMap` authority used by the
   AppKit bridge and external application commands; it distinguishes left/right
   modifiers, main/keypad Enter, navigation, and E0 extended keys. The raw
-  scan-code input API remains available for compatibility.
+  scan-code input API remains available for compatibility. The opt-in
+  `SpiceDesktopView.sourceAware` path additionally labels real local events as
+  `humanActivity` and synthetic key/button releases as `focusCleanup`; window
+  resignation, close, responder loss, and dismantle produce deterministic
+  human-only cleanup without creating a second activity signal. The original
+  `onInput` initializer and public callback property remain source compatible.
 
 Inputs transports physical key transitions, not Unicode text or IME
 composition. The AppKit bridge draws the supported alpha cursor as a remote

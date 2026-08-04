@@ -94,6 +94,46 @@ package enum SpiceDesktopPresentationPolicy {
     }
 }
 
+@MainActor
+final class SpiceDesktopFocusObserver: NSObject {
+    private let onFocusLoss: @MainActor () -> Void
+
+    init(onFocusLoss: @escaping @MainActor () -> Void) {
+        self.onFocusLoss = onFocusLoss
+    }
+
+    func attach(to object: AnyObject?) {
+        stop()
+        guard let object else { return }
+        let center = NotificationCenter.default
+        for name in [
+            NSWindow.didResignKeyNotification,
+            NSWindow.willCloseNotification,
+        ] {
+            center.addObserver(
+                self,
+                selector: #selector(didLoseFocus(_:)),
+                name: name,
+                object: object
+            )
+        }
+    }
+
+    func stop() {
+        let center = NotificationCenter.default
+        for name in [
+            NSWindow.didResignKeyNotification,
+            NSWindow.willCloseNotification,
+        ] {
+            center.removeObserver(self, name: name, object: nil)
+        }
+    }
+
+    @objc private func didLoseFocus(_ notification: Notification) {
+        onFocusLoss()
+    }
+}
+
 /// A narrow SwiftUI-to-AppKit bridge for framebuffer drawing and physical
 /// input capture. SwiftUI owns the frame and cursor values; the wrapped NSView
 /// owns only transient responder and tracking state.
@@ -102,7 +142,11 @@ public struct SpiceDesktopView: NSViewRepresentable {
     public var cursor: SpiceCursorState?
     public var pointerMode: SpicePointerMode
     public var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
+    public var onInputEvent: @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
+    private var handlesWindowFocusLoss: Bool
 
+    /// Compatibility initializer for applications that do not yet distinguish
+    /// real human activity from synthetic focus cleanup.
     public init(
         frame: SpiceFrame?,
         cursor: SpiceCursorState? = nil,
@@ -113,6 +157,40 @@ public struct SpiceDesktopView: NSViewRepresentable {
         self.cursor = cursor
         self.pointerMode = pointerMode
         self.onInput = onInput
+        self.onInputEvent = { onInput($0.input) }
+        self.handlesWindowFocusLoss = false
+    }
+
+    /// Creates a desktop bridge that preserves human-activity semantics.
+    /// Callers should process `.humanActivity` before forwarding its input so
+    /// local takeover can revoke an agent writer first. `.focusCleanup` must
+    /// only release human ownership.
+    public static func sourceAware(
+        frame: SpiceFrame?,
+        cursor: SpiceCursorState? = nil,
+        pointerMode: SpicePointerMode = .absolute,
+        onInputEvent: @escaping @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
+    ) -> Self {
+        Self(
+            frame: frame,
+            cursor: cursor,
+            pointerMode: pointerMode,
+            onInputEvent: onInputEvent
+        )
+    }
+
+    private init(
+        frame: SpiceFrame?,
+        cursor: SpiceCursorState?,
+        pointerMode: SpicePointerMode,
+        onInputEvent: @escaping @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
+    ) {
+        self.frame = frame
+        self.cursor = cursor
+        self.pointerMode = pointerMode
+        self.onInput = { _ in }
+        self.onInputEvent = onInputEvent
+        self.handlesWindowFocusLoss = true
     }
 
     public func makeNSView(context: Context) -> NSView {
@@ -120,7 +198,8 @@ public struct SpiceDesktopView: NSViewRepresentable {
             frame: frame,
             cursorState: cursor,
             pointerMode: pointerMode,
-            onInput: onInput
+            handlesWindowFocusLoss: handlesWindowFocusLoss,
+            onInputEvent: resolvedInputEventHandler
         )
     }
 
@@ -132,19 +211,38 @@ public struct SpiceDesktopView: NSViewRepresentable {
             frame: frame,
             cursorState: cursor,
             pointerMode: pointerMode,
-            onInput: onInput
+            handlesWindowFocusLoss: handlesWindowFocusLoss,
+            onInputEvent: resolvedInputEventHandler
         )
+    }
+
+    public static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
+        (nsView as? SpiceFramebufferView)?.stopInputTracking()
+    }
+
+    private var resolvedInputEventHandler:
+        @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
+    {
+        if handlesWindowFocusLoss {
+            return onInputEvent
+        }
+        let onInput = onInput
+        return { onInput($0.input) }
     }
 }
 
 @MainActor
-private final class SpiceFramebufferView: NSView {
+final class SpiceFramebufferView: NSView {
     private var desktopFrame: SpiceFrame?
     private var cursorState: SpiceCursorState?
     private var pointerMode: SpicePointerMode
-    private var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
+    private var handlesWindowFocusLoss: Bool
+    private var onInputEvent: @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
     private var trackingArea: NSTrackingArea?
-    private var pressedScanCodes: Set<UInt32> = []
+    private var humanInputState = SpiceHumanInputState()
+    private lazy var focusObserver = SpiceDesktopFocusObserver { [weak self] in
+        self?.releaseHumanInputForFocusLoss()
+    }
     private let metalView: SpiceMetalFrameView?
     private let cursorOverlay = SpiceCursorOverlayView()
     private var isUsingMetal = false
@@ -154,16 +252,18 @@ private final class SpiceFramebufferView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
-    fileprivate init(
+    init(
         frame: SpiceFrame?,
         cursorState: SpiceCursorState?,
         pointerMode: SpicePointerMode,
-        onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
+        handlesWindowFocusLoss: Bool,
+        onInputEvent: @escaping @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
     ) {
         desktopFrame = frame
         self.cursorState = cursorState
         self.pointerMode = pointerMode
-        self.onInput = onInput
+        self.handlesWindowFocusLoss = handlesWindowFocusLoss
+        self.onInputEvent = onInputEvent
         self.metalView = SpiceMetalFrameView()
         super.init(frame: .zero)
         if let metalView {
@@ -183,12 +283,18 @@ private final class SpiceFramebufferView: NSView {
         frame: SpiceFrame?,
         cursorState: SpiceCursorState?,
         pointerMode: SpicePointerMode,
-        onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
+        handlesWindowFocusLoss: Bool,
+        onInputEvent: @escaping @MainActor @Sendable (SpiceDesktopInputEvent) -> Void
     ) {
         desktopFrame = frame
         self.cursorState = cursorState
         self.pointerMode = pointerMode
-        self.onInput = onInput
+        let focusModeChanged = self.handlesWindowFocusLoss != handlesWindowFocusLoss
+        self.handlesWindowFocusLoss = handlesWindowFocusLoss
+        self.onInputEvent = onInputEvent
+        if focusModeChanged {
+            attachWindowObservers()
+        }
         isUsingMetal = metalView?.present(frame) ?? false
         updateCursorPresentation()
         needsLayout = true
@@ -232,6 +338,11 @@ private final class SpiceFramebufferView: NSView {
         super.updateTrackingAreas()
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        attachWindowObservers()
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.black.setFill()
         dirtyRect.fill()
@@ -260,8 +371,10 @@ private final class SpiceFramebufferView: NSView {
             super.keyDown(with: event)
             return
         }
-        pressedScanCodes.insert(scanCode)
-        onInput(.keyDown(scanCode: scanCode))
+        emit(humanInputState.keyDown(
+            scanCode: scanCode,
+            isRepeat: event.isARepeat
+        ))
     }
 
     override func keyUp(with event: NSEvent) {
@@ -271,8 +384,7 @@ private final class SpiceFramebufferView: NSView {
             super.keyUp(with: event)
             return
         }
-        pressedScanCodes.remove(scanCode)
-        onInput(.keyUp(scanCode: scanCode))
+        emit(humanInputState.keyUp(scanCode: scanCode))
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -282,47 +394,51 @@ private final class SpiceFramebufferView: NSView {
             super.flagsChanged(with: event)
             return
         }
-        if pressedScanCodes.insert(scanCode).inserted {
-            onInput(.keyDown(scanCode: scanCode))
-        } else {
-            pressedScanCodes.remove(scanCode)
-            onInput(.keyUp(scanCode: scanCode))
-        }
+        emit(humanInputState.modifierChanged(scanCode: scanCode))
     }
 
     override func resignFirstResponder() -> Bool {
-        for scanCode in pressedScanCodes {
-            onInput(.keyUp(scanCode: scanCode))
-        }
-        pressedScanCodes.removeAll(keepingCapacity: true)
+        releaseHumanInputForFocusLoss()
         return super.resignFirstResponder()
+    }
+
+    fileprivate func releaseHumanInputForFocusLoss() {
+        for event in humanInputState.releaseForFocusLoss() {
+            emit(event)
+        }
+    }
+
+    fileprivate func stopInputTracking() {
+        removeWindowObservers()
+        guard handlesWindowFocusLoss else { return }
+        releaseHumanInputForFocusLoss()
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        onInput(.mousePress(.left))
+        emit(humanInputState.buttonDown(.left))
     }
 
     override func mouseUp(with event: NSEvent) {
-        onInput(.mouseRelease(.left))
+        emit(humanInputState.buttonUp(.left))
     }
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        onInput(.mousePress(.right))
+        emit(humanInputState.buttonDown(.right))
     }
 
     override func rightMouseUp(with event: NSEvent) {
-        onInput(.mouseRelease(.right))
+        emit(humanInputState.buttonUp(.right))
     }
 
     override func otherMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        onInput(.mousePress(mouseButton(number: event.buttonNumber)))
+        emit(humanInputState.buttonDown(mouseButton(number: event.buttonNumber)))
     }
 
     override func otherMouseUp(with event: NSEvent) {
-        onInput(.mouseRelease(mouseButton(number: event.buttonNumber)))
+        emit(humanInputState.buttonUp(mouseButton(number: event.buttonNumber)))
     }
 
     override func mouseMoved(with event: NSEvent) { sendMotion(event) }
@@ -335,14 +451,14 @@ private final class SpiceFramebufferView: NSView {
             return
         }
         let button: SpiceMouseButton = event.scrollingDeltaY > 0 ? .scrollUp : .scrollDown
-        onInput(.mousePress(button))
-        onInput(.mouseRelease(button))
+        emitActivity(.mousePress(button))
+        emitActivity(.mouseRelease(button))
     }
 
     private func sendMotion(_ event: NSEvent) {
         switch pointerMode {
         case .relative:
-            onInput(.mouseMotion(
+            emitActivity(.mouseMotion(
                 dx: clampedInt32(event.deltaX.rounded()),
                 dy: clampedInt32(event.deltaY.rounded())
             ))
@@ -364,8 +480,29 @@ private final class SpiceFramebufferView: NSView {
             let y = min(frame.height - 1, max(0, Int(
                 ((point.y - destination.minY) / destination.height) * CGFloat(frame.height)
             )))
-            onInput(.mousePosition(x: UInt32(x), y: UInt32(y), displayID: 0))
+            emitActivity(.mousePosition(x: UInt32(x), y: UInt32(y), displayID: 0))
         }
+    }
+
+    private func emit(_ event: SpiceDesktopInputEvent?) {
+        guard let event else { return }
+        onInputEvent(event)
+    }
+
+    private func emitActivity(_ input: SpiceClientInput) {
+        emit(SpiceDesktopInputEvent(input: input, origin: .humanActivity))
+    }
+
+    private func attachWindowObservers() {
+        guard handlesWindowFocusLoss else {
+            focusObserver.stop()
+            return
+        }
+        focusObserver.attach(to: window)
+    }
+
+    private func removeWindowObservers() {
+        focusObserver.stop()
     }
 
     private func contentRectangle(frameWidth: Int, frameHeight: Int) -> NSRect {
