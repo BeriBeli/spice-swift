@@ -88,3 +88,6 @@ publication through real mini-header channel processing. Its separate opt-in
 diagnostic mode reports sampled wire, decode, message handling, SurfaceStore
 actor round-trip, publisher submit/emit, renderer, snapshot, and damage-plan
 phases without adding clock reads to the default disabled path.
+The exact 2026-08-04 same-harness paired evidence, complete attempt ledger,
+bootstrap statistics, and scoped no-speedup conclusion are in
+[`CPU_HOT_PATH_RESULTS_2026-08-04.md`](CPU_HOT_PATH_RESULTS_2026-08-04.md).

@@ -1,5 +1,15 @@
 # Local CPU display hot-path benchmark
 
+The exact 2026-08-04 same-harness paired run and its raw artifacts are
+documented in
+[`CPU_HOT_PATH_RESULTS_2026-08-04.md`](CPU_HOT_PATH_RESULTS_2026-08-04.md).
+Revalidate its formal JSONL and attempt ledger with:
+
+```sh
+uv run --no-project Benchmarks/analyze_cpu_hotpath.py \
+  Benchmarks/Results/CPUHotPath_2026-08-04 --check
+```
+
 `CPUHotPathBenchmarkTests` is an opt-in, host-only Swift Testing benchmark for
 the production CPU display path. It is inert unless
 `SWIFTSPICE_CPU_HOTPATH_BENCHMARK=1` is present, so a normal `swift test` does
@@ -86,14 +96,13 @@ The timed run is followed by an untimed revision and pixel check. This keeps
 the correctness readback out of CPU, RSS, snapshot, and materialization
 measurements.
 
-## Formal performance matrix
+## Single-commit sampling matrix
 
 The default is 1,500 input frames, approximately 24 seconds at the fixed input
 cadence. Run one backend and resolution per process so each invocation emits
 exactly one benchmark JSON object and process RSS is not inherited from an
-earlier case. Phase timing is disabled in this matrix so its clock reads do not
-pollute the A/B comparison. Prebuild the Release test bundle once, then run each
-sample in a fresh process with `--skip-build`:
+earlier case. Phase timing is disabled in this matrix. Prebuild the Release
+test bundle once, then run each sample in a fresh process with `--skip-build`:
 
 ```sh
 set -euo pipefail
@@ -122,11 +131,21 @@ done
 `4k`/`3840x2160`. If backend or resolution is omitted, the defaults are
 `cpu-iosurface` and `720p`.
 
+This loop characterizes two backends from one checkout. It is not a
+commit-to-commit A/B: `data-only` is a historical diagnostic reference, not
+the production GUI publication path. A PR-level A/B compares only
+`cpu-iosurface`, alternates baseline-first and optimized-first fresh processes,
+retains every attempt, and requires both builds to use byte-identical benchmark
+source. The checked-in 2026-08-04 evidence used a baseline-compatible harness
+for that purpose. The enhanced HEAD harness was then run separately with
+diagnostics enabled; those populations are not mixed.
+
 ## Diagnostic matrix
 
-Phase timing has a separate explicit gate and must not be enabled for the
-formal performance matrix. Add `SWIFTSPICE_CPU_HOTPATH_DIAGNOSTICS=1` when the
-goal is attribution rather than an uninstrumented A/B:
+Phase timing has a separate explicit gate and must not be enabled for an
+uninstrumented performance population. Add
+`SWIFTSPICE_CPU_HOTPATH_DIAGNOSTICS=1` when the goal is attribution rather than
+an A/B decision:
 
 ```sh
 set -euo pipefail
@@ -224,7 +243,8 @@ The schema contains:
   finish phases sample every invocation. `sampled_nanoseconds` is the sum of
   selected samples, not an extrapolated total.
 
-The optimized benchmark gates the declared sampling periods and path counts.
+The enhanced HEAD benchmark gates the declared sampling periods and path
+counts.
 It also rejects RSS collection failures: current RSS must be nonzero and peak
 RSS must be at least current RSS.
 The Data-only backend must retain no IOSurface lease; CPU-IOSurface must retain
