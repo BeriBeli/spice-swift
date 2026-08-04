@@ -10,6 +10,11 @@ uv run --no-project Benchmarks/analyze_cpu_hotpath.py \
   Benchmarks/Results/CPUHotPath_2026-08-04 --check
 ```
 
+The complementary same-day CPU-saturation A/B, which isolates the
+`ChannelSerialBarrier.record()` empty-waiter fast path, is documented in
+[`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
+It finds no reliable CPU or RSS change at either resolution.
+
 `CPUHotPathBenchmarkTests` is an opt-in, host-only Swift Testing benchmark for
 the production CPU display path. It provides paced publication and unpaced
 CPU-saturation modes. It is inert unless
@@ -215,6 +220,10 @@ Runner and analyzer bytes are recorded and locked by SHA-256. Revalidate old
 evidence with the scripts from its source commit; changing either tool creates
 a new evidence protocol implementation rather than silently reinterpreting an
 old archive.
+
+The exact 2026-08-04 checked-in saturation evidence, commit boundary,
+statistics, validation results, and artifact links are recorded in
+[`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
 
 ## Diagnostic matrix
 

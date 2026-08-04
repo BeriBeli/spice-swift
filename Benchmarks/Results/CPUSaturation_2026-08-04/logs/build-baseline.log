@@ -1,0 +1,98 @@
+[1/1] Compiling plugin CompileMetalShaders
+[2/2] Compiling plugin GenerateSpiceProtocol
+Building for production...
+[2/78] /var/folders/d_/1g7hjj2x7m758z6jlqqvrlv00000gn/T/swiftspice-cpu-saturation-v6kgp560/scratch-baseline/arm64-apple-macosx/release/SwiftSpicePackageTests.derived/runner.swift
+[3/78] Write sources
+[3/78] Copying libCUSBRedir.a
+[5/78] Write sources
+[6/78] Copying libCSpiceQUIC.a
+[7/78] Copying libCTurboJPEG.a
+[12/78] Copying h265-main-128x128.json
+[14/78] Copying h264-high-128x128.json
+[15/78] Copying quic-gray-7x5.json
+[16/78] Copying h264-baseline-128x128.json
+[16/78] Copying lzplt-plt8-9x3.json
+[17/78] Copying quic-rgba-7x5.json
+[17/78] Copying quic-rgb32-7x5.json
+[17/78] Copying quic-rgb24-7x5.json
+[17/78] Copying basic-desktop.json
+[17/78] Copying zlib-glz-rgb32.json
+[18/78] Copying lzplt-plt4le-9x3.json
+[24/78] Copying quic-rgb16-7x5.json
+[24/78] Copying lzplt-plt4be-9x3.json
+[24/78] Copying lzplt-plt1le-9x3.json
+[24/78] Copying lzplt-plt1be-9x3.json
+[28/78] Copying lz-rgb32-6x3.json
+[29/78] Copying lz-xxxa-6x3.json
+[29/78] Copying lz-rgb24-6x3.json
+[29/78] Copying lz-a8-6x3.json
+[32/78] Write sources
+[32/78] Copying jpeg-progressive-5x3.json
+[32/78] Copying jpeg-icc-6x5.json
+[33/78] Copying jpeg-cmyk-5x4.json
+[33/78] Copying jpeg-gray-7x5.json
+[33/78] Copying jpeg-8x8.json
+[34/78] Copying glz-reference-sequence.json
+[34/78] Copying lz-rgba-6x3.json
+[34/78] Copying jpeg-420-9x7.json
+[34/78] Copying lz-rgb16-6x3.json
+[34/78] Write sources
+[64/78] Write swift-version--58304C5D6DBC2206.txt
+[65/84] Compiling CUSBRedirShim USBRedirShim.c
+[67/84] Compiling SpiceTransport SpiceTransport+ExactRead.swift
+[68/85] Compiling SpiceCodecInterop QUICInterop.swift
+[69/86] Compiling SpiceWire ByteReader.swift
+[69/88] Compile Spice Metal video compositor
+[70/88] Copying SpiceVideoCompositor.metallib
+[72/88] Compiling SpiceProtocolGenerator main.swift
+[72/88] Write Objects.LinkFileList
+[74/88] Compiling SpiceProtocolGenerator main.swift
+[74/88] Write Objects.LinkFileList
+[75/88] Linking SpiceProtocolGenerator
+[77/88] Compiling SpiceTransportNetwork NetworkSpiceTransport.swift
+[77/88] Linking SpiceProtocolGenerator-tool
+[79/88] Compiling SpiceIOSurface IOSurfaceFramePool.swift
+[80/88] Compiling SpiceCodecs AdvancedVideoDecoder.swift
+[81/90] Compiling SpiceProtocol AgentProtocol.swift
+[82/93] Compiling SpiceTestSupport FakeTransport.swift
+[83/94] Compiling SpiceWireTests AddressResolverTests.swift
+[84/94] Compiling SpiceCore AckController.swift
+[85/95] Compiling SpiceVideoToolbox VideoToolboxDecoder.swift
+[86/96] Compiling SpiceCryptoSecurity SecurityTicketEncryptor.swift
+[87/96] Compiling SpiceTransportTests FakeTransportTests.swift
+[88/96] Compiling SpiceMetalCompositor SpiceMetalCompositor.swift
+[89/99] Compiling SpiceMetalCompositorTests SpiceMetalCompositorTests.swift
+[90/99] Compiling SpiceVideoToolboxTests AdvancedVideoCorpusTests.swift
+[91/99] Compiling SpiceProtocolTests AgentProtocolTests.swift
+[92/99] Compiling SpiceCodecsTests AdvancedVideoDecoderTests.swift
+[93/99] Compiling SpiceRenderer SurfaceBacking.swift
+[94/101] Compiling SpiceChannels CursorChannel.swift
+[95/103] Compiling SpiceRendererTests SurfaceStoreTests.swift
+[96/103] Compiling SwiftSpice ClipboardStateMachine.swift
+[97/106] Compiling SpiceProbe main.swift
+[97/106] Write Objects.LinkFileList
+[98/106] Linking spice-probe
+[100/106] Compiling SpiceViewer SpiceViewerApp.swift
+[100/106] Write Objects.LinkFileList
+[101/106] Linking spice-viewer
+[103/107] Compiling SpiceViewerTests ViewerClipboardStatusTests.swift
+[104/107] Compiling SpiceCoreTests CPUHotPathBenchmarkTests.swift
+[105/107] Compiling SwiftSpiceTests ClipboardStateMachineTests.swift
+[106/108] Compiling SwiftSpicePackageTests runner.swift
+[106/108] Write Objects.LinkFileList
+[107/108] Linking SwiftSpicePackageTests
+Build complete! (37.40s)
+Test Suite 'Selected tests' started at 2026-08-04 16:52:05.861.
+Test Suite 'SwiftSpicePackageTests.xctest' started at 2026-08-04 16:52:05.862.
+Test Suite 'SwiftSpicePackageTests.xctest' passed at 2026-08-04 16:52:05.862.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'Selected tests' passed at 2026-08-04 16:52:05.862.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.002) seconds
+◇ Test run started.
+↳ Testing Library Version: 1902
+↳ Target Platform: arm64e-apple-macos14.0
+◇ Suite "Opt-in local CPU display hot-path benchmark" started.
+◇ Test deterministicMiniHeaderDisplayPipeline() started.
+✔ Test deterministicMiniHeaderDisplayPipeline() passed after 0.001 seconds.
+✔ Suite "Opt-in local CPU display hot-path benchmark" passed after 0.001 seconds.
+✔ Test run with 1 test in 1 suite passed after 0.001 seconds.

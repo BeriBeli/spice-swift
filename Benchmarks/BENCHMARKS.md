@@ -94,3 +94,7 @@ adding clock reads to the default disabled path.
 The exact 2026-08-04 same-harness paired evidence, complete attempt ledger,
 bootstrap statistics, and scoped no-speedup conclusion are in
 [`CPU_HOT_PATH_RESULTS_2026-08-04.md`](CPU_HOT_PATH_RESULTS_2026-08-04.md).
+The complementary 2026-08-04 CPU-saturation commit A/B for the isolated
+`ChannelSerialBarrier.record()` empty-waiter fast path is in
+[`CPU_SATURATION_RESULTS_2026-08-04.md`](CPU_SATURATION_RESULTS_2026-08-04.md).
+It finds no reliable CPU or RSS change at 720p or 4K.
