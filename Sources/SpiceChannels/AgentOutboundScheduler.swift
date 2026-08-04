@@ -128,18 +128,25 @@ package struct AgentOutboundScheduler {
         self.limits = limits
     }
 
+    // Swift 6.3.3 release CMO can produce invalid lexical borrow lifetimes
+    // when active-state boundaries inline into MainChannel's async actor code.
+    // Keep every access to `active` isolated until the toolchain is fixed.
+    @inline(never)
     package var isIdle: Bool {
         active == nil && queuedCount == 0
     }
 
+    @inline(never)
     package var pendingCount: Int {
         queuedCount + (active == nil ? 0 : 1)
     }
 
+    @inline(never)
     package var activeHasWrittenFragment: Bool {
         active?.hasWrittenFragment == true
     }
 
+    @inline(never)
     package var activeID: UInt64? {
         active?.id
     }
@@ -191,6 +198,7 @@ package struct AgentOutboundScheduler {
         return .accepted
     }
 
+    @inline(never)
     package mutating func activateNextIfNeeded() -> UInt64? {
         guard active == nil, queuedCount > 0 else {
             return active?.id
@@ -206,6 +214,7 @@ package struct AgentOutboundScheduler {
         return nil
     }
 
+    @inline(never)
     package mutating func activeFragment() -> (id: UInt64, data: Data)? {
         guard let active,
               let fragment = active.payload.fragment(at: active.nextFragmentIndex) else {
@@ -216,6 +225,7 @@ package struct AgentOutboundScheduler {
         return (active.id, fragment)
     }
 
+    @inline(never)
     package mutating func didWriteFragment(id: UInt64) -> WriteResult {
         guard var request = active, request.id == id else { return .notActive }
         request.nextFragmentIndex += 1
@@ -232,6 +242,7 @@ package struct AgentOutboundScheduler {
         )
     }
 
+    @inline(never)
     package mutating func cancel(
         id: UInt64,
         writeInFlightID: UInt64?
@@ -266,6 +277,7 @@ package struct AgentOutboundScheduler {
         return .notFound
     }
 
+    @inline(never)
     package mutating func removeUnstartedForMigration(
         writeInFlightID: UInt64?
     ) -> [RemovedRequest] {
@@ -286,6 +298,7 @@ package struct AgentOutboundScheduler {
         return removed
     }
 
+    @inline(never)
     package mutating func removeAll(
         writeInFlightID: UInt64?
     ) -> [RemovedRequest] {
