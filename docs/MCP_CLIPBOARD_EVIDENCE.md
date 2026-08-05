@@ -112,10 +112,11 @@ Result: the `SwiftSpice`, `spice-probe`, and `spice-viewer` products built.
   update.
 - Maspice does not yet call the private offer API, enqueue a paste chord after
   GRAB completion, or expose the C2 MCP schema.
-- A serialized full-project run terminated with 436 tests in 71 suites but was
-  not green: 28 issues were in existing Metal/IOSurface/global-renderer tests,
-  including unavailable `IOSurfaceCreate`/Metal device paths. The clipboard
-  suite passed in that run, but this is not accepted as a full regression gate.
+- The complete linear upstream candidate passed 441 tests in 71 suites under
+  warnings-as-errors when local TCP, Security, IOSurface, Metal, and
+  VideoToolbox system capabilities were available. The command and the
+  distinction from Codex capability-sandbox failures are recorded in
+  [`MCP_UNIFIED_CANDIDATE_EVIDENCE.md`](MCP_UNIFIED_CANDIDATE_EVIDENCE.md).
 
 Therefore this evidence supports an A2 local functional candidate only. It does
 not satisfy the live-peer, exact-release, app-integration, or C2 release gates.
