@@ -123,6 +123,10 @@ package struct DisplayConfigurationCoordinator: Sendable {
         return true
     }
 
+    package mutating func didSend(_ configuration: SpiceDisplayConfiguration) {
+        _ = beginSend(configuration)
+    }
+
     package mutating func didFailSend(
         _ configuration: SpiceDisplayConfiguration,
         requeue: Bool

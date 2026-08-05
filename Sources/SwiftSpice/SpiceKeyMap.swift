@@ -143,7 +143,7 @@ public enum SpiceKeyMap {
         physicalKey(forMacVirtualKeyCode: keyCode)?.scanCode
     }
 
-    private static let macVirtualKeyMap: [UInt16: SpicePhysicalKey] = [
+    static let macVirtualKeyMap: [UInt16: SpicePhysicalKey] = [
         0: .a, 1: .s, 2: .d, 3: .f, 4: .h, 5: .g,
         6: .z, 7: .x, 8: .c, 9: .v, 11: .b, 12: .q,
         13: .w, 14: .e, 15: .r, 16: .y, 17: .t, 18: .digit1,
@@ -168,4 +168,10 @@ public enum SpiceKeyMap {
         122: .f1, 123: .arrowLeft, 124: .arrowRight, 125: .arrowDown,
         126: .arrowUp,
     ]
+}
+
+/// Compatibility namespace retained for package-internal v0.1.3 callers.
+/// New code should use ``SpiceKeyMap`` and ``SpicePhysicalKey``.
+package enum MacXTScanCode {
+    static let map: [UInt16: UInt32] = SpiceKeyMap.macVirtualKeyMap.mapValues(\.scanCode)
 }

@@ -355,6 +355,22 @@ public actor SpiceSession {
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
+        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
+    ) {
+        self.init(
+            transportFactory: transportFactory,
+            ticketEncryptor: ticketEncryptor,
+            migrationExecutor: migrationExecutor,
+            migrationReplacementHook: nil,
+            migrationTargetEndHook: nil,
+            migrationPreparationCompletionHook: nil,
+            migrationCompletionHook: nil
+        )
+    }
+
+    package init(
+        transportFactory: @escaping TransportFactory,
+        ticketEncryptor: any TicketEncrypting,
         migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
         migrationReplacementHook: MigrationReplacementHook? = nil,
         migrationTargetEndHook: MigrationTargetEndHook? = nil,
@@ -1034,9 +1050,19 @@ public actor SpiceSession {
     }
 
     package func sendAgentMessage(
+        _ message: SpiceAgentMessage
+    ) async throws(SpiceError) {
+        try await sendAgentMessage(
+            message,
+            priority: .normal,
+            requiredControl: false
+        )
+    }
+
+    package func sendAgentMessage(
         _ message: SpiceAgentMessage,
-        priority: AgentOutboundPriority = .normal,
-        requiredControl: Bool = false
+        priority: AgentOutboundPriority,
+        requiredControl: Bool
     ) async throws(SpiceError) {
         try ensureClientSendsAllowed()
         guard let mainChannel else {

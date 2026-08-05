@@ -3,6 +3,17 @@ import Testing
 
 @Suite("Dynamic resolution request coalescing")
 struct DisplayConfigurationCoordinatorTests {
+    @Test func legacyDidSendTransitionsToInFlight() {
+        let configuration = SpiceDisplayConfiguration(width: 800, height: 600)
+        var coordinator = DisplayConfigurationCoordinator()
+        coordinator.queue(configuration)
+
+        coordinator.didSend(configuration)
+
+        #expect(coordinator.desired == nil)
+        #expect(coordinator.inFlight == configuration)
+    }
+
     @Test func managerMigrationPolicyRetriesOnlyBeforeFirstFragment() {
         #expect(SpiceAgentManager.agentSendDisposition(
             .agentMigrationRebind(partial: false)
