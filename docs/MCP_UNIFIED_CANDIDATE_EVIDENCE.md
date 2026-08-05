@@ -95,3 +95,7 @@ live SPICE peer.
 
 Until those items pass, this document supports a unified local candidate, not a
 release-ready claim.
+
+The fixed review order, performance-PR overlap audit, final-main gates, and
+exact-tag/app-pin boundary are recorded in
+[`MCP_UPSTREAM_MERGE_CHECKLIST.md`](MCP_UPSTREAM_MERGE_CHECKLIST.md).
