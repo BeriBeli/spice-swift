@@ -29,6 +29,7 @@ public actor SpiceAgentManager {
     private let fileTransferContinuation: AsyncStream<SpiceFileTransferEvent>.Continuation
     private let automaticallySynchronizesPasteboard: Bool
     private var pasteboardSynchronizationEnabled: Bool
+    private var manualClipboardOffersEnabled = false
     private let pollInterval: Duration
     private var state: ClipboardStateMachine
     private var eventTask: Task<Void, Never>?
@@ -40,6 +41,14 @@ public actor SpiceAgentManager {
     private var clipboardDriverGeneration: UInt64?
     private var clipboardInFlight: ClipboardActionOwner?
     private var nextClipboardOwnerID: UInt64 = 1
+    private var nextManualOfferID: UInt64 = 1
+    private var manualGrabWaiters: [
+        SpiceClipboardOfferID: CheckedContinuation<Result<Void, SpiceClipboardError>, Never>
+    ] = [:]
+    private var manualGrabResults: [
+        SpiceClipboardOfferID: Result<Void, SpiceClipboardError>
+    ] = [:]
+    private var invalidatedManualGrabIDs: Set<SpiceClipboardOfferID> = []
     private var agentWorkGeneration: UInt64 = 1
     private var agentWorkInvalidationGeneration: UInt64?
     private var agentWorkInvalidationSequence: UInt64 = 0
@@ -145,6 +154,11 @@ public actor SpiceAgentManager {
         }
         for waiter in agentWorkInvalidationWaiters {
             waiter.continuation.resume()
+        }
+        for waiter in manualGrabWaiters.values {
+            waiter.resume(returning: .failure(.invalidAgentMessage(
+                "manual clipboard offer manager deinitialized"
+            )))
         }
         eventContinuation.finish()
         manualOfferContinuation.finish()
@@ -287,13 +301,92 @@ public actor SpiceAgentManager {
         guard pasteboardSynchronizationEnabled != enabled else { return }
         pasteboardSynchronizationEnabled = enabled
         guard let session else {
-            _ = state.setClipboardEnabled(enabled)
+            _ = state.setClipboardModes(
+                generalPasteboardSynchronizationEnabled: enabled,
+                manualClipboardOffersEnabled: manualClipboardOffersEnabled,
+                negotiatesClipboardOwnership: manualClipboardOffersEnabled
+            )
             return
         }
-        await execute(state.setClipboardEnabled(enabled), using: session)
+        await execute(state.setClipboardModes(
+            generalPasteboardSynchronizationEnabled: enabled,
+            manualClipboardOffersEnabled: manualClipboardOffersEnabled,
+            negotiatesClipboardOwnership: manualClipboardOffersEnabled
+        ), using: session)
         if enabled {
             await synchronizePasteboard()
         }
+    }
+
+    /// Controls the in-memory clipboard offer path independently from access
+    /// to the macOS general pasteboard.
+    public func setManualClipboardOffersEnabled(_ enabled: Bool) async {
+        guard manualClipboardOffersEnabled != enabled else { return }
+        manualClipboardOffersEnabled = enabled
+        let actions = state.setClipboardModes(
+            generalPasteboardSynchronizationEnabled: pasteboardSynchronizationEnabled,
+            manualClipboardOffersEnabled: enabled,
+            negotiatesClipboardOwnership: enabled
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
+    }
+
+    /// Creates a private in-memory UTF-8 offer and returns only after its GRAB
+    /// message has reached the Agent scheduler's physical write terminal.
+    /// This method never reads or writes the macOS general pasteboard.
+    public func offerClipboardText(
+        _ text: String,
+        leaseGeneration: UInt64
+    ) async throws -> SpiceClipboardOfferID {
+        guard manualClipboardOffersEnabled else {
+            throw SpiceClipboardError.invalidAgentMessage(
+                "manual clipboard offers are disabled"
+            )
+        }
+        guard state.isReady, let session else {
+            throw SpiceClipboardError.invalidAgentMessage(
+                "manual clipboard offer requires a negotiated Agent"
+            )
+        }
+        let id = allocateManualOfferID()
+        let actions = try state.offerManualText(
+            text,
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        return try await withTaskCancellationHandler {
+            await execute(actions, using: session)
+            try await waitForManualGrab(id: id)
+            return id
+        } onCancel: {
+            Task {
+                await self.cancelManualClipboardOffer(
+                    id: id,
+                    leaseGeneration: leaseGeneration
+                )
+            }
+        }
+    }
+
+    /// Revokes the matching lease-owned offer. A stale ID or lease generation
+    /// is a no-op and cannot revoke a replacement offer.
+    public func revokeClipboardOffer(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) async {
+        let actions = state.revokeManualOffer(
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
     }
 
     /// Coalesces resize requests while one Agent request is awaiting a reply.
@@ -1211,6 +1304,7 @@ public actor SpiceAgentManager {
         _ actions: [ClipboardStateMachine.Action],
         using session: SpiceSession
     ) async {
+        preflightManualOfferActions(actions)
         for action in actions
         where clipboardInFlight?.action != action && !pendingActions.contains(action) {
             pendingActions.append(action)
@@ -1235,12 +1329,14 @@ public actor SpiceAgentManager {
             )
             clipboardInFlight = owner
             switch action {
-            case .send, .manualOffer(.sendData):
+            case .send, .manualOffer(.sendGrab), .manualOffer(.sendData):
                 let command: VDAgentClipboardCommand
                 switch action {
                 case let .send(value):
                     command = value
                 case let .manualOffer(.sendData(value, _, _)):
+                    command = value
+                case let .manualOffer(.sendGrab(value, _, _)):
                     command = value
                 case .manualOffer(.emit), .writeGuestText, .emit:
                     preconditionFailure("non-send clipboard action")
@@ -1250,7 +1346,11 @@ public actor SpiceAgentManager {
                     message = try VDAgentClipboardCodec.encode(command)
                 } catch {
                     clearClipboardOwner(owner)
-                    emit(.failed(.invalidAgentMessage(String(describing: error))))
+                    let clipboardError = SpiceClipboardError.invalidAgentMessage(
+                        String(describing: error)
+                    )
+                    failManualGrabIfPresent(action, error: clipboardError)
+                    emit(.failed(clipboardError))
                     continue
                 }
                 let policy = Self.clipboardSendPolicy(command)
@@ -1271,6 +1371,10 @@ public actor SpiceAgentManager {
                     switch Self.agentSendDisposition(error) {
                     case .retry:
                         clearClipboardOwner(owner)
+                        if let id = manualGrabID(for: action),
+                           invalidatedManualGrabIDs.remove(id) != nil {
+                            return
+                        }
                         if !pendingActions.contains(action) {
                             pendingActions.insert(action, at: 0)
                         }
@@ -1278,6 +1382,15 @@ public actor SpiceAgentManager {
                         return
                     case .failed:
                         clearClipboardOwner(owner)
+                        let wasInvalidated: Bool
+                        if let id = manualGrabID(for: action) {
+                            wasInvalidated = invalidatedManualGrabIDs.remove(id) != nil
+                        } else {
+                            wasInvalidated = false
+                        }
+                        if !wasInvalidated {
+                            failManualGrabIfPresent(action, error: .transport(error))
+                        }
                         emit(.failed(.transport(error)))
                         return
                     }
@@ -1285,12 +1398,19 @@ public actor SpiceAgentManager {
                 guard ownsClipboardAction(owner) else { continue }
                 state.didSend(command)
                 clearClipboardOwner(owner)
-                if case let .manualOffer(.sendData(_, id, leaseGeneration)) = action {
+                switch action {
+                case let .manualOffer(.sendGrab(_, id, _)):
+                    if invalidatedManualGrabIDs.remove(id) == nil {
+                        finishManualGrab(id: id, result: .success(()))
+                    }
+                case let .manualOffer(.sendData(_, id, leaseGeneration)):
                     let followups = state.didSendManualOfferData(
                         id: id,
                         leaseGeneration: leaseGeneration
                     )
                     pendingActions.insert(contentsOf: followups, at: 0)
+                case .send, .manualOffer(.emit), .writeGuestText, .emit:
+                    break
                 }
             case let .writeGuestText(text):
                 do {
@@ -1415,6 +1535,106 @@ public actor SpiceAgentManager {
         return id
     }
 
+    private func allocateManualOfferID() -> SpiceClipboardOfferID {
+        let id = SpiceClipboardOfferID(rawValue: nextManualOfferID)
+        nextManualOfferID &+= 1
+        if nextManualOfferID == 0 { nextManualOfferID = 1 }
+        return id
+    }
+
+    private func waitForManualGrab(id: SpiceClipboardOfferID) async throws {
+        if let result = manualGrabResults.removeValue(forKey: id) {
+            return try result.get()
+        }
+        let result = await withCheckedContinuation { continuation in
+            manualGrabWaiters[id] = continuation
+        }
+        try result.get()
+    }
+
+    private func cancelManualClipboardOffer(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) async {
+        finishManualGrab(id: id, result: .failure(.transport(.cancelled)))
+        let actions = state.revokeManualOffer(
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
+    }
+
+    private func finishManualGrab(
+        id: SpiceClipboardOfferID,
+        result: Result<Void, SpiceClipboardError>
+    ) {
+        guard manualGrabResults[id] == nil else { return }
+        if let waiter = manualGrabWaiters.removeValue(forKey: id) {
+            waiter.resume(returning: result)
+        } else {
+            manualGrabResults[id] = result
+        }
+    }
+
+    private func failManualGrabIfPresent(
+        _ action: ClipboardStateMachine.Action,
+        error: SpiceClipboardError
+    ) {
+        guard case let .manualOffer(.sendGrab(_, id, _)) = action else { return }
+        finishManualGrab(id: id, result: .failure(error))
+    }
+
+    private func manualGrabID(
+        for action: ClipboardStateMachine.Action
+    ) -> SpiceClipboardOfferID? {
+        guard case let .manualOffer(.sendGrab(_, id, _)) = action else { return nil }
+        return id
+    }
+
+    private func preflightManualOfferActions(
+        _ actions: [ClipboardStateMachine.Action]
+    ) {
+        for action in actions {
+            guard case let .manualOffer(.emit(event)) = action,
+                  event.result == .superseded || event.result == .revoked else {
+                continue
+            }
+            var removedPendingGrab = false
+            pendingActions.removeAll { pending in
+                switch pending {
+                case let .manualOffer(.sendGrab(_, id, _)):
+                    if id == event.id {
+                        removedPendingGrab = true
+                        return true
+                    }
+                    return false
+                case let .manualOffer(.sendData(_, id, _)):
+                    return id == event.id
+                case .send, .manualOffer(.emit), .writeGuestText, .emit:
+                    return false
+                }
+            }
+            let invalidatesInFlight = clipboardInFlight.map {
+                manualGrabID(for: $0.action) == event.id
+            } ?? false
+            if invalidatesInFlight {
+                invalidatedManualGrabIDs.insert(event.id)
+            }
+            if removedPendingGrab || invalidatesInFlight {
+                finishManualGrab(
+                    id: event.id,
+                    result: .failure(.invalidAgentMessage(
+                        "manual clipboard offer ended before GRAB: \(event.result)"
+                    ))
+                )
+            }
+        }
+    }
+
     private func allocateOwnedAgentSendID() -> UInt64 {
         let id = nextOwnedAgentSendID
         nextOwnedAgentSendID &+= 1
@@ -1474,6 +1694,15 @@ public actor SpiceAgentManager {
             }
         }
         agentWorkInvalidationWaiters = pendingWaiters
+        var invalidatedGrabIDs = Set(pendingActions.compactMap(manualGrabID))
+        if let clipboardInFlight,
+           let id = manualGrabID(for: clipboardInFlight.action) {
+            invalidatedGrabIDs.insert(id)
+        }
+        for id in invalidatedGrabIDs {
+            finishManualGrab(id: id, result: .failure(.transport(.cancelled)))
+        }
+        invalidatedManualGrabIDs.subtract(invalidatedGrabIDs)
         pendingActions.removeAll(keepingCapacity: false)
         clipboardInFlight = nil
         clipboardDriverGeneration = nil
@@ -1523,9 +1752,15 @@ public actor SpiceAgentManager {
     }
 
     private func emitActions(_ actions: [ClipboardStateMachine.Action]) {
+        preflightManualOfferActions(actions)
         for action in actions {
-            if case let .emit(event) = action {
+            switch action {
+            case let .emit(event):
                 emit(event)
+            case let .manualOffer(.emit(event)):
+                manualOfferContinuation.yield(event)
+            case .send, .manualOffer(.sendGrab), .manualOffer(.sendData), .writeGuestText:
+                break
             }
         }
     }

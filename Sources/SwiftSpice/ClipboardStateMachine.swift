@@ -71,6 +71,11 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     package enum ManualOfferAction: Sendable, Equatable {
+        case sendGrab(
+            VDAgentClipboardCommand,
+            id: SpiceClipboardOfferID,
+            leaseGeneration: UInt64
+        )
         case sendData(
             VDAgentClipboardCommand,
             id: SpiceClipboardOfferID,
@@ -92,8 +97,8 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     private let maximumTextBytes: Int
-    private let negotiatesClipboardLimit: Bool
-    private let negotiatesClipboardOwnership: Bool
+    private var negotiatesClipboardLimit: Bool
+    private var negotiatesClipboardOwnership: Bool
     private var generalPasteboardSynchronizationEnabled: Bool
     private var manualClipboardOffersEnabled: Bool
     private var agentConnected = false
@@ -254,14 +259,17 @@ package struct ClipboardStateMachine: Sendable {
 
     package mutating func setClipboardModes(
         generalPasteboardSynchronizationEnabled generalEnabled: Bool,
-        manualClipboardOffersEnabled manualEnabled: Bool
+        manualClipboardOffersEnabled manualEnabled: Bool,
+        negotiatesClipboardOwnership ownershipEnabled: Bool? = nil
     ) -> [Action] {
+        let requestedOwnership = ownershipEnabled ?? negotiatesClipboardOwnership
         guard generalPasteboardSynchronizationEnabled != generalEnabled
-                || manualClipboardOffersEnabled != manualEnabled else {
+                || manualClipboardOffersEnabled != manualEnabled
+                || negotiatesClipboardOwnership != requestedOwnership else {
             return []
         }
         var actions: [Action] = []
-        let wasNegotiating = clipboardNegotiationEnabled
+        let previousCapabilities = localCapabilities
         let disablesCurrentSource: Bool
         switch localSource {
         case .generalPasteboard:
@@ -282,8 +290,13 @@ package struct ClipboardStateMachine: Sendable {
         }
         generalPasteboardSynchronizationEnabled = generalEnabled
         manualClipboardOffersEnabled = manualEnabled
+        negotiatesClipboardOwnership = requestedOwnership
+        negotiatesClipboardLimit = negotiatesClipboardLimit || requestedOwnership
         let isNegotiating = clipboardNegotiationEnabled
-        if wasNegotiating != isNegotiating {
+        if !requestedOwnership {
+            lastPeerGrabSerial = nil
+        }
+        if localCapabilities != previousCapabilities {
             localCapabilitiesAnnounced = false
         }
         if !generalEnabled {
@@ -364,7 +377,7 @@ package struct ClipboardStateMachine: Sendable {
             }
             if ready, !localGrabActive, let localTextData {
                 localGrabActive = true
-                actions.append(.send(makeLocalGrabCommand()))
+                actions.append(makeLocalGrabAction())
                 actions.append(.emit(.localTextOffered(byteCount: localTextData.count)))
             }
             return actions
@@ -502,7 +515,7 @@ package struct ClipboardStateMachine: Sendable {
             actions.append(.send(.release))
         }
         localGrabActive = true
-        actions.append(.send(makeLocalGrabCommand()))
+        actions.append(makeLocalGrabAction())
         actions.append(.emit(.localTextOffered(byteCount: data.count)))
         return actions
     }
@@ -541,7 +554,7 @@ package struct ClipboardStateMachine: Sendable {
             actions.append(.send(.release))
         }
         localGrabActive = true
-        actions.append(.send(makeLocalGrabCommand()))
+        actions.append(makeLocalGrabAction())
         actions.append(.emit(.localTextOffered(byteCount: data.count)))
         return actions
     }
@@ -620,6 +633,18 @@ package struct ClipboardStateMachine: Sendable {
         let serial = nextLocalGrabSerial
         nextLocalGrabSerial &+= 1
         return .serialGrab(serial: serial, types: types)
+    }
+
+    private mutating func makeLocalGrabAction() -> Action {
+        let command = makeLocalGrabCommand()
+        if case let .manual(id, leaseGeneration) = localSource {
+            return .manualOffer(.sendGrab(
+                command,
+                id: id,
+                leaseGeneration: leaseGeneration
+            ))
+        }
+        return .send(command)
     }
 
     private var localCapabilities: VDAgentCapabilities {

@@ -562,6 +562,204 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func manualClipboardOfferReturnsOnlyAfterGrabAndReportsDataTerminal() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(
+            automaticallySynchronizesPasteboard: false,
+            pasteboardSynchronizationEnabled: false
+        )
+        try await manager.start(session: session)
+        await manager.setManualClipboardOffersEnabled(true)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        var offerEvents = manager.manualOfferEvents.makeAsyncIterator()
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegrationWithClipboardOwnership
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.clipboardGrab.rawValue,
+        ])
+        let returned = Mutex(false)
+        let offer = Task {
+            let id = try await manager.offerClipboardText(
+                "中文🙂",
+                leaseGeneration: 7
+            )
+            returned.withLock { $0 = true }
+            return id
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+        #expect(!returned.withLock { $0 })
+
+        await transport.releaseBlockedAgentWrites()
+        let id = try await offer.value
+        #expect(returned.withLock { $0 })
+
+        let request = try VDAgentClipboardCodec.encode(.request(
+            type: VDAgentClipboardType.utf8Text.rawValue
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: request).first)
+        ))
+        #expect(await offerEvents.next() == .init(id: id, result: .requested))
+        #expect(await offerEvents.next() == .init(id: id, result: .dataSent))
+
+        let messages = try decodedAgentMessages(await transport.outbound)
+        let grabs = try messages.compactMap { message -> VDAgentClipboardCommand? in
+            guard message.type == VDAgentMessageType.clipboardGrab.rawValue else {
+                return nil
+            }
+            return try VDAgentClipboardCodec.decode(message, grabHasSerial: true)
+        }
+        #expect(grabs == [.serialGrab(
+            serial: 1,
+            types: [VDAgentClipboardType.utf8Text.rawValue]
+        )])
+        let commands = try messages.compactMap {
+            try VDAgentClipboardCodec.decode($0)
+        }
+        let data = commands.compactMap {
+            command -> Data? in
+            guard case let .data(type, payload) = command,
+                  type == VDAgentClipboardType.utf8Text.rawValue else {
+                return nil
+            }
+            return payload
+        }
+        #expect(data == [Data("中文🙂".utf8)])
+
+        await manager.revokeClipboardOffer(id: id, leaseGeneration: 7)
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func cancellingBlockedManualOfferRevokesItsLeaseAndFinishesWaiter() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 32
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(
+            automaticallySynchronizesPasteboard: false,
+            pasteboardSynchronizationEnabled: false
+        )
+        try await manager.start(session: session)
+        await manager.setManualClipboardOffersEnabled(true)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        var offerEvents = manager.manualOfferEvents.makeAsyncIterator()
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegrationWithClipboardOwnership
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.clipboardGrab.rawValue,
+        ])
+        let offer = Task {
+            try await manager.offerClipboardText("cancel me", leaseGeneration: 11)
+        }
+        await transport.waitForBlockedAgentWriteCount(1)
+        offer.cancel()
+        await transport.releaseBlockedAgentWrites()
+
+        await #expect(throws: SpiceClipboardError.transport(.cancelled)) {
+            _ = try await offer.value
+        }
+        #expect(await offerEvents.next() == .init(
+            id: SpiceClipboardOfferID(rawValue: 1),
+            result: .revoked
+        ))
+
+        let messages = try decodedAgentMessages(await transport.outbound)
+        #expect(!messages.contains { $0.type == VDAgentMessageType.clipboard.rawValue })
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func stoppingZeroTokenManualOfferFinishesItsPhysicalWaiter() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 3
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(
+            automaticallySynchronizesPasteboard: false,
+            pasteboardSynchronizationEnabled: false
+        )
+        try await manager.start(session: session)
+        await manager.setManualClipboardOffersEnabled(true)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+        var offerEvents = manager.manualOfferEvents.makeAsyncIterator()
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegrationWithClipboardOwnership
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        let offer = Task {
+            try await manager.offerClipboardText("zero token", leaseGeneration: 12)
+        }
+        await waitForOwnedAgentSendCount(1, manager: manager)
+        await manager.stop()
+
+        await #expect(throws: SpiceClipboardError.transport(.cancelled)) {
+            _ = try await offer.value
+        }
+        #expect(await offerEvents.next() == .init(
+            id: SpiceClipboardOfferID(rawValue: 1),
+            result: .revoked
+        ))
+        #expect(await manager.ownedAgentSendCountForTesting() == 0)
+        await session.disconnect()
+    }
+
     @Test func stoppedInitialAnnouncementCannotResurrectManagerTasks() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],

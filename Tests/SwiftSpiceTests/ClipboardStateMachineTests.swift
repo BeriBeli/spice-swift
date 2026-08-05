@@ -11,18 +11,18 @@ struct ClipboardStateMachineTests {
         let second = SpiceClipboardOfferID(rawValue: 21)
 
         #expect(try state.offerManualText("one", id: first, leaseGeneration: 1) == [
-            .send(.serialGrab(
+            .manualOffer(.sendGrab(.serialGrab(
                 serial: 1,
                 types: [VDAgentClipboardType.utf8Text.rawValue]
-            )),
+            ), id: first, leaseGeneration: 1)),
             .emit(.localTextOffered(byteCount: 3)),
         ])
         #expect(try state.offerManualText("two", id: second, leaseGeneration: 2) == [
             .manualOffer(.emit(.init(id: first, result: .superseded))),
-            .send(.serialGrab(
+            .manualOffer(.sendGrab(.serialGrab(
                 serial: 2,
                 types: [VDAgentClipboardType.utf8Text.rawValue]
-            )),
+            ), id: second, leaseGeneration: 2)),
             .emit(.localTextOffered(byteCount: 3)),
         ])
     }
@@ -41,10 +41,10 @@ struct ClipboardStateMachineTests {
         )
         #expect(Array(actions.dropFirst()) == [
             .send(.release),
-            .send(.serialGrab(
+            .manualOffer(.sendGrab(.serialGrab(
                 serial: 2,
                 types: [VDAgentClipboardType.utf8Text.rawValue]
-            )),
+            ), id: SpiceClipboardOfferID(rawValue: 23), leaseGeneration: 2)),
             .emit(.localTextOffered(byteCount: 3)),
         ])
     }
@@ -105,13 +105,21 @@ struct ClipboardStateMachineTests {
         let first = SpiceClipboardOfferID(rawValue: 25)
         let second = SpiceClipboardOfferID(rawValue: 26)
         #expect(try state.offerManualText("one", id: first, leaseGeneration: 1) == [
-            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
+            .manualOffer(.sendGrab(
+                .grab(types: [VDAgentClipboardType.utf8Text.rawValue]),
+                id: first,
+                leaseGeneration: 1
+            )),
             .emit(.localTextOffered(byteCount: 3)),
         ])
         #expect(try state.offerManualText("two", id: second, leaseGeneration: 2) == [
             .manualOffer(.emit(.init(id: first, result: .superseded))),
             .send(.release),
-            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
+            .manualOffer(.sendGrab(
+                .grab(types: [VDAgentClipboardType.utf8Text.rawValue]),
+                id: second,
+                leaseGeneration: 2
+            )),
             .emit(.localTextOffered(byteCount: 3)),
         ])
         #expect(try state.receive(.grab(types: [
@@ -151,7 +159,11 @@ struct ClipboardStateMachineTests {
         let data = Data("中文🙂".utf8)
 
         #expect(try state.offerManualText("中文🙂", id: id, leaseGeneration: 9) == [
-            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
+            .manualOffer(.sendGrab(
+                .grab(types: [VDAgentClipboardType.utf8Text.rawValue]),
+                id: id,
+                leaseGeneration: 9
+            )),
             .emit(.localTextOffered(byteCount: data.count)),
         ])
         #expect(try state.receive(.request(
@@ -180,7 +192,11 @@ struct ClipboardStateMachineTests {
         #expect(try state.offerManualText("second", id: second, leaseGeneration: 3) == [
             .manualOffer(.emit(.init(id: first, result: .superseded))),
             .send(.release),
-            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
+            .manualOffer(.sendGrab(
+                .grab(types: [VDAgentClipboardType.utf8Text.rawValue]),
+                id: second,
+                leaseGeneration: 3
+            )),
             .emit(.localTextOffered(byteCount: 6)),
         ])
         #expect(state.didSendManualOfferData(id: first, leaseGeneration: 2).isEmpty)
