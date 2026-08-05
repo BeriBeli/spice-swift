@@ -15,6 +15,19 @@ struct ClipboardProtocolTests {
         ))
         #expect(!VDAgentCapabilities.desktopIntegration.contains(.clipboardGrabSerial))
 
+        let ownership = VDAgentCapabilities.desktopIntegrationWithClipboardOwnership
+        #expect(ownership.contains(.maxClipboard))
+        #expect(ownership.contains(.clipboardNoReleaseOnRegrab))
+        #expect(ownership.contains(.clipboardGrabSerial))
+        let ownershipMessage = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: true,
+            capabilities: ownership
+        ))
+        #expect(ownershipMessage.data == Data([
+            0x01, 0x00, 0x00, 0x00,
+            0xae, 0x54, 0x03, 0x00,
+        ]))
+
         let extended = VDAgentCapabilities(words: [
             (UInt32(1) << 10) | (UInt32(1) << 16) | (UInt32(1) << 17),
         ])

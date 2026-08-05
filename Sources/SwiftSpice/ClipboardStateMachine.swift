@@ -33,41 +33,122 @@ public enum SpiceClipboardEvent: Sendable, Equatable {
     case failed(SpiceClipboardError)
 }
 
+public struct SpiceClipboardOfferID: RawRepresentable, Sendable, Hashable, Codable {
+    public let rawValue: UInt64
+
+    public init(rawValue: UInt64) {
+        self.rawValue = rawValue
+    }
+}
+
+/// `requested` is an observable intermediate result. The remaining cases are
+/// terminal, and a manual offer emits at most one of them.
+public enum SpiceClipboardOfferResult: Sendable, Equatable {
+    case superseded
+    case revoked
+    case requested
+    case dataSent
+}
+
+public struct SpiceClipboardOfferEvent: Sendable, Equatable {
+    public let id: SpiceClipboardOfferID
+    public let result: SpiceClipboardOfferResult
+
+    public init(id: SpiceClipboardOfferID, result: SpiceClipboardOfferResult) {
+        self.id = id
+        self.result = result
+    }
+}
+
 package struct ClipboardStateMachine: Sendable {
     package static let manualOfferMaximumTextBytes = 16_000
 
     package enum Action: Sendable, Equatable {
         case send(VDAgentClipboardCommand)
+        case manualOffer(ManualOfferAction)
         case writeGuestText(String)
         case emit(SpiceClipboardEvent)
     }
 
+    package enum ManualOfferAction: Sendable, Equatable {
+        case sendData(
+            VDAgentClipboardCommand,
+            id: SpiceClipboardOfferID,
+            leaseGeneration: UInt64
+        )
+        case emit(SpiceClipboardOfferEvent)
+    }
+
+    private enum LocalSource: Sendable, Equatable {
+        case generalPasteboard(changeCount: Int)
+        case manual(id: SpiceClipboardOfferID, leaseGeneration: UInt64)
+    }
+
+    private struct ManualOfferState: Sendable, Equatable {
+        let id: SpiceClipboardOfferID
+        let leaseGeneration: UInt64
+        var requested = false
+        var terminalResult: SpiceClipboardOfferResult?
+    }
+
     private let maximumTextBytes: Int
     private let negotiatesClipboardLimit: Bool
-    private var clipboardEnabled: Bool
+    private let negotiatesClipboardOwnership: Bool
+    private var generalPasteboardSynchronizationEnabled: Bool
+    private var manualClipboardOffersEnabled: Bool
     private var agentConnected = false
     private var localCapabilitiesAnnounced = false
     private var peerCapabilities: VDAgentCapabilities?
     private var peerMaximumClipboardBytes: Int?
     private var wasReady = false
     private var localTextData: Data?
+    private var localSource: LocalSource?
+    private var manualOfferState: ManualOfferState?
     private var localGrabActive = false
     private var guestGrabActive = false
     private var awaitingGuestData = false
     private var lastPasteboardChangeCount: Int?
+    private var lastPeerGrabSerial: UInt32?
+    private var nextLocalGrabSerial: UInt32 = 1
+
+    package init(maximumTextBytes: Int, clipboardEnabled: Bool = true) {
+        self.init(
+            maximumTextBytes: maximumTextBytes,
+            clipboardEnabled: clipboardEnabled,
+            manualClipboardOffersEnabled: false
+        )
+    }
 
     package init(
         maximumTextBytes: Int,
         clipboardEnabled: Bool = true,
-        negotiatesClipboardLimit: Bool = false
+        negotiatesClipboardLimit: Bool
+    ) {
+        self.init(
+            maximumTextBytes: maximumTextBytes,
+            clipboardEnabled: clipboardEnabled,
+            manualClipboardOffersEnabled: false,
+            negotiatesClipboardLimit: negotiatesClipboardLimit
+        )
+    }
+
+    package init(
+        maximumTextBytes: Int,
+        clipboardEnabled: Bool = true,
+        manualClipboardOffersEnabled: Bool,
+        negotiatesClipboardLimit: Bool = false,
+        negotiatesClipboardOwnership: Bool = false
     ) {
         self.maximumTextBytes = max(0, maximumTextBytes)
-        self.clipboardEnabled = clipboardEnabled
+        generalPasteboardSynchronizationEnabled = clipboardEnabled
+        self.manualClipboardOffersEnabled = manualClipboardOffersEnabled
         self.negotiatesClipboardLimit = negotiatesClipboardLimit
+            || negotiatesClipboardOwnership
+        self.negotiatesClipboardOwnership = negotiatesClipboardOwnership
     }
 
     package var isReady: Bool {
-        guard clipboardEnabled, agentConnected, let peerCapabilities else {
+        guard clipboardNegotiationEnabled, agentConnected, let peerCapabilities else {
             return false
         }
         // Modern Linux spice-vdagent advertises the demand protocol without
@@ -84,6 +165,11 @@ package struct ClipboardStateMachine: Sendable {
             Self.manualOfferMaximumTextBytes,
             peerMaximumClipboardBytes ?? Self.manualOfferMaximumTextBytes
         )
+    }
+
+    package var expectsPeerGrabSerial: Bool {
+        negotiatesClipboardOwnership
+            && peerCapabilities?.contains(.clipboardGrabSerial) == true
     }
 
     /// MONITORS_CONFIG and REPLY are legacy baseline capabilities until the
@@ -144,8 +230,9 @@ package struct ClipboardStateMachine: Sendable {
 
     package mutating func disconnected() -> [Action] {
         let notify = wasReady
+        let terminal = completeManualOfferIfNeeded(.revoked)
         resetConnectionState()
-        return notify ? [.emit(.unavailable)] : []
+        return terminal + (notify ? [.emit(.unavailable)] : [])
     }
 
     package mutating func announcementIfNeeded() -> [Action] {
@@ -159,26 +246,60 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     package mutating func setClipboardEnabled(_ enabled: Bool) -> [Action] {
-        guard clipboardEnabled != enabled else { return [] }
+        setClipboardModes(
+            generalPasteboardSynchronizationEnabled: enabled,
+            manualClipboardOffersEnabled: manualClipboardOffersEnabled
+        )
+    }
+
+    package mutating func setClipboardModes(
+        generalPasteboardSynchronizationEnabled generalEnabled: Bool,
+        manualClipboardOffersEnabled manualEnabled: Bool
+    ) -> [Action] {
+        guard generalPasteboardSynchronizationEnabled != generalEnabled
+                || manualClipboardOffersEnabled != manualEnabled else {
+            return []
+        }
         var actions: [Action] = []
-        if !enabled, isReady, localGrabActive {
+        let wasNegotiating = clipboardNegotiationEnabled
+        let disablesCurrentSource: Bool
+        switch localSource {
+        case .generalPasteboard:
+            disablesCurrentSource = !generalEnabled
+        case .manual:
+            disablesCurrentSource = !manualEnabled
+            if disablesCurrentSource {
+                actions.append(contentsOf: completeManualOfferIfNeeded(.revoked))
+            }
+        case nil:
+            disablesCurrentSource = false
+        }
+        if disablesCurrentSource, isReady, localGrabActive {
             actions.append(.send(.release))
         }
-        let notifyUnavailable = !enabled && wasReady
-        clipboardEnabled = enabled
-        localCapabilitiesAnnounced = false
-        localTextData = nil
-        localGrabActive = false
-        guestGrabActive = false
-        awaitingGuestData = false
-        lastPasteboardChangeCount = nil
+        if disablesCurrentSource {
+            clearLocalOffer()
+        }
+        generalPasteboardSynchronizationEnabled = generalEnabled
+        manualClipboardOffersEnabled = manualEnabled
+        let isNegotiating = clipboardNegotiationEnabled
+        if wasNegotiating != isNegotiating {
+            localCapabilitiesAnnounced = false
+        }
+        if !generalEnabled {
+            awaitingGuestData = false
+        }
+        if !isNegotiating {
+            guestGrabActive = false
+            awaitingGuestData = false
+        }
         if agentConnected {
             actions.append(contentsOf: announcementIfNeeded())
         }
-        if notifyUnavailable {
+        if !isNegotiating, wasReady {
             wasReady = false
             actions.append(.emit(.unavailable))
-        } else if enabled, isReady, !wasReady {
+        } else if isReady, !wasReady {
             wasReady = true
             actions.append(.emit(.ready))
         }
@@ -193,6 +314,21 @@ package struct ClipboardStateMachine: Sendable {
         }
     }
 
+    package mutating func didSendManualOfferData(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) -> [Action] {
+        guard case let .manual(currentID, currentLeaseGeneration) = localSource,
+              currentID == id,
+              currentLeaseGeneration == leaseGeneration,
+              manualOfferState?.id == id,
+              manualOfferState?.leaseGeneration == leaseGeneration,
+              manualOfferState?.requested == true else {
+            return []
+        }
+        return completeManualOfferIfNeeded(.dataSent)
+    }
+
     package mutating func receive(
         _ command: VDAgentClipboardCommand
     ) throws(SpiceClipboardError) -> [Action] {
@@ -204,6 +340,9 @@ package struct ClipboardStateMachine: Sendable {
             peerCapabilities = capabilities
             if !capabilities.contains(.maxClipboard) {
                 peerMaximumClipboardBytes = nil
+            }
+            if !capabilities.contains(.clipboardGrabSerial) {
+                lastPeerGrabSerial = nil
             }
             var actions: [Action] = []
             if requestReply {
@@ -225,33 +364,49 @@ package struct ClipboardStateMachine: Sendable {
             }
             if ready, !localGrabActive, let localTextData {
                 localGrabActive = true
-                actions.append(.send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])))
+                actions.append(.send(makeLocalGrabCommand()))
                 actions.append(.emit(.localTextOffered(byteCount: localTextData.count)))
             }
             return actions
-        case let .grab(types), let .serialGrab(_, types):
-            guard clipboardEnabled else { return [] }
-            try requireReady()
-            localTextData = nil
-            localGrabActive = false
-            guestGrabActive = true
-            if types.contains(VDAgentClipboardType.utf8Text.rawValue) {
-                awaitingGuestData = true
-                return [.send(.request(type: VDAgentClipboardType.utf8Text.rawValue))]
+        case let .grab(types):
+            guard !expectsPeerGrabSerial else {
+                throw .invalidAgentMessage("clipboard GRAB is missing negotiated serial")
             }
-            awaitingGuestData = false
-            return []
+            return try receivePeerGrab(types: types, serial: nil)
+        case let .serialGrab(serial, types):
+            guard expectsPeerGrabSerial else {
+                throw .invalidAgentMessage(
+                    "clipboard GRAB serial received before capability negotiation"
+                )
+            }
+            return try receivePeerGrab(types: types, serial: serial)
         case let .request(type):
-            guard clipboardEnabled else { return [] }
+            guard clipboardNegotiationEnabled else { return [] }
             try requireReady()
             guard type == VDAgentClipboardType.utf8Text.rawValue,
                   localGrabActive,
                   let localTextData else {
                 return [.send(.data(type: VDAgentClipboardType.none.rawValue, data: Data()))]
             }
+            if case let .manual(id, leaseGeneration) = localSource {
+                var actions: [Action] = []
+                if manualOfferState?.requested == false {
+                    manualOfferState?.requested = true
+                    actions.append(.manualOffer(.emit(SpiceClipboardOfferEvent(
+                        id: id,
+                        result: .requested
+                    ))))
+                }
+                actions.append(.manualOffer(.sendData(
+                    .data(type: type, data: localTextData),
+                    id: id,
+                    leaseGeneration: leaseGeneration
+                )))
+                return actions
+            }
             return [.send(.data(type: type, data: localTextData))]
         case let .data(type, data):
-            guard clipboardEnabled else { return [] }
+            guard generalPasteboardSynchronizationEnabled else { return [] }
             try requireReady()
             guard awaitingGuestData, guestGrabActive else {
                 throw .invalidAgentMessage("unsolicited clipboard data")
@@ -273,7 +428,7 @@ package struct ClipboardStateMachine: Sendable {
             }
             return [.writeGuestText(text), .emit(.guestText(text))]
         case .release:
-            guard clipboardEnabled else { return [] }
+            guard clipboardNegotiationEnabled else { return [] }
             try requireReady()
             guestGrabActive = false
             awaitingGuestData = false
@@ -299,31 +454,35 @@ package struct ClipboardStateMachine: Sendable {
         changeCount: Int,
         text: String?
     ) -> [Action] {
-        guard clipboardEnabled else { return [] }
+        guard generalPasteboardSynchronizationEnabled else { return [] }
         guard lastPasteboardChangeCount != changeCount else {
             return []
         }
         lastPasteboardChangeCount = changeCount
         guestGrabActive = false
         awaitingGuestData = false
+        let replacesManualOffer: Bool
+        if case .manual = localSource {
+            replacesManualOffer = true
+        } else {
+            replacesManualOffer = false
+        }
+        var actions = completeManualOfferIfNeeded(.superseded)
 
         guard let text else {
-            localTextData = nil
             if isReady, localGrabActive {
                 localGrabActive = false
-                return [.send(.release)]
+                actions.append(.send(.release))
             }
-            localGrabActive = false
-            return []
+            clearLocalOffer()
+            return actions
         }
         let data = Data(text.utf8)
         guard data.count <= maximumTextBytes else {
-            localTextData = nil
-            var actions: [Action] = []
             if isReady, localGrabActive {
                 actions.append(.send(.release))
             }
-            localGrabActive = false
+            clearLocalOffer()
             actions.append(.emit(.oversizedLocalText(
                 byteCount: data.count,
                 maximum: maximumTextBytes
@@ -331,21 +490,82 @@ package struct ClipboardStateMachine: Sendable {
             return actions
         }
         localTextData = data
+        localSource = .generalPasteboard(changeCount: changeCount)
+        manualOfferState = nil
         guard isReady else {
             localGrabActive = false
-            return []
+            return actions
+        }
+        if localGrabActive,
+           (replacesManualOffer || negotiatesClipboardOwnership),
+           shouldReleaseBeforeLocalRegrab {
+            actions.append(.send(.release))
         }
         localGrabActive = true
-        return [
-            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
-            .emit(.localTextOffered(byteCount: data.count)),
-        ]
+        actions.append(.send(makeLocalGrabCommand()))
+        actions.append(.emit(.localTextOffered(byteCount: data.count)))
+        return actions
+    }
+
+    package mutating func offerManualText(
+        _ text: String,
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) throws(SpiceClipboardError) -> [Action] {
+        guard manualClipboardOffersEnabled else {
+            throw .invalidAgentMessage("manual clipboard offers are disabled")
+        }
+        let data = Data(text.utf8)
+        let maximum = effectiveManualOfferMaximumTextBytes
+        guard data.count <= maximum else {
+            throw .invalidAgentMessage(
+                "manual text size \(data.count) exceeds \(maximum)"
+            )
+        }
+
+        var actions = completeManualOfferIfNeeded(.superseded)
+        let replacesLocalGrab = localGrabActive
+        localTextData = data
+        localSource = .manual(id: id, leaseGeneration: leaseGeneration)
+        manualOfferState = ManualOfferState(
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        guestGrabActive = false
+        awaitingGuestData = false
+        guard isReady else {
+            localGrabActive = false
+            return actions
+        }
+        if replacesLocalGrab, shouldReleaseBeforeLocalRegrab {
+            actions.append(.send(.release))
+        }
+        localGrabActive = true
+        actions.append(.send(makeLocalGrabCommand()))
+        actions.append(.emit(.localTextOffered(byteCount: data.count)))
+        return actions
+    }
+
+    package mutating func revokeManualOffer(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) -> [Action] {
+        guard case let .manual(currentID, currentLeaseGeneration) = localSource,
+              currentID == id,
+              currentLeaseGeneration == leaseGeneration else {
+            return []
+        }
+        var actions = completeManualOfferIfNeeded(.revoked)
+        if isReady, localGrabActive {
+            actions.append(.send(.release))
+        }
+        clearLocalOffer()
+        return actions
     }
 
     package mutating func didWriteGuestText(changeCount: Int) {
         lastPasteboardChangeCount = changeCount
-        localTextData = nil
-        localGrabActive = false
+        clearLocalOffer()
     }
 
     private func requireReady() throws(SpiceClipboardError) {
@@ -354,13 +574,90 @@ package struct ClipboardStateMachine: Sendable {
         }
     }
 
+    private mutating func receivePeerGrab(
+        types: [UInt32],
+        serial: UInt32?
+    ) throws(SpiceClipboardError) -> [Action] {
+        guard clipboardNegotiationEnabled else { return [] }
+        try requireReady()
+        if let serial {
+            if let lastPeerGrabSerial,
+               !Self.isNewerSerial(serial, than: lastPeerGrabSerial) {
+                return []
+            }
+            lastPeerGrabSerial = serial
+        }
+        var actions = completeManualOfferIfNeeded(.superseded)
+        clearLocalOffer()
+        guestGrabActive = true
+        if generalPasteboardSynchronizationEnabled,
+           types.contains(VDAgentClipboardType.utf8Text.rawValue) {
+            awaitingGuestData = true
+            actions.append(.send(.request(
+                type: VDAgentClipboardType.utf8Text.rawValue
+            )))
+            return actions
+        }
+        awaitingGuestData = false
+        return actions
+    }
+
+    private static func isNewerSerial(_ candidate: UInt32, than current: UInt32) -> Bool {
+        let distance = candidate &- current
+        return distance != 0 && distance < (UInt32(1) << 31)
+    }
+
+    private var shouldReleaseBeforeLocalRegrab: Bool {
+        !(negotiatesClipboardOwnership
+            && peerCapabilities?.contains(.clipboardNoReleaseOnRegrab) == true)
+    }
+
+    private mutating func makeLocalGrabCommand() -> VDAgentClipboardCommand {
+        let types = [VDAgentClipboardType.utf8Text.rawValue]
+        guard expectsPeerGrabSerial else {
+            return .grab(types: types)
+        }
+        let serial = nextLocalGrabSerial
+        nextLocalGrabSerial &+= 1
+        return .serialGrab(serial: serial, types: types)
+    }
+
     private var localCapabilities: VDAgentCapabilities {
-        guard clipboardEnabled else {
+        guard clipboardNegotiationEnabled else {
             return .desktopServicesWithoutClipboard
+        }
+        if negotiatesClipboardOwnership {
+            return .desktopIntegrationWithClipboardOwnership
         }
         return negotiatesClipboardLimit
             ? .desktopIntegrationWithClipboardLimit
             : .desktopIntegration
+    }
+
+    private var clipboardNegotiationEnabled: Bool {
+        generalPasteboardSynchronizationEnabled || manualClipboardOffersEnabled
+    }
+
+    private mutating func completeManualOfferIfNeeded(
+        _ result: SpiceClipboardOfferResult
+    ) -> [Action] {
+        guard var manualOfferState,
+              manualOfferState.terminalResult == nil else {
+            return []
+        }
+        manualOfferState.terminalResult = result
+        self.manualOfferState = manualOfferState
+        return [.manualOffer(.emit(SpiceClipboardOfferEvent(
+            id: manualOfferState.id,
+            result: result
+        )))]
+    }
+
+    private mutating func clearLocalOffer() {
+        localTextData = nil
+        localSource = nil
+        manualOfferState = nil
+        localGrabActive = false
     }
 
     private mutating func resetConnectionState() {
@@ -370,9 +667,13 @@ package struct ClipboardStateMachine: Sendable {
         peerMaximumClipboardBytes = nil
         wasReady = false
         localTextData = nil
+        localSource = nil
+        manualOfferState = nil
         localGrabActive = false
         guestGrabActive = false
         awaitingGuestData = false
         lastPasteboardChangeCount = nil
+        lastPeerGrabSerial = nil
+        nextLocalGrabSerial = 1
     }
 }

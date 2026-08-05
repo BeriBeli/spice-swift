@@ -64,6 +64,16 @@ package struct VDAgentCapabilities: Sendable, Equatable {
             | (UInt32(1) << UInt32(VDAgentCapability.maxClipboard.rawValue)),
     ])
 
+    package static let desktopIntegrationWithClipboardOwnership = Self(words: [
+        desktopIntegrationWithClipboardLimit.words[0]
+            | (UInt32(1) << UInt32(
+                VDAgentCapability.clipboardNoReleaseOnRegrab.rawValue
+            ))
+            | (UInt32(1) << UInt32(
+                VDAgentCapability.clipboardGrabSerial.rawValue
+            )),
+    ])
+
     package func contains(_ capability: VDAgentCapability) -> Bool {
         let word = capability.rawValue / 32
         let bit = capability.rawValue % 32

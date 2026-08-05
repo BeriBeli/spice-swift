@@ -12,6 +12,7 @@ public actor SpiceAgentManager {
     public static let maximumWireTextBytes = 16 * 1_024 * 1_024 - 4
 
     public nonisolated let events: AsyncStream<SpiceClipboardEvent>
+    public nonisolated let manualOfferEvents: AsyncStream<SpiceClipboardOfferEvent>
     public nonisolated let displayConfigurationEvents:
         AsyncStream<SpiceDisplayConfigurationEvent>
     public nonisolated let displayConfigurationSupportEvents:
@@ -19,6 +20,8 @@ public actor SpiceAgentManager {
     public nonisolated let fileTransferEvents: AsyncStream<SpiceFileTransferEvent>
 
     private let eventContinuation: AsyncStream<SpiceClipboardEvent>.Continuation
+    private let manualOfferContinuation:
+        AsyncStream<SpiceClipboardOfferEvent>.Continuation
     private let displayConfigurationContinuation:
         AsyncStream<SpiceDisplayConfigurationEvent>.Continuation
     private let displayConfigurationSupportContinuation:
@@ -95,6 +98,12 @@ public actor SpiceAgentManager {
         )
         events = pipe.stream
         eventContinuation = pipe.continuation
+        let manualOfferPipe = AsyncStream.makeStream(
+            of: SpiceClipboardOfferEvent.self,
+            bufferingPolicy: .bufferingOldest(32)
+        )
+        manualOfferEvents = manualOfferPipe.stream
+        manualOfferContinuation = manualOfferPipe.continuation
         let displayPipe = AsyncStream.makeStream(
             of: SpiceDisplayConfigurationEvent.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -138,6 +147,7 @@ public actor SpiceAgentManager {
             waiter.continuation.resume()
         }
         eventContinuation.finish()
+        manualOfferContinuation.finish()
         displayConfigurationContinuation.finish()
         displayConfigurationSupportContinuation.finish()
         fileTransferContinuation.finish()
@@ -505,7 +515,10 @@ public actor SpiceAgentManager {
                 return
             }
             do {
-                guard let command = try VDAgentClipboardCodec.decode(wireMessage) else {
+                guard let command = try VDAgentClipboardCodec.decode(
+                    wireMessage,
+                    grabHasSerial: state.expectsPeerGrabSerial
+                ) else {
                     return
                 }
                 await execute(try state.receive(command), using: session)
@@ -1222,7 +1235,16 @@ public actor SpiceAgentManager {
             )
             clipboardInFlight = owner
             switch action {
-            case let .send(command):
+            case .send, .manualOffer(.sendData):
+                let command: VDAgentClipboardCommand
+                switch action {
+                case let .send(value):
+                    command = value
+                case let .manualOffer(.sendData(value, _, _)):
+                    command = value
+                case .manualOffer(.emit), .writeGuestText, .emit:
+                    preconditionFailure("non-send clipboard action")
+                }
                 let message: VDAgentMessage
                 do {
                     message = try VDAgentClipboardCodec.encode(command)
@@ -1263,6 +1285,13 @@ public actor SpiceAgentManager {
                 guard ownsClipboardAction(owner) else { continue }
                 state.didSend(command)
                 clearClipboardOwner(owner)
+                if case let .manualOffer(.sendData(_, id, leaseGeneration)) = action {
+                    let followups = state.didSendManualOfferData(
+                        id: id,
+                        leaseGeneration: leaseGeneration
+                    )
+                    pendingActions.insert(contentsOf: followups, at: 0)
+                }
             case let .writeGuestText(text):
                 do {
                     let snapshot = try await SpicePasteboardBridge.write(text: text)
@@ -1281,6 +1310,10 @@ public actor SpiceAgentManager {
             case let .emit(event):
                 guard ownsClipboardAction(owner) else { continue }
                 emit(event)
+                clearClipboardOwner(owner)
+            case let .manualOffer(.emit(event)):
+                guard ownsClipboardAction(owner) else { continue }
+                manualOfferContinuation.yield(event)
                 clearClipboardOwner(owner)
             }
         }
