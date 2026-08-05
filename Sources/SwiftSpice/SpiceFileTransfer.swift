@@ -52,6 +52,21 @@ public enum SpiceFileTransferEvent: Sendable, Equatable {
     case failed(id: SpiceFileTransferID?, SpiceFileTransferError)
 }
 
+/// Monotonic, content-free audit counters for host-to-guest VDAgent file
+/// transfer messages that reached their physical write terminal.
+public struct SpiceFileTransferWireMetrics: Sendable, Equatable {
+    public let completedMessageCount: UInt64
+    public let payloadByteCount: UInt64
+
+    public init(
+        completedMessageCount: UInt64 = 0,
+        payloadByteCount: UInt64 = 0
+    ) {
+        self.completedMessageCount = completedMessageCount
+        self.payloadByteCount = payloadByteCount
+    }
+}
+
 package enum FileTransferPhase: Sendable, Equatable {
     case queuedStart
     case sendingStart

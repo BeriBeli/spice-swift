@@ -679,6 +679,7 @@ struct SpiceSessionTests {
         )
         let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
         try await manager.start(session: session)
+        #expect(await manager.fileTransferWireMetrics() == .init())
         var clipboardEvents = manager.events.makeAsyncIterator()
         let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
             requestReply: false,
@@ -718,6 +719,7 @@ struct SpiceSessionTests {
             if case .start = $0 { return true }
             return false
         }))
+        #expect(await manager.fileTransferWireMetrics() == .init())
         await manager.stop()
         await session.disconnect()
     }
@@ -1020,6 +1022,9 @@ struct SpiceSessionTests {
                 )
         }))
         #expect(commands.contains(.data(id: id.rawValue, bytes)))
+        let wireMetrics = await manager.fileTransferWireMetrics()
+        #expect(wireMetrics.completedMessageCount == 2)
+        #expect(wireMetrics.payloadByteCount > UInt64(bytes.count))
 
         let success = codec.encodeStatus(id: id.rawValue, result: .success)
         let successPacket = try #require(VDAgentWireEncoder.fragments(for: success).first)

@@ -55,6 +55,8 @@ public actor SpiceAgentManager {
         [SpiceFileTransferID: VDAgentFileTransferStatus] = [:]
     private var fileTransferDriverGeneration: UInt64?
     private var nextFileTransferID: UInt32 = 1
+    private var completedFileTransferMessageCount: UInt64 = 0
+    private var completedFileTransferPayloadByteCount: UInt64 = 0
 
     private struct ClipboardActionOwner: Sendable, Equatable {
         let id: UInt64
@@ -397,6 +399,15 @@ public actor SpiceAgentManager {
         if let session {
             await driveFileTransfers(using: session)
         }
+    }
+
+    /// Returns content-free counters suitable for proving that a bounded
+    /// observation period completed without any host-to-guest file message.
+    public func fileTransferWireMetrics() -> SpiceFileTransferWireMetrics {
+        SpiceFileTransferWireMetrics(
+            completedMessageCount: completedFileTransferMessageCount,
+            payloadByteCount: completedFileTransferPayloadByteCount
+        )
     }
 
     package func fileTransferSentByteCount(
@@ -1044,6 +1055,14 @@ public actor SpiceAgentManager {
                 requiredControl: requiredControl,
                 using: session
             )
+            completedFileTransferMessageCount = Self.addClamped(
+                completedFileTransferMessageCount,
+                1
+            )
+            completedFileTransferPayloadByteCount = Self.addClamped(
+                completedFileTransferPayloadByteCount,
+                UInt64(message.data.count)
+            )
             return true
         } catch let error {
             guard var job = fileTransfers[id], job.phase.isSending else {
@@ -1493,6 +1512,11 @@ public actor SpiceAgentManager {
 
     private func emitFileTransfer(_ event: SpiceFileTransferEvent) {
         _ = fileTransferContinuation.yield(event)
+    }
+
+    private static func addClamped(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
     }
 }
 
