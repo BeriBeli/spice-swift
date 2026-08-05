@@ -322,22 +322,27 @@ struct ClipboardStateMachineTests {
 
         #expect(try state.receive(.maxClipboard(0)).isEmpty)
         #expect(state.effectiveManualOfferMaximumTextBytes == 0)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 0)
         #expect(try state.receive(.maxClipboard(7)).isEmpty)
         #expect(state.effectiveManualOfferMaximumTextBytes == 7)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 7)
         #expect(try state.receive(.maxClipboard(-1)).isEmpty)
         #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 100)
         #expect(throws: SpiceClipboardError.invalidAgentMessage(
             "invalid MAX_CLIPBOARD value -2"
         )) {
             try state.receive(.maxClipboard(-2))
         }
         #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 100)
 
         #expect(try state.receive(.announceCapabilities(
             requestReply: false,
             capabilities: .utf8Clipboard
         )).isEmpty)
         #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 100)
         #expect(throws: SpiceClipboardError.invalidAgentMessage(
             "MAX_CLIPBOARD received before capability negotiation"
         )) {
@@ -349,10 +354,12 @@ struct ClipboardStateMachineTests {
         var state = try extendedReadyState()
         _ = try state.receive(.maxClipboard(9))
         #expect(state.effectiveManualOfferMaximumTextBytes == 9)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 9)
 
         _ = state.disconnected()
         _ = state.connected()
         #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 100)
         #expect(try state.receive(.announceCapabilities(
             requestReply: false,
             capabilities: clipboardCapabilities(maximum: true)
@@ -361,6 +368,7 @@ struct ClipboardStateMachineTests {
             .emit(.ready),
         ])
         #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(state.effectiveGeneralOfferMaximumTextBytes == 100)
     }
 
     @Test func rejectsPeerLimitWhenLocalLimitCapabilityIsDisabled() throws {
@@ -488,6 +496,21 @@ struct ClipboardStateMachineTests {
         #expect(state.localPasteboardChanged(changeCount: 2, text: "four") == [
             .send(.release),
             .emit(.oversizedLocalText(byteCount: 4, maximum: 3)),
+        ])
+    }
+
+    @Test func peerLimitConstrainsGeneralPasteboardButUnlimitedKeepsLocalPolicy() throws {
+        var state = try extendedReadyState()
+        _ = try state.receive(.maxClipboard(3))
+
+        #expect(state.localPasteboardChanged(changeCount: 1, text: "four") == [
+            .emit(.oversizedLocalText(byteCount: 4, maximum: 3)),
+        ])
+
+        _ = try state.receive(.maxClipboard(-1))
+        #expect(state.localPasteboardChanged(changeCount: 2, text: "four") == [
+            .send(.grab(types: [VDAgentClipboardType.utf8Text.rawValue])),
+            .emit(.localTextOffered(byteCount: 4)),
         ])
     }
 

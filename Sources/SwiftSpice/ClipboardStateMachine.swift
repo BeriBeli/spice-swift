@@ -96,6 +96,11 @@ package struct ClipboardStateMachine: Sendable {
         var terminalResult: SpiceClipboardOfferResult?
     }
 
+    private enum PeerClipboardLimit: Sendable, Equatable {
+        case unlimited
+        case bytes(Int)
+    }
+
     private let maximumTextBytes: Int
     private var negotiatesClipboardLimit: Bool
     private var negotiatesClipboardOwnership: Bool
@@ -104,7 +109,7 @@ package struct ClipboardStateMachine: Sendable {
     private var agentConnected = false
     private var localCapabilitiesAnnounced = false
     private var peerCapabilities: VDAgentCapabilities?
-    private var peerMaximumClipboardBytes: Int?
+    private var peerClipboardLimit: PeerClipboardLimit?
     private var wasReady = false
     private var localTextData: Data?
     private var localSource: LocalSource?
@@ -166,10 +171,21 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     package var effectiveManualOfferMaximumTextBytes: Int {
-        min(
-            Self.manualOfferMaximumTextBytes,
-            peerMaximumClipboardBytes ?? Self.manualOfferMaximumTextBytes
-        )
+        switch peerClipboardLimit {
+        case let .bytes(maximum):
+            min(Self.manualOfferMaximumTextBytes, maximum)
+        case .unlimited, nil:
+            Self.manualOfferMaximumTextBytes
+        }
+    }
+
+    package var effectiveGeneralOfferMaximumTextBytes: Int {
+        switch peerClipboardLimit {
+        case let .bytes(maximum):
+            min(maximumTextBytes, maximum)
+        case .unlimited, nil:
+            maximumTextBytes
+        }
     }
 
     package var expectsPeerGrabSerial: Bool {
@@ -352,7 +368,7 @@ package struct ClipboardStateMachine: Sendable {
         case let .announceCapabilities(requestReply, capabilities):
             peerCapabilities = capabilities
             if !capabilities.contains(.maxClipboard) {
-                peerMaximumClipboardBytes = nil
+                peerClipboardLimit = nil
             }
             if !capabilities.contains(.clipboardGrabSerial) {
                 lastPeerGrabSerial = nil
@@ -456,9 +472,9 @@ package struct ClipboardStateMachine: Sendable {
             guard maximum >= -1 else {
                 throw .invalidAgentMessage("invalid MAX_CLIPBOARD value \(maximum)")
             }
-            peerMaximumClipboardBytes = maximum == -1
-                ? Self.manualOfferMaximumTextBytes
-                : Int(maximum)
+            peerClipboardLimit = maximum == -1
+                ? .unlimited
+                : .bytes(Int(maximum))
             return []
         }
     }
@@ -491,14 +507,15 @@ package struct ClipboardStateMachine: Sendable {
             return actions
         }
         let data = Data(text.utf8)
-        guard data.count <= maximumTextBytes else {
+        let maximum = effectiveGeneralOfferMaximumTextBytes
+        guard data.count <= maximum else {
             if isReady, localGrabActive {
                 actions.append(.send(.release))
             }
             clearLocalOffer()
             actions.append(.emit(.oversizedLocalText(
                 byteCount: data.count,
-                maximum: maximumTextBytes
+                maximum: maximum
             )))
             return actions
         }
@@ -689,7 +706,7 @@ package struct ClipboardStateMachine: Sendable {
         agentConnected = false
         localCapabilitiesAnnounced = false
         peerCapabilities = nil
-        peerMaximumClipboardBytes = nil
+        peerClipboardLimit = nil
         wasReady = false
         localTextData = nil
         localSource = nil
