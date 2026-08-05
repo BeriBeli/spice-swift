@@ -142,7 +142,8 @@ public actor SpiceAgentManager {
         ))
         state = ClipboardStateMachine(
             maximumTextBytes: min(maximumTextBytes, Self.maximumWireTextBytes),
-            clipboardEnabled: pasteboardSynchronizationEnabled
+            clipboardEnabled: pasteboardSynchronizationEnabled,
+            negotiatesClipboardLimit: true
         )
     }
 
