@@ -5,6 +5,88 @@ import Testing
 
 @Suite("VDAgent clipboard ownership state machine")
 struct ClipboardStateMachineTests {
+    @Test func extendedLimitNegotiationIsOptInAndAdvertisesLocalReceiveLimit() throws {
+        var legacy = ClipboardStateMachine(maximumTextBytes: 100)
+        #expect(legacy.connected() == [.send(.announceCapabilities(
+            requestReply: true,
+            capabilities: .desktopIntegration
+        ))])
+
+        var state = ClipboardStateMachine(
+            maximumTextBytes: 100,
+            negotiatesClipboardLimit: true
+        )
+        #expect(state.connected() == [.send(.announceCapabilities(
+            requestReply: true,
+            capabilities: .desktopIntegrationWithClipboardLimit
+        ))])
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+
+        #expect(try state.receive(.announceCapabilities(
+            requestReply: false,
+            capabilities: clipboardCapabilities(maximum: true)
+        )) == [
+            .send(.maxClipboard(100)),
+            .emit(.ready),
+        ])
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+    }
+
+    @Test func peerLimitUsesSignedValuesAndResetsWhenCapabilityDrops() throws {
+        var state = try extendedReadyState()
+
+        #expect(try state.receive(.maxClipboard(0)).isEmpty)
+        #expect(state.effectiveManualOfferMaximumTextBytes == 0)
+        #expect(try state.receive(.maxClipboard(7)).isEmpty)
+        #expect(state.effectiveManualOfferMaximumTextBytes == 7)
+        #expect(try state.receive(.maxClipboard(-1)).isEmpty)
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(throws: SpiceClipboardError.invalidAgentMessage(
+            "invalid MAX_CLIPBOARD value -2"
+        )) {
+            try state.receive(.maxClipboard(-2))
+        }
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+
+        #expect(try state.receive(.announceCapabilities(
+            requestReply: false,
+            capabilities: .utf8Clipboard
+        )).isEmpty)
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(throws: SpiceClipboardError.invalidAgentMessage(
+            "MAX_CLIPBOARD received before capability negotiation"
+        )) {
+            try state.receive(.maxClipboard(1))
+        }
+    }
+
+    @Test func peerLimitClearsAcrossReconnectAndCapWithoutValueUsesLocalPolicy() throws {
+        var state = try extendedReadyState()
+        _ = try state.receive(.maxClipboard(9))
+        #expect(state.effectiveManualOfferMaximumTextBytes == 9)
+
+        _ = state.disconnected()
+        _ = state.connected()
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+        #expect(try state.receive(.announceCapabilities(
+            requestReply: false,
+            capabilities: clipboardCapabilities(maximum: true)
+        )) == [
+            .send(.maxClipboard(100)),
+            .emit(.ready),
+        ])
+        #expect(state.effectiveManualOfferMaximumTextBytes == 16_000)
+    }
+
+    @Test func rejectsPeerLimitWhenLocalLimitCapabilityIsDisabled() throws {
+        var state = try readyState()
+        #expect(throws: SpiceClipboardError.invalidAgentMessage(
+            "MAX_CLIPBOARD received before capability negotiation"
+        )) {
+            try state.receive(.maxClipboard(1))
+        }
+    }
+
     @Test func disabledClipboardAdvertisesOnlyNonPasteboardServices() throws {
         var state = ClipboardStateMachine(maximumTextBytes: 100, clipboardEnabled: false)
         #expect(state.connected() == [.send(.announceCapabilities(
@@ -216,5 +298,26 @@ struct ClipboardStateMachineTests {
             capabilities: .utf8Clipboard
         ))
         return state
+    }
+
+    private func extendedReadyState() throws -> ClipboardStateMachine {
+        var state = ClipboardStateMachine(
+            maximumTextBytes: 100,
+            negotiatesClipboardLimit: true
+        )
+        _ = state.connected()
+        _ = try state.receive(.announceCapabilities(
+            requestReply: false,
+            capabilities: clipboardCapabilities(maximum: true)
+        ))
+        return state
+    }
+
+    private func clipboardCapabilities(maximum: Bool) -> VDAgentCapabilities {
+        var word = UInt32(1) << UInt32(VDAgentCapability.clipboardByDemand.rawValue)
+        if maximum {
+            word |= UInt32(1) << UInt32(VDAgentCapability.maxClipboard.rawValue)
+        }
+        return VDAgentCapabilities(words: [word])
     }
 }

@@ -34,6 +34,8 @@ public enum SpiceClipboardEvent: Sendable, Equatable {
 }
 
 package struct ClipboardStateMachine: Sendable {
+    package static let manualOfferMaximumTextBytes = 16_000
+
     package enum Action: Sendable, Equatable {
         case send(VDAgentClipboardCommand)
         case writeGuestText(String)
@@ -41,10 +43,12 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     private let maximumTextBytes: Int
+    private let negotiatesClipboardLimit: Bool
     private var clipboardEnabled: Bool
     private var agentConnected = false
     private var localCapabilitiesAnnounced = false
     private var peerCapabilities: VDAgentCapabilities?
+    private var peerMaximumClipboardBytes: Int?
     private var wasReady = false
     private var localTextData: Data?
     private var localGrabActive = false
@@ -52,9 +56,14 @@ package struct ClipboardStateMachine: Sendable {
     private var awaitingGuestData = false
     private var lastPasteboardChangeCount: Int?
 
-    package init(maximumTextBytes: Int, clipboardEnabled: Bool = true) {
+    package init(
+        maximumTextBytes: Int,
+        clipboardEnabled: Bool = true,
+        negotiatesClipboardLimit: Bool = false
+    ) {
         self.maximumTextBytes = max(0, maximumTextBytes)
         self.clipboardEnabled = clipboardEnabled
+        self.negotiatesClipboardLimit = negotiatesClipboardLimit
     }
 
     package var isReady: Bool {
@@ -68,6 +77,13 @@ package struct ClipboardStateMachine: Sendable {
 
     package var isAgentConnected: Bool {
         agentConnected
+    }
+
+    package var effectiveManualOfferMaximumTextBytes: Int {
+        min(
+            Self.manualOfferMaximumTextBytes,
+            peerMaximumClipboardBytes ?? Self.manualOfferMaximumTextBytes
+        )
     }
 
     /// MONITORS_CONFIG and REPLY are legacy baseline capabilities until the
@@ -186,12 +202,21 @@ package struct ClipboardStateMachine: Sendable {
         switch command {
         case let .announceCapabilities(requestReply, capabilities):
             peerCapabilities = capabilities
+            if !capabilities.contains(.maxClipboard) {
+                peerMaximumClipboardBytes = nil
+            }
             var actions: [Action] = []
             if requestReply {
                 actions.append(.send(.announceCapabilities(
                     requestReply: false,
                     capabilities: localCapabilities
                 )))
+            }
+            if negotiatesClipboardLimit, capabilities.contains(.maxClipboard) {
+                actions.append(.send(.maxClipboard(Int32(min(
+                    maximumTextBytes,
+                    Int(Int32.max)
+                )))))
             }
             let ready = isReady
             if ready != wasReady {
@@ -253,8 +278,20 @@ package struct ClipboardStateMachine: Sendable {
             guestGrabActive = false
             awaitingGuestData = false
             return []
-        case .maxClipboard:
-            throw .invalidAgentMessage("MAX_CLIPBOARD received before capability negotiation")
+        case let .maxClipboard(maximum):
+            guard negotiatesClipboardLimit,
+                  peerCapabilities?.contains(.maxClipboard) == true else {
+                throw .invalidAgentMessage(
+                    "MAX_CLIPBOARD received before capability negotiation"
+                )
+            }
+            guard maximum >= -1 else {
+                throw .invalidAgentMessage("invalid MAX_CLIPBOARD value \(maximum)")
+            }
+            peerMaximumClipboardBytes = maximum == -1
+                ? Self.manualOfferMaximumTextBytes
+                : Int(maximum)
+            return []
         }
     }
 
@@ -318,13 +355,19 @@ package struct ClipboardStateMachine: Sendable {
     }
 
     private var localCapabilities: VDAgentCapabilities {
-        clipboardEnabled ? .desktopIntegration : .desktopServicesWithoutClipboard
+        guard clipboardEnabled else {
+            return .desktopServicesWithoutClipboard
+        }
+        return negotiatesClipboardLimit
+            ? .desktopIntegrationWithClipboardLimit
+            : .desktopIntegration
     }
 
     private mutating func resetConnectionState() {
         agentConnected = false
         localCapabilitiesAnnounced = false
         peerCapabilities = nil
+        peerMaximumClipboardBytes = nil
         wasReady = false
         localTextData = nil
         localGrabActive = false
