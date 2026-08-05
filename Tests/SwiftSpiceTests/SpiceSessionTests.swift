@@ -613,7 +613,11 @@ struct SpiceSessionTests {
         await transport.releaseBlockedAgentWrites()
         let id = try await offer.value
         #expect(returned.withLock { $0 })
+        #expect(await manager.clipboardOfferResult(id: id) == nil)
 
+        await transport.blockAgentMessages(types: [
+            VDAgentMessageType.clipboard.rawValue,
+        ])
         let request = try VDAgentClipboardCodec.encode(.request(
             type: VDAgentClipboardType.utf8Text.rawValue
         ))
@@ -622,7 +626,11 @@ struct SpiceSessionTests {
             body: try #require(VDAgentWireEncoder.fragments(for: request).first)
         ))
         #expect(await offerEvents.next() == .init(id: id, result: .requested))
+        #expect(await manager.clipboardOfferResult(id: id) == .requested)
+        await transport.waitForBlockedAgentWriteCount(2)
+        await transport.releaseBlockedAgentWrites()
         #expect(await offerEvents.next() == .init(id: id, result: .dataSent))
+        #expect(await manager.clipboardOfferResult(id: id) == .dataSent)
 
         let messages = try decodedAgentMessages(await transport.outbound)
         let grabs = try messages.compactMap { message -> VDAgentClipboardCommand? in
@@ -706,6 +714,55 @@ struct SpiceSessionTests {
 
         let messages = try decodedAgentMessages(await transport.outbound)
         #expect(!messages.contains { $0.type == VDAgentMessageType.clipboard.rawValue })
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func manualOfferResultLookupIsBoundedAndSurvivesStreamOverflow() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 256
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(
+            automaticallySynchronizesPasteboard: false,
+            pasteboardSynchronizationEnabled: false
+        )
+        try await manager.start(session: session)
+        await manager.setManualClipboardOffersEnabled(true)
+        var clipboardEvents = manager.events.makeAsyncIterator()
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegrationWithClipboardOwnership
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+
+        var firstID: SpiceClipboardOfferID?
+        var lastID: SpiceClipboardOfferID?
+        for index in 0..<33 {
+            let lease = UInt64(index + 1)
+            let id = try await manager.offerClipboardText("x", leaseGeneration: lease)
+            firstID = firstID ?? id
+            lastID = id
+            await manager.revokeClipboardOffer(id: id, leaseGeneration: lease)
+        }
+
+        #expect(await manager.clipboardOfferResult(id: try #require(firstID)) == nil)
+        #expect(await manager.clipboardOfferResult(id: try #require(lastID)) == .revoked)
+
         await manager.stop()
         await session.disconnect()
     }

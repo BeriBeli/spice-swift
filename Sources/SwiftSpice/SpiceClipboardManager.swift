@@ -10,6 +10,7 @@ import Synchronization
 /// expose guest IME composition and candidate state.
 public actor SpiceAgentManager {
     public static let maximumWireTextBytes = 16 * 1_024 * 1_024 - 4
+    private static let manualOfferResultCapacity = 32
 
     public nonisolated let events: AsyncStream<SpiceClipboardEvent>
     public nonisolated let manualOfferEvents: AsyncStream<SpiceClipboardOfferEvent>
@@ -49,6 +50,10 @@ public actor SpiceAgentManager {
         SpiceClipboardOfferID: Result<Void, SpiceClipboardError>
     ] = [:]
     private var invalidatedManualGrabIDs: Set<SpiceClipboardOfferID> = []
+    private var manualOfferResults: [
+        SpiceClipboardOfferID: SpiceClipboardOfferResult
+    ] = [:]
+    private var manualOfferResultOrder: [SpiceClipboardOfferID] = []
     private var agentWorkGeneration: UInt64 = 1
     private var agentWorkInvalidationGeneration: UInt64?
     private var agentWorkInvalidationSequence: UInt64 = 0
@@ -109,7 +114,7 @@ public actor SpiceAgentManager {
         eventContinuation = pipe.continuation
         let manualOfferPipe = AsyncStream.makeStream(
             of: SpiceClipboardOfferEvent.self,
-            bufferingPolicy: .bufferingOldest(32)
+            bufferingPolicy: .bufferingNewest(Self.manualOfferResultCapacity)
         )
         manualOfferEvents = manualOfferPipe.stream
         manualOfferContinuation = manualOfferPipe.continuation
@@ -388,6 +393,17 @@ public actor SpiceAgentManager {
             return
         }
         await execute(actions, using: session)
+    }
+
+    /// Returns the most recent observed result for a manual offer.
+    ///
+    /// This bounded history complements `manualOfferEvents`: it lets a caller
+    /// recover a recent terminal result if the observation stream overflowed.
+    /// Unknown and evicted offer IDs return `nil`.
+    public func clipboardOfferResult(
+        id: SpiceClipboardOfferID
+    ) -> SpiceClipboardOfferResult? {
+        manualOfferResults[id]
     }
 
     /// Coalesces resize requests while one Agent request is awaiting a reply.
@@ -1434,7 +1450,7 @@ public actor SpiceAgentManager {
                 clearClipboardOwner(owner)
             case let .manualOffer(.emit(event)):
                 guard ownsClipboardAction(owner) else { continue }
-                manualOfferContinuation.yield(event)
+                emitManualOffer(event)
                 clearClipboardOwner(owner)
             }
         }
@@ -1759,7 +1775,7 @@ public actor SpiceAgentManager {
             case let .emit(event):
                 emit(event)
             case let .manualOffer(.emit(event)):
-                manualOfferContinuation.yield(event)
+                emitManualOffer(event)
             case .send, .manualOffer(.sendGrab), .manualOffer(.sendData), .writeGuestText:
                 break
             }
@@ -1768,6 +1784,18 @@ public actor SpiceAgentManager {
 
     private func emit(_ event: SpiceClipboardEvent) {
         _ = eventContinuation.yield(event)
+    }
+
+    private func emitManualOffer(_ event: SpiceClipboardOfferEvent) {
+        if manualOfferResults[event.id] == nil {
+            if manualOfferResultOrder.count == Self.manualOfferResultCapacity {
+                let evicted = manualOfferResultOrder.removeFirst()
+                manualOfferResults.removeValue(forKey: evicted)
+            }
+            manualOfferResultOrder.append(event.id)
+        }
+        manualOfferResults[event.id] = event.result
+        _ = manualOfferContinuation.yield(event)
     }
 
     private func emitDisplay(_ event: SpiceDisplayConfigurationEvent) {
