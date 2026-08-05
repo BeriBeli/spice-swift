@@ -1368,6 +1368,8 @@ public actor SpiceAgentManager {
             (.high, true)
         case .announceCapabilities(requestReply: true, _),
              .grab,
+             .serialGrab,
+             .maxClipboard,
              .request:
             (.normal, false)
         }

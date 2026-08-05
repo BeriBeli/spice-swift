@@ -204,7 +204,7 @@ package struct ClipboardStateMachine: Sendable {
                 actions.append(.emit(.localTextOffered(byteCount: localTextData.count)))
             }
             return actions
-        case let .grab(types):
+        case let .grab(types), let .serialGrab(_, types):
             guard clipboardEnabled else { return [] }
             try requireReady()
             localTextData = nil
@@ -253,6 +253,8 @@ package struct ClipboardStateMachine: Sendable {
             guestGrabActive = false
             awaitingGuestData = false
             return []
+        case .maxClipboard:
+            throw .invalidAgentMessage("MAX_CLIPBOARD received before capability negotiation")
         }
     }
 
