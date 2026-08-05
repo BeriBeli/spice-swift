@@ -10,6 +10,7 @@ Candidate commits:
 - `b92b78c` — source arbitration state machine
 - `11025c4` — private offer manager flow
 - `563dd4e` — default local receive-limit negotiation
+- `5e3191b` — peer limit enforcement for both clipboard authorities
 
 ## Contract implemented
 
@@ -18,8 +19,10 @@ Candidate commits:
   no-release-on-regrab, and GRAB serial.
 - `MAX_CLIPBOARD` is signed little-endian `Int32`: `-1` is unlimited, zero is a
   real zero-byte limit, and values below `-1` are rejected. A missing value,
-  reconnect, and capability withdrawal reset the peer limit to the 16,000-byte
-  manual-offer policy. The advertised local value remains the actual local
+  reconnect, and capability withdrawal clear the peer limit. A finite peer
+  value constrains both general pasteboard offers and manual offers; `-1` keeps
+  each authority's local policy (the general receive bound and the 16,000-byte
+  manual-offer bound). The advertised local value remains the actual local
   receive bound (`16 MiB - 4` by default), not 16,000.
 - General pasteboard synchronization and in-memory manual offers are independent
   authorities. Manual-only mode does not read or write the general pasteboard,
@@ -65,10 +68,11 @@ swift test --disable-sandbox -Xswiftc -warnings-as-errors \
   --filter '(ClipboardStateMachineTests|SpiceSessionTests)'
 ```
 
-Result on 2026-08-05: 81 tests in 2 suites passed. The session tests block GRAB
+Result on 2026-08-05: 82 tests in 2 suites passed. The session tests block GRAB
 at the physical writer and prove that the public offer call does not return
 early; they also cover REQUEST/DATA terminal reporting, Task cancellation, and
-zero-token manager stop.
+zero-token manager stop. The state tests additionally prove that a finite peer
+limit constrains general pasteboard offers and that `-1` restores local policy.
 
 Source/ABI compatibility gate:
 
@@ -78,7 +82,7 @@ SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/mcp-module-cache-a2-api \
 scripts/check-api-compatibility.sh v0.1.3
 ```
 
-Result: passed with baseline API 1,233,160 bytes, current API 1,669,666 bytes,
+Result: passed with baseline API 1,233,160 bytes, current API 1,671,194 bytes,
 and 12 exactly reviewed additive enum cases. The one new allowlisted case is the
 package-internal `ClipboardStateMachine.Action.manualOffer`; the existing public
 `SpiceClipboardEvent` was not extended.
