@@ -1,0 +1,12 @@
+SwiftSpice: EnumElement ClipboardStateMachine.Action.manualOffer has been added as a new enum case
+SwiftSpice: EnumElement FileTransferPhase.sendingCancellation has been added as a new enum case
+SwiftSpice: EnumElement FileTransferPhase.sendingData has been added as a new enum case
+SwiftSpice: EnumElement FileTransferPhase.sendingFailure has been added as a new enum case
+SwiftSpice: EnumElement FileTransferPhase.sendingStart has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentCancelled has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentDisconnected has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentMessageFailed has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentMigrationRebind has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentQueueFull has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.agentStalled has been added as a new enum case
+SwiftSpice: EnumElement SpiceError.inputGenerationExpired has been added as a new enum case

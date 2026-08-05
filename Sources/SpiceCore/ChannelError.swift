@@ -18,6 +18,15 @@ package enum ChannelError: Error, Sendable, Equatable {
     case authentication(AuthenticationError)
     case linkRejected(code: UInt32)
     case migrationRequested(key: ChannelKey, data: Data?)
+    /// The operation was cancelled while still queued locally, before any
+    /// transport write was attempted.
+    case cancelledBeforeWrite
+    case agentQueueFull
+    case agentCancelled(partial: Bool)
+    case agentDisconnected
+    case agentMessageFailed(partial: Bool)
+    case agentMigrationRebind(partial: Bool)
+    case agentStalled(partial: Bool)
     case invalidState
     case unsupportedCapability
     case protocolViolation(String)

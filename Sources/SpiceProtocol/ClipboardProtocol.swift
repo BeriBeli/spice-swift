@@ -12,6 +12,8 @@ package enum VDAgentMessageType: UInt32, Sendable {
     case fileTransferStart = 10
     case fileTransferStatus = 11
     case fileTransferData = 12
+    case clientDisconnected = 13
+    case maxClipboard = 14
 }
 
 package enum VDAgentClipboardType: UInt32, Sendable {
@@ -24,10 +26,13 @@ package enum VDAgentCapability: Int, Sendable {
     case reply = 2
     case clipboard = 3
     case clipboardByDemand = 5
+    case maxClipboard = 10
     case sparseMonitorsConfig = 7
     case monitorsConfigPosition = 12
     case fileTransferDisabled = 13
     case fileTransferDetailedErrors = 14
+    case clipboardNoReleaseOnRegrab = 16
+    case clipboardGrabSerial = 17
 }
 
 package struct VDAgentCapabilities: Sendable, Equatable {
@@ -54,6 +59,21 @@ package struct VDAgentCapabilities: Sendable, Equatable {
         desktopServicesWithoutClipboard.words[0] | utf8Clipboard.words[0],
     ])
 
+    package static let desktopIntegrationWithClipboardLimit = Self(words: [
+        desktopIntegration.words[0]
+            | (UInt32(1) << UInt32(VDAgentCapability.maxClipboard.rawValue)),
+    ])
+
+    package static let desktopIntegrationWithClipboardOwnership = Self(words: [
+        desktopIntegrationWithClipboardLimit.words[0]
+            | (UInt32(1) << UInt32(
+                VDAgentCapability.clipboardNoReleaseOnRegrab.rawValue
+            ))
+            | (UInt32(1) << UInt32(
+                VDAgentCapability.clipboardGrabSerial.rawValue
+            )),
+    ])
+
     package func contains(_ capability: VDAgentCapability) -> Bool {
         let word = capability.rawValue / 32
         let bit = capability.rawValue % 32
@@ -71,9 +91,11 @@ package struct VDAgentCapabilities: Sendable, Equatable {
 package enum VDAgentClipboardCommand: Sendable, Equatable {
     case announceCapabilities(requestReply: Bool, capabilities: VDAgentCapabilities)
     case grab(types: [UInt32])
+    case serialGrab(serial: UInt32, types: [UInt32])
     case request(type: UInt32)
     case data(type: UInt32, data: Data)
     case release
+    case maxClipboard(Int32)
 }
 
 package enum VDAgentClipboardCodec {
@@ -81,7 +103,8 @@ package enum VDAgentClipboardCodec {
     private static let maximumGrabTypes = 64
 
     package static func decode(
-        _ message: VDAgentMessage
+        _ message: VDAgentMessage,
+        grabHasSerial: Bool = false
     ) throws(WireError) -> VDAgentClipboardCommand? {
         guard message.protocolID == VDAgentMessage.protocolVersion,
               let type = VDAgentMessageType(rawValue: message.type) else {
@@ -91,6 +114,7 @@ package enum VDAgentClipboardCodec {
         switch type {
         case .monitorsConfig,
              .reply,
+             .clientDisconnected,
              .fileTransferStart,
              .fileTransferStatus,
              .fileTransferData:
@@ -117,14 +141,19 @@ package enum VDAgentClipboardCodec {
             guard reader.remainingCount.isMultiple(of: MemoryLayout<UInt32>.size) else {
                 throw .invalidSize(reader.remainingCount)
             }
-            let count = reader.remainingCount / MemoryLayout<UInt32>.size
-            guard count > 0, count <= maximumGrabTypes else {
-                throw .invalidSize(count)
+            let wordCount = reader.remainingCount / MemoryLayout<UInt32>.size
+            let typeCount = wordCount - (grabHasSerial ? 1 : 0)
+            guard typeCount > 0, typeCount <= maximumGrabTypes else {
+                throw .invalidSize(typeCount)
             }
+            let serial = grabHasSerial ? try reader.readUInt32LE() : nil
             var types: [UInt32] = []
-            types.reserveCapacity(count)
-            for _ in 0..<count {
+            types.reserveCapacity(typeCount)
+            for _ in 0..<typeCount {
                 types.append(try reader.readUInt32LE())
+            }
+            if let serial {
+                return .serialGrab(serial: serial, types: types)
             }
             return .grab(types: types)
         case .clipboardRequest:
@@ -137,6 +166,10 @@ package enum VDAgentClipboardCodec {
         case .clipboardRelease:
             try reader.requireFullyConsumed()
             return .release
+        case .maxClipboard:
+            let maximum = try reader.readInt32LE()
+            try reader.requireFullyConsumed()
+            return .maxClipboard(maximum)
         }
     }
 
@@ -164,6 +197,15 @@ package enum VDAgentClipboardCodec {
             for clipboardType in types {
                 writer.writeUInt32LE(clipboardType)
             }
+        case let .serialGrab(serial, types):
+            type = .clipboardGrab
+            guard !types.isEmpty, types.count <= maximumGrabTypes else {
+                throw .invalidSize(types.count)
+            }
+            writer.writeUInt32LE(serial)
+            for clipboardType in types {
+                writer.writeUInt32LE(clipboardType)
+            }
         case let .request(clipboardType):
             type = .clipboardRequest
             writer.writeUInt32LE(clipboardType)
@@ -173,6 +215,9 @@ package enum VDAgentClipboardCodec {
             writer.writeBytes(data)
         case .release:
             type = .clipboardRelease
+        case let .maxClipboard(maximum):
+            type = .maxClipboard
+            writer.writeInt32LE(maximum)
         }
         return VDAgentMessage(
             type: type.rawValue,

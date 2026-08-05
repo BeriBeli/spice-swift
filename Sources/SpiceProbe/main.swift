@@ -2,11 +2,21 @@ import AppKit
 import Darwin
 import Foundation
 import SwiftSpice
+import SwiftUI
 
 @main
 struct SpiceProbe {
     static func main() async {
         do {
+            if Array(CommandLine.arguments.dropFirst()) == [
+                "--appkit-input-focus-gate",
+            ] {
+                try AppKitInputFocusGate.run()
+                print(
+                    #"{"appkit_input_focus_gate":"passed","activity_events":2,"cleanup_events":2}"#
+                )
+                return
+            }
             let configuration = try parseArguments()
             let password = ProcessInfo.processInfo.environment["SPICE_PASSWORD"] ?? ""
             let credentials = SpiceCredentials(password: password)
@@ -1233,7 +1243,8 @@ private enum ProbeError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .usage:
-            "usage: spice-probe HOST PORT [--tls|--tls-insecure-for-testing-only] "
+            "usage: spice-probe --appkit-input-focus-gate; or spice-probe "
+                + "HOST PORT [--tls|--tls-insecure-for-testing-only] "
                 + "[--observe-seconds N] [--exercise-input] [--require-agent] "
                 + "[--exercise-file-transfer] [--exercise-clipboard] "
                 + "[--exercise-monitor-config] [--exercise-webdav] "
@@ -1256,5 +1267,194 @@ private enum ProbeError: Error, CustomStringConvertible {
         case let .nativeVideoFailed(reason):
             "native video validation failed: \(reason)"
         }
+    }
+}
+
+@MainActor
+private enum AppKitInputFocusGate {
+    static func run() throws {
+        let application = NSApplication.shared
+        let delegate = AppKitInputFocusGateDelegate()
+        guard application.setActivationPolicy(.accessory) else {
+            throw AppKitInputFocusGateFailure("could not set accessory activation policy")
+        }
+        application.delegate = delegate
+        application.run()
+        application.delegate = nil
+        guard let outcome = delegate.outcome else {
+            throw AppKitInputFocusGateFailure("application exited without a gate outcome")
+        }
+        try outcome.get()
+    }
+}
+
+@MainActor
+private final class AppKitInputFocusGateDelegate: NSObject, NSApplicationDelegate {
+    private(set) var outcome: Result<Void, any Error>?
+    private var window: NSWindow?
+    private var hostingView: NSView?
+    private var events: [SpiceDesktopInputEvent] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let desktop = SpiceDesktopView.sourceAware(
+            frame: nil,
+            pointerMode: .absolute
+        ) { [weak self] event in
+            self?.events.append(event)
+        }
+        let hostingView = NSHostingView(rootView: desktop)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 200)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "SwiftSpice AppKit Input Focus Gate"
+        window.contentView = hostingView
+        self.hostingView = hostingView
+        self.window = window
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        Timer.scheduledTimer(
+            timeInterval: 0.2,
+            target: self,
+            selector: #selector(executeGate),
+            userInfo: nil,
+            repeats: false
+        )
+    }
+
+    @objc private func executeGate() {
+        do {
+            try verifyFocusCleanup()
+            outcome = .success(())
+        } catch {
+            outcome = .failure(error)
+        }
+        finish()
+    }
+
+    private func verifyFocusCleanup() throws {
+        guard let window, window.isKeyWindow else {
+            throw AppKitInputFocusGateFailure("probe window never became key")
+        }
+        guard let hostingView else {
+            throw AppKitInputFocusGateFailure("hosting view was not retained")
+        }
+        hostingView.layoutSubtreeIfNeeded()
+        guard let inputView = firstInputView(in: hostingView) else {
+            throw AppKitInputFocusGateFailure(
+                "SpiceDesktopView did not install its AppKit input view"
+            )
+        }
+        guard window.makeFirstResponder(inputView) else {
+            throw AppKitInputFocusGateFailure("input view rejected first responder")
+        }
+        guard let mouseDown = NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ) else {
+            throw AppKitInputFocusGateFailure("could not create mouse event")
+        }
+        guard let keyDown = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "a",
+            charactersIgnoringModifiers: "a",
+            isARepeat: false,
+            keyCode: 0
+        ) else {
+            throw AppKitInputFocusGateFailure("could not create key event")
+        }
+
+        inputView.mouseDown(with: mouseDown)
+        inputView.keyDown(with: keyDown)
+        let scanCode = SpicePhysicalKey.a.scanCode
+        let activity = [
+            SpiceDesktopInputEvent(
+                input: .mousePress(.left),
+                origin: .humanActivity
+            ),
+            SpiceDesktopInputEvent(
+                input: .keyDown(scanCode: scanCode),
+                origin: .humanActivity
+            ),
+        ]
+        guard events == activity else {
+            throw AppKitInputFocusGateFailure(
+                "unexpected human activity sequence: \(events)"
+            )
+        }
+
+        window.resignKey()
+        let expected = activity + [
+            SpiceDesktopInputEvent(
+                input: .mouseRelease(.left),
+                origin: .focusCleanup
+            ),
+            SpiceDesktopInputEvent(
+                input: .keyUp(scanCode: scanCode),
+                origin: .focusCleanup
+            ),
+        ]
+        guard events == expected else {
+            throw AppKitInputFocusGateFailure(
+                "unexpected focus cleanup sequence: \(events)"
+            )
+        }
+    }
+
+    private func firstInputView(in view: NSView) -> NSView? {
+        if String(reflecting: type(of: view)).contains("SpiceFramebufferView") {
+            return view
+        }
+        for subview in view.subviews {
+            if let result = firstInputView(in: subview) {
+                return result
+            }
+        }
+        return nil
+    }
+
+    private func finish() {
+        window?.orderOut(nil)
+        window?.contentView = nil
+        window?.close()
+        window = nil
+        hostingView = nil
+        NSApplication.shared.stop(nil)
+        if let wakeEvent = NSEvent.otherEvent(
+            with: .applicationDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 0,
+            data1: 0,
+            data2: 0
+        ) {
+            NSApplication.shared.postEvent(wakeEvent, atStart: false)
+        }
+    }
+}
+
+private struct AppKitInputFocusGateFailure: Error, CustomStringConvertible {
+    let description: String
+
+    init(_ description: String) {
+        self.description = description
     }
 }

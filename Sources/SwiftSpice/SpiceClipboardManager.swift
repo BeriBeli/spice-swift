@@ -1,4 +1,5 @@
 import Foundation
+import SpiceChannels
 import SpiceProtocol
 import SpiceWire
 import Synchronization
@@ -9,8 +10,10 @@ import Synchronization
 /// expose guest IME composition and candidate state.
 public actor SpiceAgentManager {
     public static let maximumWireTextBytes = 16 * 1_024 * 1_024 - 4
+    private static let manualOfferResultCapacity = 32
 
     public nonisolated let events: AsyncStream<SpiceClipboardEvent>
+    public nonisolated let manualOfferEvents: AsyncStream<SpiceClipboardOfferEvent>
     public nonisolated let displayConfigurationEvents:
         AsyncStream<SpiceDisplayConfigurationEvent>
     public nonisolated let displayConfigurationSupportEvents:
@@ -18,6 +21,8 @@ public actor SpiceAgentManager {
     public nonisolated let fileTransferEvents: AsyncStream<SpiceFileTransferEvent>
 
     private let eventContinuation: AsyncStream<SpiceClipboardEvent>.Continuation
+    private let manualOfferContinuation:
+        AsyncStream<SpiceClipboardOfferEvent>.Continuation
     private let displayConfigurationContinuation:
         AsyncStream<SpiceDisplayConfigurationEvent>.Continuation
     private let displayConfigurationSupportContinuation:
@@ -25,12 +30,36 @@ public actor SpiceAgentManager {
     private let fileTransferContinuation: AsyncStream<SpiceFileTransferEvent>.Continuation
     private let automaticallySynchronizesPasteboard: Bool
     private var pasteboardSynchronizationEnabled: Bool
+    private var manualClipboardOffersEnabled = false
     private let pollInterval: Duration
     private var state: ClipboardStateMachine
     private var eventTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var session: SpiceSession?
+    private var lifecycleGeneration: UInt64 = 1
+    private var startingGeneration: UInt64?
     private var pendingActions: [ClipboardStateMachine.Action] = []
+    private var clipboardDriverGeneration: UInt64?
+    private var clipboardInFlight: ClipboardActionOwner?
+    private var nextClipboardOwnerID: UInt64 = 1
+    private var nextManualOfferID: UInt64 = 1
+    private var manualGrabWaiters: [
+        SpiceClipboardOfferID: CheckedContinuation<Result<Void, SpiceClipboardError>, Never>
+    ] = [:]
+    private var manualGrabResults: [
+        SpiceClipboardOfferID: Result<Void, SpiceClipboardError>
+    ] = [:]
+    private var invalidatedManualGrabIDs: Set<SpiceClipboardOfferID> = []
+    private var manualOfferResults: [
+        SpiceClipboardOfferID: SpiceClipboardOfferResult
+    ] = [:]
+    private var manualOfferResultOrder: [SpiceClipboardOfferID] = []
+    private var agentWorkGeneration: UInt64 = 1
+    private var agentWorkInvalidationGeneration: UInt64?
+    private var agentWorkInvalidationSequence: UInt64 = 0
+    private var agentWorkInvalidationWaiters: [AgentWorkInvalidationWaiter] = []
+    private var ownedAgentSends: [UInt64: OwnedAgentSend] = [:]
+    private var nextOwnedAgentSendID: UInt64 = 1
     private var displayCoordinator = DisplayConfigurationCoordinator()
     private var lastDisplayConfigurationSupport: SpiceDisplayConfigurationSupport?
     private let maximumConcurrentFileTransfers: Int
@@ -39,7 +68,34 @@ public actor SpiceAgentManager {
     private let fileTransferCodec: VDAgentFileTransferCodec
     private var fileTransfers: [SpiceFileTransferID: FileTransferJob] = [:]
     private var fileTransferReaders: [SpiceFileTransferID: FileTransferReader] = [:]
+    private var deferredFileTransferStatuses:
+        [SpiceFileTransferID: VDAgentFileTransferStatus] = [:]
+    private var fileTransferDriverGeneration: UInt64?
     private var nextFileTransferID: UInt32 = 1
+    private var completedFileTransferMessageCount: UInt64 = 0
+    private var completedFileTransferPayloadByteCount: UInt64 = 0
+
+    private struct ClipboardActionOwner: Sendable, Equatable {
+        let id: UInt64
+        let generation: UInt64
+        let action: ClipboardStateMachine.Action
+    }
+
+    private struct AgentWorkEpoch: Sendable, Equatable {
+        let lifecycleGeneration: UInt64
+        let agentWorkGeneration: UInt64
+        let sessionID: ObjectIdentifier
+    }
+
+    private struct OwnedAgentSend {
+        let epoch: AgentWorkEpoch
+        let task: Task<Result<Void, SpiceError>, Never>
+    }
+
+    private struct AgentWorkInvalidationWaiter {
+        let observedSequence: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
 
     public init(
         maximumTextBytes: Int = SpiceAgentManager.maximumWireTextBytes,
@@ -56,6 +112,12 @@ public actor SpiceAgentManager {
         )
         events = pipe.stream
         eventContinuation = pipe.continuation
+        let manualOfferPipe = AsyncStream.makeStream(
+            of: SpiceClipboardOfferEvent.self,
+            bufferingPolicy: .bufferingNewest(Self.manualOfferResultCapacity)
+        )
+        manualOfferEvents = manualOfferPipe.stream
+        manualOfferContinuation = manualOfferPipe.continuation
         let displayPipe = AsyncStream.makeStream(
             of: SpiceDisplayConfigurationEvent.self,
             bufferingPolicy: .bufferingNewest(16)
@@ -85,38 +147,72 @@ public actor SpiceAgentManager {
         ))
         state = ClipboardStateMachine(
             maximumTextBytes: min(maximumTextBytes, Self.maximumWireTextBytes),
-            clipboardEnabled: pasteboardSynchronizationEnabled
+            clipboardEnabled: pasteboardSynchronizationEnabled,
+            negotiatesClipboardLimit: true
         )
     }
 
     deinit {
         eventTask?.cancel()
         pollTask?.cancel()
+        for send in ownedAgentSends.values {
+            send.task.cancel()
+        }
+        for waiter in agentWorkInvalidationWaiters {
+            waiter.continuation.resume()
+        }
+        for waiter in manualGrabWaiters.values {
+            waiter.resume(returning: .failure(.invalidAgentMessage(
+                "manual clipboard offer manager deinitialized"
+            )))
+        }
         eventContinuation.finish()
+        manualOfferContinuation.finish()
         displayConfigurationContinuation.finish()
         displayConfigurationSupportContinuation.finish()
         fileTransferContinuation.finish()
     }
 
     public func start(session: SpiceSession) async throws(SpiceClipboardError) {
-        guard eventTask == nil else {
+        guard eventTask == nil,
+              startingGeneration == nil,
+              agentWorkInvalidationGeneration == nil,
+              ownedAgentSends.isEmpty else {
             throw .alreadyRunning
         }
+        lifecycleGeneration &+= 1
+        let generation = lifecycleGeneration
+        startingGeneration = generation
         self.session = session
+        defer {
+            if startingGeneration == generation {
+                startingGeneration = nil
+            }
+        }
         if await session.currentAgentConnectionState() {
+            guard ownsLifecycle(session: session, generation: generation) else {
+                throw .transport(.cancelled)
+            }
             await execute(state.connected(), using: session)
         }
+        guard ownsLifecycle(session: session, generation: generation) else {
+            throw .transport(.cancelled)
+        }
         emitDisplayConfigurationSupportIfChanged()
-        eventTask = Task { [weak self] in
+        let newEventTask = Task { [weak self] in
             for await event in session.agentEvents {
                 guard !Task.isCancelled else {
                     return
                 }
-                await self?.receive(event, from: session)
+                await self?.receive(
+                    event,
+                    from: session,
+                    lifecycleGeneration: generation
+                )
             }
         }
         let pollInterval = self.pollInterval
-        pollTask = Task { [weak self] in
+        let newPollTask = Task { [weak self] in
             let clock = ContinuousClock()
             while !Task.isCancelled {
                 do {
@@ -124,32 +220,47 @@ public actor SpiceAgentManager {
                 } catch {
                     return
                 }
-                await self?.performPeriodicWork()
+                await self?.performPeriodicWork(lifecycleGeneration: generation)
             }
         }
+        guard ownsLifecycle(session: session, generation: generation) else {
+            newEventTask.cancel()
+            newPollTask.cancel()
+            throw .transport(.cancelled)
+        }
+        eventTask = newEventTask
+        pollTask = newPollTask
+        startingGeneration = nil
     }
 
-    public func stop() {
+    public func stop() async {
+        lifecycleGeneration &+= 1
+        startingGeneration = nil
         eventTask?.cancel()
         eventTask = nil
         pollTask?.cancel()
         pollTask = nil
         session = nil
-        pendingActions.removeAll(keepingCapacity: false)
+        let invalidation = beginAgentWorkInvalidation()
         displayCoordinator.reset()
         cancelAllFileTransfers()
         emitActions(state.disconnected())
         emitDisplayConfigurationSupportIfChanged()
+        await finishAgentWorkInvalidation(invalidation)
     }
 
     /// Checks the current pasteboard immediately rather than waiting for the
     /// optional polling loop.
     public func synchronizePasteboard() async {
-        guard pasteboardSynchronizationEnabled, let session else {
+        guard pasteboardSynchronizationEnabled,
+              let session,
+              let epoch = currentAgentWorkEpoch(using: session) else {
             return
         }
         await execute(state.announcementIfNeeded(), using: session)
+        guard ownsAgentWork(epoch, using: session) else { return }
         let snapshot = await SpicePasteboardBridge.snapshot()
+        guard ownsAgentWork(epoch, using: session) else { return }
         await execute(state.localPasteboardChanged(
             changeCount: snapshot.changeCount,
             text: snapshot.text
@@ -161,6 +272,8 @@ public actor SpiceAgentManager {
     /// Publishes text locally and offers it to the guest without polling delay.
     public func publish(_ text: String) async {
         guard pasteboardSynchronizationEnabled else { return }
+        let admittedSession = session
+        let admittedEpoch = admittedSession.flatMap { currentAgentWorkEpoch(using: $0) }
         let snapshot: SpicePasteboardSnapshot
         do {
             snapshot = try await SpicePasteboardBridge.write(text: text)
@@ -168,7 +281,9 @@ public actor SpiceAgentManager {
             emit(.failed(error))
             return
         }
-        guard let session else {
+        guard let session = admittedSession,
+              let admittedEpoch,
+              ownsAgentWork(admittedEpoch, using: session) else {
             return
         }
         await execute(state.localPasteboardChanged(
@@ -177,19 +292,118 @@ public actor SpiceAgentManager {
         ), using: session)
     }
 
+    // Package-scoped protocol harness used to verify logical-message ownership
+    // independently of the macOS pasteboard bridge.
+    package func sendClipboardCommandForTesting(
+        _ command: VDAgentClipboardCommand
+    ) async {
+        guard let session else { return }
+        await execute([.send(command)], using: session)
+    }
+
     /// Changes whether this manager may advertise clipboard support or access
     /// the general pasteboard. Other Agent services remain active either way.
     public func setPasteboardSynchronizationEnabled(_ enabled: Bool) async {
         guard pasteboardSynchronizationEnabled != enabled else { return }
         pasteboardSynchronizationEnabled = enabled
         guard let session else {
-            _ = state.setClipboardEnabled(enabled)
+            _ = state.setClipboardModes(
+                generalPasteboardSynchronizationEnabled: enabled,
+                manualClipboardOffersEnabled: manualClipboardOffersEnabled,
+                negotiatesClipboardOwnership: manualClipboardOffersEnabled
+            )
             return
         }
-        await execute(state.setClipboardEnabled(enabled), using: session)
+        await execute(state.setClipboardModes(
+            generalPasteboardSynchronizationEnabled: enabled,
+            manualClipboardOffersEnabled: manualClipboardOffersEnabled,
+            negotiatesClipboardOwnership: manualClipboardOffersEnabled
+        ), using: session)
         if enabled {
             await synchronizePasteboard()
         }
+    }
+
+    /// Controls the in-memory clipboard offer path independently from access
+    /// to the macOS general pasteboard.
+    public func setManualClipboardOffersEnabled(_ enabled: Bool) async {
+        guard manualClipboardOffersEnabled != enabled else { return }
+        manualClipboardOffersEnabled = enabled
+        let actions = state.setClipboardModes(
+            generalPasteboardSynchronizationEnabled: pasteboardSynchronizationEnabled,
+            manualClipboardOffersEnabled: enabled,
+            negotiatesClipboardOwnership: enabled
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
+    }
+
+    /// Creates a private in-memory UTF-8 offer and returns only after its GRAB
+    /// message has reached the Agent scheduler's physical write terminal.
+    /// This method never reads or writes the macOS general pasteboard.
+    public func offerClipboardText(
+        _ text: String,
+        leaseGeneration: UInt64
+    ) async throws -> SpiceClipboardOfferID {
+        guard manualClipboardOffersEnabled else {
+            throw SpiceClipboardError.invalidAgentMessage(
+                "manual clipboard offers are disabled"
+            )
+        }
+        guard state.isReady, let session else {
+            throw SpiceClipboardError.invalidAgentMessage(
+                "manual clipboard offer requires a negotiated Agent"
+            )
+        }
+        let id = allocateManualOfferID()
+        let actions = try state.offerManualText(
+            text,
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        return try await withTaskCancellationHandler {
+            await execute(actions, using: session)
+            try await waitForManualGrab(id: id)
+            return id
+        } onCancel: {
+            Task {
+                await self.cancelManualClipboardOffer(
+                    id: id,
+                    leaseGeneration: leaseGeneration
+                )
+            }
+        }
+    }
+
+    /// Revokes the matching lease-owned offer. A stale ID or lease generation
+    /// is a no-op and cannot revoke a replacement offer.
+    public func revokeClipboardOffer(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) async {
+        let actions = state.revokeManualOffer(
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
+    }
+
+    /// Returns the most recent observed result for a manual offer.
+    ///
+    /// This bounded history complements `manualOfferEvents`: it lets a caller
+    /// recover a recent terminal result if the observation stream overflowed.
+    /// Unknown and evicted offer IDs return `nil`.
+    public func clipboardOfferResult(
+        id: SpiceClipboardOfferID
+    ) -> SpiceClipboardOfferResult? {
+        manualOfferResults[id]
     }
 
     /// Coalesces resize requests while one Agent request is awaiting a reply.
@@ -233,7 +447,8 @@ public actor SpiceAgentManager {
         at source: URL,
         name: String? = nil
     ) async throws(SpiceFileTransferError) -> SpiceFileTransferID {
-        guard let session else {
+        guard let session,
+              let epoch = currentAgentWorkEpoch(using: session) else {
             throw .agentManagerNotRunning
         }
         guard state.isAgentConnected else {
@@ -246,7 +461,7 @@ public actor SpiceAgentManager {
             throw .tooManyConcurrentTransfers(maximum: maximumConcurrentFileTransfers)
         }
         let info = try await Self.inspectFile(source, overrideName: name)
-        guard self.session != nil, state.isAgentConnected else {
+        guard ownsAgentWork(epoch, using: session), state.isAgentConnected else {
             info.reader.close()
             throw .agentUnavailable
         }
@@ -272,6 +487,9 @@ public actor SpiceAgentManager {
         fileTransferReaders[id] = info.reader
         emitFileTransfer(.queued(id: id, name: info.name, totalBytes: info.size))
         await driveFileTransfers(using: session)
+        guard ownsAgentWork(epoch, using: session), fileTransfers[id] != nil else {
+            throw .agentUnavailable
+        }
         return id
     }
 
@@ -284,8 +502,11 @@ public actor SpiceAgentManager {
             removeFileTransfer(id)
             emitFileTransfer(.cancelled(id: id))
             return
-        case .queuedCancellation, .awaitingCancellation:
+        case .queuedCancellation, .sendingCancellation, .awaitingCancellation:
             return
+        case .sendingStart, .sendingData, .sendingFailure:
+            job.cancellationRequested = true
+            fileTransfers[id] = job
         case .awaitingGuestApproval,
              .readyToRead,
              .reading,
@@ -300,13 +521,51 @@ public actor SpiceAgentManager {
         }
     }
 
-    private func receive(_ event: SpiceAgentEvent, from session: SpiceSession) async {
+    /// Returns content-free counters suitable for proving that a bounded
+    /// observation period completed without any host-to-guest file message.
+    public func fileTransferWireMetrics() -> SpiceFileTransferWireMetrics {
+        SpiceFileTransferWireMetrics(
+            completedMessageCount: completedFileTransferMessageCount,
+            payloadByteCount: completedFileTransferPayloadByteCount
+        )
+    }
+
+    package func fileTransferSentByteCount(
+        _ id: SpiceFileTransferID
+    ) -> UInt64? {
+        fileTransfers[id]?.sentBytes
+    }
+
+    package func receiveFileTransferCommandForTesting(
+        _ command: VDAgentFileTransferCommand
+    ) async {
+        guard let session else { return }
+        await receiveFileTransfer(command, using: session)
+    }
+
+    private func receive(
+        _ event: SpiceAgentEvent,
+        from session: SpiceSession,
+        lifecycleGeneration: UInt64
+    ) async {
+        guard ownsLifecycle(
+            session: session,
+            generation: lifecycleGeneration
+        ) else {
+            return
+        }
         switch event {
         case .connected:
             guard !state.isAgentConnected else {
                 return
             }
-            pendingActions.removeAll(keepingCapacity: false)
+            await invalidateAgentWork()
+            guard ownsLifecycle(
+                session: session,
+                generation: lifecycleGeneration
+            ) else {
+                return
+            }
             displayCoordinator.disconnected()
             await execute(state.connected(), using: session)
             emitDisplayConfigurationSupportIfChanged()
@@ -320,7 +579,13 @@ public actor SpiceAgentManager {
             await sendPendingDisplayConfiguration(using: session)
             await driveFileTransfers(using: session)
         case .disconnected:
-            pendingActions.removeAll(keepingCapacity: false)
+            await invalidateAgentWork()
+            guard ownsLifecycle(
+                session: session,
+                generation: lifecycleGeneration
+            ) else {
+                return
+            }
             displayCoordinator.disconnected()
             failAllFileTransfers(with: .agentUnavailable)
             emitActions(state.disconnected())
@@ -360,7 +625,10 @@ public actor SpiceAgentManager {
                 return
             }
             do {
-                guard let command = try VDAgentClipboardCodec.decode(wireMessage) else {
+                guard let command = try VDAgentClipboardCodec.decode(
+                    wireMessage,
+                    grabHasSerial: state.expectsPeerGrabSerial
+                ) else {
                     return
                 }
                 await execute(try state.receive(command), using: session)
@@ -412,16 +680,51 @@ public actor SpiceAgentManager {
                 return
             }
             let message = try VDAgentMonitorCodec.encode(wireConfiguration)
-            try await session.sendAgentMessage(SpiceAgentMessage(
-                protocolID: message.protocolID,
-                type: message.type,
-                opaque: message.opaque,
-                data: message.data
-            ))
-            displayCoordinator.didSend(configuration)
+            guard displayCoordinator.beginSend(configuration) else { return }
+            let generation = agentWorkGeneration
+            do {
+                try await sendOwnedAgentMessage(
+                    SpiceAgentMessage(
+                        protocolID: message.protocolID,
+                        type: message.type,
+                        opaque: message.opaque,
+                        data: message.data
+                    ),
+                    priority: .normal,
+                    requiredControl: false,
+                    using: session
+                )
+            } catch let error {
+                guard generation == agentWorkGeneration,
+                      displayCoordinator.inFlight == configuration else {
+                    return
+                }
+                switch Self.agentSendDisposition(error) {
+                case .retry:
+                    displayCoordinator.didFailSend(configuration, requeue: true)
+                    emitDisplay(.failed(configuration, .transport(error)))
+                case .failed:
+                    let cancelledBeforeWrite: Bool
+                    if case .agentCancelled(partial: false) = error {
+                        cancelledBeforeWrite = true
+                    } else if case .cancelled = error {
+                        cancelledBeforeWrite = true
+                    } else {
+                        cancelledBeforeWrite = false
+                    }
+                    displayCoordinator.didFailSend(
+                        configuration,
+                        requeue: !cancelledBeforeWrite
+                    )
+                    emitDisplay(.failed(configuration, .transport(error)))
+                }
+                return
+            }
+            guard generation == agentWorkGeneration,
+                  displayCoordinator.inFlight == configuration else {
+                return
+            }
             emitDisplay(.sent(configuration))
-        } catch let error as SpiceError {
-            emitDisplay(.failed(configuration, .transport(error)))
         } catch let error as SpiceDisplayConfigurationError {
             displayCoordinator.discardDesired()
             if error == .unsupportedByAgent {
@@ -446,12 +749,24 @@ public actor SpiceAgentManager {
         await driveFileTransfers(using: session)
     }
 
-    private func performPeriodicWork() async {
+    private func performPeriodicWork(lifecycleGeneration: UInt64) async {
+        guard lifecycleGeneration == self.lifecycleGeneration,
+              startingGeneration == nil,
+              session != nil else {
+            return
+        }
         if automaticallySynchronizesPasteboard, pasteboardSynchronizationEnabled {
             await synchronizePasteboard()
         } else {
             await retryPendingAgentWork()
         }
+    }
+
+    private func ownsLifecycle(
+        session: SpiceSession,
+        generation: UInt64
+    ) -> Bool {
+        lifecycleGeneration == generation && self.session === session
     }
 
     private func makeWireDisplayConfiguration(
@@ -551,8 +866,27 @@ public actor SpiceAgentManager {
                 ))
                 return
             }
+            if job.phase.isSending {
+                guard deferredFileTransferStatuses[id] == nil else {
+                    failFileTransfer(
+                        id,
+                        error: .invalidAgentResponse(
+                            "multiple statuses arrived while a wire message was in flight"
+                        )
+                    )
+                    return
+                }
+                deferredFileTransferStatuses[id] = status
+                return
+            }
             switch status.result {
             case .canSendData:
+                if job.cancellationRequested || job.phase.isCancellationPending {
+                    // A non-terminal approval racing with host cancellation is
+                    // stale.  Keep the job alive so its sole cancellation wire
+                    // owner can notify the guest.
+                    return
+                }
                 guard job.phase == .awaitingGuestApproval else {
                     failFileTransfer(
                         id,
@@ -567,7 +901,9 @@ public actor SpiceAgentManager {
                 removeFileTransfer(id)
                 emitFileTransfer(.cancelled(id: id))
             case .success:
-                guard job.phase == .awaitingCompletion else {
+                guard job.phase == .awaitingCompletion
+                    || (job.phase.isCancellationPending
+                        && job.sentBytes == job.totalBytes) else {
                     failFileTransfer(
                         id,
                         error: .invalidAgentResponse("SUCCESS before all bytes were sent")
@@ -610,10 +946,22 @@ public actor SpiceAgentManager {
     }
 
     private func driveFileTransfers(using session: SpiceSession) async {
-        guard pendingActions.isEmpty, state.isAgentConnected else {
+        guard fileTransferDriverGeneration == nil,
+              pendingActions.isEmpty,
+              clipboardInFlight == nil,
+              state.isAgentConnected else {
             return
         }
-        while true {
+        let driverGeneration = agentWorkGeneration
+        fileTransferDriverGeneration = driverGeneration
+        defer {
+            if fileTransferDriverGeneration == driverGeneration {
+                fileTransferDriverGeneration = nil
+            }
+        }
+
+        while fileTransferDriverGeneration == driverGeneration,
+              agentWorkGeneration == driverGeneration {
             var progressed = false
             for id in fileTransfers.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
                 guard var job = fileTransfers[id] else {
@@ -641,12 +989,30 @@ public actor SpiceAgentManager {
                         progressed = true
                         continue
                     }
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    job.phase = .sendingStart
+                    fileTransfers[id] = job
+                    guard await sendFileTransferMessage(
+                        message,
+                        priority: .normal,
+                        requiredControl: false,
+                        id: id,
+                        retryPhase: .queuedStart,
+                        using: session
+                    ) else {
                         return
                     }
-                    job.phase = .awaitingGuestApproval
-                    fileTransfers[id] = job
-                    emitFileTransfer(.awaitingGuestApproval(id: id))
+                    guard var current = fileTransfers[id], current.phase == .sendingStart else {
+                        progressed = true
+                        continue
+                    }
+                    current.phase = current.cancellationRequested
+                        ? .queuedCancellation
+                        : .awaitingGuestApproval
+                    fileTransfers[id] = current
+                    if !current.cancellationRequested {
+                        emitFileTransfer(.awaitingGuestApproval(id: id))
+                    }
+                    await processDeferredFileTransferStatus(id: id, using: session)
                     progressed = true
                 case .readyToRead:
                     let remaining = job.totalBytes - job.sentBytes
@@ -694,38 +1060,83 @@ public actor SpiceAgentManager {
                         progressed = true
                         continue
                     }
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    job.phase = .sendingData(data)
+                    fileTransfers[id] = job
+                    guard await sendFileTransferMessage(
+                        message,
+                        priority: .low,
+                        requiredControl: false,
+                        id: id,
+                        retryPhase: .readyToSend(data),
+                        using: session
+                    ) else {
                         return
                     }
-                    job.sentBytes += UInt64(data.count)
-                    job.phase = job.sentBytes == job.totalBytes
-                        ? .awaitingCompletion
-                        : .readyToRead
-                    fileTransfers[id] = job
+                    guard var current = fileTransfers[id],
+                          current.phase == .sendingData(data) else {
+                        progressed = true
+                        continue
+                    }
+                    current.sentBytes += UInt64(data.count)
+                    current.phase = current.cancellationRequested
+                        ? .queuedCancellation
+                        : current.sentBytes == current.totalBytes
+                            ? .awaitingCompletion
+                            : .readyToRead
+                    fileTransfers[id] = current
                     emitFileTransfer(.progress(
                         id: id,
-                        sentBytes: job.sentBytes,
-                        totalBytes: job.totalBytes
+                        sentBytes: current.sentBytes,
+                        totalBytes: current.totalBytes
                     ))
+                    await processDeferredFileTransferStatus(id: id, using: session)
                     progressed = true
                 case .queuedCancellation:
                     let message = fileTransferCodec.encodeStatus(
                         id: id.rawValue,
                         result: .cancelled
                     )
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    job.phase = .sendingCancellation
+                    fileTransfers[id] = job
+                    guard await sendFileTransferMessage(
+                        message,
+                        priority: .high,
+                        requiredControl: true,
+                        id: id,
+                        retryPhase: .queuedCancellation,
+                        using: session
+                    ) else {
                         return
                     }
-                    job.phase = .awaitingCancellation
-                    fileTransfers[id] = job
+                    guard var current = fileTransfers[id],
+                          current.phase == .sendingCancellation else {
+                        progressed = true
+                        continue
+                    }
+                    current.phase = .awaitingCancellation
+                    fileTransfers[id] = current
+                    await processDeferredFileTransferStatus(id: id, using: session)
                     progressed = true
                 case let .queuedFailure(error):
                     let message = fileTransferCodec.encodeStatus(
                         id: id.rawValue,
                         result: .error
                     )
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    job.phase = .sendingFailure(error)
+                    fileTransfers[id] = job
+                    guard await sendFileTransferMessage(
+                        message,
+                        priority: .high,
+                        requiredControl: true,
+                        id: id,
+                        retryPhase: .queuedFailure(error),
+                        using: session
+                    ) else {
                         return
+                    }
+                    guard fileTransfers[id]?.phase == .sendingFailure(error) else {
+                        progressed = true
+                        continue
                     }
                     removeFileTransfer(id)
                     emitFileTransfer(.failed(id: id, error))
@@ -733,7 +1144,11 @@ public actor SpiceAgentManager {
                 case .awaitingGuestApproval,
                      .reading,
                      .awaitingCompletion,
-                     .awaitingCancellation:
+                     .awaitingCancellation,
+                     .sendingStart,
+                     .sendingData,
+                     .sendingCancellation,
+                     .sendingFailure:
                     break
                 }
             }
@@ -745,19 +1160,57 @@ public actor SpiceAgentManager {
 
     private func sendFileTransferMessage(
         _ message: VDAgentMessage,
+        priority: AgentOutboundPriority,
+        requiredControl: Bool,
+        id: SpiceFileTransferID,
+        retryPhase: FileTransferPhase,
         using session: SpiceSession
     ) async -> Bool {
         do {
-            return try await session.sendAgentMessageIfTokensAvailable(SpiceAgentMessage(
-                protocolID: message.protocolID,
-                type: message.type,
-                opaque: message.opaque,
-                data: message.data
-            ))
+            try await sendOwnedAgentMessage(
+                SpiceAgentMessage(
+                    protocolID: message.protocolID,
+                    type: message.type,
+                    opaque: message.opaque,
+                    data: message.data
+                ),
+                priority: priority,
+                requiredControl: requiredControl,
+                using: session
+            )
+            completedFileTransferMessageCount = Self.addClamped(
+                completedFileTransferMessageCount,
+                1
+            )
+            completedFileTransferPayloadByteCount = Self.addClamped(
+                completedFileTransferPayloadByteCount,
+                UInt64(message.data.count)
+            )
+            return true
         } catch let error {
-            failAllFileTransfers(with: .transport(error))
-            return false
+            guard var job = fileTransfers[id], job.phase.isSending else {
+                return false
+            }
+            switch Self.agentSendDisposition(error) {
+            case .retry:
+                job.phase = retryPhase
+                fileTransfers[id] = job
+                return false
+            case .failed:
+                failAllFileTransfers(with: .transport(error))
+                return false
+            }
         }
+    }
+
+    private func processDeferredFileTransferStatus(
+        id: SpiceFileTransferID,
+        using session: SpiceSession
+    ) async {
+        guard let status = deferredFileTransferStatuses.removeValue(forKey: id) else {
+            return
+        }
+        await receiveFileTransfer(.status(status), using: session)
     }
 
     private func failFileTransfer(
@@ -771,6 +1224,7 @@ public actor SpiceAgentManager {
     private func failAllFileTransfers(with error: SpiceFileTransferError) {
         let ids = fileTransfers.keys.sorted(by: { $0.rawValue < $1.rawValue })
         fileTransfers.removeAll(keepingCapacity: false)
+        deferredFileTransferStatuses.removeAll(keepingCapacity: false)
         let readers = fileTransferReaders.values
         fileTransferReaders.removeAll(keepingCapacity: false)
         for reader in readers {
@@ -784,6 +1238,7 @@ public actor SpiceAgentManager {
     private func cancelAllFileTransfers() {
         let ids = fileTransfers.keys.sorted(by: { $0.rawValue < $1.rawValue })
         fileTransfers.removeAll(keepingCapacity: false)
+        deferredFileTransferStatuses.removeAll(keepingCapacity: false)
         let readers = fileTransferReaders.values
         fileTransferReaders.removeAll(keepingCapacity: false)
         for reader in readers {
@@ -858,6 +1313,7 @@ public actor SpiceAgentManager {
 
     private func removeFileTransfer(_ id: SpiceFileTransferID) {
         fileTransfers.removeValue(forKey: id)
+        deferredFileTransferStatuses.removeValue(forKey: id)
         fileTransferReaders.removeValue(forKey: id)?.close()
     }
 
@@ -865,57 +1321,481 @@ public actor SpiceAgentManager {
         _ actions: [ClipboardStateMachine.Action],
         using session: SpiceSession
     ) async {
-        var work = pendingActions
-        pendingActions.removeAll(keepingCapacity: true)
-        for action in actions where !work.contains(action) {
-            work.append(action)
+        preflightManualOfferActions(actions)
+        for action in actions
+        where clipboardInFlight?.action != action && !pendingActions.contains(action) {
+            pendingActions.append(action)
+        }
+        guard clipboardDriverGeneration == nil else { return }
+        let driverGeneration = agentWorkGeneration
+        clipboardDriverGeneration = driverGeneration
+        defer {
+            if clipboardDriverGeneration == driverGeneration {
+                clipboardDriverGeneration = nil
+            }
         }
 
-        for (index, action) in work.enumerated() {
+        while clipboardDriverGeneration == driverGeneration,
+              agentWorkGeneration == driverGeneration,
+              !pendingActions.isEmpty {
+            let action = pendingActions.removeFirst()
+            let owner = ClipboardActionOwner(
+                id: allocateClipboardOwnerID(),
+                generation: agentWorkGeneration,
+                action: action
+            )
+            clipboardInFlight = owner
             switch action {
-            case let .send(command):
+            case .send, .manualOffer(.sendGrab), .manualOffer(.sendData):
+                let command: VDAgentClipboardCommand
+                switch action {
+                case let .send(value):
+                    command = value
+                case let .manualOffer(.sendData(value, _, _)):
+                    command = value
+                case let .manualOffer(.sendGrab(value, _, _)):
+                    command = value
+                case .manualOffer(.emit), .writeGuestText, .emit:
+                    preconditionFailure("non-send clipboard action")
+                }
+                let message: VDAgentMessage
                 do {
-                    let message = try VDAgentClipboardCodec.encode(command)
-                    try await session.sendAgentMessage(SpiceAgentMessage(
-                        protocolID: message.protocolID,
-                        type: message.type,
-                        opaque: message.opaque,
-                        data: message.data
-                    ))
-                    state.didSend(command)
-                } catch let error as SpiceError {
-                    pendingActions = Array(work[index...])
-                    emit(.failed(.transport(error)))
-                    return
+                    message = try VDAgentClipboardCodec.encode(command)
                 } catch {
-                    emit(.failed(.invalidAgentMessage(String(describing: error))))
-                    return
+                    clearClipboardOwner(owner)
+                    let clipboardError = SpiceClipboardError.invalidAgentMessage(
+                        String(describing: error)
+                    )
+                    failManualGrabIfPresent(action, error: clipboardError)
+                    emit(.failed(clipboardError))
+                    continue
+                }
+                let policy = Self.clipboardSendPolicy(command)
+                do {
+                    try await sendOwnedAgentMessage(
+                        SpiceAgentMessage(
+                            protocolID: message.protocolID,
+                            type: message.type,
+                            opaque: message.opaque,
+                            data: message.data
+                        ),
+                        priority: policy.priority,
+                        requiredControl: policy.requiredControl,
+                        using: session
+                    )
+                } catch let error {
+                    guard ownsClipboardAction(owner) else { continue }
+                    switch Self.agentSendDisposition(error) {
+                    case .retry:
+                        clearClipboardOwner(owner)
+                        if let id = manualGrabID(for: action),
+                           invalidatedManualGrabIDs.remove(id) != nil {
+                            return
+                        }
+                        if !pendingActions.contains(action) {
+                            pendingActions.insert(action, at: 0)
+                        }
+                        emit(.failed(.transport(error)))
+                        return
+                    case .failed:
+                        clearClipboardOwner(owner)
+                        let wasInvalidated: Bool
+                        if let id = manualGrabID(for: action) {
+                            wasInvalidated = invalidatedManualGrabIDs.remove(id) != nil
+                        } else {
+                            wasInvalidated = false
+                        }
+                        if !wasInvalidated {
+                            failManualGrabIfPresent(action, error: .transport(error))
+                        }
+                        emit(.failed(.transport(error)))
+                        return
+                    }
+                }
+                guard ownsClipboardAction(owner) else { continue }
+                state.didSend(command)
+                clearClipboardOwner(owner)
+                switch action {
+                case let .manualOffer(.sendGrab(_, id, _)):
+                    if invalidatedManualGrabIDs.remove(id) == nil {
+                        finishManualGrab(id: id, result: .success(()))
+                    }
+                case let .manualOffer(.sendData(_, id, leaseGeneration)):
+                    let followups = state.didSendManualOfferData(
+                        id: id,
+                        leaseGeneration: leaseGeneration
+                    )
+                    pendingActions.insert(contentsOf: followups, at: 0)
+                case .send, .manualOffer(.emit), .writeGuestText, .emit:
+                    break
                 }
             case let .writeGuestText(text):
                 do {
                     let snapshot = try await SpicePasteboardBridge.write(text: text)
+                    guard ownsClipboardAction(owner) else { continue }
                     state.didWriteGuestText(changeCount: snapshot.changeCount)
+                    clearClipboardOwner(owner)
                 } catch {
-                    pendingActions = Array(work[index...])
+                    guard ownsClipboardAction(owner) else { continue }
+                    clearClipboardOwner(owner)
+                    if !pendingActions.contains(action) {
+                        pendingActions.insert(action, at: 0)
+                    }
                     emit(.failed(error))
                     return
                 }
             case let .emit(event):
+                guard ownsClipboardAction(owner) else { continue }
                 emit(event)
+                clearClipboardOwner(owner)
+            case let .manualOffer(.emit(event)):
+                guard ownsClipboardAction(owner) else { continue }
+                emitManualOffer(event)
+                clearClipboardOwner(owner)
             }
         }
     }
 
-    private func emitActions(_ actions: [ClipboardStateMachine.Action]) {
+    package enum AgentSendDisposition: Sendable, Equatable {
+        case retry
+        case failed
+    }
+
+    package nonisolated static func agentSendDisposition(
+        _ error: SpiceError
+    ) -> AgentSendDisposition {
+        switch error {
+        case .agentQueueFull,
+             .agentMigrationRebind(partial: false):
+            .retry
+        case .agentCancelled,
+             .alreadyConnected,
+             .agentDisconnected,
+             .inputGenerationExpired,
+             .agentMessageFailed,
+             .agentMigrationRebind(partial: true),
+             .agentStalled,
+             .cancelled,
+             .connectionFailed,
+             .authenticationFailed,
+             .protocolError:
+            .failed
+        }
+    }
+
+    /// Semantic managers own a logical Agent message until its scheduler
+    /// request reaches a real terminal state.  Caller cancellation must not
+    /// detach that ownership after a partial physical write and advance the
+    /// clipboard/file state machine early.
+    private func sendOwnedAgentMessage(
+        _ message: SpiceAgentMessage,
+        priority: AgentOutboundPriority,
+        requiredControl: Bool,
+        using session: SpiceSession
+    ) async throws(SpiceError) {
+        guard let epoch = currentAgentWorkEpoch(using: session) else {
+            throw .cancelled
+        }
+        let ownerID = allocateOwnedAgentSendID()
+        let owner: Task<Result<Void, SpiceError>, Never> = Task.detached {
+            guard !Task.isCancelled else {
+                return .failure(.cancelled)
+            }
+            do {
+                try await session.sendAgentMessageJoiningPhysicalTerminal(
+                    message,
+                    priority: priority,
+                    requiredControl: requiredControl
+                )
+                return Result<Void, SpiceError>.success(())
+            } catch let error as SpiceError {
+                return .failure(error)
+            } catch {
+                return .failure(.protocolError(String(describing: error)))
+            }
+        }
+        ownedAgentSends[ownerID] = OwnedAgentSend(epoch: epoch, task: owner)
+        let result = await owner.value
+        ownedAgentSends.removeValue(forKey: ownerID)
+        guard ownsAgentWork(epoch, using: session) else {
+            throw .cancelled
+        }
+        switch result {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
+        }
+    }
+
+    private static func clipboardSendPolicy(
+        _ command: VDAgentClipboardCommand
+    ) -> (priority: AgentOutboundPriority, requiredControl: Bool) {
+        switch command {
+        case .announceCapabilities(requestReply: false, _),
+             .data,
+             .release:
+            (.high, true)
+        case .announceCapabilities(requestReply: true, _),
+             .grab,
+             .serialGrab,
+             .maxClipboard,
+             .request:
+            (.normal, false)
+        }
+    }
+
+    private func allocateClipboardOwnerID() -> UInt64 {
+        let id = nextClipboardOwnerID
+        nextClipboardOwnerID &+= 1
+        if nextClipboardOwnerID == 0 { nextClipboardOwnerID = 1 }
+        return id
+    }
+
+    private func allocateManualOfferID() -> SpiceClipboardOfferID {
+        let id = SpiceClipboardOfferID(rawValue: nextManualOfferID)
+        nextManualOfferID &+= 1
+        if nextManualOfferID == 0 { nextManualOfferID = 1 }
+        return id
+    }
+
+    private func waitForManualGrab(id: SpiceClipboardOfferID) async throws {
+        if let result = manualGrabResults.removeValue(forKey: id) {
+            return try result.get()
+        }
+        let result = await withCheckedContinuation { continuation in
+            manualGrabWaiters[id] = continuation
+        }
+        try result.get()
+    }
+
+    private func cancelManualClipboardOffer(
+        id: SpiceClipboardOfferID,
+        leaseGeneration: UInt64
+    ) async {
+        finishManualGrab(id: id, result: .failure(.transport(.cancelled)))
+        let actions = state.revokeManualOffer(
+            id: id,
+            leaseGeneration: leaseGeneration
+        )
+        guard let session else {
+            emitActions(actions)
+            return
+        }
+        await execute(actions, using: session)
+    }
+
+    private func finishManualGrab(
+        id: SpiceClipboardOfferID,
+        result: Result<Void, SpiceClipboardError>
+    ) {
+        guard manualGrabResults[id] == nil else { return }
+        if let waiter = manualGrabWaiters.removeValue(forKey: id) {
+            waiter.resume(returning: result)
+        } else {
+            manualGrabResults[id] = result
+        }
+    }
+
+    private func failManualGrabIfPresent(
+        _ action: ClipboardStateMachine.Action,
+        error: SpiceClipboardError
+    ) {
+        guard case let .manualOffer(.sendGrab(_, id, _)) = action else { return }
+        finishManualGrab(id: id, result: .failure(error))
+    }
+
+    private func manualGrabID(
+        for action: ClipboardStateMachine.Action
+    ) -> SpiceClipboardOfferID? {
+        guard case let .manualOffer(.sendGrab(_, id, _)) = action else { return nil }
+        return id
+    }
+
+    private func preflightManualOfferActions(
+        _ actions: [ClipboardStateMachine.Action]
+    ) {
         for action in actions {
-            if case let .emit(event) = action {
+            guard case let .manualOffer(.emit(event)) = action,
+                  event.result == .superseded || event.result == .revoked else {
+                continue
+            }
+            var removedPendingGrab = false
+            pendingActions.removeAll { pending in
+                switch pending {
+                case let .manualOffer(.sendGrab(_, id, _)):
+                    if id == event.id {
+                        removedPendingGrab = true
+                        return true
+                    }
+                    return false
+                case let .manualOffer(.sendData(_, id, _)):
+                    return id == event.id
+                case .send, .manualOffer(.emit), .writeGuestText, .emit:
+                    return false
+                }
+            }
+            let invalidatesInFlight = clipboardInFlight.map {
+                manualGrabID(for: $0.action) == event.id
+            } ?? false
+            if invalidatesInFlight {
+                invalidatedManualGrabIDs.insert(event.id)
+            }
+            if removedPendingGrab || invalidatesInFlight {
+                finishManualGrab(
+                    id: event.id,
+                    result: .failure(.invalidAgentMessage(
+                        "manual clipboard offer ended before GRAB: \(event.result)"
+                    ))
+                )
+            }
+        }
+    }
+
+    private func allocateOwnedAgentSendID() -> UInt64 {
+        let id = nextOwnedAgentSendID
+        nextOwnedAgentSendID &+= 1
+        if nextOwnedAgentSendID == 0 { nextOwnedAgentSendID = 1 }
+        return id
+    }
+
+    private func currentAgentWorkEpoch(using session: SpiceSession) -> AgentWorkEpoch? {
+        guard agentWorkInvalidationGeneration == nil,
+              self.session === session else {
+            return nil
+        }
+        return AgentWorkEpoch(
+            lifecycleGeneration: lifecycleGeneration,
+            agentWorkGeneration: agentWorkGeneration,
+            sessionID: ObjectIdentifier(session)
+        )
+    }
+
+    private func ownsAgentWork(
+        _ epoch: AgentWorkEpoch,
+        using session: SpiceSession
+    ) -> Bool {
+        agentWorkInvalidationGeneration == nil
+            && self.session === session
+            && epoch.lifecycleGeneration == lifecycleGeneration
+            && epoch.agentWorkGeneration == agentWorkGeneration
+            && epoch.sessionID == ObjectIdentifier(session)
+    }
+
+    private func ownsClipboardAction(_ owner: ClipboardActionOwner) -> Bool {
+        clipboardInFlight == owner && owner.generation == agentWorkGeneration
+    }
+
+    private func clearClipboardOwner(_ owner: ClipboardActionOwner) {
+        if clipboardInFlight == owner {
+            clipboardInFlight = nil
+        }
+    }
+
+    private struct AgentWorkInvalidation {
+        let generation: UInt64
+        let owners: [(id: UInt64, task: Task<Result<Void, SpiceError>, Never>)]
+    }
+
+    private func beginAgentWorkInvalidation() -> AgentWorkInvalidation {
+        agentWorkGeneration &+= 1
+        let generation = agentWorkGeneration
+        agentWorkInvalidationGeneration = generation
+        agentWorkInvalidationSequence &+= 1
+        var pendingWaiters: [AgentWorkInvalidationWaiter] = []
+        for waiter in agentWorkInvalidationWaiters {
+            if waiter.observedSequence == agentWorkInvalidationSequence {
+                pendingWaiters.append(waiter)
+            } else {
+                waiter.continuation.resume()
+            }
+        }
+        agentWorkInvalidationWaiters = pendingWaiters
+        var invalidatedGrabIDs = Set(pendingActions.compactMap(manualGrabID))
+        if let clipboardInFlight,
+           let id = manualGrabID(for: clipboardInFlight.action) {
+            invalidatedGrabIDs.insert(id)
+        }
+        for id in invalidatedGrabIDs {
+            finishManualGrab(id: id, result: .failure(.transport(.cancelled)))
+        }
+        invalidatedManualGrabIDs.subtract(invalidatedGrabIDs)
+        pendingActions.removeAll(keepingCapacity: false)
+        clipboardInFlight = nil
+        clipboardDriverGeneration = nil
+        fileTransferDriverGeneration = nil
+        let owners = ownedAgentSends.map { (id: $0.key, task: $0.value.task) }
+        for owner in owners {
+            owner.task.cancel()
+        }
+        return AgentWorkInvalidation(generation: generation, owners: owners)
+    }
+
+    private func finishAgentWorkInvalidation(
+        _ invalidation: AgentWorkInvalidation
+    ) async {
+        for owner in invalidation.owners {
+            _ = await owner.task.value
+            ownedAgentSends.removeValue(forKey: owner.id)
+        }
+        if agentWorkInvalidationGeneration == invalidation.generation {
+            agentWorkInvalidationGeneration = nil
+        }
+    }
+
+    private func invalidateAgentWork() async {
+        let invalidation = beginAgentWorkInvalidation()
+        await finishAgentWorkInvalidation(invalidation)
+    }
+
+    package func ownedAgentSendCountForTesting() -> Int {
+        ownedAgentSends.count
+    }
+
+    package func agentWorkInvalidationSequenceForTesting() -> UInt64 {
+        agentWorkInvalidationSequence
+    }
+
+    package func waitUntilAgentWorkInvalidatesForTesting(
+        after observedSequence: UInt64
+    ) async {
+        guard agentWorkInvalidationSequence == observedSequence else { return }
+        await withCheckedContinuation { continuation in
+            agentWorkInvalidationWaiters.append(AgentWorkInvalidationWaiter(
+                observedSequence: observedSequence,
+                continuation: continuation
+            ))
+        }
+    }
+
+    private func emitActions(_ actions: [ClipboardStateMachine.Action]) {
+        preflightManualOfferActions(actions)
+        for action in actions {
+            switch action {
+            case let .emit(event):
                 emit(event)
+            case let .manualOffer(.emit(event)):
+                emitManualOffer(event)
+            case .send, .manualOffer(.sendGrab), .manualOffer(.sendData), .writeGuestText:
+                break
             }
         }
     }
 
     private func emit(_ event: SpiceClipboardEvent) {
         _ = eventContinuation.yield(event)
+    }
+
+    private func emitManualOffer(_ event: SpiceClipboardOfferEvent) {
+        if manualOfferResults[event.id] == nil {
+            if manualOfferResultOrder.count == Self.manualOfferResultCapacity {
+                let evicted = manualOfferResultOrder.removeFirst()
+                manualOfferResults.removeValue(forKey: evicted)
+            }
+            manualOfferResultOrder.append(event.id)
+        }
+        manualOfferResults[event.id] = event.result
+        _ = manualOfferContinuation.yield(event)
     }
 
     private func emitDisplay(_ event: SpiceDisplayConfigurationEvent) {
@@ -931,6 +1811,11 @@ public actor SpiceAgentManager {
 
     private func emitFileTransfer(_ event: SpiceFileTransferEvent) {
         _ = fileTransferContinuation.yield(event)
+    }
+
+    private static func addClamped(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : sum
     }
 }
 

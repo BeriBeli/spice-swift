@@ -157,7 +157,22 @@ Agent behavior, including system-trusted TLS.
 - `SpiceDesktopView` is a thin `NSViewRepresentable` around one private AppKit
   framebuffer view. It performs aspect-fit BGRA drawing, alpha-cursor overlay,
   first-responder handling, physical macOS-keycode to PC-XT mapping, relative
-  or absolute pointer input, buttons, and scroll-wheel events.
+  or absolute pointer input, buttons, and scroll-wheel events. The mapping is
+  now the shared public `SpicePhysicalKey`/`SpiceKeyMap` authority used by the
+  AppKit bridge and external application commands; it distinguishes left/right
+  modifiers, main/keypad Enter, navigation, and E0 extended keys. The raw
+  scan-code input API remains available for compatibility. The opt-in
+  `SpiceDesktopView.sourceAware` path additionally labels real local events as
+  `humanActivity` and synthetic key/button releases as `focusCleanup`; window
+  resignation, close, responder loss, and dismantle produce deterministic
+  human-only cleanup without creating a second activity signal. The original
+  `onInput` initializer and public callback property remain source compatible.
+  `spice-probe --appkit-input-focus-gate` is a no-network host gate that runs
+  the production SwiftUI/AppKit bridge in its own `NSApplication`: the probe
+  requires a real key window, holds one human mouse button and physical key,
+  resigns the window, and verifies two ordered `focusCleanup` releases. Keeping
+  the AppKit event loop in a standalone process avoids polluting SwiftPM's
+  parallel graphical test runner.
 
 Inputs transports physical key transitions, not Unicode text or IME
 composition. The AppKit bridge draws the supported alpha cursor as a remote
@@ -834,6 +849,12 @@ such by an embedding application.
   only after every source child Channel is authenticated and constructed;
   preparation failure or cancellation closes only those target transports and
   leaves source supervision running.
+- Every asynchronous prepare, commit, switch, and inline seamless adoption
+  claims a monotonic `{offerID, operationID}` owner. Completion and recoverable
+  failure callbacks may advance coordinator state or clear the task slot only
+  while that exact owner is current; a stale callback can never detach or
+  cancel its successor. A newer offer, CANCEL, and teardown invalidate the old
+  operation identity before starting or releasing anything else.
 - Semi-seamless END first writes client MIGRATE_END to the prepared target, then
   atomically replaces the Main/child Channel set and starts its supervision
   before closing the source set. A dual-session fixture proves that subsequent

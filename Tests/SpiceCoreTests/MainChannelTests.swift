@@ -1,5 +1,7 @@
 import Foundation
 import SpiceTestSupport
+import SpiceTransport
+import Synchronization
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
@@ -195,17 +197,627 @@ struct MainChannelTests {
             type: 6,
             data: Data(repeating: 0xa5, count: 3_000)
         ))
-        await #expect(throws: ChannelError.protocolViolation(
-            "agent message needs 1 tokens but only 0 are available"
-        )) {
-            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data()))
-        }
+        #expect(try await channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data())
+        ) == false)
 
         let outbound = await transport.outbound
         #expect(try outbound.map(decodeMiniMessageID) == [106, 104, 107, 107])
         #expect(try decodeMiniBody(outbound[0]) == uint32(8))
         #expect(try decodeMiniBody(outbound[2]).count == 2_048)
         #expect(try decodeMiniBody(outbound[3]).count == 972)
+    }
+
+    @Test func reservesTokenBeforeSuspendingTransportWrite() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = BlockingAgentWriteTransport(
+            inbound: inbound.map(Result.success)
+        )
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await transport.setBlocksAgentWrites(true)
+
+        let first = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+        #expect(await eventually { await transport.blockedAgentWriteCount == 1 })
+
+        #expect(try await channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([2]))
+        ) == false)
+
+        await transport.releaseAgentWrites()
+        try await first.value
+        #expect(await transport.agentWriteCount == 1)
+    }
+
+    @Test func cancellationBeforeFirstFragmentRemovesWireOwnership() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: ManualAgentOutboundClock()
+        )
+        _ = try await channel.bootstrap()
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 1 })
+        send.cancel()
+        await #expect(throws: ChannelError.agentCancelled(partial: false)) {
+            try await send.value
+        }
+        #expect(await channel.pendingAgentMessageCount() == 0)
+        #expect(await transport.agentWriteCount == 0)
+    }
+
+    @Test func cancellationAfterWriteStartsDetachesCallerAndFinishesMessage() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 2,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = BlockingAgentWriteTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await transport.setBlocksAgentWrites(true)
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 3,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        #expect(await eventually { await transport.blockedAgentWriteCount == 1 })
+        send.cancel()
+        await #expect(throws: ChannelError.agentCancelled(partial: true)) {
+            try await send.value
+        }
+
+        await transport.releaseAgentWrites()
+        #expect(await eventually { await transport.agentWriteCount == 2 })
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 0 })
+        #expect(await transport.isClosed == false)
+    }
+
+    @Test func hardMessageBoundRejectsNinthBeforeRetainingPayload() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: ManualAgentOutboundClock()
+        )
+        _ = try await channel.bootstrap()
+
+        let accepted = (0..<8).map { value in
+            Task {
+                try await channel.sendAgentMessage(VDAgentMessage(
+                    type: 3,
+                    data: Data([UInt8(value)])
+                ))
+            }
+        }
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 8 })
+        await #expect(throws: ChannelError.agentQueueFull) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([9])))
+        }
+        #expect(await channel.pendingAgentMessageCount() == 8)
+        for task in accepted { task.cancel() }
+        for task in accepted {
+            await #expect(throws: ChannelError.agentCancelled(partial: false)) {
+                try await task.value
+            }
+        }
+    }
+
+    @Test func writeFailureClassifiesBeforeFirstAndAfterPartial() async throws {
+        for (failureAttempt, expectedPartial) in [(1, false), (2, true)] {
+            let inbound = try [
+                encodeMiniServerMessage(SpiceMsgMainInit(
+                    sessionID: 42,
+                    displayChannelsHint: 0,
+                    supportedMouseModes: 3,
+                    currentMouseMode: 2,
+                    agentConnected: 1,
+                    agentTokens: 2,
+                    multimediaTime: 100,
+                    ramHint: 0
+                )),
+                encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            ]
+            let transport = BlockingAgentWriteTransport(
+                inbound: inbound.map(Result.success),
+                failingAgentWriteAttempt: failureAttempt
+            )
+            try await transport.connect()
+            let channel = MainChannel(connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ))
+            _ = try await channel.bootstrap()
+
+            await #expect(throws: ChannelError.agentMessageFailed(
+                partial: expectedPartial
+            )) {
+                try await channel.sendAgentMessage(VDAgentMessage(
+                    type: 3,
+                    data: Data(repeating: 0xa5, count: 3_000)
+                ))
+            }
+            #expect(await transport.isClosed)
+        }
+    }
+
+    @Test func abortedMigrationPreparationRestoresSourceAdmission() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+
+        try await channel.prepareAgentForMigrationRebind()
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: false)) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+        await channel.abortAgentMigrationRebind()
+        try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([2])))
+        #expect(await transport.agentWriteCount == 1)
+    }
+
+    @Test func migrationDeadlinePoisonsPartialGenerationAfterThreeSeconds() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = BlockingAgentWriteTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let clock = ManualAgentOutboundClock()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: clock
+        )
+        _ = try await channel.bootstrap()
+        await transport.setBlocksAgentWrites(true)
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+        #expect(await eventually { await transport.blockedAgentWriteCount == 1 })
+        let migration = Task {
+            try await channel.prepareAgentForMigrationRebind()
+        }
+        #expect(await eventually { await clock.waiterCount >= 2 })
+        await clock.fire(duration: .seconds(3))
+
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: true)) {
+            try await migration.value
+        }
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: true)) {
+            try await send.value
+        }
+        #expect(await transport.isClosed)
+    }
+
+    @Test func migrationDrainsStartedMessageAndRejectsQueuedOwner() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 3,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let source = BlockingAgentWriteTransport(inbound: inbound.map(Result.success))
+        try await source.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await source.setBlocksAgentWrites(true)
+
+        let active = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 3,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        #expect(await eventually { await source.blockedAgentWriteCount == 1 })
+        let queued = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([2])))
+        }
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 2 })
+        let migration = Task {
+            try await channel.prepareAgentForMigrationRebind()
+        }
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: false)) {
+            try await queued.value
+        }
+
+        await source.releaseAgentWrites()
+        try await active.value
+        try await migration.value
+
+        let target = FakeTransport()
+        try await target.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: target,
+            headerMode: .mini
+        ))
+        await #expect(throws: ChannelError.agentMigrationRebind(partial: false)) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
+        }
+        #expect(await target.agentWriteCount == 0)
+        try await channel.commitAgentMigrationRebind()
+        try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
+        #expect(await target.agentWriteCount == 1)
+    }
+
+    @Test func migrationRollbackPreservesSourceAgentTokensAndPartialDecoder() async throws {
+        let message = VDAgentMessage(
+            type: VDAgentMessageType.clipboard.rawValue,
+            data: Data(repeating: 0xa5, count: 3_000)
+        )
+        let fragments = try VDAgentWireEncoder.fragments(for: message)
+        #expect(fragments.count == 2)
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            encodeMiniServerMessage(id: SpiceMainAgentWire.serverData, body: fragments[0]),
+            encodeMiniServerMessage(id: 1, body: uint32(1)),
+            encodeMiniServerMessage(id: SpiceMainAgentWire.serverData, body: fragments[1]),
+        ]
+        let source = FakeTransport(inbound: inbound.map(Result.success))
+        try await source.connect()
+        let sourceConnection = ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        )
+        let channel = MainChannel(connection: sourceConnection)
+        _ = try await channel.bootstrap()
+
+        do {
+            try await channel.run { _ in }
+            Issue.record("source did not stop at its migration boundary")
+        } catch let error {
+            guard case .migrationRequested = error else {
+                Issue.record("unexpected source error: \(error)")
+                return
+            }
+        }
+
+        try await channel.prepareAgentForMigrationRebind()
+        let target = FakeTransport()
+        try await target.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: target,
+            headerMode: .mini
+        ))
+        _ = try await channel.replaceConnection(with: sourceConnection)
+        await sourceConnection.resumeAfterMigrationCancellation()
+        #expect(await channel.abortAgentMigrationRebind())
+
+        let received = Mutex<[VDAgentMessage]>([])
+        do {
+            try await channel.run { event in
+                if case let .main(.agentMessage(message)) = event {
+                    received.withLock { $0.append(message) }
+                }
+            }
+        } catch let error {
+            guard error == .transport(.connectionClosed) else {
+                Issue.record("unexpected resumed-source error: \(error)")
+                return
+            }
+        }
+        #expect(received.withLock { $0 } == [message])
+
+        try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([7])))
+        #expect(await source.agentWriteCount == 1)
+        #expect(await target.agentWriteCount == 0)
+    }
+
+    @Test func reconnectDuringOutstandingOldGenerationWriteFailsClosed() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            encodeMiniServerMessage(id: SpiceMainAgentWire.serverDisconnected, body: uint32(9)),
+            encodeMiniServerMessage(id: SpiceMainAgentWire.serverConnectedTokens, body: uint32(1)),
+        ]
+        let transport = BlockingAgentWriteTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await transport.setBlocksAgentWrites(true)
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+        #expect(await eventually { await transport.blockedAgentWriteCount == 1 })
+        await #expect(throws: ChannelError.protocolViolation(
+            "agent reconnected while a previous generation write was still in flight"
+        )) {
+            try await channel.run { _ in }
+        }
+        await #expect(throws: ChannelError.agentDisconnected) {
+            try await send.value
+        }
+        await channel.close()
+        #expect(await transport.isClosed)
+    }
+
+    @Test func replenishedTokenResumesSameLogicalMessage() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            encodeMiniServerMessage(id: 110, body: uint32(1)),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let clock = ManualAgentOutboundClock()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: clock
+        )
+        _ = try await channel.bootstrap()
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 6,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        #expect(await eventually { await transport.agentWriteCount == 1 })
+
+        let run = Task {
+            try await channel.run { _ in }
+        }
+        try await send.value
+        _ = try? await run.value
+        #expect(await transport.agentWriteCount == 2)
+    }
+
+    @Test func partialNoProgressPoisonsGenerationAndFailsEveryWaiter() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let clock = ManualAgentOutboundClock()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: clock
+        )
+        _ = try await channel.bootstrap()
+
+        let partial = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 6,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        #expect(await eventually { await transport.agentWriteCount == 1 })
+        let queued = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([2])))
+        }
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 2 })
+        #expect(await eventually { await clock.waiterCount > 0 })
+
+        await clock.fireAll()
+
+        await #expect(throws: ChannelError.agentStalled(partial: true)) {
+            try await partial.value
+        }
+        await #expect(throws: ChannelError.agentStalled(partial: false)) {
+            try await queued.value
+        }
+        #expect(await transport.isClosed)
+        #expect(await transport.agentWriteCount == 1)
+        await #expect(throws: ChannelError.agentDisconnected) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
+        }
+    }
+
+    @Test func noProgressBeforeFirstFragmentAlsoPoisonsAndFailsEveryWaiter() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let clock = ManualAgentOutboundClock()
+        let channel = MainChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 1, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            agentClock: clock
+        )
+        _ = try await channel.bootstrap()
+
+        let active = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 6, data: Data([1])))
+        }
+        let queued = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([2])))
+        }
+        #expect(await eventually { await channel.pendingAgentMessageCount() == 2 })
+        #expect(await eventually { await clock.waiterCount > 0 })
+        #expect(await transport.agentWriteCount == 0)
+
+        await clock.fireAll()
+
+        await #expect(throws: ChannelError.agentStalled(partial: false)) {
+            try await active.value
+        }
+        await #expect(throws: ChannelError.agentStalled(partial: false)) {
+            try await queued.value
+        }
+        #expect(await transport.isClosed)
+        #expect(await transport.agentWriteCount == 0)
     }
 
     @Test func rebindingPreservesAgentConnectionAndTokenState() async throws {
@@ -241,11 +853,9 @@ struct MainChannelTests {
         try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([2])))
 
         #expect(try (await target.outbound).map(decodeMiniMessageID) == [107])
-        await #expect(throws: ChannelError.protocolViolation(
-            "agent message needs 1 tokens but only 0 are available"
-        )) {
-            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
-        }
+        #expect(try await channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([3]))
+        ) == false)
     }
 
     @Test func reassemblesRuntimeAgentStreamAndReplenishesEveryPacket() async throws {
@@ -581,6 +1191,174 @@ private actor MainEventCollector {
 
     func append(_ event: MainEvent) {
         events.append(event)
+    }
+}
+
+private func eventually(
+    _ condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    for _ in 0..<10_000 {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return false
+}
+
+private actor ManualAgentOutboundClock: AgentOutboundClock {
+    private struct Waiter {
+        let duration: Duration
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var nextID: UInt64 = 1
+    private var waiters: [UInt64: Waiter] = [:]
+
+    var waiterCount: Int {
+        waiters.count
+    }
+
+    func sleep(for duration: Duration) async throws {
+        let id = nextID
+        nextID &+= 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiters[id] = Waiter(
+                    duration: duration,
+                    continuation: continuation
+                )
+            }
+            try Task.checkCancellation()
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+    }
+
+    func fireAll() {
+        let current = waiters.values.map(\.continuation)
+        waiters.removeAll(keepingCapacity: false)
+        for waiter in current {
+            waiter.resume()
+        }
+    }
+
+    func fire(duration: Duration) {
+        let ids = waiters.compactMap { id, waiter in
+            waiter.duration == duration ? id : nil
+        }
+        let current = ids.compactMap { waiters.removeValue(forKey: $0)?.continuation }
+        for waiter in current {
+            waiter.resume()
+        }
+    }
+
+    private func cancel(id: UInt64) {
+        waiters.removeValue(forKey: id)?.continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+}
+
+private actor BlockingAgentWriteTransport: SpiceTransport {
+    private var inbound: [Result<Data, TransportError>]
+    private var outbound: [Data] = []
+    private var blocksAgentWrites = false
+    private let failingAgentWriteAttempt: Int?
+    private var agentWriteAttempts = 0
+    private var writeWaiters: [CheckedContinuation<Void, Error>] = []
+    private(set) var blockedAgentWriteCount = 0
+    private(set) var isConnected = false
+    private(set) var isClosed = false
+
+    init(
+        inbound: [Result<Data, TransportError>],
+        failingAgentWriteAttempt: Int? = nil
+    ) {
+        self.inbound = inbound
+        self.failingAgentWriteAttempt = failingAgentWriteAttempt
+    }
+
+    var agentWriteCount: Int {
+        outbound.filter(Self.isAgentData).count
+    }
+
+    func connect() async throws(TransportError) {
+        guard !isClosed else { throw .connectionClosed }
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected, !isClosed else { throw .connectionClosed }
+        guard minimum >= 0, maximum >= minimum else {
+            throw .connectionFailed("invalid read bounds")
+        }
+        guard !inbound.isEmpty else { throw .connectionClosed }
+        let data = try inbound.removeFirst().get()
+        guard data.count <= maximum else {
+            throw .connectionFailed("fixture exceeds requested maximum")
+        }
+        return data
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected, !isClosed else { throw .connectionClosed }
+        let payload = data
+        if Self.isAgentData(payload) {
+            agentWriteAttempts += 1
+            if agentWriteAttempts == failingAgentWriteAttempt {
+                throw .connectionFailed("injected Agent write failure")
+            }
+        }
+        if blocksAgentWrites, Self.isAgentData(payload) {
+            blockedAgentWriteCount += 1
+            do {
+                try await withCheckedThrowingContinuation { continuation in
+                    writeWaiters.append(continuation)
+                }
+            } catch is CancellationError {
+                throw .cancelled
+            } catch let error as TransportError {
+                throw error
+            } catch {
+                throw .connectionFailed(String(describing: error))
+            }
+        }
+        guard isConnected, !isClosed else { throw .connectionClosed }
+        outbound.append(payload)
+    }
+
+    func close() async {
+        isClosed = true
+        isConnected = false
+        let waiters = writeWaiters
+        writeWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(throwing: TransportError.connectionClosed)
+        }
+    }
+
+    func setBlocksAgentWrites(_ enabled: Bool) {
+        blocksAgentWrites = enabled
+    }
+
+    func releaseAgentWrites() {
+        blocksAgentWrites = false
+        let waiters = writeWaiters
+        writeWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private nonisolated static func isAgentData(_ data: Data) -> Bool {
+        data.count >= 2 && data[data.startIndex] == 107 && data[data.startIndex + 1] == 0
+    }
+}
+
+private extension FakeTransport {
+    var agentWriteCount: Int {
+        outbound.filter { data in
+            data.count >= 2 && data[data.startIndex] == 107 && data[data.startIndex + 1] == 0
+        }.count
     }
 }
 

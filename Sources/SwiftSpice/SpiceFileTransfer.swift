@@ -52,16 +52,35 @@ public enum SpiceFileTransferEvent: Sendable, Equatable {
     case failed(id: SpiceFileTransferID?, SpiceFileTransferError)
 }
 
+/// Monotonic, content-free audit counters for host-to-guest VDAgent file
+/// transfer messages that reached their physical write terminal.
+public struct SpiceFileTransferWireMetrics: Sendable, Equatable {
+    public let completedMessageCount: UInt64
+    public let payloadByteCount: UInt64
+
+    public init(
+        completedMessageCount: UInt64 = 0,
+        payloadByteCount: UInt64 = 0
+    ) {
+        self.completedMessageCount = completedMessageCount
+        self.payloadByteCount = payloadByteCount
+    }
+}
+
 package enum FileTransferPhase: Sendable, Equatable {
     case queuedStart
+    case sendingStart
     case awaitingGuestApproval
     case readyToRead
     case reading
     case readyToSend(Data)
+    case sendingData(Data)
     case awaitingCompletion
     case queuedCancellation
+    case sendingCancellation
     case awaitingCancellation
     case queuedFailure(SpiceFileTransferError)
+    case sendingFailure(SpiceFileTransferError)
 }
 
 package struct FileTransferJob: Sendable, Equatable {
@@ -71,4 +90,42 @@ package struct FileTransferJob: Sendable, Equatable {
     package let totalBytes: UInt64
     package var sentBytes: UInt64
     package var phase: FileTransferPhase
+    package var cancellationRequested = false
+}
+
+package extension FileTransferPhase {
+    var isSending: Bool {
+        switch self {
+        case .sendingStart, .sendingData, .sendingCancellation, .sendingFailure:
+            true
+        case .queuedStart,
+             .awaitingGuestApproval,
+             .readyToRead,
+             .reading,
+             .readyToSend,
+             .awaitingCompletion,
+             .queuedCancellation,
+             .awaitingCancellation,
+             .queuedFailure:
+            false
+        }
+    }
+
+    var isCancellationPending: Bool {
+        switch self {
+        case .queuedCancellation, .sendingCancellation, .awaitingCancellation:
+            true
+        case .queuedStart,
+             .sendingStart,
+             .awaitingGuestApproval,
+             .readyToRead,
+             .reading,
+             .readyToSend,
+             .sendingData,
+             .awaitingCompletion,
+             .queuedFailure,
+             .sendingFailure:
+            false
+        }
+    }
 }

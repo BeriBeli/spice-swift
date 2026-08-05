@@ -195,7 +195,7 @@ public struct SpiceCursorState: Sendable, Equatable {
     }
 }
 
-public enum SpiceMouseButton: UInt8, Sendable, Equatable {
+public enum SpiceMouseButton: UInt8, Sendable, Equatable, Hashable {
     case left = 1
     case middle = 2
     case right = 3
