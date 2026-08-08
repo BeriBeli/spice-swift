@@ -39,6 +39,12 @@ jobs:
       - name: Build
         run: swift build --disable-sandbox -Xswiftc -warnings-as-errors
 
+      - name: Verify public diagnostics API
+        run: >-
+          swift build --disable-sandbox
+          --package-path Tests/PublicAPIConsumer
+          -Xswiftc -warnings-as-errors
+
       - name: Test
         run: >-
           swift test --disable-sandbox

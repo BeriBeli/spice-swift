@@ -441,7 +441,12 @@ public actor SpiceSession {
         !seamlessMigrationPayloads.isEmpty
     }
 
-    package func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
+    /// Returns a best-effort aggregate snapshot of the display pipeline.
+    ///
+    /// Cumulative counters start at the most recent `connect` attempt. The
+    /// snapshot has no transport, server, mailbox, application-consumption, or
+    /// GPU-presentation timing. Advanced-video counters do not cover MJPEG.
+    public func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
         var result = retiredDisplayDiagnostics
 
         let orderedKeys = channels.keys.sorted {

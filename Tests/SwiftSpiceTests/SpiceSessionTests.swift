@@ -403,11 +403,19 @@ struct SpiceSessionTests {
             SpiceChannelDescriptor(type: 4, id: 0),
         ])
 
+        let activeDiagnostics = await session.diagnosticsSnapshot()
+        requireSendable(activeDiagnostics)
+        #expect(activeDiagnostics == activeDiagnostics)
+        #expect(activeDiagnostics.displayChannelCount == 1)
+
         await session.disconnect()
         #expect(await mainTransport.isClosed)
         #expect(await displayTransport.isClosed)
         #expect(await inputsTransport.isClosed)
         #expect(await cursorTransport.isClosed)
+
+        let retiredDiagnostics = await session.diagnosticsSnapshot()
+        #expect(retiredDiagnostics.displayChannelCount == 1)
 
         let displayLink = try decodeLinkRequest(try #require(await displayTransport.outbound.first))
         #expect(displayLink.connectionID == 77)
@@ -1436,6 +1444,10 @@ struct SpiceSessionTests {
         if case let .migration(.preparing(offer)) = event { return offer }
         return nil
     }
+}
+
+private func requireSendable<T: Sendable>(_ value: T) {
+    _ = value
 }
 
 private final class TransportPool: Sendable {
