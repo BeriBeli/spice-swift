@@ -3,10 +3,13 @@ import SpiceProtocol
 import SpiceWire
 import Synchronization
 
-/// Content-free counters for the VDAgent wire path owned by one manager.
+/// Content-free observations for the VDAgent wire and clipboard state-machine
+/// path owned by one manager.
 ///
-/// Values are cumulative for the lifetime of the manager. Message payloads,
-/// clipboard text, file names, and error strings are never retained.
+/// Counters are cumulative for the lifetime of the manager. Capability flags
+/// and last-value fields are the most recent observation in that lifetime.
+/// Message payloads, clipboard text, file names, byte counts, endpoint details,
+/// and error strings are never retained.
 public struct SpiceAgentWireDiagnostics: Sendable, Equatable {
     public internal(set) var capabilityAnnouncementsAttempted: UInt64 = 0
     public internal(set) var capabilityAnnouncementsSent: UInt64 = 0
@@ -16,10 +19,19 @@ public struct SpiceAgentWireDiagnostics: Sendable, Equatable {
     public internal(set) var inboundUnexpectedProtocolMessages: UInt64 = 0
     public internal(set) var inboundCapabilityAnnouncements: UInt64 = 0
     public internal(set) var inboundClipboardMessages: UInt64 = 0
+    public internal(set) var inboundClipboardDataMessages: UInt64 = 0
+    public internal(set) var inboundClipboardGrabMessages: UInt64 = 0
+    public internal(set) var inboundClipboardRequestMessages: UInt64 = 0
+    public internal(set) var inboundClipboardReleaseMessages: UInt64 = 0
     public internal(set) var inboundMonitorReplies: UInt64 = 0
     public internal(set) var inboundFileTransferMessages: UInt64 = 0
     public internal(set) var inboundOtherMessages: UInt64 = 0
     public internal(set) var inboundDecodeFailures: UInt64 = 0
+    /// Latest values from an explicit peer capability announcement, if any.
+    public internal(set) var peerLegacyClipboardCapability: Bool?
+    public internal(set) var peerClipboardByDemandCapability: Bool?
+    public internal(set) var clipboardFailures: UInt64 = 0
+    public internal(set) var lastClipboardFailureCategory: SpiceClipboardFailureCategory?
     public internal(set) var lastInboundProtocolID: UInt32?
     public internal(set) var lastInboundMessageType: UInt32?
 
@@ -168,7 +180,8 @@ public actor SpiceAgentManager {
         emitDisplayConfigurationSupportIfChanged()
     }
 
-    /// Returns content-free aggregate observations of the Agent wire path.
+    /// Returns content-free aggregate observations of the Agent wire and
+    /// clipboard state-machine path.
     public func diagnosticsSnapshot() -> SpiceAgentWireDiagnostics {
         wireDiagnostics
     }
@@ -397,19 +410,21 @@ public actor SpiceAgentManager {
                     command = try VDAgentClipboardCodec.decode(wireMessage)
                 } catch {
                     wireDiagnostics.inboundDecodeFailures &+= 1
-                    throw error
+                    recordClipboardFailure(.decodeFailure)
+                    emit(.failed(.invalidAgentMessage(String(describing: error))))
+                    return
                 }
                 guard let command else {
                     return
                 }
+                recordPeerClipboardCapabilities(command)
                 await execute(try state.receive(command), using: session)
                 emitDisplayConfigurationSupportIfChanged()
                 await sendPendingDisplayConfiguration(using: session)
                 await driveFileTransfers(using: session)
-            } catch let error as SpiceClipboardError {
-                emit(.failed(error))
-            } catch {
-                emit(.failed(.invalidAgentMessage(String(describing: error))))
+            } catch let failure {
+                recordClipboardFailure(failure.category)
+                emit(.failed(failure.error))
             }
         }
     }
@@ -937,12 +952,14 @@ public actor SpiceAgentManager {
                         wireDiagnostics.capabilityAnnouncementFailures &+= 1
                     }
                     pendingActions = Array(work[index...])
+                    recordClipboardFailure(.transport)
                     emit(.failed(.transport(error)))
                     return
                 } catch {
                     if isCapabilityAnnouncement {
                         wireDiagnostics.capabilityAnnouncementFailures &+= 1
                     }
+                    recordClipboardFailure(.encodeFailure)
                     emit(.failed(.invalidAgentMessage(String(describing: error))))
                     return
                 }
@@ -952,6 +969,7 @@ public actor SpiceAgentManager {
                     state.didWriteGuestText(changeCount: snapshot.changeCount)
                 } catch {
                     pendingActions = Array(work[index...])
+                    recordClipboardFailure(.pasteboardWrite)
                     emit(.failed(error))
                     return
                 }
@@ -974,8 +992,18 @@ public actor SpiceAgentManager {
         switch VDAgentMessageType(rawValue: message.type) {
         case .announceCapabilities:
             wireDiagnostics.inboundCapabilityAnnouncements &+= 1
-        case .clipboard, .clipboardGrab, .clipboardRequest, .clipboardRelease:
+        case .clipboard:
             wireDiagnostics.inboundClipboardMessages &+= 1
+            wireDiagnostics.inboundClipboardDataMessages &+= 1
+        case .clipboardGrab:
+            wireDiagnostics.inboundClipboardMessages &+= 1
+            wireDiagnostics.inboundClipboardGrabMessages &+= 1
+        case .clipboardRequest:
+            wireDiagnostics.inboundClipboardMessages &+= 1
+            wireDiagnostics.inboundClipboardRequestMessages &+= 1
+        case .clipboardRelease:
+            wireDiagnostics.inboundClipboardMessages &+= 1
+            wireDiagnostics.inboundClipboardReleaseMessages &+= 1
         case .reply:
             wireDiagnostics.inboundMonitorReplies &+= 1
         case .fileTransferStart, .fileTransferStatus, .fileTransferData:
@@ -983,6 +1011,19 @@ public actor SpiceAgentManager {
         case .monitorsConfig, .none:
             wireDiagnostics.inboundOtherMessages &+= 1
         }
+    }
+
+    private func recordPeerClipboardCapabilities(_ command: VDAgentClipboardCommand) {
+        guard case let .announceCapabilities(_, capabilities) = command else { return }
+        wireDiagnostics.peerLegacyClipboardCapability = capabilities.contains(.clipboard)
+        wireDiagnostics.peerClipboardByDemandCapability = capabilities.contains(
+            .clipboardByDemand
+        )
+    }
+
+    private func recordClipboardFailure(_ category: SpiceClipboardFailureCategory) {
+        wireDiagnostics.clipboardFailures &+= 1
+        wireDiagnostics.lastClipboardFailureCategory = category
     }
 
     private func emitActions(_ actions: [ClipboardStateMachine.Action]) {

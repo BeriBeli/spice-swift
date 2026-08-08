@@ -126,8 +126,9 @@ struct ClipboardStateMachineTests {
 
     @Test func rejectsUnsolicitedOrInvalidGuestData() throws {
         var state = try readyState()
-        #expect(throws: SpiceClipboardError.invalidAgentMessage(
-            "unsolicited clipboard data"
+        #expect(throws: ClipboardStateMachineFailure(
+            error: .invalidAgentMessage("unsolicited clipboard data"),
+            category: .unsolicitedData
         )) {
             try state.receive(.data(
                 type: VDAgentClipboardType.utf8Text.rawValue,
@@ -136,7 +137,10 @@ struct ClipboardStateMachineTests {
         }
 
         _ = try state.receive(.grab(types: [VDAgentClipboardType.utf8Text.rawValue]))
-        #expect(throws: SpiceClipboardError.invalidUTF8) {
+        #expect(throws: ClipboardStateMachineFailure(
+            error: .invalidUTF8,
+            category: .invalidUTF8
+        )) {
             try state.receive(.data(
                 type: VDAgentClipboardType.utf8Text.rawValue,
                 data: Data([0xff])

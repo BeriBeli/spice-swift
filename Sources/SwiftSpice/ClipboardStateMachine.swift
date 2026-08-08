@@ -24,6 +24,24 @@ public enum SpiceClipboardError: Error, Sendable, Equatable, CustomStringConvert
     }
 }
 
+/// Content-free classification of a clipboard synchronization failure.
+///
+/// Categories intentionally omit clipboard contents, byte counts, protocol
+/// payloads, endpoint details, and underlying error strings.
+public enum SpiceClipboardFailureCategory: String, Sendable, Equatable {
+    case agentDisconnected = "agent_disconnected"
+    case clipboardNotReady = "clipboard_not_ready"
+    case unsolicitedData = "unsolicited_data"
+    case unexpectedType = "unexpected_type"
+    case oversizedGuestText = "oversized_guest_text"
+    case invalidUTF8 = "invalid_utf8"
+    case decodeFailure = "decode_failure"
+    case encodeFailure = "encode_failure"
+    case pasteboardWrite = "pasteboard_write"
+    case transport
+    case other
+}
+
 public enum SpiceClipboardEvent: Sendable, Equatable {
     case ready
     case unavailable
@@ -31,6 +49,11 @@ public enum SpiceClipboardEvent: Sendable, Equatable {
     case localTextOffered(byteCount: Int)
     case oversizedLocalText(byteCount: Int, maximum: Int)
     case failed(SpiceClipboardError)
+}
+
+package struct ClipboardStateMachineFailure: Error, Sendable, Equatable {
+    package let error: SpiceClipboardError
+    package let category: SpiceClipboardFailureCategory
 }
 
 package struct ClipboardStateMachine: Sendable {
@@ -179,9 +202,12 @@ package struct ClipboardStateMachine: Sendable {
 
     package mutating func receive(
         _ command: VDAgentClipboardCommand
-    ) throws(SpiceClipboardError) -> [Action] {
+    ) throws(ClipboardStateMachineFailure) -> [Action] {
         guard agentConnected else {
-            throw .invalidAgentMessage("message received while agent is disconnected")
+            throw failure(
+                .invalidAgentMessage("message received while agent is disconnected"),
+                category: .agentDisconnected
+            )
         }
         switch command {
         case let .announceCapabilities(requestReply, capabilities):
@@ -229,22 +255,31 @@ package struct ClipboardStateMachine: Sendable {
             guard clipboardEnabled else { return [] }
             try requireReady()
             guard awaitingGuestData, guestGrabActive else {
-                throw .invalidAgentMessage("unsolicited clipboard data")
+                throw failure(
+                    .invalidAgentMessage("unsolicited clipboard data"),
+                    category: .unsolicitedData
+                )
             }
             awaitingGuestData = false
             if type == VDAgentClipboardType.none.rawValue {
                 return []
             }
             guard type == VDAgentClipboardType.utf8Text.rawValue else {
-                throw .invalidAgentMessage("unexpected clipboard type \(type)")
+                throw failure(
+                    .invalidAgentMessage("unexpected clipboard type \(type)"),
+                    category: .unexpectedType
+                )
             }
             guard data.count <= maximumTextBytes else {
-                throw .invalidAgentMessage(
-                    "guest text size \(data.count) exceeds \(maximumTextBytes)"
+                throw failure(
+                    .invalidAgentMessage(
+                        "guest text size \(data.count) exceeds \(maximumTextBytes)"
+                    ),
+                    category: .oversizedGuestText
                 )
             }
             guard let text = String(data: data, encoding: .utf8) else {
-                throw .invalidUTF8
+                throw failure(.invalidUTF8, category: .invalidUTF8)
             }
             return [.writeGuestText(text), .emit(.guestText(text))]
         case .release:
@@ -309,10 +344,20 @@ package struct ClipboardStateMachine: Sendable {
         localGrabActive = false
     }
 
-    private func requireReady() throws(SpiceClipboardError) {
+    private func requireReady() throws(ClipboardStateMachineFailure) {
         guard isReady else {
-            throw .invalidAgentMessage("clipboard message before capability negotiation")
+            throw failure(
+                .invalidAgentMessage("clipboard message before capability negotiation"),
+                category: .clipboardNotReady
+            )
         }
+    }
+
+    private func failure(
+        _ error: SpiceClipboardError,
+        category: SpiceClipboardFailureCategory
+    ) -> ClipboardStateMachineFailure {
+        ClipboardStateMachineFailure(error: error, category: category)
     }
 
     private var localCapabilities: VDAgentCapabilities {
