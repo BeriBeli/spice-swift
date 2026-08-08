@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "experiment_id": "CPUHotPath_2026-08-04",
+  "run_window_utc": {
+    "started": "2026-08-04T00:07:22.348Z",
+    "finished": "2026-08-04T00:31:11.478Z"
+  },
+  "host": {
+    "collected_at_utc": "2026-08-04T00:32:41.633Z",
+    "os": {
+      "name": "macOS",
+      "version": "26.6",
+      "build": "25G72"
+    },
+    "kernel": {
+      "darwin": "25.6.0",
+      "architecture": "arm64"
+    },
+    "hardware": {
+      "model_name": "MacBook Pro",
+      "model_identifier": "Mac16,8",
+      "chip": "Apple M4 Pro",
+      "cores": "12 (8 performance, 4 efficiency)",
+      "memory": "24 GB"
+    },
+    "toolchain": {
+      "xcode": "26.6 (17F113)",
+      "swift": "Apple Swift 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)",
+      "target": "arm64-apple-macosx26.0"
+    }
+  },
+  "formal": {
+    "baseline_implementation_commit": "24d780d5dea98d969e3a38f300c5ffdc3f856655",
+    "optimized_implementation_commit": "60b73098a4aa8ad704dcd55a460280f1999fc2e2",
+    "common_benchmark_harness_sha256": "a9626003badd7d56afac0297c67edefbe0e8a65c4a82664c589e383b11a58b65",
+    "warmup_attempts": 4,
+    "formal_attempts": 40,
+    "pairs_per_resolution": 10,
+    "process_model": "one fresh Release swift-test process per attempt",
+    "diagnostics_environment": "unset; disabled default",
+    "release_test_executable_bytes": {
+      "baseline": 13783496,
+      "optimized": 14359208,
+      "delta": 575712
+    }
+  },
+  "diagnostics": {
+    "implementation_commit": "60b73098a4aa8ad704dcd55a460280f1999fc2e2",
+    "enhanced_benchmark_harness_sha256": "be33b7ae131595d082a2c1fc70d3d1c924f1dfae6f8d4379ca3a1d7fbc432c74",
+    "attempts": 4,
+    "purpose": "single-sample phase attribution; excluded from paired performance decision"
+  },
+  "statistics": {
+    "paired_ratio": "optimized / baseline",
+    "estimator": "median",
+    "bootstrap": "deterministic percentile bootstrap",
+    "resamples": 100000,
+    "sorted_indices": [
+      2500,
+      97500
+    ],
+    "seeds": {
+      "720p": 720202604,
+      "4k": 420260804
+    }
+  }
+}

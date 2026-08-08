@@ -2,6 +2,7 @@ import Foundation
 import SpiceCodecs
 import SpiceIOSurface
 import SpiceMetalCompositor
+import SpiceWire
 import Synchronization
 
 package enum SurfacePixelFormat: UInt32, Sendable, Equatable {
@@ -87,9 +88,23 @@ package struct SurfaceDescriptor: Sendable, Equatable {
 package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let damageOperations: UInt64
     package let damageBytes: UInt64
+    package let damageRectanglesBeforeMerge: UInt64
+    package let damageRectanglesAfterMerge: UInt64
+    package let fullDamageByCount: UInt64
+    package let fullDamageByArea: UInt64
+    package let fullDamageByExplicit: UInt64
+    package let fullDamageBySurfaceInitialization: UInt64
+    package let fullDamageByNewSlot: UInt64
+    package let fullDamageByHistoryGap: UInt64
     package let snapshots: UInt64
+    package let revisionedSnapshotReuses: UInt64
+    package let revisionedSnapshotUploads: UInt64
+    package let dataBackendSnapshots: UInt64
+    package let revisionedSnapshotFallbacks: UInt64
+    package let unifiedBackingDisables: UInt64
     package let fullFrameCopyBytes: UInt64
     package let partialFrameCopyBytes: UInt64
+    package let snapshotCatchUpCPUCopyBytes: UInt64
     package let cpuMaterializations: UInt64
     package let cpuMaterializationBytes: UInt64
     package let poolExhaustions: UInt64
@@ -104,6 +119,18 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let currentMetalAllocatedSize: UInt64
     package let nativeVideoFrames: UInt64
     package let nativeVideoFallbacks: UInt64
+    /// Bitmap phase timings share one command selector. Each phase carries the
+    /// normalized selection period plus raw sample count and sampled time.
+    package let bitmapValidationTiming: RenderPhaseMetrics
+    package let bitmapMutationTiming: RenderPhaseMetrics
+    package let bitmapDamageJournalTiming: RenderPhaseMetrics
+    /// Snapshot phases are sampled on every invocation while diagnostics are
+    /// enabled, so their normalized period is one. Finish spans writable
+    /// commit, damage-history publication, and creation of the retained lease.
+    package let snapshotCheckoutTiming: RenderPhaseMetrics
+    package let snapshotDamagePlanTiming: RenderPhaseMetrics
+    package let snapshotCPUCopyTiming: RenderPhaseMetrics
+    package let snapshotFinishTiming: RenderPhaseMetrics
 }
 
 package final class FramePixelStorage: @unchecked Sendable {
@@ -335,7 +362,9 @@ package actor SurfaceStore {
     private let metalCompositor: SpiceMetalCompositor?
     private let metalCompositorInitializationError: SpiceMetalCompositorError?
     private let compositorFailureForAttempt: @Sendable (Int) -> SpiceMetalCompositorError?
+    private let revisionedSnapshotCopyFailureForAttempt: (@Sendable (Int) -> Bool)?
     private var compositorAttempt = 0
+    private var revisionedSnapshotCopyAttempt = 0
     private let materializationMetrics = FrameMaterializationMetrics()
     private var surfaces: [UInt32: Surface] = [:]
     /// One shared lazy readback cache for the current IOSurface revision. Every
@@ -348,9 +377,23 @@ package actor SurfaceStore {
     private var lifecycleGenerations: [UInt32: UInt64] = [:]
     private var damageOperations: UInt64 = 0
     private var damageBytes: UInt64 = 0
+    private var damageRectanglesBeforeMerge: UInt64 = 0
+    private var damageRectanglesAfterMerge: UInt64 = 0
+    private var fullDamageByCount: UInt64 = 0
+    private var fullDamageByArea: UInt64 = 0
+    private var fullDamageByExplicit: UInt64 = 0
+    private var fullDamageBySurfaceInitialization: UInt64 = 0
+    private var fullDamageByNewSlot: UInt64 = 0
+    private var fullDamageByHistoryGap: UInt64 = 0
     private var snapshots: UInt64 = 0
+    private var revisionedSnapshotReuses: UInt64 = 0
+    private var revisionedSnapshotUploads: UInt64 = 0
+    private var dataBackendSnapshots: UInt64 = 0
+    private var revisionedSnapshotFallbacks: UInt64 = 0
+    private var unifiedBackingDisables: UInt64 = 0
     private var fullFrameCopyBytes: UInt64 = 0
     private var partialFrameCopyBytes: UInt64 = 0
+    private var snapshotCatchUpCPUCopyBytes: UInt64 = 0
     private var poolExhaustions: UInt64 = 0
     private var nativeVideoFrames: UInt64 = 0
     private var nativeVideoFallbacks: UInt64 = 0
@@ -362,6 +405,15 @@ package actor SurfaceStore {
     private var rejectsNewOperations = false
     private var closeCompleted = false
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
+    private let diagnosticsEnabled: Bool
+    private var bitmapCommandSampler: RenderCommandSampler
+    private var bitmapValidationTiming: RenderPhaseRecorder
+    private var bitmapMutationTiming: RenderPhaseRecorder
+    private var bitmapDamageJournalTiming: RenderPhaseRecorder
+    private var snapshotCheckoutTiming: RenderPhaseRecorder
+    private var snapshotDamagePlanTiming: RenderPhaseRecorder
+    private var snapshotCPUCopyTiming: RenderPhaseRecorder
+    private var snapshotFinishTiming: RenderPhaseRecorder
 
     package init(
         limits: RenderLimits = .init(),
@@ -370,7 +422,10 @@ package actor SurfaceStore {
         backingPolicy: SurfaceBackingPolicy = .automatic,
         compositorFailureForAttempt: @escaping @Sendable (Int) -> SpiceMetalCompositorError? = {
             _ in nil
-        }
+        },
+        revisionedSnapshotCopyFailureForAttempt: (@Sendable (Int) -> Bool)? = nil,
+        diagnosticsMode: RenderDiagnosticsMode = .disabled,
+        diagnosticsClock: @escaping RenderPhaseRecorder.Clock = RenderPhaseRecorder.systemClock
     ) {
         self.limits = limits
         self.framePool = framePool
@@ -378,6 +433,39 @@ package actor SurfaceStore {
             maximumBytes: limits.maximumTotalSurfaceBytes
         )
         self.compositorFailureForAttempt = compositorFailureForAttempt
+        self.revisionedSnapshotCopyFailureForAttempt = revisionedSnapshotCopyFailureForAttempt
+        diagnosticsEnabled = diagnosticsMode.normalizedCommandPeriod != nil
+        bitmapCommandSampler = RenderCommandSampler(mode: diagnosticsMode)
+        bitmapValidationTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        bitmapMutationTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        bitmapDamageJournalTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        let snapshotDiagnosticsMode: RenderDiagnosticsMode =
+            diagnosticsEnabled ? .sampled(commandPeriod: 1) : .disabled
+        snapshotCheckoutTiming = RenderPhaseRecorder(
+            mode: snapshotDiagnosticsMode,
+            clock: diagnosticsClock
+        )
+        snapshotDamagePlanTiming = RenderPhaseRecorder(
+            mode: snapshotDiagnosticsMode,
+            clock: diagnosticsClock
+        )
+        snapshotCPUCopyTiming = RenderPhaseRecorder(
+            mode: snapshotDiagnosticsMode,
+            clock: diagnosticsClock
+        )
+        snapshotFinishTiming = RenderPhaseRecorder(
+            mode: snapshotDiagnosticsMode,
+            clock: diagnosticsClock
+        )
         let selectedRevisionedPool: RevisionedIOSurfacePool?
         switch backingPolicy {
         case .automatic:
@@ -608,40 +696,46 @@ package actor SurfaceStore {
     ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+        let samplesBitmapCommand = diagnosticsEnabled
+            && bitmapCommandSampler.shouldSampleCommand()
         var surface = try surface(id: surfaceID)
-        try validate(destination, in: surface)
-        let source = sourceRectangle ?? PixelRect(
-            x: 0,
-            y: 0,
-            width: bitmap.width,
-            height: bitmap.height
-        )
-        guard source.width == destination.width, source.height == destination.height,
-              bitmap.width > 0, bitmap.height > 0,
-              source.x >= 0, source.y >= 0, source.width > 0, source.height > 0
-        else {
-            throw .invalidBitmap
-        }
-        let (sourceRight, sourceRightOverflow) = source.x.addingReportingOverflow(source.width)
-        let (sourceBottom, sourceBottomOverflow) = source.y.addingReportingOverflow(source.height)
-        guard !sourceRightOverflow, !sourceBottomOverflow,
-              sourceRight <= bitmap.width, sourceBottom <= bitmap.height
-        else {
-            throw .invalidBitmap
-        }
-        let (minimumStride, strideOverflow) = bitmap.width.multipliedReportingOverflow(by: 4)
-        guard !strideOverflow, bitmap.stride >= minimumStride else {
-            throw .invalidBitmap
-        }
-        let (requiredBytes, sizeOverflow) = bitmap.stride.multipliedReportingOverflow(
-            by: bitmap.height
-        )
-        guard !sizeOverflow, requiredBytes == bitmap.pixels.count else {
-            throw .invalidBitmap
+        // Do not return `surface` from the validation helper. Keeping a second
+        // Surface/Data reference alive across `prepareForMutation` defeats the
+        // dictionary-removal uniqueness handoff and clones the full framebuffer
+        // for every small bitmap command.
+        let validation: (source: PixelRect, nextRevision: UInt64)
+        if samplesBitmapCommand {
+            var validationSample = bitmapValidationTiming.beginSelectedCommand(true)
+            defer { bitmapValidationTiming.finishCommand(&validationSample) }
+            validation = try validateBitmapCopy(
+                surface: surface,
+                destination: destination,
+                bitmap: bitmap,
+                sourceRectangle: sourceRectangle
+            )
+        } else {
+            validation = try validateBitmapCopy(
+                surface: surface,
+                destination: destination,
+                bitmap: bitmap,
+                sourceRectangle: sourceRectangle
+            )
         }
 
-        let nextRevision = try advancedRevision(surface.revision)
-        try prepareForMutation(&surface)
+        let source = validation.source
+        let nextRevision = validation.nextRevision
+        var mutationSample: RenderPhaseSample?
+        if samplesBitmapCommand {
+            mutationSample = bitmapMutationTiming.beginSelectedCommand(true)
+        }
+        do {
+            try prepareForMutation(&surface)
+        } catch let error {
+            if samplesBitmapCommand {
+                bitmapMutationTiming.finishCommand(&mutationSample)
+            }
+            throw error
+        }
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
         surface.revision = nextRevision
@@ -688,9 +782,23 @@ package actor SurfaceStore {
                 }
             }
         }
+        if samplesBitmapCommand {
+            bitmapMutationTiming.pauseCommand(&mutationSample)
+        }
+        var damageSample: RenderPhaseSample?
+        if samplesBitmapCommand {
+            damageSample = bitmapDamageJournalTiming.beginSelectedCommand(true)
+        }
         surface.storage.recordDamage(destination, revision: surface.revision)
+        if samplesBitmapCommand {
+            bitmapDamageJournalTiming.finishCommand(&damageSample)
+            bitmapMutationTiming.resumeCommand(&mutationSample)
+        }
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
+        if samplesBitmapCommand {
+            bitmapMutationTiming.finishCommand(&mutationSample)
+        }
         recordDamage(destination)
         return surfaceRevision(of: surface)
     }
@@ -966,6 +1074,7 @@ package actor SurfaceStore {
         let overwritesFullSurface = destination == fullSurface
             && clippedDestinations == [fullSurface]
         var uploadedBytes: UInt64 = 0
+        var pendingDamagePlan: SurfaceDamageJournal.CopyPlan?
         if !overwritesFullSurface {
             let synchronizesRevision = unified.current != nil
             guard await writable.synchronizeFromSource() else {
@@ -983,7 +1092,9 @@ package actor SurfaceStore {
             }
 
             if !unified.damageJournal.isEmpty {
-                let rectangles = unified.damageJournal.copyRectangles.map {
+                let damagePlan = unified.damageJournal.copyPlan
+                pendingDamagePlan = damagePlan
+                let rectangles = damagePlan.copyRectangles.map {
                     IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
                 }
                 guard let copiedBytes = writable.copyPackedPixels(
@@ -1065,7 +1176,7 @@ package actor SurfaceStore {
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = liveSurface
         if uploadedBytes > 0 {
-            if unified.damageJournal.isFullFrame {
+            if pendingDamagePlan?.isFullFrame == true {
                 fullFrameCopyBytes &+= uploadedBytes
             } else {
                 partialFrameCopyBytes &+= uploadedBytes
@@ -1162,9 +1273,23 @@ package actor SurfaceStore {
         return SurfaceStoreMetrics(
             damageOperations: damageOperations,
             damageBytes: damageBytes,
+            damageRectanglesBeforeMerge: damageRectanglesBeforeMerge,
+            damageRectanglesAfterMerge: damageRectanglesAfterMerge,
+            fullDamageByCount: fullDamageByCount,
+            fullDamageByArea: fullDamageByArea,
+            fullDamageByExplicit: fullDamageByExplicit,
+            fullDamageBySurfaceInitialization: fullDamageBySurfaceInitialization,
+            fullDamageByNewSlot: fullDamageByNewSlot,
+            fullDamageByHistoryGap: fullDamageByHistoryGap,
             snapshots: snapshots,
+            revisionedSnapshotReuses: revisionedSnapshotReuses,
+            revisionedSnapshotUploads: revisionedSnapshotUploads,
+            dataBackendSnapshots: dataBackendSnapshots,
+            revisionedSnapshotFallbacks: revisionedSnapshotFallbacks,
+            unifiedBackingDisables: unifiedBackingDisables,
             fullFrameCopyBytes: fullFrameCopyBytes,
             partialFrameCopyBytes: partialFrameCopyBytes,
+            snapshotCatchUpCPUCopyBytes: snapshotCatchUpCPUCopyBytes,
             cpuMaterializations: materializations.count,
             cpuMaterializationBytes: materializations.bytes,
             poolExhaustions: poolExhaustions,
@@ -1180,7 +1305,14 @@ package actor SurfaceStore {
                 revisionedMetrics?.recommendedMaximumWorkingSetSize ?? 0,
             currentMetalAllocatedSize: revisionedMetrics?.currentMetalAllocatedSize ?? 0,
             nativeVideoFrames: nativeVideoFrames,
-            nativeVideoFallbacks: nativeVideoFallbacks
+            nativeVideoFallbacks: nativeVideoFallbacks,
+            bitmapValidationTiming: bitmapValidationTiming.metrics,
+            bitmapMutationTiming: bitmapMutationTiming.metrics,
+            bitmapDamageJournalTiming: bitmapDamageJournalTiming.metrics,
+            snapshotCheckoutTiming: snapshotCheckoutTiming.metrics,
+            snapshotDamagePlanTiming: snapshotDamagePlanTiming.metrics,
+            snapshotCPUCopyTiming: snapshotCPUCopyTiming.metrics,
+            snapshotFinishTiming: snapshotFinishTiming.metrics
         )
     }
 
@@ -1193,6 +1325,7 @@ package actor SurfaceStore {
             guard isCurrent(requested) else {
                 return nil
             }
+            dataBackendSnapshots &+= 1
             return makeDataBackendSnapshot(from: surface)
         }
 
@@ -1204,6 +1337,7 @@ package actor SurfaceStore {
             guard isCurrent(requested) else {
                 return nil
             }
+            revisionedSnapshotReuses &+= 1
             snapshots &+= 1
             return snapshot
         }
@@ -1237,22 +1371,39 @@ package actor SurfaceStore {
                revision: current
            )
         {
+            revisionedSnapshotReuses &+= 1
             snapshots &+= 1
             return snapshot
         }
 
-        guard let writable = operationUnified.pool.checkoutWritable(
-            namespace: operationUnified.namespace,
-            surfaceID: operationSurface.id,
-            width: operationSurface.width,
-            height: operationSurface.height,
-            source: operationUnified.current,
-            allowsInPlaceSource: true
-        ) else {
+        let writableCandidate: RevisionedIOSurfaceWritableFrame?
+        if diagnosticsEnabled {
+            var checkoutSample = snapshotCheckoutTiming.beginCommand()
+            defer { snapshotCheckoutTiming.finishCommand(&checkoutSample) }
+            writableCandidate = operationUnified.pool.checkoutWritable(
+                namespace: operationUnified.namespace,
+                surfaceID: operationSurface.id,
+                width: operationSurface.width,
+                height: operationSurface.height,
+                source: operationUnified.current,
+                allowsInPlaceSource: true
+            )
+        } else {
+            writableCandidate = operationUnified.pool.checkoutWritable(
+                namespace: operationUnified.namespace,
+                surfaceID: operationSurface.id,
+                width: operationSurface.width,
+                height: operationSurface.height,
+                source: operationUnified.current,
+                allowsInPlaceSource: true
+            )
+        }
+        guard let writable = writableCandidate else {
             guard isCurrent(requested) else {
                 return nil
             }
             poolExhaustions &+= 1
+            revisionedSnapshotFallbacks &+= 1
             snapshots &+= 1
             return makeSnapshot(
                 from: operationSurface,
@@ -1261,19 +1412,58 @@ package actor SurfaceStore {
             )
         }
 
-        let catchUpJournal = operationUnified.damageHistory.catchUpJournal(
-            from: writable.destinationRevision,
-            pending: operationUnified.damageJournal
-        )
-        let rectangles = catchUpJournal.copyRectangles.map {
-            IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+        let damagePlan: SurfaceDamageJournal.CopyPlan
+        let rectangles: [IOSurfaceCopyRectangle]
+        if diagnosticsEnabled {
+            var damagePlanSample = snapshotDamagePlanTiming.beginCommand()
+            defer { snapshotDamagePlanTiming.finishCommand(&damagePlanSample) }
+            let catchUpJournal = operationUnified.damageHistory.catchUpJournal(
+                from: writable.destinationRevision,
+                pending: operationUnified.damageJournal
+            )
+            damagePlan = catchUpJournal.copyPlan
+            rectangles = damagePlan.copyRectangles.map {
+                IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
+        } else {
+            let catchUpJournal = operationUnified.damageHistory.catchUpJournal(
+                from: writable.destinationRevision,
+                pending: operationUnified.damageJournal
+            )
+            damagePlan = catchUpJournal.copyPlan
+            rectangles = damagePlan.copyRectangles.map {
+                IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
         }
-        guard let copiedBytes = writable.copyPackedPixels(
-            operationSurface.pixels,
-            sourceBytesPerRow: operationSurface.bytesPerRow,
-            rectangles: rectangles
-        ) else {
+        var cpuCopySample: RenderPhaseSample?
+        if diagnosticsEnabled {
+            cpuCopySample = snapshotCPUCopyTiming.beginCommand()
+        }
+        let copiedBytes: UInt64?
+        if let revisionedSnapshotCopyFailureForAttempt {
+            revisionedSnapshotCopyAttempt &+= 1
+            if revisionedSnapshotCopyFailureForAttempt(revisionedSnapshotCopyAttempt) {
+                copiedBytes = nil
+            } else {
+                copiedBytes = writable.copyPackedPixels(
+                    operationSurface.pixels,
+                    sourceBytesPerRow: operationSurface.bytesPerRow,
+                    rectangles: rectangles
+                )
+            }
+        } else {
+            copiedBytes = writable.copyPackedPixels(
+                operationSurface.pixels,
+                sourceBytesPerRow: operationSurface.bytesPerRow,
+                rectangles: rectangles
+            )
+        }
+        if diagnosticsEnabled {
+            snapshotCPUCopyTiming.finishCommand(&cpuCopySample)
+        }
+        guard let copiedBytes else {
             disableUnifiedBacking(for: requested.surfaceID, matching: requested)
+            revisionedSnapshotFallbacks &+= 1
             snapshots &+= 1
             return makeSnapshot(
                 from: operationSurface,
@@ -1281,8 +1471,20 @@ package actor SurfaceStore {
                 pixels: operationSurface.pixels
             )
         }
-        guard isCurrent(requested),
-              let committed = writable.finish(revision: operationSurface.revision),
+        guard isCurrent(requested) else {
+            return nil
+        }
+        var finishSample: RenderPhaseSample?
+        if diagnosticsEnabled {
+            finishSample = snapshotFinishTiming.beginCommand()
+        }
+        defer {
+            if diagnosticsEnabled {
+                snapshotFinishTiming.finishCommand(&finishSample)
+            }
+        }
+        let committedCandidate = writable.finish(revision: operationSurface.revision)
+        guard let committed = committedCandidate,
               var liveSurface = surfaces[operationSurface.id],
               liveSurface.lifecycleGeneration == operationSurface.lifecycleGeneration,
               liveSurface.revision == operationSurface.revision,
@@ -1299,19 +1501,43 @@ package actor SurfaceStore {
         liveUnified.damageJournal.clear()
         liveSurface.storage.unifiedBacking = liveUnified
         surfaces[operationSurface.id] = liveSurface
-        if catchUpJournal.isFullFrame {
+        if damagePlan.isFullFrame {
             fullFrameCopyBytes &+= copiedBytes
         } else {
             partialFrameCopyBytes &+= copiedBytes
         }
+        snapshotCatchUpCPUCopyBytes &+= copiedBytes
+        recordDamagePlanMetrics(damagePlan)
         guard let snapshot = makeRevisionedSnapshot(
             from: liveSurface,
             revision: committed
         ) else {
             return nil
         }
+        revisionedSnapshotUploads &+= 1
         snapshots &+= 1
         return snapshot
+    }
+
+    private func recordDamagePlanMetrics(_ damagePlan: SurfaceDamageJournal.CopyPlan) {
+        damageRectanglesBeforeMerge &+= damagePlan.inputRectangleCount
+        damageRectanglesAfterMerge &+= UInt64(damagePlan.copyRectangles.count)
+        switch damagePlan.fullFrameReason {
+        case .some(.rectangleCount):
+            fullDamageByCount &+= 1
+        case .some(.area):
+            fullDamageByArea &+= 1
+        case .some(.explicit):
+            fullDamageByExplicit &+= 1
+        case .some(.surfaceInitialization):
+            fullDamageBySurfaceInitialization &+= 1
+        case .some(.newSlot):
+            fullDamageByNewSlot &+= 1
+        case .some(.historyGap):
+            fullDamageByHistoryGap &+= 1
+        case nil:
+            break
+        }
     }
 
     private func makeDataBackendSnapshot(from surface: Surface) -> FrameSnapshot {
@@ -1426,9 +1652,13 @@ package actor SurfaceStore {
         else {
             return
         }
+        guard surface.storage.unifiedBacking != nil else {
+            return
+        }
         surface.storage.disableUnifiedBacking(surfaceID: surfaceID)
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
+        unifiedBackingDisables &+= 1
     }
 
     private func videoFallback(
@@ -1563,6 +1793,45 @@ package actor SurfaceStore {
         else {
             throw .invalidRectangle
         }
+    }
+
+    private func validateBitmapCopy(
+        surface targetSurface: Surface,
+        destination: PixelRect,
+        bitmap: RawBitmap,
+        sourceRectangle: PixelRect?
+    ) throws(RenderError) -> (source: PixelRect, nextRevision: UInt64) {
+        try validate(destination, in: targetSurface)
+        let source = sourceRectangle ?? PixelRect(
+            x: 0,
+            y: 0,
+            width: bitmap.width,
+            height: bitmap.height
+        )
+        guard source.width == destination.width, source.height == destination.height,
+              bitmap.width > 0, bitmap.height > 0,
+              source.x >= 0, source.y >= 0, source.width > 0, source.height > 0
+        else {
+            throw .invalidBitmap
+        }
+        let (sourceRight, sourceRightOverflow) = source.x.addingReportingOverflow(source.width)
+        let (sourceBottom, sourceBottomOverflow) = source.y.addingReportingOverflow(source.height)
+        guard !sourceRightOverflow, !sourceBottomOverflow,
+              sourceRight <= bitmap.width, sourceBottom <= bitmap.height
+        else {
+            throw .invalidBitmap
+        }
+        let (minimumStride, strideOverflow) = bitmap.width.multipliedReportingOverflow(by: 4)
+        guard !strideOverflow, bitmap.stride >= minimumStride else {
+            throw .invalidBitmap
+        }
+        let (requiredBytes, sizeOverflow) = bitmap.stride.multipliedReportingOverflow(
+            by: bitmap.height
+        )
+        guard !sizeOverflow, requiredBytes == bitmap.pixels.count else {
+            throw .invalidBitmap
+        }
+        return (source, try advancedRevision(targetSurface.revision))
     }
 
     private func checkedByteCount(width: Int, height: Int) throws(RenderError) -> Int {

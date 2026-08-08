@@ -1,5 +1,6 @@
 import Foundation
 import SpiceRenderer
+import SpiceWire
 
 package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var submissions: UInt64
@@ -8,6 +9,9 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var staleSnapshots: UInt64
     package var pendingEvictions: UInt64
     package var pendingSurfaces: Int
+    /// Time from invoking the asynchronous frame sink until it returns. This
+    /// includes any executor queueing and work performed by the sink.
+    package var frameEmitTiming: RenderPhaseMetrics
 
     package init(
         submissions: UInt64 = 0,
@@ -15,7 +19,8 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         emittedFrames: UInt64 = 0,
         staleSnapshots: UInt64 = 0,
         pendingEvictions: UInt64 = 0,
-        pendingSurfaces: Int = 0
+        pendingSurfaces: Int = 0,
+        frameEmitTiming: RenderPhaseMetrics = RenderPhaseMetrics()
     ) {
         self.submissions = submissions
         self.snapshotAttempts = snapshotAttempts
@@ -23,6 +28,7 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         self.staleSnapshots = staleSnapshots
         self.pendingEvictions = pendingEvictions
         self.pendingSurfaces = pendingSurfaces
+        self.frameEmitTiming = frameEmitTiming
     }
 
     package mutating func accumulate(_ other: Self) {
@@ -32,6 +38,7 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         staleSnapshots &+= other.staleSnapshots
         pendingEvictions &+= other.pendingEvictions
         pendingSurfaces += other.pendingSurfaces
+        frameEmitTiming = frameEmitTiming.accumulating(other.frameEmitTiming)
     }
 }
 
@@ -63,10 +70,15 @@ package actor DisplayFramePublisher {
     private var emittedFrames: UInt64 = 0
     private var staleSnapshots: UInt64 = 0
     private var pendingEvictions: UInt64 = 0
+    private let diagnosticsEnabled: Bool
+    private var frameEmitTiming: RenderPhaseRecorder
 
     package init(
         interval: Duration = .milliseconds(16),
         maximumPendingSurfaces: Int = 16,
+        diagnosticsMode: RenderDiagnosticsMode = .disabled,
+        diagnosticsClock: @escaping RenderPhaseRecorder.Clock =
+            RenderPhaseRecorder.systemClock,
         snapshot: @escaping Snapshot,
         emit: @escaping Emit
     ) {
@@ -74,6 +86,11 @@ package actor DisplayFramePublisher {
         self.maximumPendingSurfaces = max(1, maximumPendingSurfaces)
         self.snapshot = snapshot
         self.emit = emit
+        diagnosticsEnabled = diagnosticsMode.normalizedCommandPeriod != nil
+        frameEmitTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
     }
 
     package func submit(_ surfaceRevision: SurfaceRevision) {
@@ -166,7 +183,8 @@ package actor DisplayFramePublisher {
             emittedFrames: emittedFrames,
             staleSnapshots: staleSnapshots,
             pendingEvictions: pendingEvictions,
-            pendingSurfaces: pending.count
+            pendingSurfaces: pending.count,
+            frameEmitTiming: frameEmitTiming.metrics
         )
     }
 
@@ -219,7 +237,13 @@ package actor DisplayFramePublisher {
                 // A different revision from this lifecycle that is not covered
                 // remains pending; it does not invalidate the immutable snapshot.
             }
-            await emit(frame)
+            if diagnosticsEnabled {
+                var emitSample = frameEmitTiming.beginCommand()
+                await emit(frame)
+                frameEmitTiming.finishCommand(&emitSample)
+            } else {
+                await emit(frame)
+            }
             guard generation == flushGeneration else { return }
             if isCurrent(request) {
                 lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision

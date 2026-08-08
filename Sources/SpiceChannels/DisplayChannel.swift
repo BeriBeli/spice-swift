@@ -15,8 +15,20 @@ package enum DisplayEvent: Sendable, Equatable {
 }
 
 package struct DisplayChannelDiagnostics: Sendable, Equatable {
+    package let connection: ChannelConnectionMetrics
     package let surfaces: SurfaceStoreMetrics
     package let publisher: DisplayFramePublisherMetrics
+    /// Starts after `ChannelConnection.receive()` returns and covers decode,
+    /// dispatch, validation, cache work, SurfaceStore calls, and acknowledgement.
+    /// It excludes transport receive wait and contains the narrower timings.
+    package let messageHandlingTiming: RenderPhaseMetrics
+    package let messageDecodeTiming: RenderPhaseMetrics
+    /// Time across the bitmap SurfaceStore actor call, including executor
+    /// queueing and method execution. This is not a pure actor-wait metric.
+    package let bitmapSurfaceStoreRoundTripTiming: RenderPhaseMetrics
+    /// Time across DisplayFramePublisher submission, including executor queueing
+    /// and submission execution.
+    package let publisherSubmitRoundTripTiming: RenderPhaseMetrics
     package let advancedVideo: SpiceAdvancedVideoDecoderDiagnostics
     package let advancedCPUFallbackFrames: UInt64
     package let metalGenerationDisableCount: UInt64
@@ -63,6 +75,11 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     private var connection: ChannelConnection
+    private var completedConnectionMetrics = ChannelConnectionMetrics()
+    /// Metrics already attributed to the currently active connection. This
+    /// prevents migration rollback from adding the same connection history a
+    /// second time without retaining retired connections or transports.
+    private var activeConnectionMetricsBaseline = ChannelConnectionMetrics()
     private let surfaces: SurfaceStore
     private let jpegDecoder: any SpiceImageDecoder
     private let lzDecoder: any SpiceImageDecoder
@@ -77,6 +94,9 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let maximumCachedImageBytes: Int
     private let maximumStreams: Int
     private let framePublicationInterval: Duration
+    private let diagnosticsEnabled: Bool
+    private let framePublisherDiagnosticsMode: RenderDiagnosticsMode
+    private let diagnosticsClock: RenderPhaseRecorder.Clock
     private var palettes: [UInt64: SpiceLZPalette] = [:]
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
@@ -89,6 +109,10 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var advancedCPUFallbackFrames: UInt64 = 0
     private var metalGenerationDisableCount: UInt64 = 0
     private var firstMetalGenerationDisableReason: String?
+    private var messageHandlingTiming: RenderPhaseRecorder
+    private var messageDecodeTiming: RenderPhaseRecorder
+    private var bitmapSurfaceStoreRoundTripTiming: RenderPhaseRecorder
+    private var publisherSubmitRoundTripTiming: RenderPhaseRecorder
 
     package init(
         connection: ChannelConnection,
@@ -105,7 +129,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         maximumCachedImages: Int = 256,
         maximumCachedImageBytes: Int = 256 * 1_024 * 1_024,
         maximumStreams: Int = 64,
-        framePublicationInterval: Duration = .milliseconds(16)
+        framePublicationInterval: Duration = .milliseconds(16),
+        diagnosticsMode: RenderDiagnosticsMode = .disabled,
+        diagnosticsClock: @escaping RenderPhaseRecorder.Clock =
+            RenderPhaseRecorder.systemClock
     ) {
         self.connection = connection
         self.surfaces = surfaces
@@ -122,6 +149,27 @@ package actor DisplayChannel: SpiceManagedChannel {
         self.maximumCachedImageBytes = max(1, maximumCachedImageBytes)
         self.maximumStreams = min(64, max(1, maximumStreams))
         self.framePublicationInterval = framePublicationInterval
+        diagnosticsEnabled = diagnosticsMode.normalizedCommandPeriod != nil
+        framePublisherDiagnosticsMode = diagnosticsEnabled
+            ? .sampled(commandPeriod: 1)
+            : .disabled
+        self.diagnosticsClock = diagnosticsClock
+        messageHandlingTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        messageDecodeTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        bitmapSurfaceStoreRoundTripTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
+        publisherSubmitRoundTripTiming = RenderPhaseRecorder(
+            mode: diagnosticsMode,
+            clock: diagnosticsClock
+        )
     }
 
     package func run(
@@ -135,6 +183,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         ))
         let framePublisher = DisplayFramePublisher(
             interval: framePublicationInterval,
+            diagnosticsMode: framePublisherDiagnosticsMode,
+            diagnosticsClock: diagnosticsClock,
             snapshot: { [surfaces] surfaceRevision in
                 await surfaces.snapshot(atLeast: surfaceRevision)
             },
@@ -152,7 +202,13 @@ package actor DisplayChannel: SpiceManagedChannel {
                     await framePublisher.remove(surfaceID: surfaceID)
                     await emit(.surfaceDestroyed(surfaceID))
                 case let .frameChanged(surfaceRevision):
-                    await framePublisher.submit(surfaceRevision)
+                    if diagnosticsEnabled {
+                        var submitSample = publisherSubmitRoundTripTiming.beginCommand()
+                        await framePublisher.submit(surfaceRevision)
+                        publisherSubmitRoundTripTiming.finishCommand(&submitSample)
+                    } else {
+                        await framePublisher.submit(surfaceRevision)
+                    }
                 case let .monitorsConfigured(configuration):
                     await emit(.displayMonitors(
                         channelID: connection.key.id,
@@ -171,16 +227,16 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
         let framed = try await connection.receive()
-        let message: SpiceServerMessage
-        do {
-            message = try SpiceServerMessageDecoder.decode(
-                id: framed.type,
-                body: framed.body,
-                channel: .display
-            )
-        } catch let error {
-            throw .wire(error)
+        var handlingSample: RenderPhaseSample?
+        if diagnosticsEnabled {
+            handlingSample = messageHandlingTiming.beginCommand()
         }
+        defer {
+            if diagnosticsEnabled {
+                messageHandlingTiming.finishCommand(&handlingSample)
+            }
+        }
+        let message = try decode(framed)
 
         switch message {
         case let .displaySurfaceCreate(create):
@@ -358,6 +414,12 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func diagnosticsSnapshot() async -> DisplayChannelDiagnostics {
+        let activeConnection = connection
+        let activeBaseline = activeConnectionMetricsBaseline
+        var connectionMetrics = completedConnectionMetrics
+        connectionMetrics.accumulate(
+            await activeConnection.metrics().subtracting(activeBaseline)
+        )
         var advancedVideo = retiredAdvancedVideoDiagnostics
         let activeDecoders = streams.values.compactMap(\.advancedDecoder)
         for decoder in activeDecoders {
@@ -369,8 +431,14 @@ package actor DisplayChannel: SpiceManagedChannel {
             publisherMetrics.accumulate(await publisher.metrics())
         }
         return DisplayChannelDiagnostics(
+            connection: connectionMetrics,
             surfaces: await surfaces.metrics(),
             publisher: publisherMetrics,
+            messageHandlingTiming: messageHandlingTiming.metrics,
+            messageDecodeTiming: messageDecodeTiming.metrics,
+            bitmapSurfaceStoreRoundTripTiming:
+                bitmapSurfaceStoreRoundTripTiming.metrics,
+            publisherSubmitRoundTripTiming: publisherSubmitRoundTripTiming.metrics,
             advancedVideo: advancedVideo,
             advancedCPUFallbackFrames: advancedCPUFallbackFrames,
             metalGenerationDisableCount: metalGenerationDisableCount,
@@ -380,13 +448,44 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Display Channel")
         }
         let previous = connection
+        if diagnosticsEnabled {
+            // Read both actors before mutating DisplayChannel state so any
+            // reentrant diagnostics snapshot observes one coherent owner.
+            let replacementBaseline = await replacement.metrics()
+            let previousMetrics = await previous.metrics()
+            completedConnectionMetrics.accumulate(
+                previousMetrics.subtracting(activeConnectionMetricsBaseline)
+            )
+            activeConnectionMetricsBaseline = replacementBaseline
+        }
         connection = replacement
         return previous
+    }
+
+    private func decode(_ framed: FramedMessage) throws(ChannelError) -> SpiceServerMessage {
+        do {
+            if diagnosticsEnabled {
+                var decodeSample = messageDecodeTiming.beginCommand()
+                defer { messageDecodeTiming.finishCommand(&decodeSample) }
+                return try SpiceServerMessageDecoder.decode(
+                    id: framed.type,
+                    body: framed.body,
+                    channel: .display
+                )
+            }
+            return try SpiceServerMessageDecoder.decode(
+                id: framed.type,
+                body: framed.body,
+                channel: .display
+            )
+        } catch let error {
+            throw .wire(error)
+        }
     }
 
     private func createStream(_ create: SpiceDisplayStreamCreate) async throws(ChannelError) {
@@ -770,12 +869,28 @@ package actor DisplayChannel: SpiceManagedChannel {
             do {
                 switch resolvedSource {
                 case let .bitmap(bitmap):
-                    surfaceRevision = try await surfaces.drawCopy(
-                        surfaceID: command.base.surfaceID,
-                        destination: destination,
-                        bitmap: bitmap,
-                        source: source
-                    )
+                    if diagnosticsEnabled {
+                        var roundTripSample =
+                            bitmapSurfaceStoreRoundTripTiming.beginCommand()
+                        defer {
+                            bitmapSurfaceStoreRoundTripTiming.finishCommand(
+                                &roundTripSample
+                            )
+                        }
+                        surfaceRevision = try await surfaces.drawCopy(
+                            surfaceID: command.base.surfaceID,
+                            destination: destination,
+                            bitmap: bitmap,
+                            source: source
+                        )
+                    } else {
+                        surfaceRevision = try await surfaces.drawCopy(
+                            surfaceID: command.base.surfaceID,
+                            destination: destination,
+                            bitmap: bitmap,
+                            source: source
+                        )
+                    }
                 case let .surface(sourceSurfaceID):
                     surfaceRevision = try await surfaces.drawCopy(
                         surfaceID: command.base.surfaceID,

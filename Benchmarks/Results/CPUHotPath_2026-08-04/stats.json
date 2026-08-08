@@ -1,0 +1,1006 @@
+{
+  "schemaVersion": 2,
+  "method": "paired optimized/baseline ratios; median; deterministic 100000-resample percentile bootstrap; sorted indices 2500 and 97500",
+  "provenance": {
+    "baselineCommit": "24d780d5dea98d969e3a38f300c5ffdc3f856655",
+    "optimizedCommit": "60b73098a4aa8ad704dcd55a460280f1999fc2e2",
+    "formalHarnessSHA256": "a9626003badd7d56afac0297c67edefbe0e8a65c4a82664c589e383b11a58b65"
+  },
+  "attemptAudit": {
+    "attempts": 44,
+    "warmups": 4,
+    "formal": 40,
+    "failures": 0,
+    "runIndicesContinuous": true,
+    "timestampsMonotonic": true,
+    "formalHarnesses": [
+      "a9626003badd7d56afac0297c67edefbe0e8a65c4a82664c589e383b11a58b65"
+    ],
+    "commits": [
+      "24d780d5dea98d969e3a38f300c5ffdc3f856655",
+      "60b73098a4aa8ad704dcd55a460280f1999fc2e2"
+    ]
+  },
+  "resolution720p": {
+    "pairs": 10,
+    "rows": [
+      {
+        "metric": "cpu_nanoseconds_per_frame",
+        "name": "cpuPerFrame",
+        "baselineMedian": 860145.5,
+        "optimizedMedian": 850023,
+        "pairedRatios": [
+          0.9606537636291982,
+          0.962951779492418,
+          0.7961764294276205,
+          0.6822400895070531,
+          1.085036977920962,
+          0.9530229033976249,
+          1.7125417510480883,
+          0.9542094408268255,
+          1.0177563895913186,
+          0.9527636871122903
+        ],
+        "pairedMedianRatio": 0.9574316022280118,
+        "ci95": {
+          "low": 0.8745996664126227,
+          "high": 1.02399437870669,
+          "resamples": 100000,
+          "seed": 720202604
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0177563895913186,
+            "pairedRatios": [
+              0.9606537636291982,
+              0.7961764294276205,
+              1.085036977920962,
+              1.7125417510480883,
+              1.0177563895913186
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 0.9530229033976249,
+            "pairedRatios": [
+              0.962951779492418,
+              0.6822400895070531,
+              0.9530229033976249,
+              0.9542094408268255,
+              0.9527636871122903
+            ]
+          }
+        }
+      },
+      {
+        "metric": "cpu_nanoseconds_per_command",
+        "name": "cpuPerCommand",
+        "baselineMedian": 15089.5,
+        "optimizedMedian": 14912.5,
+        "pairedRatios": [
+          0.9606864274570983,
+          0.96295166015625,
+          0.7961986681465039,
+          0.682193322495936,
+          1.0850544236673179,
+          0.9530325707362269,
+          1.7126662810873337,
+          0.9542080764876085,
+          1.0177473448854109,
+          0.9528008627799277
+        ],
+        "pairedMedianRatio": 0.9574472519723534,
+        "ci95": {
+          "low": 0.8746156194413655,
+          "high": 1.0240030419117838,
+          "resamples": 100000,
+          "seed": 720202605
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0177473448854109,
+            "pairedRatios": [
+              0.9606864274570983,
+              0.7961986681465039,
+              1.0850544236673179,
+              1.7126662810873337,
+              1.0177473448854109
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 0.9530325707362269,
+            "pairedRatios": [
+              0.96295166015625,
+              0.682193322495936,
+              0.9530325707362269,
+              0.9542080764876085,
+              0.9528008627799277
+            ]
+          }
+        }
+      },
+      {
+        "metric": "publisher_emitted_frames",
+        "name": "emittedFrames",
+        "baselineMedian": 1305,
+        "optimizedMedian": 1310.5,
+        "pairedRatios": [
+          1.0046012269938651,
+          1.0053475935828877,
+          0.9938697318007663,
+          1.005355776587605,
+          1.0022918258212377,
+          1.0015337423312884,
+          1.0007662835249043,
+          1.0015325670498085,
+          1.0091954022988505,
+          0.9962006079027356
+        ],
+        "pairedMedianRatio": 1.001912784076263,
+        "ci95": {
+          "low": 0.9988665874762721,
+          "high": 1.0053475935828877,
+          "resamples": 100000,
+          "seed": 720202606
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0022918258212377,
+            "pairedRatios": [
+              1.0046012269938651,
+              0.9938697318007663,
+              1.0022918258212377,
+              1.0007662835249043,
+              1.0091954022988505
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0015337423312884,
+            "pairedRatios": [
+              1.0053475935828877,
+              1.005355776587605,
+              1.0015337423312884,
+              1.0015325670498085,
+              0.9962006079027356
+            ]
+          }
+        }
+      },
+      {
+        "metric": "resident_bytes",
+        "name": "residentBytes",
+        "baselineMedian": 42647552,
+        "optimizedMedian": 43048960,
+        "pairedRatios": [
+          1.0076923076923077,
+          1.0092307692307692,
+          1.0115163147792707,
+          1.0130718954248366,
+          1.0034416826003825,
+          1.0065109153581004,
+          1.0091918805055535,
+          1.0092201306185171,
+          1.0107568190549365,
+          1.01
+        ],
+        "pairedMedianRatio": 1.0092254499246431,
+        "ci95": {
+          "low": 1.0076923076923077,
+          "high": 1.0107581573896354,
+          "resamples": 100000,
+          "seed": 720202607
+        },
+        "outcome": "increase-detected",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0091918805055535,
+            "pairedRatios": [
+              1.0076923076923077,
+              1.0115163147792707,
+              1.0034416826003825,
+              1.0091918805055535,
+              1.0107568190549365
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0092307692307692,
+            "pairedRatios": [
+              1.0092307692307692,
+              1.0130718954248366,
+              1.0065109153581004,
+              1.0092201306185171,
+              1.01
+            ]
+          }
+        }
+      },
+      {
+        "metric": "peak_resident_bytes",
+        "name": "peakResidentBytes",
+        "baselineMedian": 42729472,
+        "optimizedMedian": 43155456,
+        "pairedRatios": [
+          1.0061443932411673,
+          1.0123076923076924,
+          1.0115163147792707,
+          1.0095675468809797,
+          1.0034416826003825,
+          1.008425890463424,
+          1.0118728456530066,
+          1.0091918805055535,
+          1.0130518234165067,
+          1.0107692307692309
+        ],
+        "pairedMedianRatio": 1.0101683888251052,
+        "ci95": {
+          "low": 1.0076681368733604,
+          "high": 1.0119120035434817,
+          "resamples": 100000,
+          "seed": 720202608
+        },
+        "outcome": "increase-detected",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0115163147792707,
+            "pairedRatios": [
+              1.0061443932411673,
+              1.0115163147792707,
+              1.0034416826003825,
+              1.0118728456530066,
+              1.0130518234165067
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0095675468809797,
+            "pairedRatios": [
+              1.0123076923076924,
+              1.0095675468809797,
+              1.008425890463424,
+              1.0091918805055535,
+              1.0107692307692309
+            ]
+          }
+        }
+      },
+      {
+        "metric": "wall_nanoseconds",
+        "name": "wallNanoseconds",
+        "baselineMedian": 23995135291.5,
+        "optimizedMedian": 23997151541.5,
+        "pairedRatios": [
+          1.0001262540945772,
+          1.0001563816505157,
+          1.0000571990611355,
+          1.0004281814442435,
+          0.9996996261749374,
+          1.0000965011588412,
+          0.9996861289089398,
+          0.9992913669895538,
+          1.0000957523057794,
+          1.000291090987729
+        ],
+        "pairedMedianRatio": 1.0000961267323103,
+        "ci95": {
+          "low": 0.9996996261749374,
+          "high": 1.0002086725411532,
+          "resamples": 100000,
+          "seed": 720202609
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0000571990611355,
+            "pairedRatios": [
+              1.0001262540945772,
+              1.0000571990611355,
+              0.9996996261749374,
+              0.9996861289089398,
+              1.0000957523057794
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0001563816505157,
+            "pairedRatios": [
+              1.0001563816505157,
+              1.0004281814442435,
+              1.0000965011588412,
+              0.9992913669895538,
+              1.000291090987729
+            ]
+          }
+        }
+      },
+      {
+        "metric": "publisher_p95_interval_nanoseconds",
+        "name": "p95Interval",
+        "baselineMedian": 21804042,
+        "optimizedMedian": 21531354.5,
+        "pairedRatios": [
+          0.9922484072006116,
+          0.9965279537572255,
+          1.0109812806805936,
+          0.9741748112214631,
+          1.0229621372016278,
+          0.9946294285150937,
+          0.9944841822310337,
+          0.9861413131629078,
+          0.969105614428577,
+          1.0084396995230338
+        ],
+        "pairedMedianRatio": 0.9945568053730638,
+        "ci95": {
+          "low": 0.9832116092110373,
+          "high": 1.0084396995230338,
+          "resamples": 100000,
+          "seed": 720202610
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 0.9944841822310337,
+            "pairedRatios": [
+              0.9922484072006116,
+              1.0109812806805936,
+              1.0229621372016278,
+              0.9944841822310337,
+              0.969105614428577
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 0.9946294285150937,
+            "pairedRatios": [
+              0.9965279537572255,
+              0.9741748112214631,
+              0.9946294285150937,
+              0.9861413131629078,
+              1.0084396995230338
+            ]
+          }
+        }
+      }
+    ],
+    "pairTable": [
+      {
+        "pair": 1,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 913480,
+        "optimizedCPUPerFrame": 877538,
+        "cpuRatio": 0.9606537636291982,
+        "baselineRSS": 42598400,
+        "optimizedRSS": 42926080,
+        "rssRatio": 1.0076923076923077,
+        "baselineEmitted": 1304,
+        "optimizedEmitted": 1310
+      },
+      {
+        "pair": 2,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 933918,
+        "optimizedCPUPerFrame": 899318,
+        "cpuRatio": 0.962951779492418,
+        "baselineRSS": 42598400,
+        "optimizedRSS": 42991616,
+        "rssRatio": 1.0092307692307692,
+        "baselineEmitted": 1309,
+        "optimizedEmitted": 1316
+      },
+      {
+        "pair": 3,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 821745,
+        "optimizedCPUPerFrame": 654254,
+        "cpuRatio": 0.7961764294276205,
+        "baselineRSS": 42680320,
+        "optimizedRSS": 43171840,
+        "rssRatio": 1.0115163147792707,
+        "baselineEmitted": 1305,
+        "optimizedEmitted": 1297
+      },
+      {
+        "pair": 4,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 911660,
+        "optimizedCPUPerFrame": 621971,
+        "cpuRatio": 0.6822400895070531,
+        "baselineRSS": 42614784,
+        "optimizedRSS": 43171840,
+        "rssRatio": 1.0130718954248366,
+        "baselineEmitted": 1307,
+        "optimizedEmitted": 1314
+      },
+      {
+        "pair": 5,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 816974,
+        "optimizedCPUPerFrame": 886447,
+        "cpuRatio": 1.085036977920962,
+        "baselineRSS": 42844160,
+        "optimizedRSS": 42991616,
+        "rssRatio": 1.0034416826003825,
+        "baselineEmitted": 1309,
+        "optimizedEmitted": 1312
+      },
+      {
+        "pair": 6,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 799794,
+        "optimizedCPUPerFrame": 762222,
+        "cpuRatio": 0.9530229033976249,
+        "baselineRSS": 42778624,
+        "optimizedRSS": 43057152,
+        "rssRatio": 1.0065109153581004,
+        "baselineEmitted": 1304,
+        "optimizedEmitted": 1306
+      },
+      {
+        "pair": 7,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 492802,
+        "optimizedCPUPerFrame": 843944,
+        "cpuRatio": 1.7125417510480883,
+        "baselineRSS": 42778624,
+        "optimizedRSS": 43171840,
+        "rssRatio": 1.0091918805055535,
+        "baselineEmitted": 1305,
+        "optimizedEmitted": 1306
+      },
+      {
+        "pair": 8,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 906213,
+        "optimizedCPUPerFrame": 864717,
+        "cpuRatio": 0.9542094408268255,
+        "baselineRSS": 42647552,
+        "optimizedRSS": 43040768,
+        "rssRatio": 1.0092201306185171,
+        "baselineEmitted": 1305,
+        "optimizedEmitted": 1307
+      },
+      {
+        "pair": 9,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 815819,
+        "optimizedCPUPerFrame": 830305,
+        "cpuRatio": 1.0177563895913186,
+        "baselineRSS": 42647552,
+        "optimizedRSS": 43106304,
+        "rssRatio": 1.0107568190549365,
+        "baselineEmitted": 1305,
+        "optimizedEmitted": 1317
+      },
+      {
+        "pair": 10,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 898546,
+        "optimizedCPUPerFrame": 856102,
+        "cpuRatio": 0.9527636871122903,
+        "baselineRSS": 42598400,
+        "optimizedRSS": 43024384,
+        "rssRatio": 1.01,
+        "baselineEmitted": 1316,
+        "optimizedEmitted": 1311
+      }
+    ]
+  },
+  "resolution4k": {
+    "pairs": 10,
+    "rows": [
+      {
+        "metric": "cpu_nanoseconds_per_frame",
+        "name": "cpuPerFrame",
+        "baselineMedian": 788688.5,
+        "optimizedMedian": 784883,
+        "pairedRatios": [
+          1.0219749462402294,
+          0.8610608103922344,
+          0.888593315028187,
+          1.0510753725225443,
+          0.7921309878175026,
+          1.051251709794263,
+          1.2064553342215578,
+          1.1984386638707003,
+          1.024901557912703,
+          0.9339152880850433
+        ],
+        "pairedMedianRatio": 1.0234382520764662,
+        "ci95": {
+          "low": 0.888593315028187,
+          "high": 1.1247570181966222,
+          "resamples": 100000,
+          "seed": 420260804
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0219749462402294,
+            "pairedRatios": [
+              1.0219749462402294,
+              0.888593315028187,
+              0.7921309878175026,
+              1.2064553342215578,
+              1.024901557912703
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0510753725225443,
+            "pairedRatios": [
+              0.8610608103922344,
+              1.0510753725225443,
+              1.051251709794263,
+              1.1984386638707003,
+              0.9339152880850433
+            ]
+          }
+        }
+      },
+      {
+        "metric": "cpu_nanoseconds_per_command",
+        "name": "cpuPerCommand",
+        "baselineMedian": 13836.5,
+        "optimizedMedian": 13769.5,
+        "pairedRatios": [
+          1.0219865745695107,
+          0.8610620670922179,
+          0.8885776251581421,
+          1.0510582737768004,
+          0.79207786020554,
+          1.0512156085664202,
+          1.2064521108281239,
+          1.1984306887532694,
+          1.0249173826834104,
+          0.9338884056170002
+        ],
+        "pairedMedianRatio": 1.0234519786264604,
+        "ci95": {
+          "low": 0.8885776251581421,
+          "high": 1.124744481265035,
+          "resamples": 100000,
+          "seed": 420260805
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0219865745695107,
+            "pairedRatios": [
+              1.0219865745695107,
+              0.8885776251581421,
+              0.79207786020554,
+              1.2064521108281239,
+              1.0249173826834104
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0510582737768004,
+            "pairedRatios": [
+              0.8610620670922179,
+              1.0510582737768004,
+              1.0512156085664202,
+              1.1984306887532694,
+              0.9338884056170002
+            ]
+          }
+        }
+      },
+      {
+        "metric": "publisher_emitted_frames",
+        "name": "emittedFrames",
+        "baselineMedian": 1307.5,
+        "optimizedMedian": 1310.5,
+        "pairedRatios": [
+          1.0053970701619122,
+          1.003058103975535,
+          0.9961832061068703,
+          1.0030604437643458,
+          1.001526717557252,
+          0.9992337164750957,
+          0.9992372234935164,
+          1,
+          1.0084485407066053,
+          1.0015302218821729
+        ],
+        "pairedMedianRatio": 1.0015284697197124,
+        "ci95": {
+          "low": 0.9992372234935164,
+          "high": 1.0042275870687236,
+          "resamples": 100000,
+          "seed": 420260806
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.001526717557252,
+            "pairedRatios": [
+              1.0053970701619122,
+              0.9961832061068703,
+              1.001526717557252,
+              0.9992372234935164,
+              1.0084485407066053
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0015302218821729,
+            "pairedRatios": [
+              1.003058103975535,
+              1.0030604437643458,
+              0.9992337164750957,
+              1,
+              1.0015302218821729
+            ]
+          }
+        }
+      },
+      {
+        "metric": "resident_bytes",
+        "name": "residentBytes",
+        "baselineMedian": 131211264,
+        "optimizedMedian": 131514368,
+        "pairedRatios": [
+          1.0032467532467533,
+          1.0019977525284056,
+          1.002621722846442,
+          1.0018714909544604,
+          1.0028735632183907,
+          1.0017471608635966,
+          1.000374531835206,
+          1.0033741564608847,
+          1.00225,
+          1.0035008752188046
+        ],
+        "pairedMedianRatio": 1.002435861423221,
+        "ci95": {
+          "low": 1.0018714909544604,
+          "high": 1.0032467532467533,
+          "resamples": 100000,
+          "seed": 420260807
+        },
+        "outcome": "increase-detected",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.002621722846442,
+            "pairedRatios": [
+              1.0032467532467533,
+              1.002621722846442,
+              1.0028735632183907,
+              1.000374531835206,
+              1.00225
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0019977525284056,
+            "pairedRatios": [
+              1.0019977525284056,
+              1.0018714909544604,
+              1.0017471608635966,
+              1.0033741564608847,
+              1.0035008752188046
+            ]
+          }
+        }
+      },
+      {
+        "metric": "peak_resident_bytes",
+        "name": "peakResidentBytes",
+        "baselineMedian": 131227648,
+        "optimizedMedian": 131563520,
+        "pairedRatios": [
+          1.0042457542457544,
+          1.0022474715944563,
+          1.0029955067398901,
+          1.0021204939503554,
+          1.0017471608635966,
+          1.0017471608635966,
+          1.0016229712858926,
+          1.003624093976506,
+          1.002747595853628,
+          1.003874031492127
+        ],
+        "pairedMedianRatio": 1.0024975337240423,
+        "ci95": {
+          "low": 1.0017471608635966,
+          "high": 1.003624093976506,
+          "resamples": 100000,
+          "seed": 420260808
+        },
+        "outcome": "increase-detected",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.002747595853628,
+            "pairedRatios": [
+              1.0042457542457544,
+              1.0029955067398901,
+              1.0017471608635966,
+              1.0016229712858926,
+              1.002747595853628
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0022474715944563,
+            "pairedRatios": [
+              1.0022474715944563,
+              1.0021204939503554,
+              1.0017471608635966,
+              1.003624093976506,
+              1.003874031492127
+            ]
+          }
+        }
+      },
+      {
+        "metric": "wall_nanoseconds",
+        "name": "wallNanoseconds",
+        "baselineMedian": 23997157562.5,
+        "optimizedMedian": 23998418479,
+        "pairedRatios": [
+          1.0008409550631137,
+          1.0001697327267132,
+          1.0002379480469197,
+          1.000158585301428,
+          0.9990120447306114,
+          0.9998087216971844,
+          1.0002590323153249,
+          1.0000667367879434,
+          1.000073458935908,
+          1.0000088337080222
+        ],
+        "pairedMedianRatio": 1.000116022118668,
+        "ci95": {
+          "low": 0.999937729242564,
+          "high": 1.0002379480469197,
+          "resamples": 100000,
+          "seed": 420260809
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0002379480469197,
+            "pairedRatios": [
+              1.0008409550631137,
+              1.0002379480469197,
+              0.9990120447306114,
+              1.0002590323153249,
+              1.000073458935908
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 1.0000667367879434,
+            "pairedRatios": [
+              1.0001697327267132,
+              1.000158585301428,
+              0.9998087216971844,
+              1.0000667367879434,
+              1.0000088337080222
+            ]
+          }
+        }
+      },
+      {
+        "metric": "publisher_p95_interval_nanoseconds",
+        "name": "p95Interval",
+        "baselineMedian": 21734979.5,
+        "optimizedMedian": 21856833.5,
+        "pairedRatios": [
+          1.0020790333688019,
+          0.9971170435388097,
+          1.026712944170327,
+          0.9897452765947624,
+          1.0156753810109258,
+          1.0010115307399177,
+          0.994848033810038,
+          1.012311442009713,
+          0.9809018427294289,
+          0.9962385619749556
+        ],
+        "pairedMedianRatio": 0.9990642871393637,
+        "ci95": {
+          "low": 0.9929919192848591,
+          "high": 1.012311442009713,
+          "resamples": 100000,
+          "seed": 420260810
+        },
+        "outcome": "no-reliable-change",
+        "orderSpecific": {
+          "baseline-then-optimized": {
+            "count": 5,
+            "pairedMedianRatio": 1.0020790333688019,
+            "pairedRatios": [
+              1.0020790333688019,
+              1.026712944170327,
+              1.0156753810109258,
+              0.994848033810038,
+              0.9809018427294289
+            ]
+          },
+          "optimized-then-baseline": {
+            "count": 5,
+            "pairedMedianRatio": 0.9971170435388097,
+            "pairedRatios": [
+              0.9971170435388097,
+              0.9897452765947624,
+              1.0010115307399177,
+              1.012311442009713,
+              0.9962385619749556
+            ]
+          }
+        }
+      }
+    ],
+    "pairTable": [
+      {
+        "pair": 1,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 585940,
+        "optimizedCPUPerFrame": 598816,
+        "cpuRatio": 1.0219749462402294,
+        "baselineRSS": 131203072,
+        "optimizedRSS": 131629056,
+        "rssRatio": 1.0032467532467533,
+        "baselineEmitted": 1297,
+        "optimizedEmitted": 1304
+      },
+      {
+        "pair": 2,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 839396,
+        "optimizedCPUPerFrame": 722771,
+        "cpuRatio": 0.8610608103922344,
+        "baselineRSS": 131219456,
+        "optimizedRSS": 131481600,
+        "rssRatio": 1.0019977525284056,
+        "baselineEmitted": 1308,
+        "optimizedEmitted": 1312
+      },
+      {
+        "pair": 3,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 630788,
+        "optimizedCPUPerFrame": 560514,
+        "cpuRatio": 0.888593315028187,
+        "baselineRSS": 131235840,
+        "optimizedRSS": 131579904,
+        "rssRatio": 1.002621722846442,
+        "baselineEmitted": 1310,
+        "optimizedEmitted": 1305
+      },
+      {
+        "pair": 4,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 829480,
+        "optimizedCPUPerFrame": 871846,
+        "cpuRatio": 1.0510753725225443,
+        "baselineRSS": 131317760,
+        "optimizedRSS": 131563520,
+        "rssRatio": 1.0018714909544604,
+        "baselineEmitted": 1307,
+        "optimizedEmitted": 1311
+      },
+      {
+        "pair": 5,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 837513,
+        "optimizedCPUPerFrame": 663420,
+        "cpuRatio": 0.7921309878175026,
+        "baselineRSS": 131137536,
+        "optimizedRSS": 131514368,
+        "rssRatio": 1.0028735632183907,
+        "baselineEmitted": 1310,
+        "optimizedEmitted": 1312
+      },
+      {
+        "pair": 6,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 747897,
+        "optimizedCPUPerFrame": 786228,
+        "cpuRatio": 1.051251709794263,
+        "baselineRSS": 131284992,
+        "optimizedRSS": 131514368,
+        "rssRatio": 1.0017471608635966,
+        "baselineEmitted": 1305,
+        "optimizedEmitted": 1304
+      },
+      {
+        "pair": 7,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 738552,
+        "optimizedCPUPerFrame": 891030,
+        "cpuRatio": 1.2064553342215578,
+        "baselineRSS": 131235840,
+        "optimizedRSS": 131284992,
+        "rssRatio": 1.000374531835206,
+        "baselineEmitted": 1311,
+        "optimizedEmitted": 1310
+      },
+      {
+        "pair": 8,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 653799,
+        "optimizedCPUPerFrame": 783538,
+        "cpuRatio": 1.1984386638707003,
+        "baselineRSS": 131104768,
+        "optimizedRSS": 131547136,
+        "rssRatio": 1.0033741564608847,
+        "baselineEmitted": 1311,
+        "optimizedEmitted": 1311
+      },
+      {
+        "pair": 9,
+        "order": "baseline-then-optimized",
+        "baselineCPUPerFrame": 862436,
+        "optimizedCPUPerFrame": 883912,
+        "cpuRatio": 1.024901557912703,
+        "baselineRSS": 131072000,
+        "optimizedRSS": 131366912,
+        "rssRatio": 1.00225,
+        "baselineEmitted": 1302,
+        "optimizedEmitted": 1313
+      },
+      {
+        "pair": 10,
+        "order": "optimized-then-baseline",
+        "baselineCPUPerFrame": 917368,
+        "optimizedCPUPerFrame": 856744,
+        "cpuRatio": 0.9339152880850433,
+        "baselineRSS": 131039232,
+        "optimizedRSS": 131497984,
+        "rssRatio": 1.0035008752188046,
+        "baselineEmitted": 1307,
+        "optimizedEmitted": 1309
+      }
+    ]
+  },
+  "host": {
+    "collected_at_utc": "2026-08-04T00:32:41.633Z",
+    "os": {
+      "name": "macOS",
+      "version": "26.6",
+      "build": "25G72"
+    },
+    "kernel": {
+      "darwin": "25.6.0",
+      "architecture": "arm64"
+    },
+    "hardware": {
+      "model_name": "MacBook Pro",
+      "model_identifier": "Mac16,8",
+      "chip": "Apple M4 Pro",
+      "cores": "12 (8 performance, 4 efficiency)",
+      "memory": "24 GB"
+    },
+    "toolchain": {
+      "xcode": "26.6 (17F113)",
+      "swift": "Apple Swift 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)",
+      "target": "arm64-apple-macosx26.0"
+    }
+  },
+  "runWindowUTC": {
+    "started": "2026-08-04T00:07:22.348Z",
+    "finished": "2026-08-04T00:31:11.478Z"
+  }
+}
