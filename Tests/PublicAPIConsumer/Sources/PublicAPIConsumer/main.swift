@@ -46,6 +46,26 @@ struct PublicAPIConsumer {
         _ = diagnostics.firstMetalGenerationDisableReason
         _ = diagnostics.surfaceAllocatedBytes
         _ = diagnostics.maximumSurfaceBytes
+
+        let agentManager = SpiceAgentManager()
+        let agentDiagnostics: SpiceAgentWireDiagnostics =
+            await agentManager.diagnosticsSnapshot()
+        requireSendable(agentDiagnostics)
+        let _: Bool = agentDiagnostics == .empty
+        _ = agentDiagnostics.capabilityAnnouncementsAttempted
+        _ = agentDiagnostics.capabilityAnnouncementsSent
+        _ = agentDiagnostics.capabilityAnnouncementFailures
+        _ = agentDiagnostics.inboundMessages
+        _ = agentDiagnostics.inboundCurrentProtocolMessages
+        _ = agentDiagnostics.inboundUnexpectedProtocolMessages
+        _ = agentDiagnostics.inboundCapabilityAnnouncements
+        _ = agentDiagnostics.inboundClipboardMessages
+        _ = agentDiagnostics.inboundMonitorReplies
+        _ = agentDiagnostics.inboundFileTransferMessages
+        _ = agentDiagnostics.inboundOtherMessages
+        _ = agentDiagnostics.inboundDecodeFailures
+        _ = agentDiagnostics.lastInboundProtocolID
+        _ = agentDiagnostics.lastInboundMessageType
     }
 }
 

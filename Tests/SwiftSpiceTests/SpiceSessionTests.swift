@@ -529,6 +529,18 @@ struct SpiceSessionTests {
         await transport.enqueue(encodeMini(id: 109, body: replyPacket))
 
         #expect(await events.next() == .acknowledged(.init(width: 1_440, height: 900)))
+        let diagnostics = await manager.diagnosticsSnapshot()
+        #expect(diagnostics.capabilityAnnouncementsAttempted == 1)
+        #expect(diagnostics.capabilityAnnouncementsSent == 1)
+        #expect(diagnostics.capabilityAnnouncementFailures == 0)
+        #expect(diagnostics.inboundMessages == 1)
+        #expect(diagnostics.inboundCurrentProtocolMessages == 1)
+        #expect(diagnostics.inboundUnexpectedProtocolMessages == 0)
+        #expect(diagnostics.inboundCapabilityAnnouncements == 0)
+        #expect(diagnostics.inboundMonitorReplies == 1)
+        #expect(diagnostics.inboundDecodeFailures == 0)
+        #expect(diagnostics.lastInboundProtocolID == VDAgentMessage.protocolVersion)
+        #expect(diagnostics.lastInboundMessageType == VDAgentMessageType.reply.rawValue)
         await manager.stop()
         await session.disconnect()
     }
@@ -576,6 +588,18 @@ struct SpiceSessionTests {
             supportsSparseMonitors: true,
             supportsMonitorPositions: true
         ))
+        let diagnostics = await manager.diagnosticsSnapshot()
+        #expect(diagnostics.capabilityAnnouncementsAttempted == 1)
+        #expect(diagnostics.capabilityAnnouncementsSent == 1)
+        #expect(diagnostics.inboundMessages == 1)
+        #expect(diagnostics.inboundCapabilityAnnouncements == 1)
+        #expect(diagnostics.inboundClipboardMessages == 0)
+        #expect(diagnostics.inboundOtherMessages == 0)
+        #expect(diagnostics.lastInboundProtocolID == VDAgentMessage.protocolVersion)
+        #expect(
+            diagnostics.lastInboundMessageType
+                == VDAgentMessageType.announceCapabilities.rawValue
+        )
 
         let layout = SpiceDisplayConfiguration(monitors: [
             .init(id: 0, x: 0, y: 0, width: 1_920, height: 1_080),
