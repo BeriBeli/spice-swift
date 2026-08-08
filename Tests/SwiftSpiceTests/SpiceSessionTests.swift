@@ -594,6 +594,8 @@ struct SpiceSessionTests {
         #expect(diagnostics.inboundMessages == 1)
         #expect(diagnostics.inboundCapabilityAnnouncements == 1)
         #expect(diagnostics.inboundClipboardMessages == 0)
+        #expect(diagnostics.peerLegacyClipboardCapability == true)
+        #expect(diagnostics.peerClipboardByDemandCapability == true)
         #expect(diagnostics.inboundOtherMessages == 0)
         #expect(diagnostics.lastInboundProtocolID == VDAgentMessage.protocolVersion)
         #expect(
@@ -632,6 +634,88 @@ struct SpiceSessionTests {
         #expect(disabled == [0, 0, 32, 0, 0])
         #expect(third == [1_024, 1_280, 32, 1_920, 0])
         #expect(reader.remainingCount == 0)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func agentManagerClassifiesClipboardWireFailuresWithoutContent() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 16
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        var events = manager.events.makeAsyncIterator()
+
+        func enqueue(_ command: VDAgentClipboardCommand) async throws {
+            let message = try VDAgentClipboardCodec.encode(command)
+            let packet = try #require(VDAgentWireEncoder.fragments(for: message).first)
+            await transport.enqueue(encodeMini(id: 109, body: packet))
+        }
+
+        let legacyClipboard = VDAgentCapabilities(words: [
+            UInt32(1) << UInt32(VDAgentCapability.clipboard.rawValue),
+        ])
+        try await enqueue(.announceCapabilities(
+            requestReply: false,
+            capabilities: legacyClipboard
+        ))
+
+        let notReadyCommands: [VDAgentClipboardCommand] = [
+            .data(type: VDAgentClipboardType.utf8Text.rawValue, data: Data("private".utf8)),
+            .grab(types: [VDAgentClipboardType.utf8Text.rawValue]),
+            .request(type: VDAgentClipboardType.utf8Text.rawValue),
+            .release,
+        ]
+        for command in notReadyCommands {
+            try await enqueue(command)
+            #expect(await events.next() == .failed(.invalidAgentMessage(
+                "clipboard message before capability negotiation"
+            )))
+        }
+
+        let legacyDiagnostics = await manager.diagnosticsSnapshot()
+        #expect(legacyDiagnostics.peerLegacyClipboardCapability == true)
+        #expect(legacyDiagnostics.peerClipboardByDemandCapability == false)
+        #expect(legacyDiagnostics.clipboardFailures == 4)
+        #expect(legacyDiagnostics.lastClipboardFailureCategory == .clipboardNotReady)
+
+        try await enqueue(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        #expect(await events.next() == .ready)
+        try await enqueue(.data(
+            type: VDAgentClipboardType.utf8Text.rawValue,
+            data: Data("also private".utf8)
+        ))
+        #expect(await events.next() == .failed(.invalidAgentMessage(
+            "unsolicited clipboard data"
+        )))
+
+        let diagnostics = await manager.diagnosticsSnapshot()
+        #expect(diagnostics.inboundMessages == 7)
+        #expect(diagnostics.inboundCapabilityAnnouncements == 2)
+        #expect(diagnostics.inboundClipboardMessages == 5)
+        #expect(diagnostics.inboundClipboardDataMessages == 2)
+        #expect(diagnostics.inboundClipboardGrabMessages == 1)
+        #expect(diagnostics.inboundClipboardRequestMessages == 1)
+        #expect(diagnostics.inboundClipboardReleaseMessages == 1)
+        #expect(diagnostics.peerLegacyClipboardCapability == true)
+        #expect(diagnostics.peerClipboardByDemandCapability == true)
+        #expect(diagnostics.clipboardFailures == 5)
+        #expect(diagnostics.lastClipboardFailureCategory == .unsolicitedData)
+        #expect(diagnostics.inboundDecodeFailures == 0)
 
         await manager.stop()
         await session.disconnect()

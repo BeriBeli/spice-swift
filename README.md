@@ -136,6 +136,11 @@ counters and gauges only: `SpiceSession.diagnosticsSnapshot()` observes the
 display pipeline, while `SpiceAgentManager.diagnosticsSnapshot()` observes
 capability-announcement and inbound Agent message counts. Neither API retains
 clipboard text, file names, credentials, frame pixels, or error strings.
+Agent snapshots also separate clipboard data, grab, request, and release
+messages; expose only the peer's clipboard capability booleans; and classify
+failures with fixed content-free categories. Counters cover the current Agent
+manager lifetime, while capability and last-failure fields are its latest
+observation.
 
 ## Command-line probe
 

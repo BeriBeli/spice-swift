@@ -60,10 +60,18 @@ struct PublicAPIConsumer {
         _ = agentDiagnostics.inboundUnexpectedProtocolMessages
         _ = agentDiagnostics.inboundCapabilityAnnouncements
         _ = agentDiagnostics.inboundClipboardMessages
+        _ = agentDiagnostics.inboundClipboardDataMessages
+        _ = agentDiagnostics.inboundClipboardGrabMessages
+        _ = agentDiagnostics.inboundClipboardRequestMessages
+        _ = agentDiagnostics.inboundClipboardReleaseMessages
         _ = agentDiagnostics.inboundMonitorReplies
         _ = agentDiagnostics.inboundFileTransferMessages
         _ = agentDiagnostics.inboundOtherMessages
         _ = agentDiagnostics.inboundDecodeFailures
+        _ = agentDiagnostics.peerLegacyClipboardCapability
+        _ = agentDiagnostics.peerClipboardByDemandCapability
+        _ = agentDiagnostics.clipboardFailures
+        _ = agentDiagnostics.lastClipboardFailureCategory
         _ = agentDiagnostics.lastInboundProtocolID
         _ = agentDiagnostics.lastInboundMessageType
     }
