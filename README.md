@@ -131,6 +131,12 @@ audio, microphone, pasteboard, file-transfer, USB, or WebDAV resources. In
 particular, enabling clipboard synchronization allows guest text to reach the
 general macOS pasteboard and may expose sensitive content.
 
+Session and Agent diagnostics are opt-in pull snapshots. They contain aggregate
+counters and gauges only: `SpiceSession.diagnosticsSnapshot()` observes the
+display pipeline, while `SpiceAgentManager.diagnosticsSnapshot()` observes
+capability-announcement and inbound Agent message counts. Neither API retains
+clipboard text, file names, credentials, frame pixels, or error strings.
+
 ## Command-line probe
 
 `spice-probe` checks a real SPICE listener. The ticket password comes from the

@@ -3,6 +3,31 @@ import SpiceProtocol
 import SpiceWire
 import Synchronization
 
+/// Content-free counters for the VDAgent wire path owned by one manager.
+///
+/// Values are cumulative for the lifetime of the manager. Message payloads,
+/// clipboard text, file names, and error strings are never retained.
+public struct SpiceAgentWireDiagnostics: Sendable, Equatable {
+    public internal(set) var capabilityAnnouncementsAttempted: UInt64 = 0
+    public internal(set) var capabilityAnnouncementsSent: UInt64 = 0
+    public internal(set) var capabilityAnnouncementFailures: UInt64 = 0
+    public internal(set) var inboundMessages: UInt64 = 0
+    public internal(set) var inboundCurrentProtocolMessages: UInt64 = 0
+    public internal(set) var inboundUnexpectedProtocolMessages: UInt64 = 0
+    public internal(set) var inboundCapabilityAnnouncements: UInt64 = 0
+    public internal(set) var inboundClipboardMessages: UInt64 = 0
+    public internal(set) var inboundMonitorReplies: UInt64 = 0
+    public internal(set) var inboundFileTransferMessages: UInt64 = 0
+    public internal(set) var inboundOtherMessages: UInt64 = 0
+    public internal(set) var inboundDecodeFailures: UInt64 = 0
+    public internal(set) var lastInboundProtocolID: UInt32?
+    public internal(set) var lastInboundMessageType: UInt32?
+
+    public init() {}
+
+    public static let empty = SpiceAgentWireDiagnostics()
+}
+
 /// Synchronizes the general macOS pasteboard with the VDAgent UTF-8 clipboard.
 ///
 /// This is a data-transfer path. It does not synthesize keyboard scan codes or
@@ -40,6 +65,7 @@ public actor SpiceAgentManager {
     private var fileTransfers: [SpiceFileTransferID: FileTransferJob] = [:]
     private var fileTransferReaders: [SpiceFileTransferID: FileTransferReader] = [:]
     private var nextFileTransferID: UInt32 = 1
+    private var wireDiagnostics = SpiceAgentWireDiagnostics()
 
     public init(
         maximumTextBytes: Int = SpiceAgentManager.maximumWireTextBytes,
@@ -140,6 +166,11 @@ public actor SpiceAgentManager {
         cancelAllFileTransfers()
         emitActions(state.disconnected())
         emitDisplayConfigurationSupportIfChanged()
+    }
+
+    /// Returns content-free aggregate observations of the Agent wire path.
+    public func diagnosticsSnapshot() -> SpiceAgentWireDiagnostics {
+        wireDiagnostics
     }
 
     /// Checks the current pasteboard immediately rather than waiting for the
@@ -326,6 +357,7 @@ public actor SpiceAgentManager {
             emitActions(state.disconnected())
             emitDisplayConfigurationSupportIfChanged()
         case let .message(message):
+            recordInboundMessage(message)
             let wireMessage = VDAgentMessage(
                 protocolID: message.protocolID,
                 type: message.type,
@@ -360,7 +392,14 @@ public actor SpiceAgentManager {
                 return
             }
             do {
-                guard let command = try VDAgentClipboardCodec.decode(wireMessage) else {
+                let command: VDAgentClipboardCommand?
+                do {
+                    command = try VDAgentClipboardCodec.decode(wireMessage)
+                } catch {
+                    wireDiagnostics.inboundDecodeFailures &+= 1
+                    throw error
+                }
+                guard let command else {
                     return
                 }
                 await execute(try state.receive(command), using: session)
@@ -874,6 +913,13 @@ public actor SpiceAgentManager {
         for (index, action) in work.enumerated() {
             switch action {
             case let .send(command):
+                let isCapabilityAnnouncement: Bool
+                if case .announceCapabilities = command {
+                    isCapabilityAnnouncement = true
+                    wireDiagnostics.capabilityAnnouncementsAttempted &+= 1
+                } else {
+                    isCapabilityAnnouncement = false
+                }
                 do {
                     let message = try VDAgentClipboardCodec.encode(command)
                     try await session.sendAgentMessage(SpiceAgentMessage(
@@ -883,11 +929,20 @@ public actor SpiceAgentManager {
                         data: message.data
                     ))
                     state.didSend(command)
+                    if isCapabilityAnnouncement {
+                        wireDiagnostics.capabilityAnnouncementsSent &+= 1
+                    }
                 } catch let error as SpiceError {
+                    if isCapabilityAnnouncement {
+                        wireDiagnostics.capabilityAnnouncementFailures &+= 1
+                    }
                     pendingActions = Array(work[index...])
                     emit(.failed(.transport(error)))
                     return
                 } catch {
+                    if isCapabilityAnnouncement {
+                        wireDiagnostics.capabilityAnnouncementFailures &+= 1
+                    }
                     emit(.failed(.invalidAgentMessage(String(describing: error))))
                     return
                 }
@@ -903,6 +958,30 @@ public actor SpiceAgentManager {
             case let .emit(event):
                 emit(event)
             }
+        }
+    }
+
+    private func recordInboundMessage(_ message: SpiceAgentMessage) {
+        wireDiagnostics.inboundMessages &+= 1
+        wireDiagnostics.lastInboundProtocolID = message.protocolID
+        wireDiagnostics.lastInboundMessageType = message.type
+        if message.protocolID == VDAgentMessage.protocolVersion {
+            wireDiagnostics.inboundCurrentProtocolMessages &+= 1
+        } else {
+            wireDiagnostics.inboundUnexpectedProtocolMessages &+= 1
+        }
+
+        switch VDAgentMessageType(rawValue: message.type) {
+        case .announceCapabilities:
+            wireDiagnostics.inboundCapabilityAnnouncements &+= 1
+        case .clipboard, .clipboardGrab, .clipboardRequest, .clipboardRelease:
+            wireDiagnostics.inboundClipboardMessages &+= 1
+        case .reply:
+            wireDiagnostics.inboundMonitorReplies &+= 1
+        case .fileTransferStart, .fileTransferStatus, .fileTransferData:
+            wireDiagnostics.inboundFileTransferMessages &+= 1
+        case .monitorsConfig, .none:
+            wireDiagnostics.inboundOtherMessages &+= 1
         }
     }
 
