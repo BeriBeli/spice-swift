@@ -18,6 +18,12 @@ struct SpiceSessionEventMailboxTests {
         #expect(frame.surfaceID == 7)
         #expect(frame.pixels[0] == UInt8(truncatingIfNeeded: 999))
         #expect(await mailbox.next() == .keyboardModifiers(0x0200))
+        let metrics = mailbox.metrics()
+        #expect(metrics.framesSent == 1_000)
+        #expect(metrics.framesDelivered == 1)
+        #expect(metrics.framesCoalesced == 999)
+        #expect(metrics.framesEvicted == 0)
+        #expect(metrics.frameQueueDelay.summary.sampleCount == 1)
         mailbox.finish()
     }
 
@@ -37,6 +43,11 @@ struct SpiceSessionEventMailboxTests {
         }
         #expect(surfaceIDs == [6, 7, 8, 9])
         #expect(await mailbox.next() == .mouseMode(supported: 3, current: 2))
+        let metrics = mailbox.metrics()
+        #expect(metrics.framesSent == 10)
+        #expect(metrics.framesDelivered == 4)
+        #expect(metrics.framesCoalesced == 0)
+        #expect(metrics.framesEvicted == 6)
         mailbox.finish()
     }
 

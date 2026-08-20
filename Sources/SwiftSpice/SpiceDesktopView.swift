@@ -180,6 +180,7 @@ public struct SpiceDesktopView: NSViewRepresentable {
     public var cursor: SpiceCursorState?
     public var pointerMode: SpicePointerMode
     public var presentationDiagnostics: SpicePresentationDiagnostics?
+    public var onFrameUpdate: (@MainActor @Sendable () -> Void)?
     public var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
 
     public init(
@@ -187,12 +188,14 @@ public struct SpiceDesktopView: NSViewRepresentable {
         cursor: SpiceCursorState? = nil,
         pointerMode: SpicePointerMode = .absolute,
         presentationDiagnostics: SpicePresentationDiagnostics? = nil,
+        onFrameUpdate: (@MainActor @Sendable () -> Void)? = nil,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
         self.frame = frame
         self.cursor = cursor
         self.pointerMode = pointerMode
         self.presentationDiagnostics = presentationDiagnostics
+        self.onFrameUpdate = onFrameUpdate
         self.onInput = onInput
     }
 
@@ -210,13 +213,16 @@ public struct SpiceDesktopView: NSViewRepresentable {
         guard let framebufferView = nsView as? SpiceFramebufferView else {
             return
         }
-        framebufferView.update(
+        let didUpdateFrame = framebufferView.update(
             frame: frame,
             cursorState: cursor,
             pointerMode: pointerMode,
             presentationDiagnostics: presentationDiagnostics,
             onInput: onInput
         )
+        if didUpdateFrame {
+            onFrameUpdate?()
+        }
     }
 
     public static func dismantleNSView(_ nsView: NSView, coordinator: Void) {
@@ -273,13 +279,14 @@ private final class SpiceFramebufferView: NSView {
         nil
     }
 
+    @discardableResult
     fileprivate func update(
         frame: SpiceFrame?,
         cursorState: SpiceCursorState?,
         pointerMode: SpicePointerMode,
         presentationDiagnostics: SpicePresentationDiagnostics?,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
-    ) {
+    ) -> Bool {
         let frameChanged = !Self.framesSharePresentationStorage(desktopFrame, frame)
         self.presentationDiagnostics = presentationDiagnostics
         metalView?.setPresentationDiagnostics(presentationDiagnostics)
@@ -297,6 +304,7 @@ private final class SpiceFramebufferView: NSView {
         updateCursorPresentation()
         needsLayout = true
         needsDisplay = true
+        return frameChanged
     }
 
     private func updatePresentedFrame(_ frame: SpiceFrame?) {

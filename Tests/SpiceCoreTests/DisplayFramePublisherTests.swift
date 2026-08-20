@@ -5,6 +5,20 @@ import Testing
 
 @Suite("Display frame publisher")
 struct DisplayFramePublisherTests {
+    @Test func timingHistogramMergesWithoutRetainingIndividualSamples() {
+        var first = SpiceTimingHistogram()
+        first.record(.milliseconds(1))
+        first.record(.milliseconds(4))
+        var second = SpiceTimingHistogram()
+        second.record(.milliseconds(33))
+
+        first.accumulate(second)
+
+        #expect(first.summary.sampleCount == 3)
+        #expect(first.summary.p95Milliseconds == 33)
+        #expect(first.summary.maximumMilliseconds == 33)
+    }
+
     @Test func snapshotsOnlyOnceAfterRepeatedChangesToOneSurface() async {
         let observations = FramePublisherObservations()
         let publisher = makePublisher(observations: observations)
@@ -25,6 +39,10 @@ struct DisplayFramePublisherTests {
         #expect(metrics.emittedFrames == 1)
         #expect(metrics.emittedIOSurfaceFrames == 0)
         #expect(metrics.emittedCPUOnlyFrames == 1)
+        #expect(metrics.flushes == 1)
+        #expect(metrics.flushesWithoutEmission == 0)
+        #expect(metrics.snapshotDuration.summary.sampleCount == 1)
+        #expect(metrics.emitDuration.summary.sampleCount == 1)
     }
 
     @Test func preservesSurfaceOrderAndPublishesLatestRevisionAtFlush() async {
@@ -180,6 +198,8 @@ struct DisplayFramePublisherTests {
         #expect(metrics.emittedCPUOnlyFrames == 0)
         #expect(metrics.staleSnapshots == 0)
         #expect(metrics.pendingSurfaces == 0)
+        #expect(metrics.flushes == 2)
+        #expect(metrics.flushesWithoutEmission == 1)
     }
 
     @Test func unpublishedIntermediateRevisionIsDeferredUntilFinalRevisionArrives() async {

@@ -174,10 +174,11 @@ particular, enabling clipboard synchronization allows guest text to reach the
 general macOS pasteboard and may expose sensitive content.
 
 Session and Agent diagnostics are opt-in pull snapshots. They contain aggregate
-counters and gauges only: `SpiceSession.diagnosticsSnapshot()` observes the
-display pipeline, while `SpiceAgentManager.diagnosticsSnapshot()` observes
-capability-announcement and inbound Agent message counts. Neither API retains
-clipboard text, file names, credentials, frame pixels, or error strings.
+counters, gauges, and bounded timing histograms only:
+`SpiceSession.diagnosticsSnapshot()` observes the display pipeline, while
+`SpiceAgentManager.diagnosticsSnapshot()` observes capability-announcement and
+inbound Agent message counts. Neither API retains clipboard text, file names,
+credentials, frame pixels, per-frame timestamps, or error strings.
 Agent snapshots also separate clipboard data, grab, request, and release
 messages; expose only the peer's clipboard capability booleans; and classify
 failures with fixed content-free categories. Counters cover the current Agent
@@ -188,7 +189,10 @@ When `SpiceDesktopView` receives `session.presentationDiagnostics`, the session
 snapshot also separates publisher-emitted IOSurface/CPU-only frames and records
 Metal presentation versus AppKit CPU fallback. Fixed fallback categories
 distinguish unavailable Metal, missing IOSurface backing, dimension or pixel
-format mismatch, and Metal texture creation failure.
+format mismatch, and Metal texture creation failure. Content-free timing
+summaries expose sample count, approximate p95, and maximum latency for
+publisher scheduling/snapshot/emission, mailbox delivery, view-to-Metal commit,
+and Metal command completion.
 
 ## Command-line probe
 

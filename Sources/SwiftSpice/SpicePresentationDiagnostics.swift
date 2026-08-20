@@ -1,4 +1,5 @@
 import Synchronization
+import SpiceChannels
 
 /// A content-free reason why a desktop frame used AppKit CPU presentation.
 public enum SpiceCPUPresentationFallbackReason: String, Sendable, Equatable {
@@ -20,6 +21,19 @@ public struct SpicePresentationMetrics: Sendable, Equatable {
     public internal(set) var pixelFormatMismatchFallbackFrames: UInt64 = 0
     public internal(set) var textureCreationFailedFallbackFrames: UInt64 = 0
     public internal(set) var lastCPUFallbackReason: SpiceCPUPresentationFallbackReason?
+    public internal(set) var metalFramesSupersededBeforeDraw: UInt64 = 0
+    public internal(set) var metalDrawableMisses: UInt64 = 0
+    public internal(set) var metalCommandCreationFailures: UInt64 = 0
+    package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
+    package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
+
+    public var viewUpdateToMetalCommit: SpiceTimingSummary {
+        viewUpdateToMetalCommitHistogram.summary
+    }
+
+    public var metalCommitToCompletion: SpiceTimingSummary {
+        metalCommitToCompletionHistogram.summary
+    }
 
     public static let empty = Self()
 }
@@ -44,6 +58,27 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func recordMetalPresentationError() {
         state.withLock { $0.metalPresentationErrors &+= 1 }
+    }
+
+    package func recordMetalFramesSupersededBeforeDraw(_ count: UInt64) {
+        guard count > 0 else { return }
+        state.withLock { $0.metalFramesSupersededBeforeDraw &+= count }
+    }
+
+    package func recordMetalDrawableMiss() {
+        state.withLock { $0.metalDrawableMisses &+= 1 }
+    }
+
+    package func recordMetalCommandCreationFailure() {
+        state.withLock { $0.metalCommandCreationFailures &+= 1 }
+    }
+
+    package func recordViewUpdateToMetalCommit(_ duration: Duration) {
+        state.withLock { $0.viewUpdateToMetalCommitHistogram.record(duration) }
+    }
+
+    package func recordMetalCommitToCompletion(_ duration: Duration) {
+        state.withLock { $0.metalCommitToCompletionHistogram.record(duration) }
     }
 
     package func recordCPUFallback(_ reason: SpiceCPUPresentationFallbackReason) {

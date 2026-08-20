@@ -36,6 +36,18 @@ struct PublicAPIConsumer {
         _ = diagnostics.publisherStaleSnapshots
         _ = diagnostics.publisherPendingEvictions
         _ = diagnostics.publisherPendingSurfaces
+        _ = diagnostics.publisherFlushes
+        _ = diagnostics.publisherFlushesWithoutEmission
+        _ = diagnostics.publisherBatchStartGap
+        _ = diagnostics.publisherFlushStartGap
+        _ = diagnostics.publisherFlushSchedulingDelay
+        _ = diagnostics.publisherSnapshotDuration
+        _ = diagnostics.publisherEmitDuration
+        _ = diagnostics.mailboxFramesSent
+        _ = diagnostics.mailboxFramesDelivered
+        _ = diagnostics.mailboxFramesCoalesced
+        _ = diagnostics.mailboxFramesEvicted
+        _ = diagnostics.mailboxFrameQueueDelay
         _ = diagnostics.videoDecoderSessionCreations
         _ = diagnostics.videoHardwareSessions
         _ = diagnostics.videoSoftwareSessions
@@ -57,11 +69,25 @@ struct PublicAPIConsumer {
         _ = diagnostics.pixelFormatMismatchFallbackFrames
         _ = diagnostics.textureCreationFailedFallbackFrames
         _ = diagnostics.lastCPUFallbackReason
+        _ = diagnostics.metalFramesSupersededBeforeDraw
+        _ = diagnostics.metalDrawableMisses
+        _ = diagnostics.metalCommandCreationFailures
+        let timing: SpiceTimingSummary = diagnostics.viewUpdateToMetalCommit
+        requireSendable(timing)
+        _ = timing.sampleCount
+        _ = timing.p95Milliseconds
+        _ = timing.maximumMilliseconds
+        _ = diagnostics.metalCommitToCompletion
 
         let presentation: SpicePresentationMetrics =
             session.presentationDiagnostics.snapshot()
         requireSendable(presentation)
         let _: Bool = presentation == .empty
+        _ = presentation.metalFramesSupersededBeforeDraw
+        _ = presentation.metalDrawableMisses
+        _ = presentation.metalCommandCreationFailures
+        _ = presentation.viewUpdateToMetalCommit
+        _ = presentation.metalCommitToCompletion
 
         let agentManager = SpiceAgentManager()
         let agentDiagnostics: SpiceAgentWireDiagnostics =

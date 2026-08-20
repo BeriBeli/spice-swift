@@ -446,8 +446,9 @@ public actor SpiceSession {
     /// Returns a best-effort aggregate snapshot of the display pipeline.
     ///
     /// Cumulative counters start at the most recent `connect` attempt. The
-    /// snapshot has no transport, server, mailbox, application-consumption, or
-    /// GPU-presentation timing. Presentation counters require passing
+    /// snapshot has no transport or server timing and does not retain per-frame
+    /// timestamps. It includes bounded publisher, mailbox, and GPU-presentation
+    /// timing summaries. Presentation counters require passing
     /// `presentationDiagnostics` to `SpiceDesktopView`. Advanced-video counters
     /// do not cover MJPEG.
     public func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
@@ -461,6 +462,13 @@ public actor SpiceSession {
             guard let display = channel as? DisplayChannel else { continue }
             result.accumulate(await display.diagnosticsSnapshot())
         }
+
+        let mailbox = eventMailbox.metrics()
+        result.mailboxFramesSent = mailbox.framesSent
+        result.mailboxFramesDelivered = mailbox.framesDelivered
+        result.mailboxFramesCoalesced = mailbox.framesCoalesced
+        result.mailboxFramesEvicted = mailbox.framesEvicted
+        result.mailboxFrameQueueDelayHistogram = mailbox.frameQueueDelay
 
         result.totalIOSurfaceAllocatedBytes = IOSurfaceAllocationBudget.shared.allocatedBytes
         let surfaceBudget = surfaceMemoryBudget.metrics()
@@ -478,6 +486,13 @@ public actor SpiceSession {
         result.textureCreationFailedFallbackFrames =
             presentation.textureCreationFailedFallbackFrames
         result.lastCPUFallbackReason = presentation.lastCPUFallbackReason
+        result.metalFramesSupersededBeforeDraw = presentation.metalFramesSupersededBeforeDraw
+        result.metalDrawableMisses = presentation.metalDrawableMisses
+        result.metalCommandCreationFailures = presentation.metalCommandCreationFailures
+        result.viewUpdateToMetalCommitHistogram =
+            presentation.viewUpdateToMetalCommitHistogram
+        result.metalCommitToCompletionHistogram =
+            presentation.metalCommitToCompletionHistogram
         return result
     }
 

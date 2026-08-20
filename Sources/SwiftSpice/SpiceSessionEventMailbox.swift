@@ -1,4 +1,13 @@
 import Synchronization
+import SpiceChannels
+
+package struct SpiceSessionEventMailboxMetrics: Sendable, Equatable {
+    package var framesSent: UInt64 = 0
+    package var framesDelivered: UInt64 = 0
+    package var framesCoalesced: UInt64 = 0
+    package var framesEvicted: UInt64 = 0
+    package var frameQueueDelay = SpiceTimingHistogram()
+}
 
 /// A bounded, frame-coalescing handoff for the public session event stream.
 ///
@@ -33,6 +42,7 @@ package final class SpiceSessionEventMailbox: Sendable {
         var nextFrameToken: UInt64 = 0
         var nextWaiterToken: UInt64 = 0
         var finished = false
+        var metrics = SpiceSessionEventMailboxMetrics()
     }
 
     private enum Delivery {
@@ -61,16 +71,27 @@ package final class SpiceSessionEventMailbox: Sendable {
     }
 
     package func send(_ event: SpiceSessionEvent, displayChannelID: UInt8? = nil) {
+        let stampedEvent: SpiceSessionEvent
+        if case var .frame(frame) = event {
+            frame.diagnosticsMailboxSentAt = ContinuousClock().now
+            stampedEvent = .frame(frame)
+        } else {
+            stampedEvent = event
+        }
         let delivery = state.withLock { state -> Delivery in
             guard !state.finished else { return .none }
+            if case .frame = stampedEvent {
+                state.metrics.framesSent &+= 1
+            }
             if let continuation = Self.removeFirstWaiter(from: &state) {
-                return .event(continuation, event)
+                Self.recordFrameDelivery(stampedEvent, state: &state)
+                return .event(continuation, stampedEvent)
             }
 
-            switch event {
+            switch stampedEvent {
             case let .frame(frame):
                 enqueueFrame(
-                    event,
+                    stampedEvent,
                     identity: FrameIdentity(
                         displayChannelID: displayChannelID,
                         surfaceID: frame.surfaceID
@@ -86,10 +107,10 @@ package final class SpiceSessionEventMailbox: Sendable {
                     state: &state
                 )
                 state.latestFrameTokenByIdentity.removeAll(keepingCapacity: true)
-                state.pending.append(.control(event))
+                state.pending.append(.control(stampedEvent))
             default:
                 state.latestFrameTokenByIdentity.removeAll(keepingCapacity: true)
-                state.pending.append(.control(event))
+                state.pending.append(.control(stampedEvent))
             }
             return .none
         }
@@ -127,6 +148,10 @@ package final class SpiceSessionEventMailbox: Sendable {
         }
     }
 
+    package func metrics() -> SpiceSessionEventMailboxMetrics {
+        state.withLock { $0.metrics }
+    }
+
     package func finish() {
         let continuations = state.withLock { state in
             guard !state.finished else {
@@ -155,6 +180,7 @@ package final class SpiceSessionEventMailbox: Sendable {
         if let token = state.latestFrameTokenByIdentity[identity],
            state.frames[token] != nil {
             state.frames[token]?.event = event
+            state.metrics.framesCoalesced &+= 1
             return
         }
 
@@ -171,6 +197,7 @@ package final class SpiceSessionEventMailbox: Sendable {
             if state.latestFrameTokenByIdentity[removed.identity] == token {
                 state.latestFrameTokenByIdentity.removeValue(forKey: removed.identity)
             }
+            state.metrics.framesEvicted &+= 1
         }
 
         let token = state.nextFrameToken
@@ -244,9 +271,21 @@ package final class SpiceSessionEventMailbox: Sendable {
                 if state.latestFrameTokenByIdentity[frame.identity] == token {
                     state.latestFrameTokenByIdentity.removeValue(forKey: frame.identity)
                 }
+                recordFrameDelivery(frame.event, state: &state)
                 return frame.event
             }
         }
         return nil
+    }
+
+    private static func recordFrameDelivery(
+        _ event: SpiceSessionEvent,
+        state: inout State
+    ) {
+        guard case let .frame(frame) = event else { return }
+        state.metrics.framesDelivered &+= 1
+        if let sentAt = frame.diagnosticsMailboxSentAt {
+            state.metrics.frameQueueDelay.record(sentAt.duration(to: ContinuousClock().now))
+        }
     }
 }

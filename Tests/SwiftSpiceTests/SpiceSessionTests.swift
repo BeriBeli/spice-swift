@@ -367,17 +367,17 @@ struct SpiceSessionTests {
     }
 
     @Test func connectsDiscoversChannelsAndDisconnects() async throws {
-        let mainTransport = FakeTransport(
-            inbound: try makeServerTranscript().map(Result.success)
+        let mainTransport = StreamingSessionTransport(
+            initial: try makeServerTranscript()
         )
-        let displayTransport = FakeTransport(
-            inbound: try makeLinkResponses().map(Result.success)
+        let displayTransport = StreamingSessionTransport(
+            initial: try makeLinkResponses()
         )
-        let inputsTransport = FakeTransport(
-            inbound: try makeLinkResponses().map(Result.success)
+        let inputsTransport = StreamingSessionTransport(
+            initial: try makeLinkResponses()
         )
-        let cursorTransport = FakeTransport(
-            inbound: try makeLinkResponses().map(Result.success)
+        let cursorTransport = StreamingSessionTransport(
+            initial: try makeLinkResponses()
         )
         let transports = TransportPool([
             mainTransport,
@@ -417,11 +417,10 @@ struct SpiceSessionTests {
         #expect(presentationDiagnostics.lastCPUFallbackReason == .textureCreationFailed)
 
         await session.disconnect()
-        #expect(await mainTransport.isClosed)
-        #expect(await displayTransport.isClosed)
-        #expect(await inputsTransport.isClosed)
-        let cursorTransportIsClosed = await cursorTransport.isClosed
-        #expect(cursorTransportIsClosed)
+        #expect(!(await mainTransport.isConnected))
+        #expect(!(await displayTransport.isConnected))
+        #expect(!(await inputsTransport.isConnected))
+        #expect(!(await cursorTransport.isConnected))
 
         let retiredDiagnostics = await session.diagnosticsSnapshot()
         #expect(retiredDiagnostics.displayChannelCount == 1)

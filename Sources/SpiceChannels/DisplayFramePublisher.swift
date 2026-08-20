@@ -10,6 +10,13 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var staleSnapshots: UInt64
     package var pendingEvictions: UInt64
     package var pendingSurfaces: Int
+    package var flushes: UInt64
+    package var flushesWithoutEmission: UInt64
+    package var batchStartGap = SpiceTimingHistogram()
+    package var flushStartGap = SpiceTimingHistogram()
+    package var flushSchedulingDelay = SpiceTimingHistogram()
+    package var snapshotDuration = SpiceTimingHistogram()
+    package var emitDuration = SpiceTimingHistogram()
 
     package init(
         submissions: UInt64 = 0,
@@ -19,7 +26,14 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         emittedCPUOnlyFrames: UInt64 = 0,
         staleSnapshots: UInt64 = 0,
         pendingEvictions: UInt64 = 0,
-        pendingSurfaces: Int = 0
+        pendingSurfaces: Int = 0,
+        flushes: UInt64 = 0,
+        flushesWithoutEmission: UInt64 = 0,
+        batchStartGap: SpiceTimingHistogram = .init(),
+        flushStartGap: SpiceTimingHistogram = .init(),
+        flushSchedulingDelay: SpiceTimingHistogram = .init(),
+        snapshotDuration: SpiceTimingHistogram = .init(),
+        emitDuration: SpiceTimingHistogram = .init()
     ) {
         self.submissions = submissions
         self.snapshotAttempts = snapshotAttempts
@@ -29,6 +43,13 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         self.staleSnapshots = staleSnapshots
         self.pendingEvictions = pendingEvictions
         self.pendingSurfaces = pendingSurfaces
+        self.flushes = flushes
+        self.flushesWithoutEmission = flushesWithoutEmission
+        self.batchStartGap = batchStartGap
+        self.flushStartGap = flushStartGap
+        self.flushSchedulingDelay = flushSchedulingDelay
+        self.snapshotDuration = snapshotDuration
+        self.emitDuration = emitDuration
     }
 
     package mutating func accumulate(_ other: Self) {
@@ -40,6 +61,13 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         staleSnapshots &+= other.staleSnapshots
         pendingEvictions &+= other.pendingEvictions
         pendingSurfaces += other.pendingSurfaces
+        flushes &+= other.flushes
+        flushesWithoutEmission &+= other.flushesWithoutEmission
+        batchStartGap.accumulate(other.batchStartGap)
+        flushStartGap.accumulate(other.flushStartGap)
+        flushSchedulingDelay.accumulate(other.flushSchedulingDelay)
+        snapshotDuration.accumulate(other.snapshotDuration)
+        emitDuration.accumulate(other.emitDuration)
     }
 }
 
@@ -65,6 +93,7 @@ package actor DisplayFramePublisher {
     private var isFlushing = false
     private var isCancelled = false
     private var lastFlushStart: ContinuousClock.Instant?
+    private var lastBatchStart: ContinuousClock.Instant?
     private var generation: UInt64 = 0
     private var submissions: UInt64 = 0
     private var snapshotAttempts: UInt64 = 0
@@ -73,6 +102,13 @@ package actor DisplayFramePublisher {
     private var emittedCPUOnlyFrames: UInt64 = 0
     private var staleSnapshots: UInt64 = 0
     private var pendingEvictions: UInt64 = 0
+    private var flushes: UInt64 = 0
+    private var flushesWithoutEmission: UInt64 = 0
+    private var batchStartGap = SpiceTimingHistogram()
+    private var flushStartGap = SpiceTimingHistogram()
+    private var flushSchedulingDelay = SpiceTimingHistogram()
+    private var snapshotDuration = SpiceTimingHistogram()
+    private var emitDuration = SpiceTimingHistogram()
 
     package init(
         interval: Duration = .milliseconds(16),
@@ -101,6 +137,14 @@ package actor DisplayFramePublisher {
            isNewer(existing.surfaceRevision, than: surfaceRevision)
         {
             return
+        }
+
+        if pending.isEmpty {
+            let now = clock.now
+            if let lastBatchStart {
+                batchStartGap.record(lastBatchStart.duration(to: now))
+            }
+            lastBatchStart = now
         }
 
         if pending[surfaceID] == nil {
@@ -139,7 +183,7 @@ package actor DisplayFramePublisher {
             guard !Task.isCancelled else {
                 return
             }
-            await self?.flush()
+            await self?.flush(scheduledFor: deadline)
         }
     }
 
@@ -164,6 +208,7 @@ package actor DisplayFramePublisher {
         flushTask = nil
         isFlushing = false
         lastFlushStart = nil
+        lastBatchStart = nil
         pending.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
         lastEmittedRevisions.removeAll(keepingCapacity: false)
@@ -178,15 +223,33 @@ package actor DisplayFramePublisher {
             emittedCPUOnlyFrames: emittedCPUOnlyFrames,
             staleSnapshots: staleSnapshots,
             pendingEvictions: pendingEvictions,
-            pendingSurfaces: pending.count
+            pendingSurfaces: pending.count,
+            flushes: flushes,
+            flushesWithoutEmission: flushesWithoutEmission,
+            batchStartGap: batchStartGap,
+            flushStartGap: flushStartGap,
+            flushSchedulingDelay: flushSchedulingDelay,
+            snapshotDuration: snapshotDuration,
+            emitDuration: emitDuration
         )
     }
 
-    private func flush() async {
+    private func flush(scheduledFor deadline: ContinuousClock.Instant? = nil) async {
         guard !isCancelled, !isFlushing else { return }
         let flushGeneration = generation
         isFlushing = true
-        lastFlushStart = clock.now
+        let flushStartedAt = clock.now
+        if let lastFlushStart {
+            flushStartGap.record(lastFlushStart.duration(to: flushStartedAt))
+        }
+        if let deadline, deadline < flushStartedAt {
+            flushSchedulingDelay.record(deadline.duration(to: flushStartedAt))
+        } else if deadline != nil {
+            flushSchedulingDelay.record(.zero)
+        }
+        lastFlushStart = flushStartedAt
+        flushes &+= 1
+        let emittedAtFlushStart = emittedFrames
         let requests = order.compactMap { pending[$0] }
         pending.removeAll(keepingCapacity: true)
         order.removeAll(keepingCapacity: true)
@@ -194,10 +257,13 @@ package actor DisplayFramePublisher {
 
         for request in requests {
             snapshotAttempts &+= 1
+            let snapshotStartedAt = clock.now
             guard let frame = await snapshot(request.surfaceRevision) else {
+                snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
                 staleSnapshots &+= 1
                 continue
             }
+            snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
             guard generation == flushGeneration else { return }
             guard isCurrent(request), frameCovers(frame, request: request) else {
                 staleSnapshots &+= 1
@@ -231,7 +297,9 @@ package actor DisplayFramePublisher {
                 // A different revision from this lifecycle that is not covered
                 // remains pending; it does not invalidate the immutable snapshot.
             }
+            let emitStartedAt = clock.now
             await emit(frame)
+            emitDuration.record(emitStartedAt.duration(to: clock.now))
             guard generation == flushGeneration else { return }
             if isCurrent(request) {
                 lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
@@ -248,6 +316,9 @@ package actor DisplayFramePublisher {
             }
         }
         guard generation == flushGeneration else { return }
+        if emittedFrames == emittedAtFlushStart {
+            flushesWithoutEmission &+= 1
+        }
         isFlushing = false
         scheduleFlushIfNeeded()
     }

@@ -8,7 +8,15 @@ import Testing
 @Suite("NetworkSpiceTransport")
 struct NetworkSpiceTransportTests {
     @Test func cancellationStopsPendingEstablishment() async throws {
-        let transport = NetworkSpiceTransport(host: "192.0.2.1", port: 5900)
+        let fixture = try await makeStalledTLSListener(
+            label: "swiftspice.cancel-establishment-test"
+        )
+        defer { fixture.listener.cancel() }
+        let transport = NetworkSpiceTransport(
+            host: "127.0.0.1",
+            port: fixture.port,
+            tlsPolicy: .system
+        )
         let task = Task {
             try await transport.connect()
         }
@@ -26,7 +34,15 @@ struct NetworkSpiceTransportTests {
     }
 
     @Test func closeStopsPendingEstablishmentAndAllowsRetry() async throws {
-        let transport = NetworkSpiceTransport(host: "192.0.2.1", port: 5900)
+        let fixture = try await makeStalledTLSListener(
+            label: "swiftspice.close-establishment-test"
+        )
+        defer { fixture.listener.cancel() }
+        let transport = NetworkSpiceTransport(
+            host: "127.0.0.1",
+            port: fixture.port,
+            tlsPolicy: .system
+        )
 
         for _ in 0 ..< 25 {
             let task = Task {
@@ -104,12 +120,31 @@ struct NetworkSpiceTransportTests {
     }
 
     @Test func timesOutWhenPeerNeverCompletesTLSHandshake() async throws {
+        let fixture = try await makeStalledTLSListener(
+            label: "swiftspice.tls-timeout-test"
+        )
+        defer { fixture.listener.cancel() }
+        let transport = NetworkSpiceTransport(
+            host: "127.0.0.1",
+            port: fixture.port,
+            tlsPolicy: .system,
+            establishmentTimeout: .milliseconds(100)
+        )
+
+        await #expect(throws: TransportError.timeout) {
+            try await transport.connect()
+        }
+    }
+
+    private func makeStalledTLSListener(
+        label: String
+    ) async throws -> (listener: NWListener, port: UInt16) {
         let listener = try NWListener(using: .tcp, on: .any)
-        let queue = DispatchQueue(label: "swiftspice.tls-timeout-test")
+        let queue = DispatchQueue(label: label)
         listener.newConnectionHandler = { connection in
+            // Accept TCP, but intentionally exchange no TLS handshake bytes.
             connection.start(queue: queue)
         }
-
         let states = AsyncStream<NWListener.State> { continuation in
             listener.stateUpdateHandler = { state in
                 continuation.yield(state)
@@ -122,26 +157,18 @@ struct NetworkSpiceTransportTests {
             }
         }
         listener.start(queue: queue)
-        defer { listener.cancel() }
-
-        var port: NWEndpoint.Port?
         for await state in states {
-            if case .ready = state {
-                port = listener.port
-                break
+            switch state {
+            case .ready:
+                return (listener, try #require(listener.port).rawValue)
+            case let .failed(error):
+                Issue.record("local listener failed: \(error)")
+                throw TransportError.connectionFailed(String(describing: error))
+            default:
+                continue
             }
         }
-        let resolvedPort = try #require(port)
-        let transport = NetworkSpiceTransport(
-            host: "127.0.0.1",
-            port: resolvedPort.rawValue,
-            tlsPolicy: .system,
-            establishmentTimeout: .milliseconds(100)
-        )
-
-        await #expect(throws: TransportError.timeout) {
-            try await transport.connect()
-        }
+        throw TransportError.connectionClosed
     }
 
     @Test func terminalTLSWaitingTrustErrorsDoNotBecomeTimeouts() {

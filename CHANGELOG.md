@@ -13,11 +13,15 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - Added dedicated library building, viewer debug-run, version-check, release,
   and Makefile task-runner commands.
 - Added version, changelog, and release-tag consistency gates.
+- Added bounded, content-free timing summaries across frame publishing,
+  session mailbox delivery, and Metal presentation.
 
 ### Fixed
 
 - Made an asynchronous transport-close assertion evaluate reliably with the
   Swift 6.4 Testing runtime.
+- Made the library build gate target `SwiftSpice` directly and recognize both
+  Swift Build and native SwiftPM module layouts.
 
 ## [0.1.8] — 2026-08-20
 

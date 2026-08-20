@@ -207,6 +207,8 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
     private var wasUsingMetal = false
     private var presentedFrameGeneration: UInt64 = 0
     private var recordedFrameGeneration: UInt64?
+    private let clock = ContinuousClock()
+    private var presentedFrameRequestedAt: ContinuousClock.Instant?
 
     override var isOpaque: Bool { true }
 
@@ -266,6 +268,7 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
         presentedFrame = frame
         sourceTexture = texture
         presentedFrameGeneration &+= 1
+        presentedFrameRequestedAt = clock.now
         if !wasUsingMetal {
             spiceRenderingLogger.info("Presentation path changed to Metal IOSurface")
         }
@@ -292,19 +295,43 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         guard let frame = presentedFrame,
-              let sourceTexture,
-              let drawable = currentDrawable,
-              let commandBuffer = presenter.makePresentationCommand(
-                  source: sourceTexture,
-                  destination: drawable.texture,
-                  retaining: frame
-              )
-        else {
+              let sourceTexture else { return }
+        guard let drawable = currentDrawable else {
+            presentationDiagnostics?.recordMetalDrawableMiss()
             return
+        }
+        guard let commandBuffer = presenter.makePresentationCommand(
+            source: sourceTexture,
+            destination: drawable.texture,
+            retaining: frame
+        ) else {
+            presentationDiagnostics?.recordMetalCommandCreationFailure()
+            return
+        }
+        let committedAt = clock.now
+        let isNewFrame = recordedFrameGeneration != presentedFrameGeneration
+        if isNewFrame {
+            if let presentedFrameRequestedAt {
+                presentationDiagnostics?.recordViewUpdateToMetalCommit(
+                    presentedFrameRequestedAt.duration(to: committedAt)
+                )
+            }
+            self.presentedFrameRequestedAt = nil
+            let completionStartedAt = committedAt
+            commandBuffer.addCompletedHandler { [presentationDiagnostics] _ in
+                presentationDiagnostics?.recordMetalCommitToCompletion(
+                    completionStartedAt.duration(to: ContinuousClock().now)
+                )
+            }
         }
         commandBuffer.present(drawable)
         commandBuffer.commit()
-        if recordedFrameGeneration != presentedFrameGeneration {
+        if isNewFrame {
+            let previousGeneration = recordedFrameGeneration ?? 0
+            let superseded = presentedFrameGeneration > previousGeneration
+                ? presentedFrameGeneration - previousGeneration - 1
+                : 0
+            presentationDiagnostics?.recordMetalFramesSupersededBeforeDraw(superseded)
             recordedFrameGeneration = presentedFrameGeneration
             presentationDiagnostics?.recordMetalPresentedFrame()
         }

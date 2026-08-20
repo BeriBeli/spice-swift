@@ -83,6 +83,11 @@ struct SpiceMetalPresenterTests {
         diagnostics.recordCPUFallback(.missingIOSurface)
         diagnostics.recordCPUFallback(.pixelFormatMismatch)
         diagnostics.recordMetalPresentationError()
+        diagnostics.recordMetalFramesSupersededBeforeDraw(2)
+        diagnostics.recordMetalDrawableMiss()
+        diagnostics.recordMetalCommandCreationFailure()
+        diagnostics.recordViewUpdateToMetalCommit(.milliseconds(3))
+        diagnostics.recordMetalCommitToCompletion(.milliseconds(4))
 
         let metrics = diagnostics.snapshot()
         #expect(metrics.metalPresentedFrames == 1)
@@ -91,6 +96,11 @@ struct SpiceMetalPresenterTests {
         #expect(metrics.missingIOSurfaceFallbackFrames == 1)
         #expect(metrics.pixelFormatMismatchFallbackFrames == 1)
         #expect(metrics.lastCPUFallbackReason == .pixelFormatMismatch)
+        #expect(metrics.metalFramesSupersededBeforeDraw == 2)
+        #expect(metrics.metalDrawableMisses == 1)
+        #expect(metrics.metalCommandCreationFailures == 1)
+        #expect(metrics.viewUpdateToMetalCommit.p95Milliseconds == 3)
+        #expect(metrics.metalCommitToCompletion.p95Milliseconds == 4)
 
         diagnostics.reset()
         #expect(diagnostics.snapshot() == .empty)

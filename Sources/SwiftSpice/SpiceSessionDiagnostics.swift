@@ -11,10 +11,11 @@ import SpiceChannels
 /// strictly live gauges. The snapshot is assembled across actors and is not
 /// atomic.
 ///
-/// This type intentionally contains no per-frame log, pixel data, or native
-/// buffer handles. It also does not measure transport or server latency,
-/// mailbox queueing, application consumption latency, or GPU presentation
-/// timing. Publisher emission occurs before those downstream stages.
+/// This type intentionally contains no per-frame log or timestamp, pixel data,
+/// or native buffer handles. It does not measure transport or server latency.
+/// Bounded histograms summarize publisher, mailbox, and GPU-presentation timing
+/// without retaining individual samples. Publisher emission occurs before the
+/// downstream mailbox and presentation stages.
 /// Presentation counters are populated only when the desktop view receives
 /// this session's `presentationDiagnostics` recorder. Advanced-video counters
 /// cover H.264/H.265 decoding and do not describe the MJPEG path.
@@ -51,6 +52,18 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var publisherStaleSnapshots: UInt64 = 0
     public internal(set) var publisherPendingEvictions: UInt64 = 0
     public internal(set) var publisherPendingSurfaces: Int = 0
+    public internal(set) var publisherFlushes: UInt64 = 0
+    public internal(set) var publisherFlushesWithoutEmission: UInt64 = 0
+    package var publisherBatchStartGapHistogram = SpiceTimingHistogram()
+    package var publisherFlushStartGapHistogram = SpiceTimingHistogram()
+    package var publisherFlushSchedulingDelayHistogram = SpiceTimingHistogram()
+    package var publisherSnapshotDurationHistogram = SpiceTimingHistogram()
+    package var publisherEmitDurationHistogram = SpiceTimingHistogram()
+    public internal(set) var mailboxFramesSent: UInt64 = 0
+    public internal(set) var mailboxFramesDelivered: UInt64 = 0
+    public internal(set) var mailboxFramesCoalesced: UInt64 = 0
+    public internal(set) var mailboxFramesEvicted: UInt64 = 0
+    package var mailboxFrameQueueDelayHistogram = SpiceTimingHistogram()
     public internal(set) var videoDecoderSessionCreations: UInt64 = 0
     public internal(set) var videoHardwareSessions: UInt64 = 0
     public internal(set) var videoSoftwareSessions: UInt64 = 0
@@ -72,8 +85,45 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var pixelFormatMismatchFallbackFrames: UInt64 = 0
     public internal(set) var textureCreationFailedFallbackFrames: UInt64 = 0
     public internal(set) var lastCPUFallbackReason: SpiceCPUPresentationFallbackReason?
+    public internal(set) var metalFramesSupersededBeforeDraw: UInt64 = 0
+    public internal(set) var metalDrawableMisses: UInt64 = 0
+    public internal(set) var metalCommandCreationFailures: UInt64 = 0
+    package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
+    package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
 
     public static let empty = Self()
+
+    public var publisherBatchStartGap: SpiceTimingSummary {
+        publisherBatchStartGapHistogram.summary
+    }
+
+    public var publisherFlushStartGap: SpiceTimingSummary {
+        publisherFlushStartGapHistogram.summary
+    }
+
+    public var publisherFlushSchedulingDelay: SpiceTimingSummary {
+        publisherFlushSchedulingDelayHistogram.summary
+    }
+
+    public var publisherSnapshotDuration: SpiceTimingSummary {
+        publisherSnapshotDurationHistogram.summary
+    }
+
+    public var publisherEmitDuration: SpiceTimingSummary {
+        publisherEmitDurationHistogram.summary
+    }
+
+    public var mailboxFrameQueueDelay: SpiceTimingSummary {
+        mailboxFrameQueueDelayHistogram.summary
+    }
+
+    public var viewUpdateToMetalCommit: SpiceTimingSummary {
+        viewUpdateToMetalCommitHistogram.summary
+    }
+
+    public var metalCommitToCompletion: SpiceTimingSummary {
+        metalCommitToCompletionHistogram.summary
+    }
 
     mutating func accumulate(_ diagnostics: DisplayChannelDiagnostics) {
         let surface = diagnostics.surfaces
@@ -120,6 +170,13 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         publisherStaleSnapshots &+= publisher.staleSnapshots
         publisherPendingEvictions &+= publisher.pendingEvictions
         publisherPendingSurfaces += publisher.pendingSurfaces
+        publisherFlushes &+= publisher.flushes
+        publisherFlushesWithoutEmission &+= publisher.flushesWithoutEmission
+        publisherBatchStartGapHistogram.accumulate(publisher.batchStartGap)
+        publisherFlushStartGapHistogram.accumulate(publisher.flushStartGap)
+        publisherFlushSchedulingDelayHistogram.accumulate(publisher.flushSchedulingDelay)
+        publisherSnapshotDurationHistogram.accumulate(publisher.snapshotDuration)
+        publisherEmitDurationHistogram.accumulate(publisher.emitDuration)
 
         videoDecoderSessionCreations &+= video.sessionCreationCount
         videoHardwareSessions &+= video.hardwareSessionCount

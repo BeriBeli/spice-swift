@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIGURATION="${CONFIGURATION:-${CONFIG:-release}}"
-PRODUCT_NAME="SwiftSpice"
+TARGET_NAME="SwiftSpice"
 SCRATCH_PATH="$ROOT_DIR/.build/lib-arm64"
 
 log() {
@@ -25,12 +25,12 @@ mkdir -p "$ROOT_DIR/.build/module-cache"
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT_DIR/.build/module-cache}"
 export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT_DIR/.build/module-cache}"
 
-log "building $PRODUCT_NAME ($CONFIGURATION, arm64)"
+log "building $TARGET_NAME ($CONFIGURATION, arm64)"
 swift build --disable-sandbox \
     -c "$CONFIGURATION" \
     --triple arm64-apple-macosx26.0 \
     --scratch-path "$SCRATCH_PATH" \
-    --product "$PRODUCT_NAME" \
+    --target "$TARGET_NAME" \
     -Xswiftc -warnings-as-errors
 BIN_PATH="$(swift build --disable-sandbox \
     -c "$CONFIGURATION" \
@@ -38,8 +38,13 @@ BIN_PATH="$(swift build --disable-sandbox \
     --scratch-path "$SCRATCH_PATH" \
     --show-bin-path)"
 
-[[ -d "$BIN_PATH/$PRODUCT_NAME.swiftmodule" ]] \
-    || die "built Swift module not found: $BIN_PATH/$PRODUCT_NAME.swiftmodule"
+MODULE_PATH="$BIN_PATH/$TARGET_NAME.swiftmodule"
+if [[ ! -e "$MODULE_PATH" ]]; then
+    # SwiftPM's native builder keeps modules under Modules/, while Swift Build
+    # places them directly in the products directory.
+    MODULE_PATH="$BIN_PATH/Modules/$TARGET_NAME.swiftmodule"
+fi
+[[ -e "$MODULE_PATH" ]] || die "built Swift module not found below: $BIN_PATH"
 "$ROOT_DIR/Scripts/verify-native-closure.sh" --artifacts-only
 
-log "done -> $BIN_PATH/$PRODUCT_NAME.swiftmodule"
+log "done -> $MODULE_PATH"

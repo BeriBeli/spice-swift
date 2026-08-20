@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import SpiceIOSurface
 @testable import SpiceRenderer
 @testable import SwiftSpice
 
@@ -30,7 +31,14 @@ struct SpiceFrameTests {
     }
 
     @Test func comparesDistinctIOSurfaceFramesWithoutMaterializingPixels() async throws {
-        let store = SurfaceStore(backingPolicy: .dataOnly)
+        let framePool = IOSurfaceFramePool(limits: .init(
+            maximumFrames: 2,
+            maximumBytes: 1_024 * 1_024
+        ))
+        let store = SurfaceStore(
+            framePool: framePool,
+            backingPolicy: .dataOnly
+        )
         try await store.create(id: 7, width: 2, height: 1, format: 32)
         try await store.fill(
             surfaceID: 7,

@@ -682,16 +682,17 @@ such by an embedding application.
   viewer does not materialize it.
 - Aggregate diagnostics cover damage and copy bytes, CPU materialization, pool
   exhaustion and leases, GPU copies/errors, native/fallback video, publisher
-  suppression, and actual VideoToolbox decoder selection. There is no per-frame
-  telemetry log. `spice-probe --require-native-video` turns the zero-BGRA and
+  suppression, mailbox coalescing/eviction, Metal presentation failures, and
+  actual VideoToolbox decoder selection. Bounded content-free histograms expose
+  publisher, mailbox, and Metal timing without retaining individual samples or
+  per-frame logs. `spice-probe --require-native-video` turns the zero-BGRA and
   zero-GPU-error expectations into a live gate. Fault-injection regressions
   prove failed VT session creation retries and a Metal command error disables
   only the current stream generation before CPU fallback.
 - The SwiftPM `CompileMetalShaders` build-tool plugin produces the resource
-  `.metallib`. Apple Silicon app staging installs its bundle under
-  `Contents/Resources`, and the closure verifier requires exactly one arm64
-  executable slice, macOS 26 minimum, the shader entry point, signing, and no
-  absolute build-machine/Homebrew paths.
+  `.metallib`; package consumers receive it through SwiftPM. The native artifact
+  closure verifier requires exact arm64 static frameworks and rejects absolute
+  build-machine or Homebrew paths.
 - `SpiceDesktopView` keeps its existing narrow `NSViewRepresentable` and AppKit
   responder boundary, but its private framebuffer view now owns an on-demand
   `MTKView` child. IOSurface-backed BGRA frames become Metal textures and are
@@ -957,7 +958,7 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 353 tests in 69 suites, the
+The current warnings-as-errors gate passes 354 tests in 69 suites, the
 `SwiftSpice` library build, the generated-protocol consistency check, and
 exact-arm64 native artifact closure verification.
 
