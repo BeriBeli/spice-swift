@@ -408,6 +408,14 @@ struct SpiceSessionTests {
         #expect(activeDiagnostics == activeDiagnostics)
         #expect(activeDiagnostics.displayChannelCount == 1)
 
+        session.presentationDiagnostics.recordMetalPresentedFrame()
+        session.presentationDiagnostics.recordCPUFallback(.textureCreationFailed)
+        let presentationDiagnostics = await session.diagnosticsSnapshot()
+        #expect(presentationDiagnostics.metalPresentedFrames == 1)
+        #expect(presentationDiagnostics.cpuFallbackFrames == 1)
+        #expect(presentationDiagnostics.textureCreationFailedFallbackFrames == 1)
+        #expect(presentationDiagnostics.lastCPUFallbackReason == .textureCreationFailed)
+
         await session.disconnect()
         #expect(await mainTransport.isClosed)
         #expect(await displayTransport.isClosed)
@@ -1071,8 +1079,11 @@ struct SpiceSessionTests {
         }
         #expect(sawCompletion)
         #expect(sawTargetMouseMode)
-        await target.waitForOutboundCount(4)
-        #expect(try decodeMiniMessageID((await target.outbound).last ?? Data()) == 109)
+        // Runtime mouse-mode renegotiation adds a target-side
+        // MAIN_MOUSE_MODE_REQUEST before the final MIGRATE_END acknowledgement.
+        await target.waitForOutboundCount(5)
+        let targetOutbound = await target.outbound
+        #expect(try targetOutbound.suffix(2).map(decodeMiniMessageID) == [109, 105])
         #expect(!(await source.isConnected))
         #expect(await target.isConnected)
         #expect(!(await sourceInputs.isConnected))

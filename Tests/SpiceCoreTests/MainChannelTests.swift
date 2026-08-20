@@ -103,6 +103,56 @@ struct MainChannelTests {
         #expect(try decodeMiniBody(outbound[0]) == Data([0x02, 0x00]))
     }
 
+    @Test func requestsClientMouseModeWhenRuntimeSupportAppearsWithoutSpamming() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 1,
+                currentMouseMode: 1,
+                agentConnected: 0,
+                agentTokens: 0,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            encodeMiniServerMessage(SpiceMsgMainMouseMode(
+                supportedModes: 3,
+                currentMode: 1
+            )),
+            encodeMiniServerMessage(SpiceMsgMainMouseMode(
+                supportedModes: 3,
+                currentMode: 1
+            )),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+
+        let bootstrap = try await channel.bootstrap()
+        #expect(bootstrap.supportedMouseModes == 1)
+        #expect(bootstrap.currentMouseMode == 1)
+        let collector = MainEventCollector()
+        await #expect(throws: ChannelError.transport(.connectionClosed)) {
+            try await channel.run { event in
+                guard case let .main(mainEvent) = event else { return }
+                await collector.append(mainEvent)
+            }
+        }
+
+        #expect(await collector.events == [
+            .mouseMode(supported: 3, current: 1),
+            .mouseMode(supported: 3, current: 1),
+        ])
+        let outbound = await transport.outbound
+        #expect(try outbound.map(decodeMiniMessageID) == [104, 105])
+        #expect(try decodeMiniBody(outbound[1]) == Data([0x02, 0x00]))
+    }
+
     @Test func discoversChannelsAndHandlesPingAndAckWindow() async throws {
         let mainInit = SpiceMsgMainInit(
             sessionID: 42,

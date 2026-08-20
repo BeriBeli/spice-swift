@@ -23,6 +23,8 @@ struct DisplayFramePublisherTests {
         #expect(metrics.submissions == 1_000)
         #expect(metrics.snapshotAttempts == 1)
         #expect(metrics.emittedFrames == 1)
+        #expect(metrics.emittedIOSurfaceFrames == 0)
+        #expect(metrics.emittedCPUOnlyFrames == 1)
     }
 
     @Test func preservesSurfaceOrderAndPublishesLatestRevisionAtFlush() async {
@@ -174,6 +176,8 @@ struct DisplayFramePublisherTests {
         #expect(metrics.submissions == 2)
         #expect(metrics.snapshotAttempts == 2)
         #expect(metrics.emittedFrames == 1)
+        #expect(metrics.emittedIOSurfaceFrames == 1)
+        #expect(metrics.emittedCPUOnlyFrames == 0)
         #expect(metrics.staleSnapshots == 0)
         #expect(metrics.pendingSurfaces == 0)
     }

@@ -31,6 +31,8 @@ struct PublicAPIConsumer {
         _ = diagnostics.publisherSubmissions
         _ = diagnostics.publisherSnapshotAttempts
         _ = diagnostics.publisherEmittedFrames
+        _ = diagnostics.publisherEmittedIOSurfaceFrames
+        _ = diagnostics.publisherEmittedCPUOnlyFrames
         _ = diagnostics.publisherStaleSnapshots
         _ = diagnostics.publisherPendingEvictions
         _ = diagnostics.publisherPendingSurfaces
@@ -46,6 +48,20 @@ struct PublicAPIConsumer {
         _ = diagnostics.firstMetalGenerationDisableReason
         _ = diagnostics.surfaceAllocatedBytes
         _ = diagnostics.maximumSurfaceBytes
+        _ = diagnostics.metalPresentedFrames
+        _ = diagnostics.metalPresentationErrors
+        _ = diagnostics.cpuFallbackFrames
+        _ = diagnostics.metalUnavailableFallbackFrames
+        _ = diagnostics.missingIOSurfaceFallbackFrames
+        _ = diagnostics.ioSurfaceDimensionMismatchFallbackFrames
+        _ = diagnostics.pixelFormatMismatchFallbackFrames
+        _ = diagnostics.textureCreationFailedFallbackFrames
+        _ = diagnostics.lastCPUFallbackReason
+
+        let presentation: SpicePresentationMetrics =
+            session.presentationDiagnostics.snapshot()
+        requireSendable(presentation)
+        let _: Bool = presentation == .empty
 
         let agentManager = SpiceAgentManager()
         let agentDiagnostics: SpiceAgentWireDiagnostics =

@@ -1080,6 +1080,8 @@ private struct ProbeBenchmarkReport: Codable {
     let publisherSubmissions: UInt64
     let publisherSnapshotAttempts: UInt64
     let publisherEmittedFrames: UInt64
+    let publisherEmittedIOSurfaceFrames: UInt64
+    let publisherEmittedCPUOnlyFrames: UInt64
     let publisherStaleSnapshots: UInt64
     let publisherPendingEvictions: UInt64
     let publisherPendingSurfaces: Int
@@ -1148,6 +1150,8 @@ private struct ProbeBenchmarkReport: Codable {
         publisherSubmissions = diagnostics.publisherSubmissions
         publisherSnapshotAttempts = diagnostics.publisherSnapshotAttempts
         publisherEmittedFrames = diagnostics.publisherEmittedFrames
+        publisherEmittedIOSurfaceFrames = diagnostics.publisherEmittedIOSurfaceFrames
+        publisherEmittedCPUOnlyFrames = diagnostics.publisherEmittedCPUOnlyFrames
         publisherStaleSnapshots = diagnostics.publisherStaleSnapshots
         publisherPendingEvictions = diagnostics.publisherPendingEvictions
         publisherPendingSurfaces = diagnostics.publisherPendingSurfaces
@@ -1202,6 +1206,8 @@ private struct ProbeBenchmarkReport: Codable {
         case publisherSubmissions = "publisher_submissions"
         case publisherSnapshotAttempts = "publisher_snapshot_attempts"
         case publisherEmittedFrames = "publisher_emitted_frames"
+        case publisherEmittedIOSurfaceFrames = "publisher_emitted_iosurface_frames"
+        case publisherEmittedCPUOnlyFrames = "publisher_emitted_cpu_only_frames"
         case publisherStaleSnapshots = "publisher_stale_snapshots"
         case publisherPendingEvictions = "publisher_pending_evictions"
         case publisherPendingSurfaces = "publisher_pending_surfaces"

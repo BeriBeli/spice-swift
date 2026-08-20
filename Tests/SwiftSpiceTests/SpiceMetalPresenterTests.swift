@@ -70,6 +70,30 @@ struct SpiceMetalPresenterTests {
             pixels: Data([1, 2, 3, 255])
         )
         #expect(presenter.makeTexture(for: frame) == nil)
+        guard case .cpuFallback(.missingIOSurface) = presenter.makeTextureResult(for: frame) else {
+            Issue.record("Expected the missing IOSurface fallback reason")
+            return
+        }
+    }
+
+    @Test func recordsContentFreeFallbackReasons() {
+        let diagnostics = SpicePresentationDiagnostics()
+
+        diagnostics.recordMetalPresentedFrame()
+        diagnostics.recordCPUFallback(.missingIOSurface)
+        diagnostics.recordCPUFallback(.pixelFormatMismatch)
+        diagnostics.recordMetalPresentationError()
+
+        let metrics = diagnostics.snapshot()
+        #expect(metrics.metalPresentedFrames == 1)
+        #expect(metrics.metalPresentationErrors == 1)
+        #expect(metrics.cpuFallbackFrames == 2)
+        #expect(metrics.missingIOSurfaceFallbackFrames == 1)
+        #expect(metrics.pixelFormatMismatchFallbackFrames == 1)
+        #expect(metrics.lastCPUFallbackReason == .pixelFormatMismatch)
+
+        diagnostics.reset()
+        #expect(diagnostics.snapshot() == .empty)
     }
 
     @Test func scalesIOSurfaceIntoBackingSizedTexture() async throws {

@@ -27,6 +27,10 @@ package enum MainEvent: Sendable, Equatable {
 
 package actor MainChannel: SpiceManagedChannel {
     private static let clientMouseMode: UInt16 = 2
+    private struct MouseModeState: Equatable {
+        let supported: UInt32
+        let current: UInt32
+    }
 
     private var connection: ChannelConnection
     private let multimediaClock: (any MultimediaClockScheduling)?
@@ -39,6 +43,7 @@ package actor MainChannel: SpiceManagedChannel {
     private var serverAgentTokens: UInt32 = 0
     private var pendingEvents: [MainEvent] = []
     private var pendingAgentBytes = 0
+    private var lastClientMouseModeRequest: MouseModeState?
 
     package init(
         connection: ChannelConnection,
@@ -63,12 +68,10 @@ package actor MainChannel: SpiceManagedChannel {
         var bootstrapSupportedMouseModes = mainInit.supportedMouseModes
         var bootstrapCurrentMouseMode = mainInit.currentMouseMode
 
-        if mainInit.currentMouseMode != UInt32(Self.clientMouseMode),
-           mainInit.supportedMouseModes & UInt32(Self.clientMouseMode) != 0 {
-            try await connection.send(SpiceMsgcMainMouseModeRequest(
-                mode: Self.clientMouseMode
-            ))
-        }
+        try await requestClientMouseModeIfNeeded(
+            supported: mainInit.supportedMouseModes,
+            current: mainInit.currentMouseMode
+        )
 
         if mainInit.agentConnected != 0 {
             try await startAgent(clientTokens: mainInit.agentTokens)
@@ -96,6 +99,10 @@ package actor MainChannel: SpiceManagedChannel {
             case let .mainMouseMode(mode):
                 bootstrapSupportedMouseModes = UInt32(mode.supportedModes)
                 bootstrapCurrentMouseMode = UInt32(mode.currentMode)
+                try await requestClientMouseModeIfNeeded(
+                    supported: bootstrapSupportedMouseModes,
+                    current: bootstrapCurrentMouseMode
+                )
                 try await acknowledgeIfNeeded()
             case let .setAck(setAck):
                 ackController.configure(generation: setAck.generation, window: setAck.window)
@@ -142,6 +149,7 @@ package actor MainChannel: SpiceManagedChannel {
         }
         let previous = connection
         connection = replacement
+        lastClientMouseModeRequest = nil
         return previous
     }
 
@@ -220,10 +228,16 @@ package actor MainChannel: SpiceManagedChannel {
         }
         switch message {
         case let .mainMouseMode(mode):
+            let supported = UInt32(mode.supportedModes)
+            let current = UInt32(mode.currentMode)
+            try await requestClientMouseModeIfNeeded(
+                supported: supported,
+                current: current
+            )
             try await acknowledgeIfNeeded()
             return .mouseMode(
-                supported: UInt32(mode.supportedModes),
-                current: UInt32(mode.currentMode)
+                supported: supported,
+                current: current
             )
         case let .mainMultimediaTime(update):
             await multimediaClock?.reset(to: update.multimediaTime)
@@ -248,6 +262,27 @@ package actor MainChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return nil
         }
+    }
+
+    private func requestClientMouseModeIfNeeded(
+        supported: UInt32,
+        current: UInt32
+    ) async throws(ChannelError) {
+        let clientMode = UInt32(Self.clientMouseMode)
+        guard current != clientMode, supported & clientMode != 0 else {
+            lastClientMouseModeRequest = nil
+            return
+        }
+
+        let state = MouseModeState(supported: supported, current: current)
+        guard lastClientMouseModeRequest != state else {
+            return
+        }
+
+        try await connection.send(SpiceMsgcMainMouseModeRequest(
+            mode: Self.clientMouseMode
+        ))
+        lastClientMouseModeRequest = state
     }
 
     private func handleAgent(

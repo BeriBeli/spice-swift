@@ -120,7 +120,8 @@ physical input events:
 SpiceDesktopView(
     frame: frame,
     cursor: cursor,
-    pointerMode: pointerMode
+    pointerMode: pointerMode,
+    presentationDiagnostics: session.presentationDiagnostics
 ) { input in
     Task { try? await session.send(input) }
 }
@@ -141,6 +142,12 @@ messages; expose only the peer's clipboard capability booleans; and classify
 failures with fixed content-free categories. Counters cover the current Agent
 manager lifetime, while capability and last-failure fields are its latest
 observation.
+
+When `SpiceDesktopView` receives `session.presentationDiagnostics`, the session
+snapshot also separates publisher-emitted IOSurface/CPU-only frames and records
+Metal presentation versus AppKit CPU fallback. Fixed fallback categories
+distinguish unavailable Metal, missing IOSurface backing, dimension or pixel
+format mismatch, and Metal texture creation failure.
 
 ## Command-line probe
 

@@ -15,6 +15,11 @@ package struct SpiceMetalPresenterMetrics: Sendable, Equatable {
     package let commandErrors: UInt64
 }
 
+package enum SpiceMetalTextureResult {
+    case texture(any MTLTexture)
+    case cpuFallback(SpiceCPUPresentationFallbackReason)
+}
+
 private final class SpiceMetalPresenterCompletionMetrics: Sendable {
     private struct State: Sendable {
         var commandErrors: UInt64 = 0
@@ -43,8 +48,12 @@ package final class SpiceMetalPresenter {
     private let commandQueue: any MTLCommandQueue
     private let scaler: MPSImageLanczosScale
     private let completionMetrics = SpiceMetalPresenterCompletionMetrics()
+    private var presentationDiagnostics: SpicePresentationDiagnostics?
 
-    package init?(device: (any MTLDevice)? = SpiceMetalSystemDevice.shared.device) {
+    package init?(
+        device: (any MTLDevice)? = SpiceMetalSystemDevice.shared.device,
+        presentationDiagnostics: SpicePresentationDiagnostics? = nil
+    ) {
         guard let device, let commandQueue = device.makeCommandQueue() else {
             return nil
         }
@@ -53,15 +62,25 @@ package final class SpiceMetalPresenter {
         let scaler = MPSImageLanczosScale(device: device)
         scaler.edgeMode = .clamp
         self.scaler = scaler
+        self.presentationDiagnostics = presentationDiagnostics
     }
 
     package func makeTexture(for frame: SpiceFrame) -> (any MTLTexture)? {
-        guard let ioSurface = frame.ioSurface,
-              ioSurface.width == frame.width,
-              ioSurface.height == frame.height,
-              ioSurface.pixelFormat == kCVPixelFormatType_32BGRA
-        else {
+        guard case let .texture(texture) = makeTextureResult(for: frame) else {
             return nil
+        }
+        return texture
+    }
+
+    package func makeTextureResult(for frame: SpiceFrame) -> SpiceMetalTextureResult {
+        guard let ioSurface = frame.ioSurface else {
+            return .cpuFallback(.missingIOSurface)
+        }
+        guard ioSurface.width == frame.width, ioSurface.height == frame.height else {
+            return .cpuFallback(.ioSurfaceDimensionMismatch)
+        }
+        guard ioSurface.pixelFormat == kCVPixelFormatType_32BGRA else {
+            return .cpuFallback(.pixelFormatMismatch)
         }
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
@@ -71,13 +90,21 @@ package final class SpiceMetalPresenter {
         )
         descriptor.storageMode = .shared
         descriptor.usage = [.shaderRead]
-        return ioSurface.backing.withIOSurface { surface in
+        let texture = ioSurface.backing.withIOSurface { surface in
             device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0)
         }
+        guard let texture else {
+            return .cpuFallback(.textureCreationFailed)
+        }
+        return .texture(texture)
     }
 
     package nonisolated func metrics() -> SpiceMetalPresenterMetrics {
         completionMetrics.snapshot()
+    }
+
+    package func setPresentationDiagnostics(_ diagnostics: SpicePresentationDiagnostics?) {
+        presentationDiagnostics = diagnostics
     }
 
     /// The returned command buffer retains the frame lease until GPU completion,
@@ -108,11 +135,15 @@ package final class SpiceMetalPresenter {
             destinationOrigin: .init(x: 0, y: 0, z: 0)
         )
         blit.endEncoding()
-        commandBuffer.addCompletedHandler { [completionMetrics] commandBuffer in
+        commandBuffer.addCompletedHandler {
+            [completionMetrics, presentationDiagnostics] commandBuffer in
             if commandBuffer.status == .error, completionMetrics.recordCommandError() {
                 spiceRenderingLogger.error(
                     "Metal frame copy failed: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public)"
                 )
+            }
+            if commandBuffer.status == .error {
+                presentationDiagnostics?.recordMetalPresentationError()
             }
             withExtendedLifetime(frame) {}
         }
@@ -151,11 +182,15 @@ package final class SpiceMetalPresenter {
             sourceTexture: source,
             destinationTexture: destination
         )
-        commandBuffer.addCompletedHandler { [completionMetrics] commandBuffer in
+        commandBuffer.addCompletedHandler {
+            [completionMetrics, presentationDiagnostics] commandBuffer in
             if commandBuffer.status == .error, completionMetrics.recordCommandError() {
                 spiceRenderingLogger.error(
                     "Metal frame scale failed: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public)"
                 )
+            }
+            if commandBuffer.status == .error {
+                presentationDiagnostics?.recordMetalPresentationError()
             }
             withExtendedLifetime(frame) {}
         }
@@ -166,18 +201,28 @@ package final class SpiceMetalPresenter {
 @MainActor
 final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
     private let presenter: SpiceMetalPresenter
+    private var presentationDiagnostics: SpicePresentationDiagnostics?
     private var presentedFrame: SpiceFrame?
     private var sourceTexture: (any MTLTexture)?
     private var wasUsingMetal = false
+    private var presentedFrameGeneration: UInt64 = 0
+    private var recordedFrameGeneration: UInt64?
 
     override var isOpaque: Bool { true }
 
-    init?(presenter: SpiceMetalPresenter? = nil) {
-        guard let presenter = presenter ?? SpiceMetalPresenter() else {
+    init?(
+        presenter: SpiceMetalPresenter? = nil,
+        presentationDiagnostics: SpicePresentationDiagnostics? = nil
+    ) {
+        guard let presenter = presenter ?? SpiceMetalPresenter(
+            presentationDiagnostics: presentationDiagnostics
+        ) else {
             return nil
         }
         self.presenter = presenter
+        self.presentationDiagnostics = presentationDiagnostics
         super.init(frame: .zero, device: presenter.device)
+        presenter.setPresentationDiagnostics(presentationDiagnostics)
         colorPixelFormat = .bgra8Unorm
         framebufferOnly = false
         autoResizeDrawable = true
@@ -193,7 +238,22 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
     }
 
     func present(_ frame: SpiceFrame?) -> Bool {
-        guard let frame, let texture = presenter.makeTexture(for: frame) else {
+        guard let frame else {
+            if wasUsingMetal {
+                spiceRenderingLogger.info("Presentation path changed to AppKit CPU fallback")
+            }
+            wasUsingMetal = false
+            presentedFrame = nil
+            sourceTexture = nil
+            isHidden = true
+            return false
+        }
+        let texture: any MTLTexture
+        switch presenter.makeTextureResult(for: frame) {
+        case let .texture(sourceTexture):
+            texture = sourceTexture
+        case let .cpuFallback(reason):
+            presentationDiagnostics?.recordCPUFallback(reason)
             if wasUsingMetal {
                 spiceRenderingLogger.info("Presentation path changed to AppKit CPU fallback")
             }
@@ -205,6 +265,7 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
         }
         presentedFrame = frame
         sourceTexture = texture
+        presentedFrameGeneration &+= 1
         if !wasUsingMetal {
             spiceRenderingLogger.info("Presentation path changed to Metal IOSurface")
         }
@@ -212,6 +273,11 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
         isHidden = false
         needsDisplay = true
         return true
+    }
+
+    func setPresentationDiagnostics(_ diagnostics: SpicePresentationDiagnostics?) {
+        presentationDiagnostics = diagnostics
+        presenter.setPresentationDiagnostics(diagnostics)
     }
 
     override func layout() {
@@ -238,6 +304,10 @@ final class SpiceMetalFrameView: MTKView, MTKViewDelegate {
         }
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        if recordedFrameGeneration != presentedFrameGeneration {
+            recordedFrameGeneration = presentedFrameGeneration
+            presentationDiagnostics?.recordMetalPresentedFrame()
+        }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}

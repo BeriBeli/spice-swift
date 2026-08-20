@@ -24,10 +24,13 @@ package enum SpiceSystemCursorDescriptor: Equatable {
 }
 
 package enum SpiceDesktopPresentationPolicy {
-    package static func cursorLayer(for pointerMode: SpicePointerMode) -> SpiceCursorLayer {
+    package static func cursorLayer(
+        for pointerMode: SpicePointerMode,
+        isPointerCaptured: Bool = true
+    ) -> SpiceCursorLayer {
         switch pointerMode {
         case .absolute: .native
-        case .relative: .overlay
+        case .relative: isPointerCaptured ? .overlay : .native
         }
     }
 
@@ -54,10 +57,11 @@ package enum SpiceDesktopPresentationPolicy {
         for pointerMode: SpicePointerMode,
         cursorState: SpiceCursorState?,
         frameSize: CGSize?,
-        destinationSize: CGSize
+        destinationSize: CGSize,
+        isPointerCaptured: Bool = true
     ) -> SpiceSystemCursorDescriptor {
         guard pointerMode == .absolute else {
-            return .transparent
+            return isPointerCaptured ? .transparent : .arrow
         }
         guard let cursorState else {
             return .arrow
@@ -94,6 +98,80 @@ package enum SpiceDesktopPresentationPolicy {
     }
 }
 
+@MainActor
+package final class SpicePointerCaptureController {
+    private let disconnectCursor: () -> Bool
+    private let reconnectCursor: () -> Void
+    private let currentCursorLocation: () -> CGPoint?
+    private let warpCursor: (CGPoint) -> Void
+    private let hideCursor: () -> Void
+    private let unhideCursor: () -> Void
+    private var restoreLocation: CGPoint?
+
+    package private(set) var isCaptured = false
+
+    package init(
+        disconnectCursor: @escaping () -> Bool,
+        reconnectCursor: @escaping () -> Void,
+        currentCursorLocation: @escaping () -> CGPoint?,
+        warpCursor: @escaping (CGPoint) -> Void,
+        hideCursor: @escaping () -> Void,
+        unhideCursor: @escaping () -> Void
+    ) {
+        self.disconnectCursor = disconnectCursor
+        self.reconnectCursor = reconnectCursor
+        self.currentCursorLocation = currentCursorLocation
+        self.warpCursor = warpCursor
+        self.hideCursor = hideCursor
+        self.unhideCursor = unhideCursor
+    }
+
+    package static func system() -> SpicePointerCaptureController {
+        SpicePointerCaptureController(
+            disconnectCursor: {
+                CGAssociateMouseAndMouseCursorPosition(0) == .success
+            },
+            reconnectCursor: {
+                _ = CGAssociateMouseAndMouseCursorPosition(1)
+            },
+            currentCursorLocation: {
+                CGEvent(source: nil)?.location
+            },
+            warpCursor: { location in
+                _ = CGWarpMouseCursorPosition(location)
+            },
+            hideCursor: {
+                NSCursor.hide()
+            },
+            unhideCursor: {
+                NSCursor.unhide()
+            }
+        )
+    }
+
+    @discardableResult
+    package func capture() -> Bool {
+        guard !isCaptured else { return true }
+        let location = currentCursorLocation()
+        guard disconnectCursor() else { return false }
+        restoreLocation = location
+        hideCursor()
+        isCaptured = true
+        return true
+    }
+
+    package func release() {
+        guard isCaptured else { return }
+        if let restoreLocation {
+            warpCursor(restoreLocation)
+        }
+        reconnectCursor()
+        unhideCursor()
+        restoreLocation = nil
+        isCaptured = false
+    }
+}
+
 /// A narrow SwiftUI-to-AppKit bridge for framebuffer drawing and physical
 /// input capture. SwiftUI owns the frame and cursor values; the wrapped NSView
 /// owns only transient responder and tracking state.
@@ -101,17 +179,20 @@ public struct SpiceDesktopView: NSViewRepresentable {
     public var frame: SpiceFrame?
     public var cursor: SpiceCursorState?
     public var pointerMode: SpicePointerMode
+    public var presentationDiagnostics: SpicePresentationDiagnostics?
     public var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
 
     public init(
         frame: SpiceFrame?,
         cursor: SpiceCursorState? = nil,
         pointerMode: SpicePointerMode = .absolute,
+        presentationDiagnostics: SpicePresentationDiagnostics? = nil,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
         self.frame = frame
         self.cursor = cursor
         self.pointerMode = pointerMode
+        self.presentationDiagnostics = presentationDiagnostics
         self.onInput = onInput
     }
 
@@ -120,6 +201,7 @@ public struct SpiceDesktopView: NSViewRepresentable {
             frame: frame,
             cursorState: cursor,
             pointerMode: pointerMode,
+            presentationDiagnostics: presentationDiagnostics,
             onInput: onInput
         )
     }
@@ -132,8 +214,13 @@ public struct SpiceDesktopView: NSViewRepresentable {
             frame: frame,
             cursorState: cursor,
             pointerMode: pointerMode,
+            presentationDiagnostics: presentationDiagnostics,
             onInput: onInput
         )
+    }
+
+    public static func dismantleNSView(_ nsView: NSView, coordinator: Void) {
+        (nsView as? SpiceFramebufferView)?.prepareForDismantle()
     }
 }
 
@@ -142,6 +229,8 @@ private final class SpiceFramebufferView: NSView {
     private var desktopFrame: SpiceFrame?
     private var cursorState: SpiceCursorState?
     private var pointerMode: SpicePointerMode
+    private var presentationDiagnostics: SpicePresentationDiagnostics?
+    private var windowObservers: [NSObjectProtocol] = []
     private var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
     private var trackingArea: NSTrackingArea?
     private var pressedScanCodes: Set<UInt32> = []
@@ -150,6 +239,7 @@ private final class SpiceFramebufferView: NSView {
     private var isUsingMetal = false
     private var systemCursorDescriptor: SpiceSystemCursorDescriptor?
     private var systemCursor: NSCursor = .arrow
+    private let pointerCapture = SpicePointerCaptureController.system()
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -158,19 +248,23 @@ private final class SpiceFramebufferView: NSView {
         frame: SpiceFrame?,
         cursorState: SpiceCursorState?,
         pointerMode: SpicePointerMode,
+        presentationDiagnostics: SpicePresentationDiagnostics?,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
         desktopFrame = frame
         self.cursorState = cursorState
         self.pointerMode = pointerMode
+        self.presentationDiagnostics = presentationDiagnostics
         self.onInput = onInput
-        self.metalView = SpiceMetalFrameView()
+        self.metalView = SpiceMetalFrameView(
+            presentationDiagnostics: presentationDiagnostics
+        )
         super.init(frame: .zero)
         if let metalView {
             addSubview(metalView)
         }
         addSubview(cursorOverlay)
-        isUsingMetal = metalView?.present(frame) ?? false
+        updatePresentedFrame(frame)
         updateCursorPresentation()
     }
 
@@ -183,16 +277,82 @@ private final class SpiceFramebufferView: NSView {
         frame: SpiceFrame?,
         cursorState: SpiceCursorState?,
         pointerMode: SpicePointerMode,
+        presentationDiagnostics: SpicePresentationDiagnostics?,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
-        desktopFrame = frame
+        let frameChanged = !Self.framesSharePresentationStorage(desktopFrame, frame)
+        self.presentationDiagnostics = presentationDiagnostics
+        metalView?.setPresentationDiagnostics(presentationDiagnostics)
         self.cursorState = cursorState
         self.pointerMode = pointerMode
         self.onInput = onInput
-        isUsingMetal = metalView?.present(frame) ?? false
+        if pointerMode == .absolute {
+            releasePointerCapture()
+        }
+        if frameChanged {
+            updatePresentedFrame(frame)
+        } else {
+            desktopFrame = frame
+        }
         updateCursorPresentation()
         needsLayout = true
         needsDisplay = true
+    }
+
+    private func updatePresentedFrame(_ frame: SpiceFrame?) {
+        desktopFrame = frame
+        if let metalView {
+            isUsingMetal = metalView.present(frame)
+            return
+        }
+        isUsingMetal = false
+        if frame != nil {
+            presentationDiagnostics?.recordCPUFallback(.metalUnavailable)
+        }
+    }
+
+    private static func framesSharePresentationStorage(
+        _ lhs: SpiceFrame?,
+        _ rhs: SpiceFrame?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            true
+        case let (lhs?, rhs?):
+            lhs.sharesPresentationStorage(with: rhs)
+        default:
+            false
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeWindowObservers()
+        guard let window else {
+            releasePointerCapture()
+            return
+        }
+        window.acceptsMouseMovedEvents = true
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            NSWindow.didResignKeyNotification,
+            NSWindow.willCloseNotification,
+        ]
+        windowObservers = names.map { name in
+            center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.releasePointerCapture()
+                }
+            }
+        }
+    }
+
+    private func removeWindowObservers() {
+        let center = NotificationCenter.default
+        for observer in windowObservers {
+            center.removeObserver(observer)
+        }
+        windowObservers.removeAll()
     }
 
     override func layout() {
@@ -289,11 +449,13 @@ private final class SpiceFramebufferView: NSView {
             onInput(.keyUp(scanCode: scanCode))
         }
         pressedScanCodes.removeAll(keepingCapacity: true)
+        releasePointerCapture()
         return super.resignFirstResponder()
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        capturePointerIfNeeded()
         onInput(.mousePress(.left))
     }
 
@@ -303,6 +465,7 @@ private final class SpiceFramebufferView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        capturePointerIfNeeded()
         onInput(.mousePress(.right))
     }
 
@@ -312,6 +475,7 @@ private final class SpiceFramebufferView: NSView {
 
     override func otherMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        capturePointerIfNeeded()
         onInput(.mousePress(mouseButton(number: event.buttonNumber)))
     }
 
@@ -336,10 +500,11 @@ private final class SpiceFramebufferView: NSView {
     private func sendMotion(_ event: NSEvent) {
         switch pointerMode {
         case .relative:
-            onInput(.mouseMotion(
-                dx: clampedInt32(event.deltaX.rounded()),
-                dy: clampedInt32(event.deltaY.rounded())
-            ))
+            guard pointerCapture.isCaptured else { return }
+            let dx = clampedInt32(event.deltaX.rounded())
+            let dy = clampedInt32(event.deltaY.rounded())
+            guard dx != 0 || dy != 0 else { return }
+            onInput(.mouseMotion(dx: dx, dy: dy))
         case .absolute:
             guard let frame = desktopFrame else {
                 return
@@ -362,6 +527,27 @@ private final class SpiceFramebufferView: NSView {
         }
     }
 
+    private func capturePointerIfNeeded() {
+        guard pointerMode == .relative, window?.isKeyWindow == true else { return }
+        if pointerCapture.capture() {
+            updateCursorPresentation()
+        }
+    }
+
+    fileprivate func releasePointerCapture() {
+        pointerCapture.release()
+        updateCursorPresentation()
+    }
+
+    @objc func releaseSpicePointerCapture(_ sender: Any?) {
+        releasePointerCapture()
+    }
+
+    fileprivate func prepareForDismantle() {
+        releasePointerCapture()
+        removeWindowObservers()
+    }
+
     private func contentRectangle(frameWidth: Int, frameHeight: Int) -> NSRect {
         SpiceFrameDrawing.contentRectangle(
             in: bounds,
@@ -371,7 +557,10 @@ private final class SpiceFramebufferView: NSView {
     }
 
     private func updateCursorPresentation() {
-        let usesOverlay = SpiceDesktopPresentationPolicy.cursorLayer(for: pointerMode) == .overlay
+        let usesOverlay = SpiceDesktopPresentationPolicy.cursorLayer(
+            for: pointerMode,
+            isPointerCaptured: pointerCapture.isCaptured
+        ) == .overlay
         cursorOverlay.isHidden = !usesOverlay
         cursorOverlay.update(
             frame: desktopFrame,
@@ -386,7 +575,8 @@ private final class SpiceFramebufferView: NSView {
             frameSize: desktopFrame.map {
                 CGSize(width: $0.width, height: $0.height)
             },
-            destinationSize: destinationSize
+            destinationSize: destinationSize,
+            isPointerCaptured: pointerCapture.isCaptured
         )
         guard descriptor != systemCursorDescriptor else {
             return

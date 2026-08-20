@@ -13,8 +13,10 @@ import SpiceChannels
 ///
 /// This type intentionally contains no per-frame log, pixel data, or native
 /// buffer handles. It also does not measure transport or server latency,
-/// mailbox queueing, application consumption, or GPU presentation. Publisher
-/// emission occurs before those downstream stages. Advanced-video counters
+/// mailbox queueing, application consumption latency, or GPU presentation
+/// timing. Publisher emission occurs before those downstream stages.
+/// Presentation counters are populated only when the desktop view receives
+/// this session's `presentationDiagnostics` recorder. Advanced-video counters
 /// cover H.264/H.265 decoding and do not describe the MJPEG path.
 ///
 /// `totalIOSurfaceAllocatedBytes` is process-wide live state.
@@ -44,6 +46,8 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var publisherSubmissions: UInt64 = 0
     public internal(set) var publisherSnapshotAttempts: UInt64 = 0
     public internal(set) var publisherEmittedFrames: UInt64 = 0
+    public internal(set) var publisherEmittedIOSurfaceFrames: UInt64 = 0
+    public internal(set) var publisherEmittedCPUOnlyFrames: UInt64 = 0
     public internal(set) var publisherStaleSnapshots: UInt64 = 0
     public internal(set) var publisherPendingEvictions: UInt64 = 0
     public internal(set) var publisherPendingSurfaces: Int = 0
@@ -59,6 +63,15 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var firstMetalGenerationDisableReason: String?
     public internal(set) var surfaceAllocatedBytes: Int = 0
     public internal(set) var maximumSurfaceBytes: Int = 0
+    public internal(set) var metalPresentedFrames: UInt64 = 0
+    public internal(set) var metalPresentationErrors: UInt64 = 0
+    public internal(set) var cpuFallbackFrames: UInt64 = 0
+    public internal(set) var metalUnavailableFallbackFrames: UInt64 = 0
+    public internal(set) var missingIOSurfaceFallbackFrames: UInt64 = 0
+    public internal(set) var ioSurfaceDimensionMismatchFallbackFrames: UInt64 = 0
+    public internal(set) var pixelFormatMismatchFallbackFrames: UInt64 = 0
+    public internal(set) var textureCreationFailedFallbackFrames: UInt64 = 0
+    public internal(set) var lastCPUFallbackReason: SpiceCPUPresentationFallbackReason?
 
     public static let empty = Self()
 
@@ -102,6 +115,8 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         publisherSubmissions &+= publisher.submissions
         publisherSnapshotAttempts &+= publisher.snapshotAttempts
         publisherEmittedFrames &+= publisher.emittedFrames
+        publisherEmittedIOSurfaceFrames &+= publisher.emittedIOSurfaceFrames
+        publisherEmittedCPUOnlyFrames &+= publisher.emittedCPUOnlyFrames
         publisherStaleSnapshots &+= publisher.staleSnapshots
         publisherPendingEvictions &+= publisher.pendingEvictions
         publisherPendingSurfaces += publisher.pendingSurfaces

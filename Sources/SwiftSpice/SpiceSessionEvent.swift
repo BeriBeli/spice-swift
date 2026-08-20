@@ -71,11 +71,31 @@ public struct SpiceFrame: Sendable, Equatable {
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.surfaceID == rhs.surfaceID
-            && lhs.width == rhs.width
-            && lhs.height == rhs.height
-            && lhs.bytesPerRow == rhs.bytesPerRow
-            && lhs.pixels == rhs.pixels
+        guard lhs.surfaceID == rhs.surfaceID,
+              lhs.width == rhs.width,
+              lhs.height == rhs.height,
+              lhs.bytesPerRow == rhs.bytesPerRow
+        else {
+            return false
+        }
+        if lhs.pixelStorage === rhs.pixelStorage {
+            return true
+        }
+        // A distinct GPU-backed storage object represents a distinct committed
+        // frame revision. Comparing its pixels would synchronously read the
+        // entire IOSurface back to the CPU during SwiftUI view diffing.
+        guard lhs.ioSurface == nil, rhs.ioSurface == nil else {
+            return false
+        }
+        return lhs.pixels == rhs.pixels
+    }
+
+    package func sharesPresentationStorage(with other: Self) -> Bool {
+        surfaceID == other.surfaceID
+            && width == other.width
+            && height == other.height
+            && bytesPerRow == other.bytesPerRow
+            && pixelStorage === other.pixelStorage
     }
 }
 

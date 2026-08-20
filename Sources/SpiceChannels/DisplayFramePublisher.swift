@@ -5,6 +5,8 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var submissions: UInt64
     package var snapshotAttempts: UInt64
     package var emittedFrames: UInt64
+    package var emittedIOSurfaceFrames: UInt64
+    package var emittedCPUOnlyFrames: UInt64
     package var staleSnapshots: UInt64
     package var pendingEvictions: UInt64
     package var pendingSurfaces: Int
@@ -13,6 +15,8 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         submissions: UInt64 = 0,
         snapshotAttempts: UInt64 = 0,
         emittedFrames: UInt64 = 0,
+        emittedIOSurfaceFrames: UInt64 = 0,
+        emittedCPUOnlyFrames: UInt64 = 0,
         staleSnapshots: UInt64 = 0,
         pendingEvictions: UInt64 = 0,
         pendingSurfaces: Int = 0
@@ -20,6 +24,8 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         self.submissions = submissions
         self.snapshotAttempts = snapshotAttempts
         self.emittedFrames = emittedFrames
+        self.emittedIOSurfaceFrames = emittedIOSurfaceFrames
+        self.emittedCPUOnlyFrames = emittedCPUOnlyFrames
         self.staleSnapshots = staleSnapshots
         self.pendingEvictions = pendingEvictions
         self.pendingSurfaces = pendingSurfaces
@@ -29,6 +35,8 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         submissions &+= other.submissions
         snapshotAttempts &+= other.snapshotAttempts
         emittedFrames &+= other.emittedFrames
+        emittedIOSurfaceFrames &+= other.emittedIOSurfaceFrames
+        emittedCPUOnlyFrames &+= other.emittedCPUOnlyFrames
         staleSnapshots &+= other.staleSnapshots
         pendingEvictions &+= other.pendingEvictions
         pendingSurfaces += other.pendingSurfaces
@@ -61,6 +69,8 @@ package actor DisplayFramePublisher {
     private var submissions: UInt64 = 0
     private var snapshotAttempts: UInt64 = 0
     private var emittedFrames: UInt64 = 0
+    private var emittedIOSurfaceFrames: UInt64 = 0
+    private var emittedCPUOnlyFrames: UInt64 = 0
     private var staleSnapshots: UInt64 = 0
     private var pendingEvictions: UInt64 = 0
 
@@ -164,6 +174,8 @@ package actor DisplayFramePublisher {
             submissions: submissions,
             snapshotAttempts: snapshotAttempts,
             emittedFrames: emittedFrames,
+            emittedIOSurfaceFrames: emittedIOSurfaceFrames,
+            emittedCPUOnlyFrames: emittedCPUOnlyFrames,
             staleSnapshots: staleSnapshots,
             pendingEvictions: pendingEvictions,
             pendingSurfaces: pending.count
@@ -229,6 +241,11 @@ package actor DisplayFramePublisher {
                 )
             }
             emittedFrames &+= 1
+            if frame.ioSurfaceFrame == nil {
+                emittedCPUOnlyFrames &+= 1
+            } else {
+                emittedIOSurfaceFrames &+= 1
+            }
         }
         guard generation == flushGeneration else { return }
         isFlushing = false

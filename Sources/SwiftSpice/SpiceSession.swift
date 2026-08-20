@@ -130,6 +130,7 @@ public actor SpiceSession {
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
+    public nonisolated let presentationDiagnostics = SpicePresentationDiagnostics()
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
     public nonisolated let playbackEvents: AsyncStream<SpicePlaybackEvent>
@@ -294,6 +295,7 @@ public actor SpiceSession {
             throw .alreadyConnected
         }
         retiredDisplayDiagnostics = SpiceSessionDiagnostics()
+        presentationDiagnostics.reset()
         isConnecting = true
         defer { isConnecting = false }
 
@@ -445,7 +447,9 @@ public actor SpiceSession {
     ///
     /// Cumulative counters start at the most recent `connect` attempt. The
     /// snapshot has no transport, server, mailbox, application-consumption, or
-    /// GPU-presentation timing. Advanced-video counters do not cover MJPEG.
+    /// GPU-presentation timing. Presentation counters require passing
+    /// `presentationDiagnostics` to `SpiceDesktopView`. Advanced-video counters
+    /// do not cover MJPEG.
     public func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
         var result = retiredDisplayDiagnostics
 
@@ -462,6 +466,18 @@ public actor SpiceSession {
         let surfaceBudget = surfaceMemoryBudget.metrics()
         result.surfaceAllocatedBytes = surfaceBudget.allocatedBytes
         result.maximumSurfaceBytes = surfaceBudget.maximumBytes
+        let presentation = presentationDiagnostics.snapshot()
+        result.metalPresentedFrames = presentation.metalPresentedFrames
+        result.metalPresentationErrors = presentation.metalPresentationErrors
+        result.cpuFallbackFrames = presentation.cpuFallbackFrames
+        result.metalUnavailableFallbackFrames = presentation.metalUnavailableFallbackFrames
+        result.missingIOSurfaceFallbackFrames = presentation.missingIOSurfaceFallbackFrames
+        result.ioSurfaceDimensionMismatchFallbackFrames =
+            presentation.ioSurfaceDimensionMismatchFallbackFrames
+        result.pixelFormatMismatchFallbackFrames = presentation.pixelFormatMismatchFallbackFrames
+        result.textureCreationFailedFallbackFrames =
+            presentation.textureCreationFailedFallbackFrames
+        result.lastCPUFallbackReason = presentation.lastCPUFallbackReason
         return result
     }
 
