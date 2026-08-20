@@ -10,9 +10,12 @@ fail=0
 check_macho() {
     local binary="$1"
     local architectures
+    local file_kind
+    file_kind="$(file "$binary")"
     # Static archives have no dyld load commands, but release inputs must still
     # be Apple Silicon-only so an Intel slice cannot re-enter the product.
-    if [[ "$binary" == *.a ]]; then
+    # A static framework's executable has no .a suffix, so inspect its file kind.
+    if [[ "$binary" == *.a || "$file_kind" == *"current ar archive"* ]]; then
         local archive_architectures
         archive_architectures="$(lipo -archs "$binary" 2>/dev/null || true)"
         if [[ "$archive_architectures" != "arm64" ]]; then
@@ -21,7 +24,7 @@ check_macho() {
         fi
         return
     fi
-    if ! file "$binary" | grep -q 'Mach-O'; then
+    if [[ "$file_kind" != *"Mach-O"* ]]; then
         return
     fi
     architectures="$(lipo -archs "$binary" 2>/dev/null || true)"

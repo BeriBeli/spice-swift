@@ -1,4 +1,4 @@
-module CTurboJPEG {
+framework module CSpiceQUIC {
   header "shim.h"
   export *
 }

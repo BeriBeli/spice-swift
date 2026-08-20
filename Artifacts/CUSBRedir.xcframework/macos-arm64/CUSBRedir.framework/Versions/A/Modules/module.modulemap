@@ -1,0 +1,8 @@
+framework module CUSBRedir {
+  header "usbredirhost.h"
+  header "libusb.h"
+  header "usbredirfilter.h"
+  header "usbredirparser.h"
+  header "usbredirproto.h"
+  export *
+}

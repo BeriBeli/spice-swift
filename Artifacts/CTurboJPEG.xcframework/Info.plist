@@ -6,13 +6,11 @@
 	<array>
 		<dict>
 			<key>BinaryPath</key>
-			<string>libCTurboJPEG.a</string>
-			<key>HeadersPath</key>
-			<string>Headers</string>
+			<string>CTurboJPEG.framework/Versions/A/CTurboJPEG</string>
 			<key>LibraryIdentifier</key>
 			<string>macos-arm64</string>
 			<key>LibraryPath</key>
-			<string>libCTurboJPEG.a</string>
+			<string>CTurboJPEG.framework</string>
 			<key>SupportedArchitectures</key>
 			<array>
 				<string>arm64</string>

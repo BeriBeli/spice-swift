@@ -68,12 +68,53 @@ fetch_verified() {
     fi
 }
 
-write_module_map() {
+write_framework_module_map() {
     local directory="$1"
     local module="$2"
-    local header="$3"
-    printf 'module %s {\n  header "%s"\n  export *\n}\n' "$module" "$header" \
-        >"$directory/module.modulemap"
+    shift 2
+    {
+        printf 'framework module %s {\n' "$module"
+        for header in "$@"; do
+            printf '  header "%s"\n' "$header"
+        done
+        printf '  export *\n}\n'
+    } >"$directory/module.modulemap"
+}
+
+create_static_xcframework() {
+    local module="$1"
+    local source="$2"
+    local framework="$WORK_DIR/frameworks/$module.framework"
+    local version="$framework/Versions/A"
+    local info_plist="$version/Resources/Info.plist"
+
+    rm -rf "$framework"
+    mkdir -p "$version/Headers" "$version/Modules" "$version/Resources"
+    cp "$source/lib$module.a" "$version/$module"
+    cp "$source/Headers/"*.h "$version/Headers/"
+    cp "$source/Headers/module.modulemap" "$version/Modules/module.modulemap"
+
+    plutil -create xml1 "$info_plist"
+    plutil -insert CFBundleDevelopmentRegion -string en "$info_plist"
+    plutil -insert CFBundleExecutable -string "$module" "$info_plist"
+    plutil -insert CFBundleIdentifier -string "com.beribeli.SwiftSpice.$module" "$info_plist"
+    plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$info_plist"
+    plutil -insert CFBundleName -string "$module" "$info_plist"
+    plutil -insert CFBundlePackageType -string FMWK "$info_plist"
+    plutil -insert CFBundleShortVersionString -string 1.0 "$info_plist"
+    plutil -insert CFBundleVersion -string 1 "$info_plist"
+    plutil -insert MinimumOSVersion -string "$MACOS_DEPLOYMENT_TARGET" "$info_plist"
+
+    ln -s A "$framework/Versions/Current"
+    ln -s "Versions/Current/$module" "$framework/$module"
+    ln -s Versions/Current/Headers "$framework/Headers"
+    ln -s Versions/Current/Modules "$framework/Modules"
+    ln -s Versions/Current/Resources "$framework/Resources"
+
+    rm -rf "$OUTPUT_DIR/$module.xcframework"
+    xcodebuild -create-xcframework \
+        -framework "$framework" \
+        -output "$OUTPUT_DIR/$module.xcframework"
 }
 
 require_tool curl
@@ -247,12 +288,13 @@ cp "$WORK_DIR/build/arm64/libCTurboJPEG.a" \
     "$artifact_stage/CTurboJPEG/libCTurboJPEG.a"
 cp "$ROOT_DIR/Sources/CTurboJPEG/shim.h" "$artifact_stage/CTurboJPEG/Headers/"
 cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/src/turbojpeg.h" "$artifact_stage/CTurboJPEG/Headers/"
-write_module_map "$artifact_stage/CTurboJPEG/Headers" CTurboJPEG shim.h
+write_framework_module_map "$artifact_stage/CTurboJPEG/Headers" \
+    CTurboJPEG shim.h turbojpeg.h
 
 cp "$WORK_DIR/build/arm64/libCSpiceQUIC.a" \
     "$artifact_stage/CSpiceQUIC/libCSpiceQUIC.a"
 cp "$ROOT_DIR/Sources/CSpiceQUIC/shim.h" "$artifact_stage/CSpiceQUIC/Headers/"
-write_module_map "$artifact_stage/CSpiceQUIC/Headers" CSpiceQUIC shim.h
+write_framework_module_map "$artifact_stage/CSpiceQUIC/Headers" CSpiceQUIC shim.h
 
 cp "$WORK_DIR/build/arm64/libCUSBRedir.a" \
     "$artifact_stage/CUSBRedir/libCUSBRedir.a"
@@ -262,15 +304,14 @@ cp "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/usbredirhost/usbredirhost.h" \
     "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/usbredirparser/usbredirproto.h" \
     "$WORK_DIR/build/arm64/prefix/libusb/include/libusb-1.0/libusb.h" \
     "$artifact_stage/CUSBRedir/Headers/"
-write_module_map "$artifact_stage/CUSBRedir/Headers" CUSBRedir usbredirhost.h
+sed -i '' 's|#include <libusb.h>|#include "libusb.h"|' \
+    "$artifact_stage/CUSBRedir/Headers/usbredirhost.h"
+write_framework_module_map "$artifact_stage/CUSBRedir/Headers" \
+    CUSBRedir usbredirhost.h libusb.h usbredirfilter.h usbredirparser.h usbredirproto.h
 
 mkdir -p "$OUTPUT_DIR"
 for module in CTurboJPEG CSpiceQUIC CUSBRedir; do
-    rm -rf "$OUTPUT_DIR/$module.xcframework"
-    xcodebuild -create-xcframework \
-        -library "$artifact_stage/$module/lib$module.a" \
-        -headers "$artifact_stage/$module/Headers" \
-        -output "$OUTPUT_DIR/$module.xcframework"
+    create_static_xcframework "$module" "$artifact_stage/$module"
 done
 
 mkdir -p "$OUTPUT_DIR/CTurboJPEG.xcframework/Licenses" \

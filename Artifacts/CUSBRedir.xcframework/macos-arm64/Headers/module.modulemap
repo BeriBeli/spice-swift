@@ -1,4 +1,0 @@
-module CUSBRedir {
-  header "usbredirhost.h"
-  export *
-}

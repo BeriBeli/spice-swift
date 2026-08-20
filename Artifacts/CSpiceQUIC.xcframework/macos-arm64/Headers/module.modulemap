@@ -1,4 +1,0 @@
-module CSpiceQUIC {
-  header "shim.h"
-  export *
-}

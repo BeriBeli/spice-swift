@@ -9,7 +9,7 @@
 #include <string.h>
 #include <sys/time.h>
 
-#include <usbredirhost.h>
+#include <CUSBRedir/usbredirhost.h>
 
 struct SpiceUSBRedirHostContext {
     libusb_context *usb_context;

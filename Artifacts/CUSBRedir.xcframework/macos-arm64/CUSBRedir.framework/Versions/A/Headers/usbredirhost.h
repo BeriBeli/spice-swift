@@ -20,7 +20,7 @@
 */
 #pragma once
 
-#include <libusb.h>
+#include "libusb.h"
 #include "usbredirparser.h"
 #include "usbredirfilter.h"
 
