@@ -322,7 +322,7 @@ struct DisplayChannelTests {
         #expect(diagnostics.surfaces.nativeVideoFallbacks == 1)
     }
 
-    @Test func commandFailureDisablesMetalUntilTheNextStreamGeneration() async throws {
+    @Test func unavailableMetalDisablesUntilTheNextStreamGeneration() async throws {
         let decoder = StubAdvancedVideoDecoder(image: SpiceDecodedImage(
             width: 2,
             height: 2,
@@ -369,9 +369,7 @@ struct DisplayChannelTests {
         ]
         let transport = FakeTransport(inbound: inbound.map(Result.success))
         try await transport.connect()
-        let store = SurfaceStore(compositorFailureForAttempt: { attempt in
-            attempt == 1 ? .commandExecutionFailed("injected command failure") : nil
-        })
+        let store = SurfaceStore(backingPolicy: .dataOnly)
         let channel = DisplayChannel(
             connection: ChannelConnection(
                 key: ChannelKey(type: 2, id: 0),
@@ -392,13 +390,13 @@ struct DisplayChannelTests {
 
         let diagnostics = await channel.diagnosticsSnapshot()
         #expect(diagnostics.advancedCPUFallbackFrames == 3)
-        #expect(diagnostics.metalGenerationDisableCount == 1)
+        #expect(diagnostics.metalGenerationDisableCount == 2)
         #expect(
             diagnostics.firstMetalGenerationDisableReason?
-                .contains("injected command failure") == true
+                .contains("Metal compositor requires") == true
         )
         #expect(diagnostics.surfaces.nativeVideoFallbacks == 2)
-        #expect(diagnostics.surfaces.compositorErrors == 1)
+        #expect(diagnostics.surfaces.compositorErrors == 0)
         #expect(await decoder.receivedPayloads == [Data([1]), Data([2]), Data([3])])
         #expect(try await channel.processNext() == .ignored(125))
     }
