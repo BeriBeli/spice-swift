@@ -29,7 +29,11 @@ products_directory="$(dirname "$codecov_directory")"
 profile="$codecov_directory/default.profdata"
 
 shopt -s nullglob
-coverage_binaries=("$products_directory"/*.xctest/Contents/MacOS/*)
+coverage_binaries=()
+for candidate in "$products_directory"/*.xctest/Contents/MacOS/*; do
+    [[ -f "$candidate" && -x "$candidate" ]] || continue
+    coverage_binaries+=("$candidate")
+done
 shopt -u nullglob
 if [[ "${#coverage_binaries[@]}" -eq 0 || ! -f "$profile" ]]; then
     printf '[coverage] SwiftPM did not produce test binaries and a merged profile\n' >&2
