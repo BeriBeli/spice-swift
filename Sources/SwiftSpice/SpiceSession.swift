@@ -446,9 +446,10 @@ public actor SpiceSession {
     /// Returns a best-effort aggregate snapshot of the display pipeline.
     ///
     /// Cumulative counters start at the most recent `connect` attempt. The
-    /// snapshot has no transport or server timing and does not retain per-frame
-    /// timestamps. It includes bounded publisher, mailbox, and GPU-presentation
-    /// timing summaries. Presentation counters require passing
+    /// snapshot has no timing before a complete framed message returns from the
+    /// transport and does not retain per-frame timestamps. It includes bounded
+    /// receive-to-surface-apply, publisher, mailbox, and GPU-presentation timing
+    /// summaries. Presentation counters require passing
     /// `presentationDiagnostics` to `SpiceDesktopView`. Advanced-video counters
     /// do not cover MJPEG.
     public func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {

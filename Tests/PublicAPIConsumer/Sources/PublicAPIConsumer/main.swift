@@ -39,6 +39,9 @@ struct PublicAPIConsumer {
         _ = diagnostics.publisherFlushes
         _ = diagnostics.publisherFlushesWithoutEmission
         _ = diagnostics.publisherBatchStartGap
+        _ = diagnostics.publisherFramedReceiveBatchStartGap
+        _ = diagnostics.publisherMessageReceiveToSurfaceReady
+        _ = diagnostics.publisherSurfaceReadyToSubmit
         _ = diagnostics.publisherFlushStartGap
         _ = diagnostics.publisherFlushSchedulingDelay
         _ = diagnostics.publisherSnapshotDuration

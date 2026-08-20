@@ -19,6 +19,37 @@ struct DisplayFramePublisherTests {
         #expect(first.summary.maximumMilliseconds == 33)
     }
 
+    @Test func recordsBoundedSourcePipelineTiming() async {
+        let observations = FramePublisherObservations()
+        let publisher = makePublisher(observations: observations)
+        let clock = ContinuousClock()
+        let secondReceivedAt = clock.now.advanced(by: .milliseconds(-8))
+        let firstReceivedAt = secondReceivedAt.advanced(by: .milliseconds(-33))
+
+        await publisher.submit(
+            surfaceRevision(surfaceID: 1, revision: 1),
+            sourceTiming: DisplayFrameSourceTiming(
+                messageReceivedAt: firstReceivedAt,
+                surfaceReadyAt: firstReceivedAt.advanced(by: .milliseconds(4))
+            )
+        )
+        await publisher.flushNow()
+        await publisher.submit(
+            surfaceRevision(surfaceID: 1, revision: 2),
+            sourceTiming: DisplayFrameSourceTiming(
+                messageReceivedAt: secondReceivedAt,
+                surfaceReadyAt: secondReceivedAt.advanced(by: .milliseconds(4))
+            )
+        )
+
+        let metrics = await publisher.metrics()
+        #expect(metrics.framedReceiveBatchStartGap.summary.sampleCount == 1)
+        #expect(metrics.framedReceiveBatchStartGap.summary.p95Milliseconds == 33)
+        #expect(metrics.messageReceiveToSurfaceReady.summary.sampleCount == 2)
+        #expect(metrics.messageReceiveToSurfaceReady.summary.p95Milliseconds == 4)
+        #expect(metrics.surfaceReadyToSubmit.summary.sampleCount == 2)
+    }
+
     @Test func snapshotsOnlyOnceAfterRepeatedChangesToOneSurface() async {
         let observations = FramePublisherObservations()
         let publisher = makePublisher(observations: observations)

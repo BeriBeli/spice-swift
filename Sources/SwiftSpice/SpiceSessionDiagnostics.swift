@@ -12,10 +12,11 @@ import SpiceChannels
 /// atomic.
 ///
 /// This type intentionally contains no per-frame log or timestamp, pixel data,
-/// or native buffer handles. It does not measure transport or server latency.
-/// Bounded histograms summarize publisher, mailbox, and GPU-presentation timing
-/// without retaining individual samples. Publisher emission occurs before the
-/// downstream mailbox and presentation stages.
+/// or native buffer handles. It does not measure server or transport latency
+/// before `ChannelConnection.receive()` returns a complete framed message.
+/// Bounded histograms summarize receive-to-surface-apply, publisher, mailbox,
+/// and GPU-presentation timing without retaining individual samples. Publisher
+/// emission occurs before the downstream mailbox and presentation stages.
 /// Presentation counters are populated only when the desktop view receives
 /// this session's `presentationDiagnostics` recorder. Advanced-video counters
 /// cover H.264/H.265 decoding and do not describe the MJPEG path.
@@ -55,6 +56,9 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var publisherFlushes: UInt64 = 0
     public internal(set) var publisherFlushesWithoutEmission: UInt64 = 0
     package var publisherBatchStartGapHistogram = SpiceTimingHistogram()
+    package var publisherFramedReceiveBatchStartGapHistogram = SpiceTimingHistogram()
+    package var publisherMessageReceiveToSurfaceReadyHistogram = SpiceTimingHistogram()
+    package var publisherSurfaceReadyToSubmitHistogram = SpiceTimingHistogram()
     package var publisherFlushStartGapHistogram = SpiceTimingHistogram()
     package var publisherFlushSchedulingDelayHistogram = SpiceTimingHistogram()
     package var publisherSnapshotDurationHistogram = SpiceTimingHistogram()
@@ -95,6 +99,23 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
 
     public var publisherBatchStartGap: SpiceTimingSummary {
         publisherBatchStartGapHistogram.summary
+    }
+
+    /// Gap between the receive-completion timestamps of successive publisher
+    /// batches. This begins after transport framing, not at the server.
+    public var publisherFramedReceiveBatchStartGap: SpiceTimingSummary {
+        publisherFramedReceiveBatchStartGapHistogram.summary
+    }
+
+    /// Time from receiving a complete display message through image decode and
+    /// applying its resulting pixels to the surface, before protocol ACK work.
+    public var publisherMessageReceiveToSurfaceReady: SpiceTimingSummary {
+        publisherMessageReceiveToSurfaceReadyHistogram.summary
+    }
+
+    /// Actor handoff time from the completed surface apply to publisher entry.
+    public var publisherSurfaceReadyToSubmit: SpiceTimingSummary {
+        publisherSurfaceReadyToSubmitHistogram.summary
     }
 
     public var publisherFlushStartGap: SpiceTimingSummary {
@@ -173,6 +194,15 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         publisherFlushes &+= publisher.flushes
         publisherFlushesWithoutEmission &+= publisher.flushesWithoutEmission
         publisherBatchStartGapHistogram.accumulate(publisher.batchStartGap)
+        publisherFramedReceiveBatchStartGapHistogram.accumulate(
+            publisher.framedReceiveBatchStartGap
+        )
+        publisherMessageReceiveToSurfaceReadyHistogram.accumulate(
+            publisher.messageReceiveToSurfaceReady
+        )
+        publisherSurfaceReadyToSubmitHistogram.accumulate(
+            publisher.surfaceReadyToSubmit
+        )
         publisherFlushStartGapHistogram.accumulate(publisher.flushStartGap)
         publisherFlushSchedulingDelayHistogram.accumulate(publisher.flushSchedulingDelay)
         publisherSnapshotDurationHistogram.accumulate(publisher.snapshotDuration)

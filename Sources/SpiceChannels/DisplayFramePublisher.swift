@@ -1,6 +1,19 @@
 import Foundation
 import SpiceRenderer
 
+package struct DisplayFrameSourceTiming: Sendable, Equatable {
+    package let messageReceivedAt: ContinuousClock.Instant
+    package let surfaceReadyAt: ContinuousClock.Instant
+
+    package init(
+        messageReceivedAt: ContinuousClock.Instant,
+        surfaceReadyAt: ContinuousClock.Instant
+    ) {
+        self.messageReceivedAt = messageReceivedAt
+        self.surfaceReadyAt = surfaceReadyAt
+    }
+}
+
 package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var submissions: UInt64
     package var snapshotAttempts: UInt64
@@ -13,6 +26,9 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var flushes: UInt64
     package var flushesWithoutEmission: UInt64
     package var batchStartGap = SpiceTimingHistogram()
+    package var framedReceiveBatchStartGap = SpiceTimingHistogram()
+    package var messageReceiveToSurfaceReady = SpiceTimingHistogram()
+    package var surfaceReadyToSubmit = SpiceTimingHistogram()
     package var flushStartGap = SpiceTimingHistogram()
     package var flushSchedulingDelay = SpiceTimingHistogram()
     package var snapshotDuration = SpiceTimingHistogram()
@@ -30,6 +46,9 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         flushes: UInt64 = 0,
         flushesWithoutEmission: UInt64 = 0,
         batchStartGap: SpiceTimingHistogram = .init(),
+        framedReceiveBatchStartGap: SpiceTimingHistogram = .init(),
+        messageReceiveToSurfaceReady: SpiceTimingHistogram = .init(),
+        surfaceReadyToSubmit: SpiceTimingHistogram = .init(),
         flushStartGap: SpiceTimingHistogram = .init(),
         flushSchedulingDelay: SpiceTimingHistogram = .init(),
         snapshotDuration: SpiceTimingHistogram = .init(),
@@ -46,6 +65,9 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         self.flushes = flushes
         self.flushesWithoutEmission = flushesWithoutEmission
         self.batchStartGap = batchStartGap
+        self.framedReceiveBatchStartGap = framedReceiveBatchStartGap
+        self.messageReceiveToSurfaceReady = messageReceiveToSurfaceReady
+        self.surfaceReadyToSubmit = surfaceReadyToSubmit
         self.flushStartGap = flushStartGap
         self.flushSchedulingDelay = flushSchedulingDelay
         self.snapshotDuration = snapshotDuration
@@ -64,6 +86,9 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         flushes &+= other.flushes
         flushesWithoutEmission &+= other.flushesWithoutEmission
         batchStartGap.accumulate(other.batchStartGap)
+        framedReceiveBatchStartGap.accumulate(other.framedReceiveBatchStartGap)
+        messageReceiveToSurfaceReady.accumulate(other.messageReceiveToSurfaceReady)
+        surfaceReadyToSubmit.accumulate(other.surfaceReadyToSubmit)
         flushStartGap.accumulate(other.flushStartGap)
         flushSchedulingDelay.accumulate(other.flushSchedulingDelay)
         snapshotDuration.accumulate(other.snapshotDuration)
@@ -94,6 +119,7 @@ package actor DisplayFramePublisher {
     private var isCancelled = false
     private var lastFlushStart: ContinuousClock.Instant?
     private var lastBatchStart: ContinuousClock.Instant?
+    private var lastFramedReceiveBatchStart: ContinuousClock.Instant?
     private var generation: UInt64 = 0
     private var submissions: UInt64 = 0
     private var snapshotAttempts: UInt64 = 0
@@ -105,6 +131,9 @@ package actor DisplayFramePublisher {
     private var flushes: UInt64 = 0
     private var flushesWithoutEmission: UInt64 = 0
     private var batchStartGap = SpiceTimingHistogram()
+    private var framedReceiveBatchStartGap = SpiceTimingHistogram()
+    private var messageReceiveToSurfaceReady = SpiceTimingHistogram()
+    private var surfaceReadyToSubmit = SpiceTimingHistogram()
     private var flushStartGap = SpiceTimingHistogram()
     private var flushSchedulingDelay = SpiceTimingHistogram()
     private var snapshotDuration = SpiceTimingHistogram()
@@ -122,8 +151,20 @@ package actor DisplayFramePublisher {
         self.emit = emit
     }
 
-    package func submit(_ surfaceRevision: SurfaceRevision) {
+    package func submit(
+        _ surfaceRevision: SurfaceRevision,
+        sourceTiming: DisplayFrameSourceTiming? = nil
+    ) {
+        let submittedAt = clock.now
         submissions &+= 1
+        if let sourceTiming {
+            messageReceiveToSurfaceReady.record(
+                sourceTiming.messageReceivedAt.duration(to: sourceTiming.surfaceReadyAt)
+            )
+            surfaceReadyToSubmit.record(
+                sourceTiming.surfaceReadyAt.duration(to: submittedAt)
+            )
+        }
         guard !isCancelled else { return }
         let surfaceID = surfaceRevision.surfaceID
         if let lastEmitted = lastEmittedRevisions[surfaceID],
@@ -140,11 +181,19 @@ package actor DisplayFramePublisher {
         }
 
         if pending.isEmpty {
-            let now = clock.now
+            let now = submittedAt
             if let lastBatchStart {
                 batchStartGap.record(lastBatchStart.duration(to: now))
             }
             lastBatchStart = now
+            if let framedReceiveBatchStartedAt = sourceTiming?.messageReceivedAt {
+                if let lastFramedReceiveBatchStart {
+                    framedReceiveBatchStartGap.record(
+                        lastFramedReceiveBatchStart.duration(to: framedReceiveBatchStartedAt)
+                    )
+                }
+                lastFramedReceiveBatchStart = framedReceiveBatchStartedAt
+            }
         }
 
         if pending[surfaceID] == nil {
@@ -209,6 +258,7 @@ package actor DisplayFramePublisher {
         isFlushing = false
         lastFlushStart = nil
         lastBatchStart = nil
+        lastFramedReceiveBatchStart = nil
         pending.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
         lastEmittedRevisions.removeAll(keepingCapacity: false)
@@ -227,6 +277,9 @@ package actor DisplayFramePublisher {
             flushes: flushes,
             flushesWithoutEmission: flushesWithoutEmission,
             batchStartGap: batchStartGap,
+            framedReceiveBatchStartGap: framedReceiveBatchStartGap,
+            messageReceiveToSurfaceReady: messageReceiveToSurfaceReady,
+            surfaceReadyToSubmit: surfaceReadyToSubmit,
             flushStartGap: flushStartGap,
             flushSchedulingDelay: flushSchedulingDelay,
             snapshotDuration: snapshotDuration,

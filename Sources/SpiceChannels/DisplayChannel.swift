@@ -85,6 +85,9 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var ackController = AckController()
     private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
     private var completedPublisherMetrics = DisplayFramePublisherMetrics()
+    private let diagnosticsClock = ContinuousClock()
+    private var currentMessageReceivedAt: ContinuousClock.Instant?
+    private var completedFrameSourceTiming: DisplayFrameSourceTiming?
     private var retiredAdvancedVideoDiagnostics = SpiceAdvancedVideoDecoderDiagnostics()
     private var advancedCPUFallbackFrames: UInt64 = 0
     private var metalGenerationDisableCount: UInt64 = 0
@@ -145,14 +148,18 @@ package actor DisplayChannel: SpiceManagedChannel {
         framePublishers[ObjectIdentifier(framePublisher)] = framePublisher
         do {
             while !Task.isCancelled {
-                switch try await processNext() {
+                let event = try await processNext()
+                switch event {
                 case let .surfaceCreated(surfaceID):
                     await emit(.surfaceCreated(surfaceID))
                 case let .surfaceDestroyed(surfaceID):
                     await framePublisher.remove(surfaceID: surfaceID)
                     await emit(.surfaceDestroyed(surfaceID))
                 case let .frameChanged(surfaceRevision):
-                    await framePublisher.submit(surfaceRevision)
+                    await framePublisher.submit(
+                        surfaceRevision,
+                        sourceTiming: completedFrameSourceTiming
+                    )
                 case let .monitorsConfigured(configuration):
                     await emit(.displayMonitors(
                         channelID: connection.key.id,
@@ -170,7 +177,9 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
+        completedFrameSourceTiming = nil
         let framed = try await connection.receive()
+        currentMessageReceivedAt = diagnosticsClock.now
         let message: SpiceServerMessage
         do {
             message = try SpiceServerMessageDecoder.decode(
@@ -254,8 +263,9 @@ package actor DisplayChannel: SpiceManagedChannel {
                 sizing: nil,
                 data: data.data
             )
+            let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
-            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return event
         case let .displayStreamDataSized(data):
             let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
@@ -263,8 +273,9 @@ package actor DisplayChannel: SpiceManagedChannel {
                 sizing: (data.width, data.height, data.destination),
                 data: data.data
             )
+            let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
-            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return event
         case let .displayStreamClip(clip):
             try updateStreamClip(clip)
             try await acknowledgeIfNeeded()
@@ -292,16 +303,19 @@ package actor DisplayChannel: SpiceManagedChannel {
             return .monitorsConfigured(configuration)
         case let .displayCopyBits(command):
             let surfaceRevision = try await execute(command)
+            let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
-            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return event
         case let .displayDrawFill(command):
             let surfaceRevision = try await execute(command)
+            let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
-            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return event
         case let .displayDrawCopy(command):
             let surfaceRevision = try await execute(command)
+            let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
-            return surfaceRevision.map(DisplayEvent.frameChanged) ?? .ignored(framed.type)
+            return event
         case let .setAck(setAck):
             ackController.configure(generation: setAck.generation, window: setAck.window)
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
@@ -341,6 +355,20 @@ package actor DisplayChannel: SpiceManagedChannel {
         } catch {
             throw .protocolViolation(String(describing: error))
         }
+    }
+
+    private func frameEvent(
+        _ surfaceRevision: SurfaceRevision?,
+        ignoredType: UInt16
+    ) -> DisplayEvent {
+        guard let surfaceRevision else { return .ignored(ignoredType) }
+        if let currentMessageReceivedAt {
+            completedFrameSourceTiming = DisplayFrameSourceTiming(
+                messageReceivedAt: currentMessageReceivedAt,
+                surfaceReadyAt: diagnosticsClock.now
+            )
+        }
+        return .frameChanged(surfaceRevision)
     }
 
     package func close() async {

@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Refined bounded display timing diagnostics with framed-receive, surface-ready,
+  publisher, mailbox, and presentation boundaries for locating dropped frames
+  without recording display content.
+
 ## [0.1.9] — 2026-08-20
 
 ### Added
