@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Strengthened the trusted baseline with exclusion-free tests,
+  security-focused C static analysis, AddressSanitizer, and a merged production
+  line coverage floor enforced locally, in CI, and before releases.
+
 ## [0.1.10] — 2026-08-20
 
 ### Changed

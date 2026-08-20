@@ -60,6 +60,9 @@ swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 ./Scripts/build-lib.sh
+./Scripts/analyze-c-shims.sh
+./Scripts/test-address-sanitizer.sh
+./Scripts/check-code-coverage.sh
 ```
 
 `build-lib.sh` builds the primary `SwiftSpice` library product for arm64 and
@@ -81,6 +84,9 @@ The common commands are also exposed through the repository Makefile:
 make help
 make build
 make test
+make analyze
+make sanitize
+make coverage
 make debug
 make all
 ```
@@ -101,12 +107,18 @@ dependencies, and non-relocatable runtime search paths:
 ./Scripts/audit-dylib-links.sh Artifacts
 ```
 
+The trusted local and CI baseline runs every test without exclusions, analyzes
+the owned C shims with security-focused Clang checks, runs the complete suite
+under AddressSanitizer, and requires at least 69 percent merged line coverage
+across production sources. Tests, plugins, generated protocol declarations,
+and build output are excluded from the coverage denominator.
+
 `VERSION` and the latest released `CHANGELOG.md` heading must agree. CI checks
 them on every build and also checks a release tag:
 
 ```sh
 ./Scripts/check-version.sh
-./Scripts/check-version.sh v0.1.8
+./Scripts/check-version.sh v0.1.10
 ```
 
 To publish a release from a clean, synchronized `main`, run the full local
@@ -116,7 +128,7 @@ version, commits the two version files, pushes `main`, and pushes the tag that
 starts the repository's GitHub Release workflow:
 
 ```sh
-./Scripts/release.sh 0.1.9
+./Scripts/release.sh 0.1.11
 ```
 
 ## Use the library

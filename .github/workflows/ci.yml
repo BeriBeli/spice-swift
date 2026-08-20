@@ -48,6 +48,9 @@ jobs:
       - name: Verify generated protocol sources
         run: swift package --allow-writing-to-package-directory generate-spice-protocol --check
 
+      - name: Analyze C shims
+        run: ./Scripts/analyze-c-shims.sh
+
       - name: Build
         run: ./Scripts/build-lib.sh
 
@@ -60,5 +63,10 @@ jobs:
       - name: Test
         run: >-
           swift test --disable-sandbox
-          --skip commandFailureDisablesMetalUntilTheNextStreamGeneration
           -Xswiftc -warnings-as-errors
+
+      - name: Test with AddressSanitizer
+        run: ./Scripts/test-address-sanitizer.sh
+
+      - name: Enforce code coverage baseline
+        run: ./Scripts/check-code-coverage.sh

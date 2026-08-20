@@ -932,7 +932,7 @@ such by an embedding application.
   still needs its custom KVM kernel and local QEMU image restored before rerun.
 
 The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate passes 324 tests in 67 suites. The current Rocky
+warnings-as-errors gate runs every test without exclusions. The current Rocky
 yuv420p H.264/H.265 native composition gate is closed; broader codec profiles,
 resolutions, and display behavior remain part of the real-host gate. Smartcard
 hardware, a redirected USB device, human-audible Playback/device route
@@ -958,15 +958,20 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 354 tests in 69 suites, the
-`SwiftSpice` library build, the generated-protocol consistency check, and
-exact-arm64 native artifact closure verification.
+The current trusted baseline passes warnings-as-errors tests without
+exclusions, security-focused Clang analysis of the owned C shims, the complete
+AddressSanitizer suite, and a 69 percent merged production-source line coverage
+minimum. The `SwiftSpice` library build, generated-protocol consistency check,
+and exact-arm64 native artifact closure verification also pass.
 
 ```sh
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 ./Scripts/build-lib.sh
+./Scripts/analyze-c-shims.sh
+./Scripts/test-address-sanitizer.sh
+./Scripts/check-code-coverage.sh
 ```
 
 The repository-backed Apple/container live gate is:

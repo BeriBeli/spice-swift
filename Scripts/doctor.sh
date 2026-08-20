@@ -65,7 +65,7 @@ else
 fi
 
 missing_tools=()
-for tool in file git lipo otool plutil swift xcodebuild xcrun; do
+for tool in file git jq lipo otool plutil swift xcodebuild xcrun; do
     command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
 if [[ "${#missing_tools[@]}" -eq 0 ]]; then

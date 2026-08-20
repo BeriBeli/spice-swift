@@ -15,6 +15,8 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - H.264/H.265 parsing, explicit opt-in negotiation, VideoToolbox decoding, and
   deterministic Rocky yuv420p protocol evidence
 - Revisioned Apple Silicon IOSurface backing and native NV12-to-Metal composition
+- Full tests without exclusions, security-focused C static analysis,
+  AddressSanitizer, and a merged production-source line coverage baseline
 
 ## External acceptance gates
 
@@ -51,6 +53,9 @@ swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 ./Scripts/build-lib.sh
+./Scripts/analyze-c-shims.sh
+./Scripts/test-address-sanitizer.sh
+./Scripts/check-code-coverage.sh
 ```
 
 The nested QEMU gates have additional host requirements and retained artifacts.

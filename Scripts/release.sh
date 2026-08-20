@@ -89,6 +89,9 @@ export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT_DIR/.
 log "verifying generated protocol sources"
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 
+log "analyzing owned C shims"
+"$ROOT_DIR/Scripts/analyze-c-shims.sh"
+
 log "building package"
 "$ROOT_DIR/Scripts/build-lib.sh"
 
@@ -99,8 +102,13 @@ swift build --disable-sandbox \
 
 log "running tests"
 swift test --disable-sandbox \
-    --skip commandFailureDisablesMetalUntilTheNextStreamGeneration \
     -Xswiftc -warnings-as-errors
+
+log "running AddressSanitizer tests"
+"$ROOT_DIR/Scripts/test-address-sanitizer.sh"
+
+log "checking code coverage"
+"$ROOT_DIR/Scripts/check-code-coverage.sh"
 
 log "rechecking main and tags after validation"
 unexpected_changes="$(git status --porcelain \
