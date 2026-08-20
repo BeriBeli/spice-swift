@@ -1,7 +1,6 @@
 .build/
 .swiftpm/
 DerivedData/
-dist/
 Integration/AppleContainer/Artifacts/
 *.xcodeproj/
 xcuserdata/

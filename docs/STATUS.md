@@ -705,9 +705,9 @@ such by an embedding application.
   CPU stride. A real Metal test maps the IOSurface, performs the GPU blit, and
   reads back byte-exact BGRA. CPU-only rejection and the complete existing suite
   are also covered.
-- Added the `spice-viewer` SwiftPM GUI executable and a project-local
-  `Scripts/build-and-run.sh` that stages a real `SpiceViewer.app`, supports
-  run/debug/log/telemetry/verify modes, and backs the Codex `Run` action.
+- Added the `spice-viewer` SwiftPM GUI executable as a project-local debug and
+  integration client, with terminal logging and native-closure verification
+  scripts for its library dependencies.
 - The validation host drives synthetic 640×360 BGRA SurfaceStore frames with an
   absolute-deadline 30 fps schedule. Window-level inspection confirmed animated
   Metal output, aspect-fit presentation, and a measured 29.3 fps submission
@@ -957,15 +957,15 @@ License: LGPL-2.1-or-later
 
 ## Acceptance commands
 
-The current warnings-as-errors gate passes 324 tests in 67 suites, `swift build`,
-the generated-protocol consistency check, and exact-arm64 app packaging with
-recursive native-closure verification.
+The current warnings-as-errors gate passes 353 tests in 69 suites, the
+`SwiftSpice` library build, the generated-protocol consistency check, and
+exact-arm64 native artifact closure verification.
 
 ```sh
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
-./Scripts/build-and-run.sh --package
+./Scripts/build-lib.sh
 ```
 
 The repository-backed Apple/container live gate is:

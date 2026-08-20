@@ -17,9 +17,9 @@ tools and external validation fixtures have one directory per responsibility.
 | `Benchmarks/` | Performance collectors, orchestration, analysis, and retained summaries |
 | `docs/` | Architecture, status, roadmap, and repository guidance |
 
-The root contains the SwiftPM manifest, project entry-point README, license, and
-third-party notices. Generated build output belongs in `.build/` or `dist/` and
-must remain ignored.
+The root contains the SwiftPM manifest, project entry-point README, changelog,
+version file, license, and third-party notices. Generated build output belongs
+in `.build/` and must remain ignored.
 
 ## Placement rules
 
@@ -28,15 +28,14 @@ must remain ignored.
 - Put SwiftPM build logic in `Plugins/`. A helper used only by one plugin stays
   beside that plugin.
 - Put commands used across the repository in `Scripts/`. Use lowercase
-  hyphenated filenames, such as `build-and-run.sh`.
+  hyphenated filenames, such as `build-lib.sh`.
 - Put host-specific live environments in `Integration/<Environment>/`. Scripts
   used only by one fixture stay inside that fixture.
 - Put measurement tools and result summaries in `Benchmarks/`. Do not mix
   benchmark orchestration with correctness gates.
 - Put stable project documentation in `docs/` and use descriptive filenames.
   The root `README.md` is the only file named `README.md`.
-- Do not commit credentials, live run logs, downloaded images, or generated app
-  bundles.
+- Do not commit credentials, live run logs, downloaded images, or build output.
 
 ## Integration layout
 

@@ -420,7 +420,8 @@ struct SpiceSessionTests {
         #expect(await mainTransport.isClosed)
         #expect(await displayTransport.isClosed)
         #expect(await inputsTransport.isClosed)
-        #expect(await cursorTransport.isClosed)
+        let cursorTransportIsClosed = await cursorTransport.isClosed
+        #expect(cursorTransportIsClosed)
 
         let retiredDiagnostics = await session.diagnosticsSnapshot()
         #expect(retiredDiagnostics.displayChannelCount == 1)

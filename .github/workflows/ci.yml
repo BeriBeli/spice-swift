@@ -33,11 +33,23 @@ jobs:
       - name: Install Metal shader toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
+      - name: Check build environment
+        run: ./Scripts/doctor.sh
+
+      - name: Check release metadata
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            ./Scripts/check-version.sh "$GITHUB_REF_NAME"
+          else
+            ./Scripts/check-version.sh
+          fi
+
       - name: Verify generated protocol sources
         run: swift package --allow-writing-to-package-directory generate-spice-protocol --check
 
       - name: Build
-        run: swift build --disable-sandbox -Xswiftc -warnings-as-errors
+        run: ./Scripts/build-lib.sh
 
       - name: Verify public diagnostics API
         run: >-
@@ -50,9 +62,3 @@ jobs:
           swift test --disable-sandbox
           --skip commandFailureDisablesMetalUntilTheNextStreamGeneration
           -Xswiftc -warnings-as-errors
-
-      - name: Build Apple Silicon relocatable app
-        run: ./Scripts/build-and-run.sh --package
-
-      - name: Verify native dependency closure
-        run: ./Scripts/verify-native-closure.sh

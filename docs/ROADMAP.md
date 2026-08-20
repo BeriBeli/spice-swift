@@ -50,7 +50,7 @@ New work must meet these conditions:
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
-./Scripts/build-and-run.sh --package
+./Scripts/build-lib.sh
 ```
 
 The nested QEMU gates have additional host requirements and retained artifacts.

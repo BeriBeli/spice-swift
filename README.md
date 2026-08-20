@@ -45,10 +45,9 @@ pending gates.
 - The Xcode Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
 
 The package includes macOS static XCFrameworks for libjpeg-turbo, spice-common
-QUIC, usbredir, and libusb. Supported SwiftPM builds select arm64, and packaged
-apps contain exactly one arm64 executable slice; x86_64 builds are rejected.
-Builds and packaged apps do not require Homebrew or `pkg-config`. The artifacts
-are reproducible from pinned, checksum-verified upstream sources with
+QUIC, usbredir, and libusb. Supported SwiftPM builds select arm64; x86_64
+builds are rejected. Builds do not require Homebrew or `pkg-config`. The
+artifacts are reproducible from pinned, checksum-verified upstream sources with
 `Scripts/build-native-dependencies.sh`; licenses and provenance are recorded in
 `THIRD_PARTY_NOTICES.md`.
 The SwiftPM build-tool plugin compiles the package shader into a resource
@@ -60,23 +59,65 @@ The SwiftPM build-tool plugin compiles the package shader into a resource
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
 swift test --disable-sandbox -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
-./Scripts/build-and-run.sh --package
+./Scripts/build-lib.sh
 ```
 
-`./Scripts/build-and-run.sh --stage` remains available as a development helper.
-`--package` builds an arm64 release and verifies the staged native closure.
+`build-lib.sh` builds the primary `SwiftSpice` library product for arm64 and
+checks its native artifact closure. The repository's viewer is a debug and
+integration client; it is not a packaged release product.
 
-Run the viewer after staging it:
+Build and run the viewer in a terminal while capturing stdout and stderr:
 
 ```sh
-./Scripts/build-and-run.sh
+./Scripts/debug-run.sh
 ```
 
-Generated app bundles are written to the ignored `dist/` directory. Staged and
-package bundles use an ad hoc signature. Release distribution still requires
-Developer ID signing and notarization; third-party notices ship with the native
-artifacts. The shader is installed at
-`Contents/Resources/SwiftSpice_SpiceMetalCompositor.bundle/SpiceVideoCompositor.metallib`.
+Set `SWIFTSPICE_SKIP_BUILD=1` to rerun the existing debug executable, and set
+`SWIFTSPICE_LOG` to choose the log path.
+
+The common commands are also exposed through the repository Makefile:
+
+```sh
+make help
+make build
+make test
+make debug
+make all
+```
+
+## Maintenance scripts
+
+Check whether the selected Xcode, Swift, SDK, Metal toolchain, and checked-in
+native artifacts are ready for development:
+
+```sh
+./Scripts/doctor.sh
+```
+
+Audit any built Mach-O or directory for Homebrew paths, other build-host
+dependencies, and non-relocatable runtime search paths:
+
+```sh
+./Scripts/audit-dylib-links.sh Artifacts
+```
+
+`VERSION` and the latest released `CHANGELOG.md` heading must agree. CI checks
+them on every build and also checks a release tag:
+
+```sh
+./Scripts/check-version.sh
+./Scripts/check-version.sh v0.1.8
+```
+
+To publish a release from a clean, synchronized `main`, run the full local
+release gate. Add the release notes under `CHANGELOG.md`'s `[Unreleased]`
+heading first. After confirmation, the script rolls those notes into the new
+version, commits the two version files, pushes `main`, and pushes the tag that
+starts the repository's GitHub Release workflow:
+
+```sh
+./Scripts/release.sh 0.1.9
+```
 
 ## Use the library
 

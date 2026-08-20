@@ -8,8 +8,8 @@ Each XCFramework contains a named static framework so Swift Build stages its
 headers and module map inside that framework instead of merging unrelated
 binary targets into a shared `include` directory. The dependency artifacts
 contain exactly one `arm64` macOS slice. SwiftSpice supports Apple Silicon only,
-and the packaged app is verified to contain the same single architecture. The
-artifacts are built from pinned, checksum-verified upstream sources by:
+and the library build verifies that dependency closure before use. The artifacts
+are built from pinned, checksum-verified upstream sources by:
 
 ```sh
 Scripts/build-native-dependencies.sh
