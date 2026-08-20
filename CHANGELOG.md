@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-20
+
 ### Added
 
 - Added build-environment diagnostics and reusable Mach-O dependency auditing.
@@ -77,7 +79,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/BeriBeli/spice-swift/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/BeriBeli/spice-swift/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/BeriBeli/spice-swift/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/BeriBeli/spice-swift/compare/v0.1.5...v0.1.6
