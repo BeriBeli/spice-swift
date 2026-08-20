@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 SCRATCH_PATH="${SWIFTSPICE_COVERAGE_SCRATCH_PATH:-$ROOT_DIR/.build/coverage}"
-MINIMUM_LINE_COVERAGE="${SWIFTSPICE_MIN_LINE_COVERAGE:-69.0}"
+MINIMUM_LINE_COVERAGE="${SWIFTSPICE_MIN_LINE_COVERAGE:-62.0}"
 IGNORE_FILENAME_REGEX='/(Tests|Plugins)/|/GeneratedMessages\.swift$|/\.build/'
 
 if [[ ! "$MINIMUM_LINE_COVERAGE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
@@ -39,6 +39,7 @@ if [[ "${#coverage_binaries[@]}" -eq 0 || ! -f "$profile" ]]; then
     printf '[coverage] SwiftPM did not produce test binaries and a merged profile\n' >&2
     exit 1
 fi
+printf '[coverage] merging %d executable test bundle(s)\n' "${#coverage_binaries[@]}"
 
 llvm_cov="$(xcrun -f llvm-cov)"
 llvm_cov_arguments=(

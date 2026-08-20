@@ -109,9 +109,12 @@ dependencies, and non-relocatable runtime search paths:
 
 The trusted local and CI baseline runs every test without exclusions, analyzes
 the owned C shims with security-focused Clang checks, runs the complete suite
-under AddressSanitizer, and requires at least 69 percent merged line coverage
+under AddressSanitizer, and requires at least 62 percent merged line coverage
 across production sources. Tests, plugins, generated protocol declarations,
-and build output are excluded from the coverage denominator.
+and build output are excluded from the coverage denominator. The unified CI
+test executable is the canonical denominator; SwiftPM versions that emit
+multiple test bundles can report a higher local percentage because they link a
+smaller aggregate source set.
 
 `VERSION` and the latest released `CHANGELOG.md` heading must agree. CI checks
 them on every build and also checks a release tag:

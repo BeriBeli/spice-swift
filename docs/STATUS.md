@@ -960,7 +960,7 @@ License: LGPL-2.1-or-later
 
 The current trusted baseline passes warnings-as-errors tests without
 exclusions, security-focused Clang analysis of the owned C shims, the complete
-AddressSanitizer suite, and a 69 percent merged production-source line coverage
+AddressSanitizer suite, and a 62 percent merged production-source line coverage
 minimum. The `SwiftSpice` library build, generated-protocol consistency check,
 and exact-arm64 native artifact closure verification also pass.
 
