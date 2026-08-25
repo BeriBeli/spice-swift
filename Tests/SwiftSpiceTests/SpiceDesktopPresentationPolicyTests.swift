@@ -103,7 +103,7 @@ struct SpiceDesktopPresentationPolicyTests {
 
     @Test func oneHundredTwentyHzProducerPresentsAtMostOncePerSixtyHzTick() throws {
         let latch = SpiceDesktopReadyLatch()
-        var wakeups = 0
+        var pacing = SpiceDesktopPresentationPacingPolicy()
         var presentations = 0
         var lastGeneration: UInt64 = 0
 
@@ -116,18 +116,47 @@ struct SpiceDesktopPresentationPolicyTests {
                     cursor: nil,
                     pointerMode: .absolute
                 )) {
-                    wakeups += 1
+                    switch pacing.readyBecameAvailable() {
+                    case .selectImmediately:
+                        let selected = try #require(latch.take())
+                        presentations += 1
+                        lastGeneration = selected.generation
+                    case .waitForDisplayLink:
+                        break
+                    case .selectOnDisplayLink, .pauseDisplayLink:
+                        Issue.record("Unexpected ready-update pacing action")
+                    }
                 }
             }
-            let selected = try #require(latch.take())
-            presentations += 1
-            lastGeneration = selected.generation
+            switch pacing.displayLinkFired(hasReadySnapshot: !latch.isEmpty) {
+            case .selectOnDisplayLink:
+                let selected = try #require(latch.take())
+                presentations += 1
+                lastGeneration = selected.generation
+            case .pauseDisplayLink:
+                break
+            case .selectImmediately, .waitForDisplayLink:
+                Issue.record("Unexpected display-link pacing action")
+            }
         }
 
-        #expect(wakeups == 60)
-        #expect(presentations == 60)
+        // One idle fast-path selection followed by at most one selection for
+        // each display tick. The steady-state rate remains display-limited.
+        #expect(presentations == 61)
         #expect(lastGeneration == 120)
         #expect(latch.isEmpty)
+    }
+
+    @Test func sparseUpdatesUseImmediateSelectionAfterIdleTick() {
+        var pacing = SpiceDesktopPresentationPacingPolicy()
+
+        #expect(pacing.readyBecameAvailable() == .selectImmediately)
+        #expect(pacing.displayLinkFired(hasReadySnapshot: false) == .pauseDisplayLink)
+        #expect(pacing.readyBecameAvailable() == .selectImmediately)
+        #expect(pacing.readyBecameAvailable() == .waitForDisplayLink)
+        #expect(
+            pacing.displayLinkFired(hasReadySnapshot: true) == .selectOnDisplayLink
+        )
     }
 
     @Test func cursorOnlySnapshotDoesNotInvokeFramebufferCommandSubmission() {

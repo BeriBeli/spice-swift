@@ -666,6 +666,7 @@ public actor SpiceSession {
         result.desktopDisplayLinkWakeups = presentation.desktopDisplayLinkWakeups
         result.desktopDisplayLinkTicks = presentation.desktopDisplayLinkTicks
         result.desktopDisplayLinkIdlePauses = presentation.desktopDisplayLinkIdlePauses
+        result.desktopImmediateSelections = presentation.desktopImmediateSelections
         result.desktopReadyToDisplayLinkHistogram =
             presentation.desktopReadyToDisplayLinkHistogram
         result.viewUpdateToMetalCommitHistogram =

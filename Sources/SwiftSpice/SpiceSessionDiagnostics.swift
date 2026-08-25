@@ -117,6 +117,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var desktopDisplayLinkWakeups: UInt64 = 0
     public internal(set) var desktopDisplayLinkTicks: UInt64 = 0
     public internal(set) var desktopDisplayLinkIdlePauses: UInt64 = 0
+    public internal(set) var desktopImmediateSelections: UInt64 = 0
     package var desktopReadyToDisplayLinkHistogram = SpiceTimingHistogram()
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
@@ -166,7 +167,8 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     }
 
     /// Time from the first coalesced desktop update becoming ready until the
-    /// AppKit display link selects the latest revision for presentation.
+    /// AppKit presentation scheduler selects the latest revision. The property
+    /// name remains source-compatible with SwiftSpice 0.2.5.
     public var desktopReadyToDisplayLink: SpiceTimingSummary {
         desktopReadyToDisplayLinkHistogram.summary
     }

@@ -107,6 +107,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.desktopDisplayLinkWakeups
         _ = diagnostics.desktopDisplayLinkTicks
         _ = diagnostics.desktopDisplayLinkIdlePauses
+        _ = diagnostics.desktopImmediateSelections
         _ = diagnostics.desktopReadyToDisplayLink
         let timing: SpiceTimingSummary = diagnostics.viewUpdateToMetalCommit
         requireSendable(timing)

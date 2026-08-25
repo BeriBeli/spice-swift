@@ -15,6 +15,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- Sparse desktop updates now select their latest revision immediately when the
+  display link is idle, while one active tick remains as a pacing fence for
+  continuous producers. This removes a redundant refresh-period wait without
+  allowing presentation work to outrun the display.
 - Full-surface raw bitmap copies now write directly into a revisioned IOSurface
   and publish that canonical revision without a second full-frame CPU upload.
 - Fractionally scaled desktops use MPS Lanczos directly into the drawable,
