@@ -294,6 +294,135 @@ struct MainChannelTests {
         #expect(try (await transport.outbound).map(decodeMiniMessageID) == [106, 104, 107])
     }
 
+    @Test func concurrentMultiFragmentAgentMessagesDoNotInterleave() async throws {
+        let source = GatedWriteTransport(inbound: try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 4,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ].map(Result.success))
+        try await source.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+
+        let firstMessage = VDAgentMessage(
+            type: 6,
+            data: Data(repeating: 0xa1, count: 3_000)
+        )
+        let secondMessage = VDAgentMessage(
+            type: 6,
+            data: Data(repeating: 0xb2, count: 3_000)
+        )
+        let firstFragments = try VDAgentWireEncoder.fragments(for: firstMessage)
+        let secondFragments = try VDAgentWireEncoder.fragments(for: secondMessage)
+
+        await source.blockNextWrite()
+        let firstSend = Task {
+            try await channel.sendAgentMessage(firstMessage)
+        }
+        await source.waitUntilWriteIsBlocked()
+        let secondSend = Task {
+            try await channel.sendAgentMessage(secondMessage)
+        }
+
+        for _ in 0..<1_000 {
+            if await channel.pendingAgentSendCountForTesting() == 1 { break }
+            await Task.yield()
+        }
+        #expect(await channel.pendingAgentSendCountForTesting() == 1)
+        #expect(await source.outbound.count == 3)
+
+        await source.releaseBlockedWrite()
+        try await firstSend.value
+        try await secondSend.value
+
+        let outbound = await source.outbound
+        #expect(try outbound.map(decodeMiniMessageID) == [106, 104, 107, 107, 107, 107])
+        #expect(try outbound.dropFirst(2).map(decodeMiniBody) == firstFragments + secondFragments)
+    }
+
+    @Test func partialAgentMessageFailureInvalidatesStreamBeforeNextTicket() async throws {
+        let source = GatedWriteTransport(inbound: try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 4,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ].map(Result.success))
+        try await source.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+
+        let firstMessage = VDAgentMessage(
+            type: 6,
+            data: Data(repeating: 0xa1, count: 3_000)
+        )
+        let secondMessage = VDAgentMessage(
+            type: 6,
+            data: Data(repeating: 0xb2, count: 3_000)
+        )
+        let firstFragments = try VDAgentWireEncoder.fragments(for: firstMessage)
+
+        await source.blockNextWrite()
+        let firstSend = Task {
+            try await channel.sendAgentMessage(firstMessage)
+        }
+        await source.waitUntilWriteIsBlocked()
+        let secondSend = Task {
+            try await channel.sendAgentMessage(secondMessage)
+        }
+        for _ in 0..<1_000 {
+            if await channel.pendingAgentSendCountForTesting() == 1 { break }
+            await Task.yield()
+        }
+        #expect(await channel.pendingAgentSendCountForTesting() == 1)
+
+        await source.failNextWrite(with: .cancelled)
+        await source.releaseBlockedWrite()
+
+        await #expect(throws: ChannelError.transport(.cancelled)) {
+            try await firstSend.value
+        }
+        await #expect(throws: ChannelError.protocolViolation(
+            "agent lifecycle changed during message send"
+        )) {
+            try await secondSend.value
+        }
+
+        let outbound = await source.outbound
+        #expect(try outbound.map(decodeMiniMessageID) == [106, 104, 107])
+        let sentFragment = try #require(outbound.dropFirst(2).first)
+        let expectedFragment = try #require(firstFragments.first)
+        #expect(try decodeMiniBody(sentFragment) == expectedFragment)
+        #expect(await channel.pendingAgentSendCountForTesting() == 0)
+        await #expect(throws: ChannelError.protocolViolation(
+            "agent message sent while agent is disconnected"
+        )) {
+            try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([1])))
+        }
+    }
+
     @Test func rebindingPreservesAgentConnectionAndTokenState() async throws {
         let source = FakeTransport(inbound: try [
             encodeMiniServerMessage(SpiceMsgMainInit(
@@ -764,6 +893,8 @@ struct MainChannelTests {
 private actor GatedWriteTransport: SpiceTransport {
     private var inbound: [Result<Data, TransportError>]
     private var blockAtWriteCount: Int?
+    private var failAtWriteCount: Int?
+    private var writeFailure: TransportError?
     private var writeIsBlocked = false
     private var blockedWriteContinuation: CheckedContinuation<Void, Never>?
     private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
@@ -794,6 +925,12 @@ private actor GatedWriteTransport: SpiceTransport {
 
     func write(_ data: sending Data) async throws(TransportError) {
         guard isConnected, !isClosed else { throw .connectionClosed }
+        if outbound.count + 1 == failAtWriteCount {
+            let error = writeFailure ?? .connectionFailed("injected write failure")
+            failAtWriteCount = nil
+            writeFailure = nil
+            throw error
+        }
         outbound.append(data)
         guard outbound.count == blockAtWriteCount else { return }
         writeIsBlocked = true
@@ -814,6 +951,11 @@ private actor GatedWriteTransport: SpiceTransport {
     func blockNextWrite() {
         blockAtWriteCount = outbound.count + 1
         writeIsBlocked = false
+    }
+
+    func failNextWrite(with error: TransportError) {
+        failAtWriteCount = outbound.count + 1
+        writeFailure = error
     }
 
     func waitUntilWriteIsBlocked() async {

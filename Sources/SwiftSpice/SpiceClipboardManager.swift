@@ -58,7 +58,16 @@ public actor SpiceAgentManager {
     private struct ReconnectBoundaryWaiter {
         let runKey: RunKey
         let targetRevision: UInt64
+        let operationToken: UInt64
         let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct ReconnectBoundaryOperation {
+        let runKey: RunKey
+        let connectionGeneration: UInt64
+        var sessionLifecycleID: UInt64?
+        var sessionWaitTask: Task<Void, Never>?
+        var superseded = false
     }
 
     private struct ActiveAgentOperation {
@@ -94,9 +103,11 @@ public actor SpiceAgentManager {
     private var isStarting = false
     private var isStopping = false
     private var startCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var reconnectStartWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
     private var stopCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     private var activeOperationCount = 0
-    private var operationDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextOperationDrainWaiterToken: UInt64 = 0
+    private var operationDrainWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
     private var pendingActions: [ClipboardStateMachine.Action] = []
     private var displayCoordinator = DisplayConfigurationCoordinator()
     private var lastDisplayConfigurationSupport: SpiceDisplayConfigurationSupport?
@@ -109,10 +120,17 @@ public actor SpiceAgentManager {
     private var nextFileTransferID: UInt32 = 1
     private var wireDiagnostics = SpiceAgentWireDiagnostics()
     private var currentAgentConnectionGeneration: UInt64 = 0
+    private var currentSessionLifecycleID: UInt64?
     private var processedBoundary: ProcessedBoundary?
     private var reconnectQuiescingRunKey: RunKey?
     private var reconnectQuiescingConnectionGeneration: UInt64?
+    private var nextReconnectBoundaryToken: UInt64 = 0
+    private var activeReconnectBoundaries: [UInt64: ReconnectBoundaryOperation] = [:]
+    private var committedReconnectQuiesceRunKey: RunKey?
+    private var committedReconnectQuiesceGeneration: UInt64?
+    private var committedReconnectQuiesceLifecycleID: UInt64?
     private var reconnectBoundaryWaiters: [ReconnectBoundaryWaiter] = []
+    private var reconnectBoundarySnapshotHook: (@Sendable () async -> Void)?
     private var messageProcessingHook: (@Sendable () async -> Void)?
     private var eventProcessingHook: (@Sendable (SpiceAgentEvent) async -> Void)?
     private var startProcessingHook: (@Sendable () async -> Void)?
@@ -170,6 +188,9 @@ public actor SpiceAgentManager {
     deinit {
         eventTask?.cancel()
         pollTask?.cancel()
+        for operation in activeReconnectBoundaries.values {
+            operation.sessionWaitTask?.cancel()
+        }
         eventContinuation.finish()
         displayConfigurationContinuation.finish()
         displayConfigurationSupportContinuation.finish()
@@ -180,10 +201,13 @@ public actor SpiceAgentManager {
         for waiter in startCompletionWaiters {
             waiter.resume()
         }
+        for waiter in reconnectStartWaiters.values {
+            waiter.resume()
+        }
         for waiter in stopCompletionWaiters {
             waiter.resume()
         }
-        for waiter in operationDrainWaiters {
+        for waiter in operationDrainWaiters.values {
             waiter.resume()
         }
     }
@@ -218,6 +242,7 @@ public actor SpiceAgentManager {
         let agentConnection = await session.currentAgentConnectionSnapshot()
         guard isCurrentStartingRun(runKey, session: session) else { return }
         currentAgentConnectionGeneration = agentConnection.generation
+        currentSessionLifecycleID = agentConnection.sessionLifecycleID
         if agentConnection.isConnected {
             await execute(
                 state.connected(),
@@ -258,6 +283,9 @@ public actor SpiceAgentManager {
             return
         }
         isStopping = true
+        for operation in activeReconnectBoundaries.values {
+            operation.sessionWaitTask?.cancel()
+        }
         let oldEventTask = eventTask
         eventTask = nil
         let oldPollTask = pollTask
@@ -294,9 +322,14 @@ public actor SpiceAgentManager {
         resumeReconnectBoundaryWaiters()
         currentRunKey = nil
         currentAgentConnectionGeneration = 0
+        currentSessionLifecycleID = nil
         processedBoundary = nil
         reconnectQuiescingRunKey = nil
         reconnectQuiescingConnectionGeneration = nil
+        activeReconnectBoundaries.removeAll(keepingCapacity: false)
+        committedReconnectQuiesceRunKey = nil
+        committedReconnectQuiesceGeneration = nil
+        committedReconnectQuiesceLifecycleID = nil
         isStopping = false
         let stopWaiters = stopCompletionWaiters
         stopCompletionWaiters.removeAll(keepingCapacity: false)
@@ -306,54 +339,148 @@ public actor SpiceAgentManager {
     }
 
     /// Waits until the manager's single Agent event pump has processed the
-    /// latest disconnect boundary emitted by its session. Every old-session
-    /// message ordered before that revision has then finished processing, so
-    /// the same `SpiceSession` may safely reconnect without carrying Agent work
-    /// into the new connection.
+    /// latest disconnect boundary emitted by its session. The session
+    /// disconnect itself and every old-session message ordered before that
+    /// revision have then finished, so the same `SpiceSession` may safely
+    /// reconnect without carrying Agent work into the new connection.
     public func waitForSessionReconnectBoundary() async {
         guard !isStopping, let session, let runKey = currentRunKey else { return }
-        // Block new work before the first await. Only a connected envelope
-        // from a strictly newer transport generation may reopen this run.
-        reconnectQuiescingRunKey = runKey
+        nextReconnectBoundaryToken &+= 1
+        let operationToken = nextReconnectBoundaryToken
+        activeReconnectBoundaries[operationToken] = ReconnectBoundaryOperation(
+            runKey: runKey,
+            connectionGeneration: currentAgentConnectionGeneration,
+            sessionLifecycleID: currentSessionLifecycleID
+        )
+        refreshReconnectQuiesce(for: runKey)
+        defer { finishReconnectBoundaryOperation(operationToken, runKey: runKey) }
+
+        if let reconnectBoundarySnapshotHook {
+            await reconnectBoundarySnapshotHook()
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
+        }
         let connection = await session.currentAgentConnectionSnapshot()
-        guard self.session === session, currentRunKey == runKey, !isStopping else { return }
-        reconnectQuiescingRunKey = runKey
-        reconnectQuiescingConnectionGeneration = connection.generation
-        if isStarting {
-            await withCheckedContinuation { continuation in
-                if !isStarting || self.session !== session
-                    || currentRunKey != runKey || isStopping {
-                    continuation.resume()
-                } else {
-                    startCompletionWaiters.append(continuation)
-                }
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        let boundaryLifecycleID = activeReconnectBoundaries[operationToken]?.sessionLifecycleID
+        let lifecycleToWait: UInt64?
+        if let currentLifecycleID = connection.sessionLifecycleID {
+            if let boundaryLifecycleID {
+                // A different live lifecycle means disconnect/reconnect won
+                // the actor hop. Never attach this old boundary to the new
+                // session and wait for its next disconnect.
+                lifecycleToWait = currentLifecycleID == boundaryLifecycleID
+                    ? currentLifecycleID
+                    : nil
+            } else {
+                activeReconnectBoundaries[operationToken]?.sessionLifecycleID = currentLifecycleID
+                currentSessionLifecycleID = currentLifecycleID
+                lifecycleToWait = currentLifecycleID
             }
-            guard self.session === session, currentRunKey == runKey, !isStopping else { return }
+        } else {
+            lifecycleToWait = nil
+        }
+        refreshReconnectQuiesce(for: runKey)
+
+        if let lifecycleID = lifecycleToWait {
+            // Bind the wait to the exact lifecycle seen by the first snapshot.
+            // A complete disconnect/reconnect between these actor hops then
+            // returns immediately instead of waiting on the new connection.
+            let sessionWaitTask = Task {
+                await session.waitUntilConnectionInactiveForReconnect(
+                    observedLifecycleID: lifecycleID
+                )
+            }
+            activeReconnectBoundaries[operationToken]?.sessionWaitTask = sessionWaitTask
+            await withTaskCancellationHandler {
+                await sessionWaitTask.value
+            } onCancel: {
+                sessionWaitTask.cancel()
+            }
+            activeReconnectBoundaries[operationToken]?.sessionWaitTask = nil
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
+        }
+        if isStarting {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled || !isStarting || self.session !== session
+                        || currentRunKey != runKey || isStopping {
+                        continuation.resume()
+                    } else {
+                        reconnectStartWaiters[operationToken] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelReconnectStartWaiter(operationToken) }
+            }
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
         }
         let targetRevision = await session.currentAgentDisconnectRevision()
-        guard self.session === session, currentRunKey == runKey, !isStopping else { return }
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
         let processedRevision = processedBoundary?.runKey == runKey
             ? processedBoundary?.revision ?? 0
             : 0
         if processedRevision < targetRevision {
-            await withCheckedContinuation { continuation in
-                let currentProcessedRevision = processedBoundary?.runKey == runKey
-                ? processedBoundary?.revision ?? 0
-                : 0
-                if self.session !== session || currentRunKey != runKey || isStopping
-                    || currentProcessedRevision >= targetRevision {
-                    continuation.resume()
-                } else {
-                    reconnectBoundaryWaiters.append(ReconnectBoundaryWaiter(
-                        runKey: runKey,
-                        targetRevision: targetRevision,
-                        continuation: continuation
-                    ))
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let currentProcessedRevision = processedBoundary?.runKey == runKey
+                    ? processedBoundary?.revision ?? 0
+                    : 0
+                    if Task.isCancelled || self.session !== session
+                        || currentRunKey != runKey || isStopping
+                        || currentProcessedRevision >= targetRevision {
+                        continuation.resume()
+                    } else {
+                        reconnectBoundaryWaiters.append(ReconnectBoundaryWaiter(
+                            runKey: runKey,
+                            targetRevision: targetRevision,
+                            operationToken: operationToken,
+                            continuation: continuation
+                        ))
+                    }
                 }
+            } onCancel: {
+                Task { await self.cancelReconnectBoundaryWaiter(operationToken) }
             }
         }
-        guard self.session === session, currentRunKey == runKey, !isStopping else { return }
-        await waitForActiveOperationsToDrain()
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        await waitForActiveOperationsToDrain(cancellable: true)
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        guard let operation = activeReconnectBoundaries[operationToken] else { return }
+        committedReconnectQuiesceRunKey = runKey
+        committedReconnectQuiesceGeneration = connection.generation
+        committedReconnectQuiesceLifecycleID = operation.sessionLifecycleID
+        if currentSessionLifecycleID == operation.sessionLifecycleID {
+            currentSessionLifecycleID = nil
+        }
+        refreshReconnectQuiesce(for: runKey)
     }
 
     package func setMessageProcessingHookForTesting(
@@ -389,6 +516,21 @@ public actor SpiceAgentManager {
     ) {
         precondition(eventTask == nil)
         fileMessageCompletionHook = hook
+    }
+
+    package func setReconnectBoundarySnapshotHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        reconnectBoundarySnapshotHook = hook
+    }
+
+    package func isReconnectBoundaryQuiescingForTesting() -> Bool {
+        reconnectQuiescingRunKey == currentRunKey
+    }
+
+    package func isReconnectBoundaryWaitingForOperationsForTesting() -> Bool {
+        !operationDrainWaiters.isEmpty
     }
 
     package func activeFileTransferCountForTesting() -> Int {
@@ -612,13 +754,15 @@ public actor SpiceAgentManager {
         switch event {
         case .connected:
             currentAgentConnectionGeneration = expectedConnectionGeneration
+            currentSessionLifecycleID = envelope.sessionLifecycleID
+            // Retire old-session fences before capability, pasteboard, or
+            // display work introduces an actor reentrancy window.
+            reconnectDidConnect(
+                generation: expectedConnectionGeneration,
+                sessionLifecycleID: envelope.sessionLifecycleID,
+                runKey: runKey
+            )
             guard !state.isAgentConnected else {
-                if reconnectQuiescingRunKey == runKey,
-                   let boundaryGeneration = reconnectQuiescingConnectionGeneration,
-                   expectedConnectionGeneration > boundaryGeneration {
-                    reconnectQuiescingRunKey = nil
-                    reconnectQuiescingConnectionGeneration = nil
-                }
                 return
             }
             pendingActions.removeAll(keepingCapacity: false)
@@ -644,14 +788,11 @@ public actor SpiceAgentManager {
                 using: session,
                 expectedConnectionGeneration: expectedConnectionGeneration
             )
-            if reconnectQuiescingRunKey == runKey,
-               let boundaryGeneration = reconnectQuiescingConnectionGeneration,
-               expectedConnectionGeneration > boundaryGeneration {
-                reconnectQuiescingRunKey = nil
-                reconnectQuiescingConnectionGeneration = nil
-            }
         case .disconnected:
             currentAgentConnectionGeneration = expectedConnectionGeneration
+            if let sessionLifecycleID = envelope.sessionLifecycleID {
+                currentSessionLifecycleID = sessionLifecycleID
+            }
             transitionToDisconnected()
             if let revision = envelope.disconnectRevision {
                 acknowledgeReconnectBoundary(revision: revision, runKey: runKey)
@@ -797,6 +938,124 @@ public actor SpiceAgentManager {
         for waiter in waiters {
             waiter.resume()
         }
+        let reconnectWaiters = Array(reconnectStartWaiters.values)
+        reconnectStartWaiters.removeAll(keepingCapacity: false)
+        for waiter in reconnectWaiters {
+            waiter.resume()
+        }
+    }
+
+    private func isCurrentReconnectBoundaryOperation(
+        _ token: UInt64,
+        runKey: RunKey,
+        session: SpiceSession
+    ) -> Bool {
+        guard !Task.isCancelled, !isStopping,
+              currentRunKey == runKey, self.session === session,
+              let operation = activeReconnectBoundaries[token] else {
+            return false
+        }
+        return operation.runKey == runKey && !operation.superseded
+    }
+
+    private func finishReconnectBoundaryOperation(
+        _ token: UInt64,
+        runKey: RunKey
+    ) {
+        activeReconnectBoundaries.removeValue(forKey: token)?.sessionWaitTask?.cancel()
+        reconnectStartWaiters.removeValue(forKey: token)?.resume()
+        cancelReconnectBoundaryWaiter(token)
+        refreshReconnectQuiesce(for: runKey)
+    }
+
+    private func cancelReconnectStartWaiter(_ token: UInt64) {
+        reconnectStartWaiters.removeValue(forKey: token)?.resume()
+    }
+
+    private func cancelReconnectBoundaryWaiter(_ operationToken: UInt64) {
+        var remaining: [ReconnectBoundaryWaiter] = []
+        for waiter in reconnectBoundaryWaiters {
+            if waiter.operationToken == operationToken {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        reconnectBoundaryWaiters = remaining
+    }
+
+    private func refreshReconnectQuiesce(for runKey: RunKey) {
+        guard !isStopping, currentRunKey == runKey else {
+            if reconnectQuiescingRunKey == runKey {
+                reconnectQuiescingRunKey = nil
+                reconnectQuiescingConnectionGeneration = nil
+            }
+            return
+        }
+        var generations = activeReconnectBoundaries.values.compactMap { operation in
+            operation.runKey == runKey && !operation.superseded
+                ? operation.connectionGeneration
+                : nil
+        }
+        if committedReconnectQuiesceRunKey == runKey,
+           let generation = committedReconnectQuiesceGeneration {
+            generations.append(generation)
+        }
+        guard let generation = generations.max() else {
+            if reconnectQuiescingRunKey == runKey {
+                reconnectQuiescingRunKey = nil
+                reconnectQuiescingConnectionGeneration = nil
+            }
+            return
+        }
+        reconnectQuiescingRunKey = runKey
+        reconnectQuiescingConnectionGeneration = generation
+    }
+
+    private func reconnectDidConnect(
+        generation: UInt64,
+        sessionLifecycleID: UInt64?,
+        runKey: RunKey
+    ) {
+        guard reconnectQuiescingRunKey == runKey else { return }
+        if committedReconnectQuiesceRunKey == runKey,
+           let committedGeneration = committedReconnectQuiesceGeneration,
+           isNewSessionConnection(
+               generation: generation,
+               sessionLifecycleID: sessionLifecycleID,
+               relativeToGeneration: committedGeneration,
+               relativeToLifecycleID: committedReconnectQuiesceLifecycleID
+           ) {
+            committedReconnectQuiesceRunKey = nil
+            committedReconnectQuiesceGeneration = nil
+            committedReconnectQuiesceLifecycleID = nil
+        }
+        for token in Array(activeReconnectBoundaries.keys) {
+            guard var operation = activeReconnectBoundaries[token],
+                  operation.runKey == runKey,
+                  isNewSessionConnection(
+                      generation: generation,
+                      sessionLifecycleID: sessionLifecycleID,
+                      relativeToGeneration: operation.connectionGeneration,
+                      relativeToLifecycleID: operation.sessionLifecycleID
+                  ) else { continue }
+            operation.superseded = true
+            operation.sessionWaitTask?.cancel()
+            activeReconnectBoundaries[token] = operation
+        }
+        refreshReconnectQuiesce(for: runKey)
+    }
+
+    private func isNewSessionConnection(
+        generation: UInt64,
+        sessionLifecycleID: UInt64?,
+        relativeToGeneration oldGeneration: UInt64,
+        relativeToLifecycleID oldLifecycleID: UInt64?
+    ) -> Bool {
+        if let sessionLifecycleID {
+            return sessionLifecycleID != oldLifecycleID
+        }
+        return generation > oldGeneration
     }
 
     private func beginActiveAgentOperation() -> ActiveAgentOperation? {
@@ -831,23 +1090,42 @@ public actor SpiceAgentManager {
         precondition(activeOperationCount > 0)
         activeOperationCount -= 1
         guard activeOperationCount == 0 else { return }
-        let waiters = operationDrainWaiters
+        let waiters = Array(operationDrainWaiters.values)
         operationDrainWaiters.removeAll(keepingCapacity: false)
         for waiter in waiters {
             waiter.resume()
         }
     }
 
-    private func waitForActiveOperationsToDrain() async {
-        while activeOperationCount > 0 {
+    private func waitForActiveOperationsToDrain(cancellable: Bool = false) async {
+        guard activeOperationCount > 0 else { return }
+        let token = nextOperationDrainWaiterToken
+        nextOperationDrainWaiterToken &+= 1
+        guard cancellable else {
             await withCheckedContinuation { continuation in
                 if activeOperationCount == 0 {
                     continuation.resume()
                 } else {
-                    operationDrainWaiters.append(continuation)
+                    operationDrainWaiters[token] = continuation
                 }
             }
+            return
         }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled || activeOperationCount == 0 {
+                    continuation.resume()
+                } else {
+                    operationDrainWaiters[token] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelOperationDrainWaiter(token) }
+        }
+    }
+
+    private func cancelOperationDrainWaiter(_ token: UInt64) {
+        operationDrainWaiters.removeValue(forKey: token)?.resume()
     }
 
     private func receiveMonitorReply(

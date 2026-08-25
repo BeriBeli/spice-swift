@@ -188,6 +188,13 @@ public actor SpiceSession {
     private var currentEndpoint: SpiceEndpoint?
     private var currentBootstrap: MainBootstrap?
     private var isConnecting = false
+    private var isDisconnecting = false
+    private var nextConnectionLifecycleID: UInt64 = 0
+    private var currentConnectionLifecycleID: UInt64?
+    private var connectionAttemptTask: Task<SpiceSessionInfo, any Error>?
+    private var nextConnectionLifecycleWaiterToken: UInt64 = 0
+    private var connectionLifecycleWaiters: [UInt64: ConnectionLifecycleWaiter] = [:]
+    private var disconnectProcessingHook: (@Sendable () async -> Void)?
     private var isAgentConnected = false
     private var agentDisconnectRevision: UInt64 = 0
     private var agentConnectionGeneration: UInt64 = 0
@@ -202,6 +209,11 @@ public actor SpiceSession {
     }
     private var seamlessMigrationPayloads:
         [UInt64: [ChannelKey: ChannelMigrationPayload]] = [:]
+
+    private struct ConnectionLifecycleWaiter {
+        let lifecycleID: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
 
     private struct PreparedSession: Sendable {
         let endpoint: SpiceEndpoint
@@ -318,27 +330,66 @@ public actor SpiceSession {
     deinit {
         eventMailbox.finish()
         agentEventMailbox.finish()
+        connectionAttemptTask?.cancel()
+        for waiter in connectionLifecycleWaiters.values {
+            waiter.continuation.resume()
+        }
     }
 
     public func connect(
         endpoint: SpiceEndpoint,
         credentials: consuming SpiceCredentials
     ) async throws(SpiceError) -> SpiceSessionInfo {
-        guard mainChannel == nil, !isConnecting else {
+        guard mainChannel == nil, !isConnecting, !isDisconnecting else {
             throw .alreadyConnected
         }
         retiredDisplayDiagnostics = SpiceSessionDiagnostics()
         presentationDiagnostics.reset()
+        nextConnectionLifecycleID &+= 1
+        let lifecycleID = nextConnectionLifecycleID
+        currentConnectionLifecycleID = lifecycleID
         isConnecting = true
-        defer { isConnecting = false }
-
         let credentialStorage = credentials.transferStorage()
-        let prepared = try await prepareConnection(
-            endpoint: endpoint,
-            credentials: credentialStorage
-        )
-        adopt(prepared, credentials: credentialStorage)
-        return prepared.info
+        let attempt = Task { [self] () throws -> SpiceSessionInfo in
+            do {
+                let prepared = try await prepareConnection(
+                    endpoint: endpoint,
+                    credentials: credentialStorage
+                )
+                guard !Task.isCancelled,
+                      currentConnectionLifecycleID == lifecycleID,
+                      !isDisconnecting else {
+                    await Self.closePrepared(prepared)
+                    throw SpiceError.cancelled
+                }
+                adopt(prepared, credentials: credentialStorage)
+                connectionAttemptFinished(lifecycleID: lifecycleID, connected: true)
+                return prepared.info
+            } catch is CancellationError {
+                connectionAttemptFinished(lifecycleID: lifecycleID, connected: false)
+                throw SpiceError.cancelled
+            } catch {
+                connectionAttemptFinished(lifecycleID: lifecycleID, connected: false)
+                throw error
+            }
+        }
+        connectionAttemptTask = attempt
+
+        let result = await withTaskCancellationHandler {
+            await attempt.result
+        } onCancel: {
+            attempt.cancel()
+        }
+        switch result {
+        case let .success(info):
+            return info
+        case let .failure(error as SpiceError):
+            throw error
+        case .failure(is CancellationError):
+            throw .cancelled
+        case let .failure(error):
+            throw .protocolError(String(describing: error))
+        }
     }
 
     private func prepareConnection(
@@ -451,8 +502,30 @@ public actor SpiceSession {
     }
 
     public func disconnect() async {
+        if isDisconnecting {
+            if let lifecycleID = currentConnectionLifecycleID {
+                await waitUntilConnectionInactiveForReconnect(
+                    observedLifecycleID: lifecycleID
+                )
+            }
+            return
+        }
+        if currentConnectionLifecycleID == nil {
+            nextConnectionLifecycleID &+= 1
+            currentConnectionLifecycleID = nextConnectionLifecycleID
+        }
+        let lifecycleID = currentConnectionLifecycleID
+        isDisconnecting = true
         supervisionGeneration &+= 1
         agentConnectionGeneration &+= 1
+        let attempt = connectionAttemptTask
+        attempt?.cancel()
+        if let attempt {
+            _ = await attempt.result
+        }
+        if let disconnectProcessingHook {
+            await disconnectProcessingHook()
+        }
         await cancelMigrationHandoff()
         await stopUSBRedirectionHosts()
         await stopWebDAVServers()
@@ -480,6 +553,7 @@ public actor SpiceSession {
             hadPlaybackChannel: hadPlaybackChannel
         )
         eventMailbox.send(.disconnected)
+        finishConnectionLifecycle(lifecycleID)
     }
 
     package func currentAgentConnectionState() -> Bool {
@@ -488,9 +562,46 @@ public actor SpiceSession {
 
     package func currentAgentConnectionSnapshot() -> (
         isConnected: Bool,
-        generation: UInt64
+        generation: UInt64,
+        sessionLifecycleID: UInt64?
     ) {
-        (isAgentConnected, agentConnectionGeneration)
+        (
+            isAgentConnected,
+            agentConnectionGeneration,
+            currentConnectionLifecycleID
+        )
+    }
+
+    /// Waits until the exact connection lifecycle observed by the caller is
+    /// inactive. A completed disconnect followed by a new connection has a
+    /// different ID and therefore cannot be mistaken for the old lifecycle.
+    package func waitUntilConnectionInactiveForReconnect(
+        observedLifecycleID: UInt64
+    ) async {
+        guard currentConnectionLifecycleID == observedLifecycleID else { return }
+        let token = nextConnectionLifecycleWaiterToken
+        nextConnectionLifecycleWaiterToken &+= 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled,
+                      currentConnectionLifecycleID == observedLifecycleID else {
+                    continuation.resume()
+                    return
+                }
+                connectionLifecycleWaiters[token] = ConnectionLifecycleWaiter(
+                    lifecycleID: observedLifecycleID,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancelConnectionLifecycleWaiter(token) }
+        }
+    }
+
+    package func setDisconnectProcessingHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        disconnectProcessingHook = hook
     }
 
     package func isChannelMigrationFlushing() -> Bool {
@@ -1907,6 +2018,7 @@ public actor SpiceSession {
         guard generation == supervisionGeneration, mainChannel != nil else {
             return
         }
+        isDisconnecting = true
         supervisionGeneration &+= 1
         agentConnectionGeneration &+= 1
         await cancelMigrationHandoff()
@@ -1936,6 +2048,44 @@ public actor SpiceSession {
             hadPlaybackChannel: hadPlaybackChannel
         )
         eventMailbox.send(.failed(Self.map(channelError: error)))
+        finishConnectionLifecycle(currentConnectionLifecycleID)
+    }
+
+    private func connectionAttemptFinished(
+        lifecycleID: UInt64,
+        connected: Bool
+    ) {
+        guard currentConnectionLifecycleID == lifecycleID else { return }
+        isConnecting = false
+        connectionAttemptTask = nil
+        if !connected, !isDisconnecting {
+            finishConnectionLifecycle(lifecycleID)
+        }
+    }
+
+    private func cancelConnectionLifecycleWaiter(_ token: UInt64) {
+        connectionLifecycleWaiters.removeValue(forKey: token)?.continuation.resume()
+    }
+
+    private func finishConnectionLifecycle(_ lifecycleID: UInt64?) {
+        guard let lifecycleID else {
+            isDisconnecting = false
+            return
+        }
+        if currentConnectionLifecycleID == lifecycleID {
+            currentConnectionLifecycleID = nil
+        }
+        isConnecting = false
+        isDisconnecting = false
+        let tokens = connectionLifecycleWaiters.compactMap { token, waiter in
+            waiter.lifecycleID == lifecycleID ? token : nil
+        }
+        let continuations = tokens.compactMap {
+            connectionLifecycleWaiters.removeValue(forKey: $0)?.continuation
+        }
+        for continuation in continuations {
+            continuation.resume()
+        }
     }
 
     private func emitChannelLifecycleEnded(
@@ -1965,7 +2115,8 @@ public actor SpiceSession {
         agentEventMailbox.sendLifecycle(
             event,
             disconnectRevision: disconnectRevision,
-            connectionGeneration: agentConnectionGeneration
+            connectionGeneration: agentConnectionGeneration,
+            sessionLifecycleID: currentConnectionLifecycleID
         )
     }
 

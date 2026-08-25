@@ -581,11 +581,11 @@ struct SpiceSessionTests {
     }
 
     @Test func publishesAgentConnectedStateFromMainInit() async throws {
-        let transport = FakeTransport(inbound: try makeServerTranscript(
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
             agentConnected: 1,
             agentTokens: 8
-        ).map(Result.success))
+        ))
         let session = SpiceSession(
             transportFactory: { _ in transport },
             ticketEncryptor: SessionTicketEncryptor()
@@ -809,6 +809,272 @@ struct SpiceSessionTests {
 
         await manager.stop()
         await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryWaitsForDisconnectThatHasNotPublishedItsRevision() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+
+        let disconnectGate = AgentMessageProcessingGate()
+        let eventGate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setEventProcessingHookForTesting { event in
+            if case .disconnected = event { await eventGate.block() }
+        }
+        try await manager.start(session: session)
+        await session.setDisconnectProcessingHookForTesting {
+            await disconnectGate.block()
+        }
+
+        let disconnect = Task { await session.disconnect() }
+        await disconnectGate.waitUntilEntered()
+        #expect(await session.currentAgentDisconnectRevision() == 0)
+
+        let boundaryCompleted = Mutex(false)
+        let boundary = Task {
+            await manager.waitForSessionReconnectBoundary()
+            boundaryCompleted.withLock { $0 = true }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!boundaryCompleted.withLock { $0 })
+
+        await disconnectGate.release()
+        await eventGate.waitUntilEntered()
+        await disconnect.value
+        #expect(await session.currentAgentDisconnectRevision() == 1)
+        #expect(!boundaryCompleted.withLock { $0 })
+
+        await eventGate.release()
+        await boundary.value
+        #expect(boundaryCompleted.withLock { $0 })
+        await manager.stop()
+    }
+
+    @Test func cancellingReconnectBoundaryRollsBackQuiesce() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+
+        let boundary = Task { await manager.waitForSessionReconnectBoundary() }
+        for _ in 0..<100 {
+            if await manager.isReconnectBoundaryQuiescingForTesting() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await manager.isReconnectBoundaryQuiescingForTesting())
+        boundary.cancel()
+        await boundary.value
+        #expect(!(await manager.isReconnectBoundaryQuiescingForTesting()))
+
+        try await manager.requestResolution(width: 800, height: 600)
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func stoppingManagerReleasesBoundaryWaitingOnConnectedSession() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+
+        let boundaryCompleted = Mutex(false)
+        let boundary = Task {
+            await manager.waitForSessionReconnectBoundary()
+            boundaryCompleted.withLock { $0 = true }
+        }
+        for _ in 0..<100 {
+            if await manager.isReconnectBoundaryQuiescingForTesting() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await manager.isReconnectBoundaryQuiescingForTesting())
+
+        await manager.stop()
+        await boundary.value
+        #expect(boundaryCompleted.withLock { $0 })
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryDoesNotAttachToLifecycleThatWonActorHop() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 0,
+            agentTokens: 0
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let snapshotGate = AgentMessageProcessingGate()
+        let connectedEventGate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setReconnectBoundarySnapshotHookForTesting {
+            await snapshotGate.block()
+        }
+        await manager.setEventProcessingHookForTesting { event in
+            if case .connected = event { await connectedEventGate.block() }
+        }
+        try await manager.start(session: session)
+
+        let boundaryCompleted = Mutex(false)
+        let boundary = Task {
+            await manager.waitForSessionReconnectBoundary()
+            boundaryCompleted.withLock { $0 = true }
+        }
+        await snapshotGate.waitUntilEntered()
+        await session.disconnect()
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        await connectedEventGate.waitUntilEntered()
+
+        await snapshotGate.release()
+        for _ in 0..<100 {
+            if boundaryCompleted.withLock({ $0 }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(boundaryCompleted.withLock { $0 })
+        if !boundaryCompleted.withLock({ $0 }) { boundary.cancel() }
+        await boundary.value
+
+        await connectedEventGate.release()
+        await second.waitForOutboundCount(6)
+        try await manager.requestResolution(width: 800, height: 600)
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func sameLifecycleAgentRestartDoesNotReleaseReconnectBoundary() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        await transport.waitForOutboundCount(6)
+
+        let boundaryCompleted = Mutex(false)
+        let boundary = Task {
+            await manager.waitForSessionReconnectBoundary()
+            boundaryCompleted.withLock { $0 = true }
+        }
+        for _ in 0..<100 {
+            if await manager.isReconnectBoundaryQuiescingForTesting() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        await transport.enqueue(encodeMini(id: 108, body: uint32(0)))
+        await transport.enqueue(encodeMini(id: 115, body: uint32(8)))
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 2 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect((await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 2)
+        #expect(!boundaryCompleted.withLock { $0 })
+        #expect(await manager.isReconnectBoundaryQuiescingForTesting())
+
+        await session.disconnect()
+        await boundary.value
+        #expect(boundaryCompleted.withLock { $0 })
+        await manager.stop()
+    }
+
+    @Test func cancellingReconnectBoundaryReleasesOperationDrainWaiter() async throws {
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "swiftspice-cancel-reconnect-drain-\(UUID().uuidString).txt"
+        )
+        try Data("drain".utf8).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let operationGate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setFileInspectionHookForTesting { await operationGate.block() }
+        try await manager.start(session: session)
+
+        let transfer = Task { try await manager.sendFile(at: source) }
+        await operationGate.waitUntilEntered()
+        await session.disconnect()
+        let boundary = Task { await manager.waitForSessionReconnectBoundary() }
+        for _ in 0..<100 {
+            if await manager.isReconnectBoundaryWaitingForOperationsForTesting() { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(await manager.isReconnectBoundaryWaitingForOperationsForTesting())
+
+        boundary.cancel()
+        await boundary.value
+        #expect(!(await manager.isReconnectBoundaryQuiescingForTesting()))
+        #expect(!(await manager.isReconnectBoundaryWaitingForOperationsForTesting()))
+
+        await operationGate.release()
+        await #expect(throws: SpiceFileTransferError.agentUnavailable) {
+            try await transfer.value
+        }
+        await manager.stop()
     }
 
     @Test func reconnectBoundaryQuiescesConnectionWithoutAgentLifecycle() async throws {
@@ -1992,6 +2258,145 @@ struct SpiceSessionTests {
         #expect(await mainTransport.isClosed)
         #expect(await displayTransport.isClosed)
         #expect(await blockedInputsTransport.isClosed)
+    }
+
+    @Test func disconnectCancelsAnInFlightConnectionBeforeItCanAdopt() async throws {
+        let blocked = BlockingTransport()
+        let replacement = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: []
+        ))
+        let transports = TransportPool([blocked, replacement])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+
+        let connection = Task {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        await blocked.waitUntilFirstWrite()
+        let disconnect = Task { await session.disconnect() }
+
+        do {
+            _ = try await connection.value
+            Issue.record("disconnect allowed the pending connection to adopt")
+        } catch let error as SpiceError {
+            #expect(error == .cancelled)
+        } catch {
+            Issue.record("unexpected connection error: \(error)")
+        }
+        await disconnect.value
+        #expect(await blocked.isClosed)
+        #expect(await session.currentAgentConnectionSnapshot().sessionLifecycleID == nil)
+
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        #expect(await replacement.isConnected)
+        await session.disconnect()
+    }
+
+    @Test func connectCannotAdoptWhileDisconnectCleanupIsSuspended() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        await session.setDisconnectProcessingHookForTesting { await gate.block() }
+
+        let disconnect = Task { await session.disconnect() }
+        await gate.waitUntilEntered()
+        await #expect(throws: SpiceError.alreadyConnected) {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        await disconnect.value
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        #expect(await second.isConnected)
+        await session.disconnect()
+    }
+
+    @Test func failedConnectionResumesExactLifecycleWaiters() async throws {
+        let transport = BlockingTransport()
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let connection = Task {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        await transport.waitUntilFirstWrite()
+        let lifecycleID = try #require(
+            await session.currentAgentConnectionSnapshot().sessionLifecycleID
+        )
+        let waiterCompleted = Mutex(false)
+        let waiter = Task {
+            await session.waitUntilConnectionInactiveForReconnect(
+                observedLifecycleID: lifecycleID
+            )
+            waiterCompleted.withLock { $0 = true }
+        }
+
+        await transport.close()
+        do {
+            _ = try await connection.value
+            Issue.record("closed transport unexpectedly connected")
+        } catch {
+            // The exact transport failure is not relevant to the lifecycle fence.
+        }
+        await waiter.value
+        #expect(waiterCompleted.withLock { $0 })
+        #expect(await session.currentAgentConnectionSnapshot().sessionLifecycleID == nil)
+    }
+
+    @Test func exactLifecycleWaitDoesNotAttachToAReplacementConnection() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let oldLifecycleID = try #require(
+            await session.currentAgentConnectionSnapshot().sessionLifecycleID
+        )
+        await session.disconnect()
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+
+        await session.waitUntilConnectionInactiveForReconnect(
+            observedLifecycleID: oldLifecycleID
+        )
+        #expect(await second.isConnected)
+        await session.disconnect()
     }
 
     @Test func preparedMigrationAtomicallyAdoptsTargetAfterEnd() async throws {

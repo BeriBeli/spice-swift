@@ -4,15 +4,18 @@ package struct SpiceAgentEventEnvelope: Sendable, Equatable {
     package let event: SpiceAgentEvent
     package let disconnectRevision: UInt64?
     package let connectionGeneration: UInt64
+    package let sessionLifecycleID: UInt64?
 
     package init(
         event: SpiceAgentEvent,
         disconnectRevision: UInt64? = nil,
-        connectionGeneration: UInt64 = 0
+        connectionGeneration: UInt64 = 0,
+        sessionLifecycleID: UInt64? = nil
     ) {
         self.event = event
         self.disconnectRevision = disconnectRevision
         self.connectionGeneration = connectionGeneration
+        self.sessionLifecycleID = sessionLifecycleID
     }
 }
 
@@ -90,12 +93,14 @@ package final class SpiceAgentEventMailbox: Sendable {
     package func sendLifecycle(
         _ event: SpiceAgentEvent,
         disconnectRevision: UInt64? = nil,
-        connectionGeneration: UInt64 = 0
+        connectionGeneration: UInt64 = 0,
+        sessionLifecycleID: UInt64? = nil
     ) {
         let envelope = SpiceAgentEventEnvelope(
             event: event,
             disconnectRevision: disconnectRevision,
-            connectionGeneration: connectionGeneration
+            connectionGeneration: connectionGeneration,
+            sessionLifecycleID: sessionLifecycleID
         )
         let delivery = state.withLock { state -> Delivery in
             guard !state.finished else { return .none }
