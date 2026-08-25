@@ -118,8 +118,11 @@ struct SpiceSessionTests {
             ticketEncryptor: SessionTicketEncryptor()
         )
         let desktop = session.desktop.subscribe()
+        let pointerModes = Mutex<[SpicePointerMode]>([])
+        desktop.setUpdateHandler { snapshot in
+            pointerModes.withLock { $0.append(snapshot.pointerMode) }
+        }
         desktop.setDemand(.visible)
-        var desktopUpdates = desktop.updates.makeAsyncIterator()
 
         let info = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -127,22 +130,38 @@ struct SpiceSessionTests {
         )
         #expect(info.supportedMouseModes == 3)
         #expect(info.currentMouseMode == 1)
-        await transport.waitForOutboundCount(5)
+        for _ in 0..<1_000 {
+            if await transport.outbound.count >= 5 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
         let outbound = await transport.outbound
+        try #require(outbound.count >= 5)
         #expect(try decodeMiniMessageID(outbound[3]) == 105)
         #expect(try decodeMiniBody(outbound[3]) == Data([0x02, 0x00]))
         #expect(try decodeMiniMessageID(outbound[4]) == 104)
-        #expect(try #require(await desktopUpdates.next()).pointerMode == .relative)
+        #expect(pointerModes.withLock { $0.last } == .relative)
 
+        let absoluteBaseline = pointerModes.withLock(\.count)
         await transport.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 2)
         ))
-        #expect(try #require(await desktopUpdates.next()).pointerMode == .absolute)
+        for _ in 0..<1_000 {
+            if pointerModes.withLock({ $0.count > absoluteBaseline }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(pointerModes.withLock { $0.count } == absoluteBaseline + 1)
+        #expect(pointerModes.withLock { $0.last } == .absolute)
 
+        let relativeBaseline = pointerModes.withLock(\.count)
         await transport.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
         ))
-        #expect(try #require(await desktopUpdates.next()).pointerMode == .relative)
+        for _ in 0..<1_000 {
+            if pointerModes.withLock({ $0.count > relativeBaseline }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(pointerModes.withLock { $0.count } == relativeBaseline + 1)
+        #expect(pointerModes.withLock { $0.last } == .relative)
         desktop.cancel()
         await session.disconnect()
     }
