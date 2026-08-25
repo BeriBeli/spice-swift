@@ -32,6 +32,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var snapshots: UInt64 = 0
     public internal(set) var fullFrameCopyBytes: UInt64 = 0
     public internal(set) var partialFrameCopyBytes: UInt64 = 0
+    public internal(set) var directIOSurfaceWriteBytes: UInt64 = 0
     public internal(set) var cpuMaterializations: UInt64 = 0
     public internal(set) var cpuMaterializationBytes: UInt64 = 0
     public internal(set) var poolExhaustions: UInt64 = 0
@@ -88,6 +89,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var mjpegIOSurfaceAllocations: UInt64 = 0
     public internal(set) var mjpegPeakBuffersInUse: Int = 0
     public internal(set) var mjpegPeakConcurrentDecodes: Int = 0
+    public internal(set) var mjpegFramesSupersededBeforeDecode: UInt64 = 0
     public internal(set) var advancedCPUFallbackFrames: UInt64 = 0
     public internal(set) var metalGenerationDisableCount: UInt64 = 0
     public internal(set) var firstMetalGenerationDisableReason: String?
@@ -115,6 +117,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var desktopDisplayLinkWakeups: UInt64 = 0
     public internal(set) var desktopDisplayLinkTicks: UInt64 = 0
     public internal(set) var desktopDisplayLinkIdlePauses: UInt64 = 0
+    package var desktopReadyToDisplayLinkHistogram = SpiceTimingHistogram()
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
     package var metalRequestToPresentedHistogram = SpiceTimingHistogram()
@@ -162,6 +165,12 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         viewUpdateToMetalCommitHistogram.summary
     }
 
+    /// Time from the first coalesced desktop update becoming ready until the
+    /// AppKit display link selects the latest revision for presentation.
+    public var desktopReadyToDisplayLink: SpiceTimingSummary {
+        desktopReadyToDisplayLinkHistogram.summary
+    }
+
     public var metalCommitToCompletion: SpiceTimingSummary {
         metalCommitToCompletionHistogram.summary
     }
@@ -181,6 +190,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         snapshots &+= surface.snapshots
         fullFrameCopyBytes &+= surface.fullFrameCopyBytes
         partialFrameCopyBytes &+= surface.partialFrameCopyBytes
+        directIOSurfaceWriteBytes &+= surface.directIOSurfaceWriteBytes
         cpuMaterializations &+= surface.cpuMaterializations
         cpuMaterializationBytes &+= surface.cpuMaterializationBytes
         poolExhaustions &+= surface.poolExhaustions
@@ -257,6 +267,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
             mjpegPeakConcurrentDecodes,
             diagnostics.mjpeg.peakConcurrentDecodes
         )
+        mjpegFramesSupersededBeforeDecode &+= diagnostics.mjpeg.supersededBeforeDecode
         advancedCPUFallbackFrames &+= diagnostics.advancedCPUFallbackFrames
         metalGenerationDisableCount &+= diagnostics.metalGenerationDisableCount
         if firstMetalGenerationDisableReason == nil {

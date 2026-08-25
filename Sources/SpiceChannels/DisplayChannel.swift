@@ -32,6 +32,7 @@ package struct DisplayMJPEGDiagnostics: Sendable, Equatable {
     package var ioSurfaceAllocations: UInt64 = 0
     package var peakBuffersInUse: Int = 0
     package var peakConcurrentDecodes: Int = 0
+    package var supersededBeforeDecode: UInt64 = 0
 
     package mutating func accumulate(_ diagnostics: SpiceMJPEGDecoderDiagnostics) {
         handleCreations &+= diagnostics.handleCreationCount
@@ -87,6 +88,15 @@ package actor DisplayChannel: SpiceManagedChannel {
         var metalCompositorDisabled: Bool
     }
 
+    private struct PendingMJPEGFrame: Sendable {
+        let streamID: UInt32
+        let streamGeneration: UInt64
+        let multimediaTime: UInt32
+        let sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?
+        let data: Data
+        let receivedAt: ContinuousClock.Instant
+    }
+
     private var connection: ChannelConnection
     private let surfaces: SurfaceStore
     private let jpegDecoder: any SpiceImageDecoder
@@ -109,6 +119,11 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
     private var streams: [UInt32: VideoStream] = [:]
+    private var schedulesMJPEGAsynchronously = false
+    private var pendingMJPEGFrames: [UInt32: PendingMJPEGFrame] = [:]
+    private var mjpegFrameTasks: [UInt32: Task<Void, Never>] = [:]
+    private var asynchronousFailure: ChannelError?
+    private var mjpegFramesSupersededBeforeDecode: UInt64 = 0
     private var nextStreamGeneration: UInt64 = 1
     private var ackController = AckController()
     private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
@@ -182,6 +197,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
         )
         framePublishers[ObjectIdentifier(framePublisher)] = framePublisher
+        schedulesMJPEGAsynchronously = true
         let demandPipe = AsyncStream.makeStream(
             of: DisplayFrameDemandEvent.self,
             bufferingPolicy: .unbounded
@@ -206,6 +222,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             _ = demandPipe.continuation.yield(event)
         }
         defer {
+            stopAsynchronousMJPEGScheduling()
             demandRegistration?.cancel()
             demandPipe.continuation.finish()
             demandTask.cancel()
@@ -241,6 +258,9 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
+        if let asynchronousFailure {
+            throw asynchronousFailure
+        }
         completedFrameSourceTiming = nil
         let framed = try await connection.receive()
         currentMessageReceivedAt = diagnosticsClock.now
@@ -278,6 +298,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -288,6 +309,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -323,6 +345,18 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamData(data):
+            if schedulesMJPEGAsynchronously,
+               streams[data.streamID]?.codec == .mjpeg {
+                try enqueueMJPEGFrame(
+                    streamID: data.streamID,
+                    multimediaTime: data.multimediaTime,
+                    sizing: nil,
+                    data: data.data,
+                    receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
+                )
+                try await acknowledgeIfNeeded()
+                return .ignored(framed.type)
+            }
             let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
@@ -333,6 +367,18 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamDataSized(data):
+            if schedulesMJPEGAsynchronously,
+               streams[data.streamID]?.codec == .mjpeg {
+                try enqueueMJPEGFrame(
+                    streamID: data.streamID,
+                    multimediaTime: data.multimediaTime,
+                    sizing: (data.width, data.height, data.destination),
+                    data: data.data,
+                    receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
+                )
+                try await acknowledgeIfNeeded()
+                return .ignored(framed.type)
+            }
             let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
@@ -350,6 +396,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard let removed = streams.removeValue(forKey: streamID) else {
                 throw .protocolViolation("destroy of unknown stream \(streamID)")
             }
+            cancelScheduledMJPEG(streamID: streamID)
             await retireAdvancedDecoder(removed.advancedDecoder)
             await retireMJPEGDecoder(removed.mjpegDecoder)
             try await acknowledgeIfNeeded()
@@ -358,6 +405,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -439,7 +487,91 @@ package actor DisplayChannel: SpiceManagedChannel {
         return .frameChanged(surfaceRevision)
     }
 
+    private func enqueueMJPEGFrame(
+        streamID: UInt32,
+        multimediaTime: UInt32,
+        sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
+        data: Data,
+        receivedAt: ContinuousClock.Instant
+    ) throws(ChannelError) {
+        guard let stream = streams[streamID], stream.codec == .mjpeg else {
+            throw .protocolViolation("data for unknown MJPEG stream \(streamID)")
+        }
+        if pendingMJPEGFrames[streamID] != nil {
+            mjpegFramesSupersededBeforeDecode &+= 1
+        }
+        pendingMJPEGFrames[streamID] = PendingMJPEGFrame(
+            streamID: streamID,
+            streamGeneration: stream.generation,
+            multimediaTime: multimediaTime,
+            sizing: sizing,
+            data: data,
+            receivedAt: receivedAt
+        )
+        guard mjpegFrameTasks[streamID] == nil else { return }
+        mjpegFrameTasks[streamID] = Task { [weak self] in
+            await self?.drainScheduledMJPEG(
+                streamID: streamID,
+                streamGeneration: stream.generation
+            )
+        }
+    }
+
+    private func drainScheduledMJPEG(
+        streamID: UInt32,
+        streamGeneration: UInt64
+    ) async {
+        while !Task.isCancelled {
+            guard streams[streamID]?.generation == streamGeneration,
+                  let pending = pendingMJPEGFrames.removeValue(forKey: streamID),
+                  pending.streamGeneration == streamGeneration
+            else {
+                break
+            }
+            do {
+                guard let revision = try await renderStreamFrame(
+                    streamID: pending.streamID,
+                    multimediaTime: pending.multimediaTime,
+                    sizing: pending.sizing,
+                    data: pending.data
+                ) else {
+                    continue
+                }
+                let timing = DisplayFrameSourceTiming(
+                    messageReceivedAt: pending.receivedAt,
+                    surfaceReadyAt: diagnosticsClock.now
+                )
+                let publishers = Array(framePublishers.values)
+                for publisher in publishers {
+                    await publisher.submit(revision, sourceTiming: timing)
+                }
+            } catch {
+                asynchronousFailure = error
+                await connection.close()
+                break
+            }
+        }
+        if streams[streamID]?.generation == streamGeneration {
+            mjpegFrameTasks.removeValue(forKey: streamID)
+        }
+    }
+
+    private func cancelScheduledMJPEG(streamID: UInt32) {
+        pendingMJPEGFrames.removeValue(forKey: streamID)
+        mjpegFrameTasks.removeValue(forKey: streamID)?.cancel()
+    }
+
+    private func stopAsynchronousMJPEGScheduling() {
+        schedulesMJPEGAsynchronously = false
+        pendingMJPEGFrames.removeAll(keepingCapacity: false)
+        for task in mjpegFrameTasks.values {
+            task.cancel()
+        }
+        mjpegFrameTasks.removeAll(keepingCapacity: false)
+    }
+
     package func close() async {
+        stopAsynchronousMJPEGScheduling()
         await connection.close()
         let publishers = Array(framePublishers.values)
         for publisher in publishers {
@@ -448,6 +580,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         let removedStreams = Array(streams.values)
         streams.removeAll(keepingCapacity: false)
         for stream in removedStreams {
+            cancelScheduledMJPEG(streamID: stream.streamID)
             await retireAdvancedDecoder(stream.advancedDecoder)
             await retireMJPEGDecoder(stream.mjpegDecoder)
         }
@@ -470,6 +603,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         for decoder in activeMJPEGDecoders {
             mjpeg.accumulate(await decoder.diagnosticsSnapshot())
         }
+        mjpeg.supersededBeforeDecode = mjpegFramesSupersededBeforeDecode
         return DisplayChannelDiagnostics(
             surfaces: await surfaces.metrics(),
             publisher: publisherMetrics,

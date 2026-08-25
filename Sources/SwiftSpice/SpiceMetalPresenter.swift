@@ -2,6 +2,7 @@ import CoreVideo
 import Foundation
 import Metal
 import MetalKit
+import MetalPerformanceShaders
 import OSLog
 import SpiceIOSurface
 import SpiceMetalCompositor
@@ -32,7 +33,7 @@ package enum SpiceMetalTextureResult {
 
 package enum SpiceMetalSamplingFilter: Sendable, Equatable {
     case nearest
-    case linear
+    case lanczos
 }
 
 fileprivate final class SpiceMetalPresenterCompletionMetrics: Sendable {
@@ -154,7 +155,7 @@ package final class SpiceMetalPresenter {
     private let commandQueue: any MTLCommandQueue
     private let pipeline: any MTLRenderPipelineState
     private let nearestSampler: any MTLSamplerState
-    private let linearSampler: any MTLSamplerState
+    private let lanczosScaler: MPSImageLanczosScale
     fileprivate let completionMetrics = SpiceMetalPresenterCompletionMetrics()
     private var presentationDiagnostics: SpicePresentationDiagnostics?
     private var textureCache: [TextureCacheKey: TextureCacheEntry] = [:]
@@ -193,16 +194,7 @@ package final class SpiceMetalPresenter {
         nearestDescriptor.sAddressMode = .clampToEdge
         nearestDescriptor.tAddressMode = .clampToEdge
 
-        let linearDescriptor = MTLSamplerDescriptor()
-        linearDescriptor.minFilter = .linear
-        linearDescriptor.magFilter = .linear
-        linearDescriptor.mipFilter = .notMipmapped
-        linearDescriptor.sAddressMode = .clampToEdge
-        linearDescriptor.tAddressMode = .clampToEdge
-
-        guard let nearestSampler = device.makeSamplerState(descriptor: nearestDescriptor),
-              let linearSampler = device.makeSamplerState(descriptor: linearDescriptor)
-        else {
+        guard let nearestSampler = device.makeSamplerState(descriptor: nearestDescriptor) else {
             return nil
         }
 
@@ -210,7 +202,9 @@ package final class SpiceMetalPresenter {
         self.commandQueue = commandQueue
         self.pipeline = pipeline
         self.nearestSampler = nearestSampler
-        self.linearSampler = linearSampler
+        let lanczosScaler = MPSImageLanczosScale(device: device)
+        lanczosScaler.edgeMode = .clamp
+        self.lanczosScaler = lanczosScaler
         self.presentationDiagnostics = presentationDiagnostics
     }
 
@@ -225,7 +219,7 @@ package final class SpiceMetalPresenter {
               destinationWidth > 0,
               destinationHeight > 0
         else {
-            return .linear
+            return .lanczos
         }
         if sourceWidth == destinationWidth, sourceHeight == destinationHeight {
             return .nearest
@@ -234,7 +228,7 @@ package final class SpiceMetalPresenter {
             && destinationHeight >= sourceHeight
             && destinationWidth.isMultiple(of: sourceWidth)
             && destinationHeight.isMultiple(of: sourceHeight)
-        return isIntegerMagnification ? .nearest : .linear
+        return isIntegerMagnification ? .nearest : .lanczos
     }
 
     package func makeTexture(for frame: SpiceFrame) -> (any MTLTexture)? {
@@ -357,33 +351,39 @@ package final class SpiceMetalPresenter {
             return nil
         }
 
-        let renderPass = MTLRenderPassDescriptor()
-        renderPass.colorAttachments[0].texture = destination
-        renderPass.colorAttachments[0].loadAction = .clear
-        renderPass.colorAttachments[0].storeAction = .store
-        renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
-        guard let encoder = commandBuffer.makeRenderCommandEncoder(
-            descriptor: renderPass
-        ) else {
-            completionMetrics.releaseCommandSlot()
-            return nil
-        }
-
         let filter = Self.samplingFilter(
             sourceWidth: source.width,
             sourceHeight: source.height,
             destinationWidth: destination.width,
             destinationHeight: destination.height
         )
-        encoder.label = "SwiftSpice fullscreen IOSurface presentation"
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(source, index: 0)
-        encoder.setFragmentSamplerState(
-            filter == .nearest ? nearestSampler : linearSampler,
-            index: 0
-        )
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding()
+        if filter == .lanczos {
+            // MPS writes its high-quality scale directly into the drawable. This
+            // restores v0.1.x text clarity without an intermediate texture or blit.
+            lanczosScaler.encode(
+                commandBuffer: commandBuffer,
+                sourceTexture: source,
+                destinationTexture: destination
+            )
+        } else {
+            let renderPass = MTLRenderPassDescriptor()
+            renderPass.colorAttachments[0].texture = destination
+            renderPass.colorAttachments[0].loadAction = .clear
+            renderPass.colorAttachments[0].storeAction = .store
+            renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(
+                descriptor: renderPass
+            ) else {
+                completionMetrics.releaseCommandSlot()
+                return nil
+            }
+            encoder.label = "SwiftSpice fullscreen IOSurface presentation"
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setFragmentTexture(source, index: 0)
+            encoder.setFragmentSamplerState(nearestSampler, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            encoder.endEncoding()
+        }
 
         let commandEpoch = presentationEpoch ?? presentationDiagnostics?.currentEpoch()
         commandBuffer.addCompletedHandler {
@@ -459,7 +459,8 @@ package final class SpiceMetalFrameView: MTKView {
         super.init(frame: .zero, device: presenter.device)
         presenter.setPresentationDiagnostics(presentationDiagnostics)
         colorPixelFormat = .bgra8Unorm
-        framebufferOnly = true
+        // MPS Lanczos writes directly into non-integer-scaled drawables.
+        framebufferOnly = false
         autoResizeDrawable = false
         enableSetNeedsDisplay = false
         isPaused = true

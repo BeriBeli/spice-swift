@@ -558,6 +558,7 @@ struct SpiceProbe {
                 "display diagnostics: native-video=\(diagnostics.nativeVideoFrames) "
                     + "advanced-cpu-fallback=\(diagnostics.advancedCPUFallbackFrames) "
                     + "cpu-materialization=\(diagnostics.cpuMaterializations) "
+                    + "direct-iosurface-bytes=\(diagnostics.directIOSurfaceWriteBytes) "
                     + "vt-hardware/software=\(diagnostics.videoHardwareSessions)/"
                     + "\(diagnostics.videoSoftwareSessions) gpu-errors=\(diagnostics.gpuErrors) "
                     + "iosurface-bytes=\(diagnostics.totalIOSurfaceAllocatedBytes)"
@@ -1094,6 +1095,7 @@ private struct ProbeBenchmarkReport: Codable {
     let snapshots: UInt64
     let fullFrameCopyBytes: UInt64
     let partialFrameCopyBytes: UInt64
+    let directIOSurfaceWriteBytes: UInt64
     let cpuMaterializations: UInt64
     let cpuMaterializationBytes: UInt64
     let poolExhaustions: UInt64
@@ -1164,6 +1166,7 @@ private struct ProbeBenchmarkReport: Codable {
         snapshots = diagnostics.snapshots
         fullFrameCopyBytes = diagnostics.fullFrameCopyBytes
         partialFrameCopyBytes = diagnostics.partialFrameCopyBytes
+        directIOSurfaceWriteBytes = diagnostics.directIOSurfaceWriteBytes
         cpuMaterializations = diagnostics.cpuMaterializations
         cpuMaterializationBytes = diagnostics.cpuMaterializationBytes
         poolExhaustions = diagnostics.poolExhaustions
@@ -1220,6 +1223,7 @@ private struct ProbeBenchmarkReport: Codable {
         case snapshots
         case fullFrameCopyBytes = "full_frame_copy_bytes"
         case partialFrameCopyBytes = "partial_frame_copy_bytes"
+        case directIOSurfaceWriteBytes = "direct_iosurface_write_bytes"
         case cpuMaterializations = "cpu_materializations"
         case cpuMaterializationBytes = "cpu_materialization_bytes"
         case poolExhaustions = "pool_exhaustions"

@@ -7,6 +7,32 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded desktop-ready-to-display-link timing diagnostics so frame-clock
+  scheduling delay is measured separately from Metal commit and compositor
+  presentation latency.
+
+### Performance
+
+- Full-surface raw bitmap copies now write directly into a revisioned IOSurface
+  and publish that canonical revision without a second full-frame CPU upload.
+- Fractionally scaled desktops use MPS Lanczos directly into the drawable,
+  restoring v0.1.x text clarity without an intermediate texture or blit.
+- Blocking MJPEG decode work now runs on a per-stream GCD serial executor so
+  it cannot starve input and UI jobs on Swift's cooperative executor.
+- Display receive now feeds a one-in-flight, one-latest MJPEG mailbox, matching
+  spice-gtk's queued decoder scheduling by discarding superseded encoded frames
+  before libturbojpeg instead of accumulating visual latency.
+
+### Fixed
+
+- MJPEG streams now preserve libjpeg-turbo's accurate DCT and chroma
+  upsampling, matching the static JPEG path instead of blurring colored text.
+- Every plain and TLS SPICE channel now uses spice-gtk's TCP keepalive policy,
+  preventing an otherwise idle main channel from timing out while display and
+  input channels remain active.
+
 ## [0.2.4] — 2026-08-25
 
 ### Performance

@@ -90,6 +90,7 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let snapshots: UInt64
     package let fullFrameCopyBytes: UInt64
     package let partialFrameCopyBytes: UInt64
+    package let directIOSurfaceWriteBytes: UInt64
     package let cpuMaterializations: UInt64
     package let cpuMaterializationBytes: UInt64
     package let poolExhaustions: UInt64
@@ -403,6 +404,7 @@ package actor SurfaceStore {
     private var snapshots: UInt64 = 0
     private var fullFrameCopyBytes: UInt64 = 0
     private var partialFrameCopyBytes: UInt64 = 0
+    private var directIOSurfaceWriteBytes: UInt64 = 0
     private var poolExhaustions: UInt64 = 0
     private var nativeVideoFrames: UInt64 = 0
     private var nativeVideoFallbacks: UInt64 = 0
@@ -694,52 +696,60 @@ package actor SurfaceStore {
         }
 
         let nextRevision = try advancedRevision(surface.revision)
-        try prepareForMutation(&surface)
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
+        let fullSurface = PixelRect(
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height
+        )
+        if destination == fullSurface,
+           var unified = surface.storage.unifiedBacking,
+           let writable = unified.pool.checkoutWritable(
+               namespace: unified.namespace,
+               surfaceID: surfaceID,
+               width: surface.width,
+               height: surface.height,
+               source: unified.current,
+               allowsInPlaceSource: true
+           ),
+           writable.withLockedMutableBytes({ destinationBase, bytesPerRow in
+               copyRawBitmap(
+                   bitmap,
+                   source: source,
+                   to: destinationBase,
+                   destinationBytesPerRow: bytesPerRow,
+                   preservesAlpha: preservesAlpha
+               )
+           }) != nil,
+           let committed = writable.finish(revision: nextRevision)
+        {
+            surface.revision = nextRevision
+            unified.current = committed
+            unified.damageJournal.clear()
+            unified.damageHistory.reset(at: nextRevision)
+            surface.storage.unifiedBacking = unified
+            surface.storage.recordPublicationDamage(fullSurface)
+            currentFramePixelStorage[surfaceID] = nil
+            surfaces[surfaceID] = surface
+            directIOSurfaceWriteBytes &+= UInt64(surface.width * surface.height * 4)
+            recordDamage(fullSurface)
+            return surfaceRevision(of: surface)
+        }
+
+        try prepareForMutation(&surface)
         surface.revision = nextRevision
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
-            bitmap.pixels.withUnsafeBytes { sourceBytes in
-                guard let destinationBase = destinationBytes.baseAddress,
-                      let sourceBase = sourceBytes.baseAddress
-                else {
-                    return
-                }
-                for destinationRow in 0..<source.height {
-                    let logicalSourceRow = source.y + destinationRow
-                    let sourceRow = bitmap.topDown
-                        ? logicalSourceRow
-                        : bitmap.height - 1 - logicalSourceRow
-                    let sourceStart = sourceRow * bitmap.stride + source.x * 4
-                    let destinationStart = (destination.y + destinationRow)
-                        * destinationBytesPerRow + destination.x * 4
-                    let sourceRowBase = sourceBase.advanced(by: sourceStart)
-                    let destinationRowBase = destinationBase.advanced(by: destinationStart)
-                    if preservesAlpha {
-                        memmove(destinationRowBase, sourceRowBase, source.width * 4)
-                    } else if Int(bitPattern: sourceRowBase) & 3 == 0,
-                              Int(bitPattern: destinationRowBase) & 3 == 0
-                    {
-                        let sourcePixels = sourceRowBase.assumingMemoryBound(to: UInt32.self)
-                        let destinationPixels = destinationRowBase.assumingMemoryBound(
-                            to: UInt32.self
-                        )
-                        for column in 0..<source.width {
-                            destinationPixels[column] = sourcePixels[column] | 0xff00_0000
-                        }
-                    } else {
-                        for column in 0..<source.width {
-                            let sourcePixel = sourceRowBase.advanced(by: column * 4)
-                            let destinationPixel = destinationRowBase.advanced(by: column * 4)
-                            let sourceBGRA = sourcePixel.loadUnaligned(as: UInt32.self)
-                            destinationPixel.storeBytes(
-                                of: sourceBGRA | 0xff00_0000,
-                                as: UInt32.self
-                            )
-                        }
-                    }
-                }
-            }
+            guard let destinationBase = destinationBytes.baseAddress else { return }
+            copyRawBitmap(
+                bitmap,
+                source: source,
+                to: destinationBase.advanced(by: destination.y * destinationBytesPerRow
+                    + destination.x * 4),
+                destinationBytesPerRow: destinationBytesPerRow,
+                preservesAlpha: preservesAlpha
+            )
         }
         surface.storage.recordDamage(destination, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
@@ -1269,6 +1279,7 @@ package actor SurfaceStore {
             snapshots: snapshots,
             fullFrameCopyBytes: fullFrameCopyBytes,
             partialFrameCopyBytes: partialFrameCopyBytes,
+            directIOSurfaceWriteBytes: directIOSurfaceWriteBytes,
             cpuMaterializations: materializations.count,
             cpuMaterializationBytes: materializations.bytes,
             poolExhaustions: poolExhaustions,
@@ -1655,6 +1666,50 @@ package actor SurfaceStore {
         surface.storage.pixels = pixels
         surface.storage.dataRevision = surface.revision
         materializationMetrics.record(bytes: pixels.count)
+    }
+
+    private func copyRawBitmap(
+        _ bitmap: RawBitmap,
+        source: PixelRect,
+        to destinationBase: UnsafeMutableRawPointer,
+        destinationBytesPerRow: Int,
+        preservesAlpha: Bool
+    ) {
+        bitmap.pixels.withUnsafeBytes { sourceBytes in
+            guard let sourceBase = sourceBytes.baseAddress else { return }
+            for destinationRow in 0..<source.height {
+                let logicalSourceRow = source.y + destinationRow
+                let sourceRow = bitmap.topDown
+                    ? logicalSourceRow
+                    : bitmap.height - 1 - logicalSourceRow
+                let sourceStart = sourceRow * bitmap.stride + source.x * 4
+                let sourceRowBase = sourceBase.advanced(by: sourceStart)
+                let destinationRowBase = destinationBase.advanced(
+                    by: destinationRow * destinationBytesPerRow
+                )
+                if preservesAlpha {
+                    memmove(destinationRowBase, sourceRowBase, source.width * 4)
+                } else if Int(bitPattern: sourceRowBase) & 3 == 0,
+                          Int(bitPattern: destinationRowBase) & 3 == 0
+                {
+                    let sourcePixels = sourceRowBase.assumingMemoryBound(to: UInt32.self)
+                    let destinationPixels = destinationRowBase.assumingMemoryBound(to: UInt32.self)
+                    for column in 0..<source.width {
+                        destinationPixels[column] = sourcePixels[column] | 0xff00_0000
+                    }
+                } else {
+                    for column in 0..<source.width {
+                        let sourcePixel = sourceRowBase.advanced(by: column * 4)
+                        let destinationPixel = destinationRowBase.advanced(by: column * 4)
+                        let sourceBGRA = sourcePixel.loadUnaligned(as: UInt32.self)
+                        destinationPixel.storeBytes(
+                            of: sourceBGRA | 0xff00_0000,
+                            as: UInt32.self
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private func validate(_ rectangle: PixelRect, in surface: Surface) throws(RenderError) {

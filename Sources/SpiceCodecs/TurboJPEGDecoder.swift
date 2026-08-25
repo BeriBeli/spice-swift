@@ -1,6 +1,25 @@
 import CoreVideo
+import Dispatch
 import Foundation
 import SpiceCodecInterop
+
+/// Runs blocking libturbojpeg work on GCD rather than occupying Swift's
+/// cooperative executor. Each stream still owns a serial decoder context.
+private final class SpiceMJPEGStreamExecutor: SerialExecutor, @unchecked Sendable {
+    private let queue = DispatchQueue(
+        label: "org.swiftspice.mjpeg-decode",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let unownedJob = UnownedJob(job)
+        let unownedExecutor = asUnownedSerialExecutor()
+        queue.async {
+            unownedJob.runSynchronously(on: unownedExecutor)
+        }
+    }
+}
 
 package struct SpiceJPEGDecoder: SpiceImageDecoder {
     package nonisolated let format = SpiceImageFormat.jpeg
@@ -131,7 +150,7 @@ package struct SpiceMJPEGDecoderDiagnostics: Sendable, Equatable {
     package let decodeLimiter: SpiceMJPEGDecodeLimiterDiagnostics
 }
 
-/// An immutable IOSurface-backed fast-MJPEG result. Retaining this frame owns a
+/// An immutable IOSurface-backed MJPEG result. Retaining this frame owns a
 /// pool lease; releasing it returns the CVPixelBuffer to the stream's bounded
 /// three-slot pool after Metal or a CPU fallback has finished reading it.
 package final class SpiceMJPEGFrame: SpiceDecodedVideoFrame, @unchecked Sendable {
@@ -192,6 +211,11 @@ package final class SpiceMJPEGFrame: SpiceDecodedVideoFrame, @unchecked Sendable
 /// directly into IOSurface-backed BGRA buffers when one is immediately free,
 /// and uses a bounded Data decode rather than waiting when all three are leased.
 package actor SpiceMJPEGStreamDecoder {
+    nonisolated private let executor = SpiceMJPEGStreamExecutor()
+    package nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
     private let limits: SpiceJPEGDecodeLimits
     private let limiter: SpiceMJPEGDecodeLimiter
     private let pool: SpiceMJPEGBufferPool
@@ -287,7 +311,6 @@ package actor SpiceMJPEGStreamDecoder {
                                 expectedHeight: descriptor.height,
                                 bytesPerRow: bytesPerRow,
                                 outputByteCount: outputByteCount,
-                                mode: .mjpegFast,
                                 into: UnsafeMutableRawBufferPointer(
                                     start: baseAddress,
                                     count: outputByteCount
@@ -317,8 +340,7 @@ package actor SpiceMJPEGStreamDecoder {
                 expectedWidth: descriptor.width,
                 expectedHeight: descriptor.height,
                 bytesPerRow: layout.bytesPerRow,
-                outputByteCount: layout.byteCount,
-                mode: .mjpegFast
+                outputByteCount: layout.byteCount
             )
         } catch {
             throw Self.codecError(

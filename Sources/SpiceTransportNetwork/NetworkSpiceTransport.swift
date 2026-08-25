@@ -92,7 +92,7 @@ public actor NetworkSpiceTransport: SpiceTransport {
         switch configuration {
         case .tcp:
             newConnection = .tcp(NetworkConnection(to: endpoint) {
-                TCP().noDelay(true).connectionTimeout(10)
+                Self.configuredTCP()
             })
         case let .tls(policy):
             let tls = makeTLS(policy: policy)
@@ -334,7 +334,7 @@ public actor NetworkSpiceTransport: SpiceTransport {
 
     private func makeTLS(policy: NetworkTLSPolicy) -> TLS {
         let tls = TLS {
-            TCP().noDelay(true)
+            Self.configuredTCP()
         }
         switch policy {
         case .system:
@@ -360,6 +360,21 @@ public actor NetworkSpiceTransport: SpiceTransport {
         case .insecureForTestingOnly:
             return tls.certificateValidator { _, _ in true }
         }
+    }
+
+    private nonisolated static func configuredTCP() -> TCP {
+        // Match spice-gtk's per-channel keepalive policy. SPICE main can be
+        // otherwise idle for long stretches while display and input remain
+        // active, so relying on the system idle timeout can tear down a
+        // healthy session.
+        TCP()
+            .noDelay(true)
+            .keepalive(
+                idleTimeInSeconds: 30,
+                count: 3,
+                intervalInSeconds: 15
+            )
+            .connectionTimeout(10)
     }
 
     package nonisolated static func evaluateCustomCertificateAuthority(

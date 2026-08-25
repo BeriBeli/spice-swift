@@ -9,16 +9,6 @@ package enum TurboJPEGInteropError: Error, Sendable, Equatable {
     case decompressionFailed(String)
 }
 
-package enum TurboJPEGDecodeMode: Sendable, Equatable {
-    /// Preserve libjpeg-turbo's default inverse DCT and chroma upsampling. This
-    /// remains the mode used for ordinary SPICE JPEG images and their goldens.
-    case exact
-
-    /// Favor stream throughput and bounded latency over bit-exact component
-    /// values. This is deliberately restricted to disposable MJPEG frames.
-    case mjpegFast
-}
-
 /// One persistent libturbojpeg decompressor. The C handle is not internally
 /// thread safe, so calls are serialized even though stream decoders normally
 /// isolate an instance inside their own actor.
@@ -43,7 +33,6 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
         expectedHeight: Int,
         bytesPerRow: Int,
         outputByteCount: Int,
-        mode: TurboJPEGDecodeMode,
         into destination: UnsafeMutableRawBufferPointer
     ) throws(TurboJPEGInteropError) {
         let (minimumRowBytes, rowOverflow) = expectedWidth.multipliedReportingOverflow(by: 4)
@@ -98,11 +87,7 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
             guard let cBytesPerRow = Int32(exactly: bytesPerRow) else {
                 return .failure(.invalidDestination("BGRA row stride exceeds TurboJPEG limits"))
             }
-            var flags = Int32(TJFLAG_STOPONWARNING)
-            if mode == .mjpegFast {
-                flags |= Int32(TJFLAG_FASTDCT)
-                flags |= Int32(TJFLAG_FASTUPSAMPLE)
-            }
+            let flags = Int32(TJFLAG_STOPONWARNING)
             guard let outputBase = destination.baseAddress?.assumingMemoryBound(to: UInt8.self)
             else {
                 return .failure(.invalidDestination("empty output buffer"))
@@ -138,8 +123,7 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
         expectedWidth: Int,
         expectedHeight: Int,
         bytesPerRow: Int,
-        outputByteCount: Int,
-        mode: TurboJPEGDecodeMode
+        outputByteCount: Int
     ) throws(TurboJPEGInteropError) -> Data {
         var output = Data(count: outputByteCount)
         let result: Result<Void, TurboJPEGInteropError> = output.withUnsafeMutableBytes {
@@ -151,7 +135,6 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
                     expectedHeight: expectedHeight,
                     bytesPerRow: bytesPerRow,
                     outputByteCount: outputByteCount,
-                    mode: mode,
                     into: outputBytes
                 )
                 return .success(())
@@ -204,7 +187,7 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
 
 /// Convenience boundary for one-shot decodes. It intentionally creates and
 /// destroys a handle so static JPEG behavior remains independent from the
-/// persistent, fast MJPEG stream path.
+/// persistent MJPEG stream path.
 package struct TurboJPEGInterop: Sendable {
     package init() {}
 
@@ -221,8 +204,7 @@ package struct TurboJPEGInterop: Sendable {
             expectedWidth: expectedWidth,
             expectedHeight: expectedHeight,
             bytesPerRow: bytesPerRow,
-            outputByteCount: outputByteCount,
-            mode: .exact
+            outputByteCount: outputByteCount
         )
     }
 }

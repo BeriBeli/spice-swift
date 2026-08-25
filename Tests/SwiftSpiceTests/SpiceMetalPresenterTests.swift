@@ -137,6 +137,7 @@ struct SpiceMetalPresenterTests {
         diagnostics.recordDesktopDisplayLinkWakeup()
         diagnostics.recordDesktopDisplayLinkTick()
         diagnostics.recordDesktopDisplayLinkIdlePause()
+        diagnostics.recordDesktopReadyToDisplayLink(.milliseconds(2))
         diagnostics.recordViewUpdateToMetalCommit(.milliseconds(3))
         diagnostics.recordMetalCommitToCompletion(.milliseconds(4))
         diagnostics.recordMetalRequestToPresented(.milliseconds(5))
@@ -161,6 +162,7 @@ struct SpiceMetalPresenterTests {
         #expect(metrics.desktopDisplayLinkWakeups == 1)
         #expect(metrics.desktopDisplayLinkTicks == 1)
         #expect(metrics.desktopDisplayLinkIdlePauses == 1)
+        #expect(metrics.desktopReadyToDisplayLink.p95Milliseconds == 2)
         #expect(metrics.viewUpdateToMetalCommit.p95Milliseconds == 3)
         #expect(metrics.metalCommitToCompletion.p95Milliseconds == 4)
         #expect(metrics.metalRequestToPresented.p95Milliseconds == 5)
@@ -321,7 +323,7 @@ struct SpiceMetalPresenterTests {
             sourceHeight: 480,
             destinationWidth: 1_024,
             destinationHeight: 768
-        ) == .linear)
+        ) == .lanczos)
     }
 
     @Test func integerMagnificationKeepsPixelEdgesSharp() async throws {
@@ -392,11 +394,11 @@ struct SpiceMetalPresenterTests {
         ]))
     }
 
-    @Test func nonIntegerScaleUsesLinearSampling() async throws {
+    @Test func nonIntegerScaleUsesLanczosSampling() async throws {
         let presenter = try #require(SpiceMetalPresenter())
         let sourceDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
-            width: 2,
+            width: 4,
             height: 1,
             mipmapped: false
         )
@@ -406,13 +408,15 @@ struct SpiceMetalPresenterTests {
         let sourcePixels: [UInt8] = [
             0, 0, 0, 255,
             255, 255, 255, 255,
+            0, 0, 0, 255,
+            255, 255, 255, 255,
         ]
         sourcePixels.withUnsafeBytes { bytes in
             source.replace(
-                region: MTLRegionMake2D(0, 0, 2, 1),
+                region: MTLRegionMake2D(0, 0, 4, 1),
                 mipmapLevel: 0,
                 withBytes: bytes.baseAddress!,
-                bytesPerRow: 8
+                bytesPerRow: 16
             )
         }
         let destinationDescriptor = MTLTextureDescriptor.texture2DDescriptor(
@@ -428,9 +432,9 @@ struct SpiceMetalPresenterTests {
         )
         let frame = SpiceFrame(
             surfaceID: 0,
-            width: 2,
+            width: 4,
             height: 1,
-            bytesPerRow: 8,
+            bytesPerRow: 16,
             pixels: Data(sourcePixels)
         )
         let commandBuffer = try #require(presenter.makePresentationCommand(
@@ -452,10 +456,17 @@ struct SpiceMetalPresenterTests {
                 mipmapLevel: 0
             )
         }
+        let first = Array(result[0..<4])
         let middle = Array(result[4..<8])
+        let last = Array(result[8..<12])
+        // MPS Lanczos suppresses the alternating source's frequencies above
+        // the smaller destination's Nyquist limit instead of preserving the
+        // ringing/overshoot produced by the former unsharp-linear experiment.
+        #expect((84...88).contains(Int(first[0])))
         #expect((127...128).contains(Int(middle[0])))
         #expect((127...128).contains(Int(middle[1])))
         #expect((127...128).contains(Int(middle[2])))
+        #expect((167...171).contains(Int(last[0])))
         #expect(middle[3] == 255)
     }
 
@@ -463,7 +474,7 @@ struct SpiceMetalPresenterTests {
         let view = try #require(SpiceMetalFrameView())
         #expect(view.isPaused)
         #expect(!view.enableSetNeedsDisplay)
-        #expect(view.framebufferOnly)
+        #expect(!view.framebufferOnly)
         #expect(!view.presentsWithTransaction)
         #expect(!view.autoResizeDrawable)
     }

@@ -868,6 +868,19 @@ package final class RevisionedIOSurfaceWritableFrame: @unchecked Sendable {
         return succeeded ? copiedBytes : nil
     }
 
+    /// Performs a synchronous CPU write while the IOSurface is locked. The
+    /// writable candidate is not published until `finish(revision:)` succeeds.
+    package func withLockedMutableBytes<Result>(
+        _ body: (UnsafeMutableRawPointer, Int) -> Result
+    ) -> Result? {
+        var seed: UInt32 = 0
+        guard IOSurfaceLock(slot.surface, [], &seed) == 0 else {
+            return nil
+        }
+        defer { IOSurfaceUnlock(slot.surface, [], &seed) }
+        return body(IOSurfaceGetBaseAddress(slot.surface), slot.bytesPerRow)
+    }
+
     package func withIOSurface<Result, Failure: Error>(
         _ body: (IOSurfaceRef) throws(Failure) -> Result
     ) throws(Failure) -> Result {
