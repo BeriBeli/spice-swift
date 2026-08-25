@@ -3,24 +3,6 @@ import Dispatch
 import Foundation
 import SpiceCodecInterop
 
-/// Runs blocking libturbojpeg work on GCD rather than occupying Swift's
-/// cooperative executor. Each stream still owns a serial decoder context.
-private final class SpiceMJPEGStreamExecutor: SerialExecutor, @unchecked Sendable {
-    private let queue = DispatchQueue(
-        label: "org.swiftspice.mjpeg-decode",
-        qos: .userInitiated,
-        autoreleaseFrequency: .workItem
-    )
-
-    func enqueue(_ job: consuming ExecutorJob) {
-        let unownedJob = UnownedJob(job)
-        let unownedExecutor = asUnownedSerialExecutor()
-        queue.async {
-            unownedJob.runSynchronously(on: unownedExecutor)
-        }
-    }
-}
-
 package struct SpiceJPEGDecoder: SpiceImageDecoder {
     package nonisolated let format = SpiceImageFormat.jpeg
     private let limits: SpiceJPEGDecodeLimits
@@ -210,15 +192,22 @@ package final class SpiceMJPEGFrame: SpiceDecodedVideoFrame, @unchecked Sendable
 /// Per-SPICE-stream MJPEG decoder. It keeps one TurboJPEG handle warm, writes
 /// directly into IOSurface-backed BGRA buffers when one is immediately free,
 /// and uses a bounded Data decode rather than waiting when all three are leased.
+/// Blocking libturbojpeg work runs on a private serial GCD queue; the actor only
+/// coordinates permits, lifecycle, and diagnostics on Swift's executor.
 package actor SpiceMJPEGStreamDecoder {
-    nonisolated private let executor = SpiceMJPEGStreamExecutor()
-    package nonisolated var unownedExecutor: UnownedSerialExecutor {
-        executor.asUnownedSerialExecutor()
+    private struct DecodeWorkResult: Sendable {
+        let frame: any SpiceDecodedVideoFrame
+        let usedIOSurface: Bool
     }
 
     private let limits: SpiceJPEGDecodeLimits
     private let limiter: SpiceMJPEGDecodeLimiter
     private let pool: SpiceMJPEGBufferPool
+    private nonisolated let decodeQueue = DispatchQueue(
+        label: "org.swiftspice.mjpeg-decode",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
     private var backend: TurboJPEGDecoderHandle?
     private var decodedFrameCount: UInt64 = 0
     private var ioSurfaceFrameCount: UInt64 = 0
@@ -244,27 +233,34 @@ package actor SpiceMJPEGStreamDecoder {
         payload: Data
     ) async throws(SpiceCodecError) -> any SpiceDecodedVideoFrame {
         let layout = try validatedLayout(descriptor: descriptor, payload: payload)
-        guard backend != nil else {
+        guard let backend else {
             throw .cancelled
         }
 
         await limiter.acquire()
-        let result: Result<any SpiceDecodedVideoFrame, SpiceCodecError>
+        let result: Result<DecodeWorkResult, SpiceCodecError>
         if Task.isCancelled {
             result = .failure(.cancelled)
         } else {
-            do {
-                result = .success(try decodeWithPermit(
-                    descriptor: descriptor,
-                    payload: payload,
-                    layout: layout
-                ))
-            } catch {
-                result = .failure(error)
-            }
+            result = await performDecode(
+                backend: backend,
+                descriptor: descriptor,
+                payload: payload,
+                layout: layout
+            )
         }
         await limiter.release()
-        return try result.get()
+        guard self.backend != nil, !Task.isCancelled else {
+            throw .cancelled
+        }
+        let completed = try result.get()
+        decodedFrameCount &+= 1
+        if completed.usedIOSurface {
+            ioSurfaceFrameCount &+= 1
+        } else {
+            dataFallbackCount &+= 1
+        }
+        return completed.frame
     }
 
     package func diagnosticsSnapshot() async -> SpiceMJPEGDecoderDiagnostics {
@@ -285,14 +281,40 @@ package actor SpiceMJPEGStreamDecoder {
         pool.discardAvailableBuffers()
     }
 
-    private func decodeWithPermit(
+    private func performDecode(
+        backend: TurboJPEGDecoderHandle,
         descriptor: SpiceCodecImageDescriptor,
         payload: Data,
         layout: (bytesPerRow: Int, byteCount: Int)
-    ) throws(SpiceCodecError) -> any SpiceDecodedVideoFrame {
-        guard let backend else {
-            throw .cancelled
+    ) async -> Result<DecodeWorkResult, SpiceCodecError> {
+        await withCheckedContinuation { continuation in
+            decodeQueue.async { [pool] in
+                do {
+                    continuation.resume(returning: .success(try Self.decodeWithPermit(
+                        backend: backend,
+                        pool: pool,
+                        descriptor: descriptor,
+                        payload: payload,
+                        layout: layout
+                    )))
+                } catch let error as SpiceCodecError {
+                    continuation.resume(returning: .failure(error))
+                } catch {
+                    continuation.resume(returning: .failure(
+                        .backendFailure(String(describing: error))
+                    ))
+                }
+            }
         }
+    }
+
+    private nonisolated static func decodeWithPermit(
+        backend: TurboJPEGDecoderHandle,
+        pool: SpiceMJPEGBufferPool,
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data,
+        layout: (bytesPerRow: Int, byteCount: Int)
+    ) throws(SpiceCodecError) -> DecodeWorkResult {
         if let lease = pool.acquire(width: descriptor.width, height: descriptor.height) {
             let buffer = lease.pixelBuffer
             let lockStatus = CVPixelBufferLockBaseAddress(buffer, [])
@@ -316,9 +338,10 @@ package actor SpiceMJPEGStreamDecoder {
                                     count: outputByteCount
                                 )
                             )
-                            decodedFrameCount &+= 1
-                            ioSurfaceFrameCount &+= 1
-                            return SpiceMJPEGFrame(lease: lease)
+                            return DecodeWorkResult(
+                                frame: SpiceMJPEGFrame(lease: lease),
+                                usedIOSurface: true
+                            )
                         } catch {
                             throw Self.codecError(
                                 from: error,
@@ -349,13 +372,14 @@ package actor SpiceMJPEGStreamDecoder {
                 expectedHeight: descriptor.height
             )
         }
-        decodedFrameCount &+= 1
-        dataFallbackCount &+= 1
-        return SpiceDecodedImage(
-            width: descriptor.width,
-            height: descriptor.height,
-            bytesPerRow: layout.bytesPerRow,
-            pixelsBGRA: pixels
+        return DecodeWorkResult(
+            frame: SpiceDecodedImage(
+                width: descriptor.width,
+                height: descriptor.height,
+                bytesPerRow: layout.bytesPerRow,
+                pixelsBGRA: pixels
+            ),
+            usedIOSurface: false
         )
     }
 
