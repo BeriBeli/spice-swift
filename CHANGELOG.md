@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-08-26
+
+### Performance
+
+- Sparse desktop updates now select their latest revision immediately when the
+  display link is idle, while one active tick remains as a pacing fence for
+  continuous producers. This removes a redundant refresh-period wait without
+  allowing presentation work to outrun the display.
+
+## [0.2.5] — 2026-08-26
+
 ### Added
 
 - Added bounded desktop-ready-to-display-link timing diagnostics so frame-clock
@@ -15,10 +26,6 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
-- Sparse desktop updates now select their latest revision immediately when the
-  display link is idle, while one active tick remains as a pacing fence for
-  continuous producers. This removes a redundant refresh-period wait without
-  allowing presentation work to outrun the display.
 - Full-surface raw bitmap copies now write directly into a revisioned IOSurface
   and publish that canonical revision without a second full-frame CPU upload.
 - Fractionally scaled desktops use MPS Lanczos directly into the drawable,
@@ -199,7 +206,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/BeriBeli/spice-swift/compare/v0.2.5...v0.2.6
+[0.2.5]: https://github.com/BeriBeli/spice-swift/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/BeriBeli/spice-swift/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/BeriBeli/spice-swift/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...v0.2.2
