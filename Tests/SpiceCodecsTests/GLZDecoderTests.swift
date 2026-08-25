@@ -157,6 +157,51 @@ struct GLZDecoderTests {
         #expect(second.pixelsBGRA == first.pixelsBGRA)
     }
 
+    @Test func expandsLongOverlappingRGBAReferencesWithoutChangingColor() async throws {
+        let width = 16_383
+        var compressed: [UInt8] = [
+            2,
+            1, 2, 3,
+            4, 5, 6,
+            7, 8, 9,
+        ]
+        appendSameImageReference(
+            length: width - 3,
+            lengthBias: 0,
+            pixelOffset: 3,
+            to: &compressed
+        )
+        compressed.append(contentsOf: [2, 0x20, 0x40, 0x80])
+        appendSameImageReference(
+            length: width - 3,
+            lengthBias: 2,
+            pixelOffset: 3,
+            to: &compressed
+        )
+
+        let decoded = try await SpiceGLZDecoder().decode(
+            descriptor: .init(width: width, height: 1),
+            payload: glzPayload(
+                type: 9,
+                width: UInt32(width),
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: compressed
+            )
+        )
+        let pattern: [[UInt8]] = [
+            [1, 2, 3, 0x20],
+            [4, 5, 6, 0x40],
+            [7, 8, 9, 0x80],
+        ]
+        var expected = Data(capacity: width * 4)
+        for index in 0..<width {
+            expected.append(contentsOf: pattern[index % pattern.count])
+        }
+        #expect(decoded.pixelsBGRA == expected)
+    }
+
     @Test func malformedInputDoesNotMutateDictionary() async throws {
         let decoder = SpiceGLZDecoder()
         let image0 = glzPayload(
@@ -557,6 +602,26 @@ struct GLZDecoderTests {
         for shift in stride(from: 56, through: 0, by: -8) {
             data.append(UInt8(truncatingIfNeeded: value >> UInt64(shift)))
         }
+    }
+
+    private func appendSameImageReference(
+        length: Int,
+        lengthBias: Int,
+        pixelOffset: Int,
+        to bytes: inout [UInt8]
+    ) {
+        var encodedLength = length - lengthBias
+        precondition(encodedLength >= 7)
+        precondition((1...16).contains(pixelOffset))
+        bytes.append(0xe0 | UInt8(pixelOffset - 1))
+        encodedLength -= 7
+        while encodedLength >= 255 {
+            bytes.append(255)
+            encodedLength -= 255
+        }
+        bytes.append(UInt8(encodedLength))
+        bytes.append(0)
+        bytes.append(0)
     }
 
     private func uniformPixels(_ pixel: [UInt8], count: Int) -> Data {

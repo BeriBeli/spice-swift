@@ -1,3 +1,4 @@
+import CSpicePixelOps
 import Foundation
 
 package struct SpiceGLZDecodeLimits: Sendable, Equatable {
@@ -408,11 +409,12 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
                 }
                 return
             }
-            for index in 0..<count {
-                let sourceOffset = (sourcePixel + index) * 4
-                let destinationOffset = (destinationPixel + index) * 4
-                bytes[destinationOffset + 3] = bytes[sourceOffset + 3]
-            }
+            spice_copy_bgra_alpha_overlap(
+                base.assumingMemoryBound(to: UInt8.self),
+                sourcePixel,
+                destinationPixel,
+                count
+            )
         }
     }
 
@@ -439,14 +441,13 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
                     )
                     return
                 }
-                for index in 0..<count {
-                    let sourceOffset = (sourcePixel + index) * 4
-                    let destinationOffset = (destinationPixel + index) * 4
-                    destinationBytes[destinationOffset + 3] = sourceBase.load(
-                        fromByteOffset: sourceOffset + 3,
-                        as: UInt8.self
-                    )
-                }
+                spice_copy_bgra_alpha(
+                    sourceBase.assumingMemoryBound(to: UInt8.self)
+                        .advanced(by: sourcePixel * 4),
+                    destinationBase.assumingMemoryBound(to: UInt8.self)
+                        .advanced(by: destinationPixel * 4),
+                    count
+                )
             }
         }
     }
