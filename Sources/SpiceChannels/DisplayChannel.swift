@@ -222,7 +222,6 @@ package actor DisplayChannel: SpiceManagedChannel {
             _ = demandPipe.continuation.yield(event)
         }
         defer {
-            stopAsynchronousMJPEGScheduling()
             demandRegistration?.cancel()
             demandPipe.continuation.finish()
             demandTask.cancel()
@@ -251,9 +250,11 @@ package actor DisplayChannel: SpiceManagedChannel {
                 }
             }
         } catch {
+            await stopAsynchronousMJPEGScheduling()
             await retireFramePublisher(framePublisher)
             throw error
         }
+        await stopAsynchronousMJPEGScheduling()
         await retireFramePublisher(framePublisher)
     }
 
@@ -298,7 +299,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
-                cancelScheduledMJPEG(streamID: stream.streamID)
+                await cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -309,7 +310,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
-                cancelScheduledMJPEG(streamID: stream.streamID)
+                await cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -396,7 +397,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard let removed = streams.removeValue(forKey: streamID) else {
                 throw .protocolViolation("destroy of unknown stream \(streamID)")
             }
-            cancelScheduledMJPEG(streamID: streamID)
+            await cancelScheduledMJPEG(streamID: streamID)
             await retireAdvancedDecoder(removed.advancedDecoder)
             await retireMJPEGDecoder(removed.mjpegDecoder)
             try await acknowledgeIfNeeded()
@@ -405,7 +406,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
-                cancelScheduledMJPEG(streamID: stream.streamID)
+                await cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -556,22 +557,28 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
     }
 
-    private func cancelScheduledMJPEG(streamID: UInt32) {
+    private func cancelScheduledMJPEG(streamID: UInt32) async {
         pendingMJPEGFrames.removeValue(forKey: streamID)
-        mjpegFrameTasks.removeValue(forKey: streamID)?.cancel()
+        guard let task = mjpegFrameTasks.removeValue(forKey: streamID) else { return }
+        task.cancel()
+        await task.value
     }
 
-    private func stopAsynchronousMJPEGScheduling() {
+    private func stopAsynchronousMJPEGScheduling() async {
         schedulesMJPEGAsynchronously = false
         pendingMJPEGFrames.removeAll(keepingCapacity: false)
-        for task in mjpegFrameTasks.values {
+        let tasks = Array(mjpegFrameTasks.values)
+        mjpegFrameTasks.removeAll(keepingCapacity: false)
+        for task in tasks {
             task.cancel()
         }
-        mjpegFrameTasks.removeAll(keepingCapacity: false)
+        for task in tasks {
+            await task.value
+        }
     }
 
     package func close() async {
-        stopAsynchronousMJPEGScheduling()
+        await stopAsynchronousMJPEGScheduling()
         await connection.close()
         let publishers = Array(framePublishers.values)
         for publisher in publishers {
@@ -580,7 +587,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         let removedStreams = Array(streams.values)
         streams.removeAll(keepingCapacity: false)
         for stream in removedStreams {
-            cancelScheduledMJPEG(streamID: stream.streamID)
+            await cancelScheduledMJPEG(streamID: stream.streamID)
             await retireAdvancedDecoder(stream.advancedDecoder)
             await retireMJPEGDecoder(stream.mjpegDecoder)
         }
