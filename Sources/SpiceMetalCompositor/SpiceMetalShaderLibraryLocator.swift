@@ -49,6 +49,16 @@ package enum SpiceMetalShaderLibraryLocator {
             if !roots.contains(bundleURL) {
                 roots.append(bundleURL)
             }
+            // Unified SwiftPM test executables keep target resource bundles
+            // beside the outer xctest bundle rather than inside its signed
+            // resource directory. Restrict the sibling lookup to xctest so a
+            // packaged app never searches outside its own bundle boundary.
+            if bundleURL.pathExtension == "xctest" {
+                let testProductsDirectory = bundleURL.deletingLastPathComponent()
+                if !roots.contains(testProductsDirectory) {
+                    roots.append(testProductsDirectory)
+                }
+            }
         }
         return roots
     }

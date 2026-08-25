@@ -21,6 +21,41 @@ struct SpiceMetalCompositorTests {
         #expect(resolved?.deletingLastPathComponent().lastPathComponent == "Resources")
     }
 
+    @Test func unifiedSwiftPMTestsMaySearchOnlyTheirXCTestSiblingDirectory() throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appending(
+            path: "swiftspice-xctest-bundle-\(UUID().uuidString)"
+        )
+        defer { try? fileManager.removeItem(at: root) }
+        let testBundleURL = root.appending(path: "SwiftSpicePackageTests.xctest")
+        let contents = testBundleURL.appending(path: "Contents")
+        try fileManager.createDirectory(at: contents, withIntermediateDirectories: true)
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "CFBundleIdentifier": "org.swiftspice.tests.unified",
+                "CFBundleName": "SwiftSpicePackageTests",
+                "CFBundlePackageType": "BNDL",
+                "CFBundleVersion": "1",
+            ],
+            format: .xml,
+            options: 0
+        )
+        try info.write(to: contents.appending(path: "Info.plist"))
+        let testBundle = try #require(Bundle(url: testBundleURL))
+
+        let roots = SpiceMetalShaderLibraryLocator.mainBundleSearchRoots(testBundle)
+        let normalizedRoots = roots.map {
+            $0.standardizedFileURL.path().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
+        let normalizedRoot = root.standardizedFileURL.path()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let externalParent = root.deletingLastPathComponent().standardizedFileURL.path()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        #expect(normalizedRoots.contains(normalizedRoot))
+        #expect(!normalizedRoots.contains(externalParent))
+    }
+
     @Test func distinguishesFrameFallbackFromGenerationDisable() {
         #expect(
             SpiceMetalCompositorError.sourceTextureMappingFailed(
