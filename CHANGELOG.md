@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-08-25
+
+### Performance
+
+- Vectorized overlapping GLZ alpha-plane expansion with Apple Silicon NEON,
+  while retaining a scalar tail and preserving the untouched BGRA color lanes.
+
 ## [0.2.3] — 2026-08-25
 
 ### Fixed
@@ -162,7 +169,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/BeriBeli/spice-swift/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/BeriBeli/spice-swift/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...v0.2.1

@@ -33,7 +33,10 @@ let package = Package(
         ),
         .target(
             name: "SpiceCodecs",
-            dependencies: ["SpiceCodecInterop"]
+            dependencies: ["CSpicePixelOps", "SpiceCodecInterop"]
+        ),
+        .target(
+            name: "CSpicePixelOps"
         ),
         .target(
             name: "SpiceVideoToolbox",

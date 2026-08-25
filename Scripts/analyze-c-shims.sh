@@ -32,6 +32,12 @@ printf '[analyze-c-shims] analyzing CUSBRedirShim\n'
     "$ROOT_DIR/Sources/CUSBRedirShim/USBRedirShim.c" \
     -o /dev/null
 
+printf '[analyze-c-shims] analyzing CSpicePixelOps\n'
+"$CLANG" "${common_arguments[@]}" \
+    -I "$ROOT_DIR/Sources/CSpicePixelOps/include" \
+    "$ROOT_DIR/Sources/CSpicePixelOps/SpicePixelOps.c" \
+    -o /dev/null
+
 for header in Sources/CSpiceQUIC/shim.h Sources/CZlib/shim.h; do
     printf '[analyze-c-shims] analyzing %s\n' "$header"
     "$CLANG" "${common_arguments[@]}" \
