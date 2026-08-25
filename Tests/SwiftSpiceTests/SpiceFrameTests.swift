@@ -6,6 +6,29 @@ import Testing
 
 @Suite("SpiceFrame storage")
 struct SpiceFrameTests {
+    @Test func carriesAdvancedVideoProvenanceOnlyFromRendererSnapshots() {
+        let rendererFrame = SpiceFrame(FrameSnapshot(
+            surfaceID: 9,
+            width: 1,
+            height: 1,
+            bytesPerRow: 4,
+            revision: 1,
+            pixels: Data([0, 0, 0, 255]),
+            ioSurfaceFrame: nil,
+            isAdvancedVideoFrame: true
+        ))
+        let publicFrame = SpiceFrame(
+            surfaceID: 9,
+            width: 1,
+            height: 1,
+            bytesPerRow: 4,
+            pixels: Data([0, 0, 0, 255])
+        )
+
+        #expect(rendererFrame.isAdvancedVideoFrame)
+        #expect(!publicFrame.isAdvancedVideoFrame)
+    }
+
     @Test func sharesAndCachesLazyPixelsAcrossValueCopiesAndEquality() async throws {
         let store = SurfaceStore(backingPolicy: .dataOnly)
         try await store.create(id: 42, width: 1, height: 1, format: 32)

@@ -179,6 +179,7 @@ package struct FrameSnapshot: Sendable, Equatable {
     package let pixelStorage: FramePixelStorage
     package let ioSurfaceFrame: IOSurfaceFrame?
     package let publicationDamage: SurfaceDamageJournal
+    package let isAdvancedVideoFrame: Bool
 
     package var pixels: Data {
         pixelStorage.pixels()
@@ -202,7 +203,8 @@ package struct FrameSnapshot: Sendable, Equatable {
         pixels: consuming Data?,
         ioSurfaceFrame: IOSurfaceFrame?,
         materializationMetrics: FrameMaterializationMetrics? = nil,
-        publicationDamage: SurfaceDamageJournal? = nil
+        publicationDamage: SurfaceDamageJournal? = nil,
+        isAdvancedVideoFrame: Bool = false
     ) {
         self.surfaceID = surfaceID
         self.width = width
@@ -222,6 +224,7 @@ package struct FrameSnapshot: Sendable, Equatable {
             height: height,
             initiallyFull: true
         )
+        self.isAdvancedVideoFrame = isAdvancedVideoFrame
     }
 
     package init(
@@ -233,7 +236,8 @@ package struct FrameSnapshot: Sendable, Equatable {
         revision: UInt64,
         pixelStorage: FramePixelStorage,
         ioSurfaceFrame: IOSurfaceFrame,
-        publicationDamage: SurfaceDamageJournal? = nil
+        publicationDamage: SurfaceDamageJournal? = nil,
+        isAdvancedVideoFrame: Bool = false
     ) {
         self.surfaceID = surfaceID
         self.width = width
@@ -248,6 +252,7 @@ package struct FrameSnapshot: Sendable, Equatable {
             height: height,
             initiallyFull: true
         )
+        self.isAdvancedVideoFrame = isAdvancedVideoFrame
     }
 
     package func withPublicationDamage(
@@ -263,7 +268,8 @@ package struct FrameSnapshot: Sendable, Equatable {
                 revision: revision,
                 pixelStorage: pixelStorage,
                 ioSurfaceFrame: ioSurfaceFrame,
-                publicationDamage: damage
+                publicationDamage: damage,
+                isAdvancedVideoFrame: isAdvancedVideoFrame
             )
         }
         return FrameSnapshot(
@@ -275,7 +281,8 @@ package struct FrameSnapshot: Sendable, Equatable {
             revision: revision,
             pixels: pixelStorage.pixels(),
             ioSurfaceFrame: nil,
-            publicationDamage: damage
+            publicationDamage: damage,
+            isAdvancedVideoFrame: isAdvancedVideoFrame
         )
     }
 
@@ -287,6 +294,7 @@ package struct FrameSnapshot: Sendable, Equatable {
             && lhs.lifecycleGeneration == rhs.lifecycleGeneration
             && lhs.revision == rhs.revision
             && lhs.publicationDamage == rhs.publicationDamage
+            && lhs.isAdvancedVideoFrame == rhs.isAdvancedVideoFrame
             && lhs.pixels == rhs.pixels
     }
 }
@@ -356,6 +364,7 @@ package actor SurfaceStore {
         let lifecycleGeneration: UInt64
         let memoryLease: SurfaceMemoryLease
         var revision: UInt64
+        var latestAdvancedVideoRevision: UInt64?
         var storage: SurfaceStorage
 
         var bytesPerRow: Int { width * 4 }
@@ -484,6 +493,7 @@ package actor SurfaceStore {
             lifecycleGeneration: lifecycleGeneration,
             memoryLease: memoryLease,
             revision: 0,
+            latestAdvancedVideoRevision: nil,
             storage: SurfaceStorage(
                 pixels: Data(repeating: 0, count: byteCount),
                 width: width,
@@ -931,7 +941,8 @@ package actor SurfaceStore {
         frame: any SpiceDecodedVideoFrame,
         source: PixelRect,
         topDown: Bool,
-        clippedDestinations: [PixelRect]
+        clippedDestinations: [PixelRect],
+        isAdvancedVideo: Bool = false
     ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
         guard let compositor = metalCompositor else {
             throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
@@ -1101,6 +1112,9 @@ package actor SurfaceStore {
         }
 
         liveSurface.revision = nextRevision
+        if isAdvancedVideo {
+            liveSurface.latestAdvancedVideoRevision = nextRevision
+        }
         liveUnified.current = committedRevision
         liveUnified.damageJournal.clear()
         liveUnified.damageHistory.reset(at: nextRevision)
@@ -1441,7 +1455,8 @@ package actor SurfaceStore {
                 lifecycleGeneration: surface.lifecycleGeneration,
                 revision: surface.revision,
                 pixelStorage: cached.storage,
-                ioSurfaceFrame: ioSurfaceFrame
+                ioSurfaceFrame: ioSurfaceFrame,
+                isAdvancedVideoFrame: surface.latestAdvancedVideoRevision == surface.revision
             )
         }
         guard let ioSurfaceFrame = current.makeLease() else {
@@ -1462,7 +1477,8 @@ package actor SurfaceStore {
             lifecycleGeneration: surface.lifecycleGeneration,
             revision: surface.revision,
             pixelStorage: storage,
-            ioSurfaceFrame: ioSurfaceFrame
+            ioSurfaceFrame: ioSurfaceFrame,
+            isAdvancedVideoFrame: surface.latestAdvancedVideoRevision == surface.revision
         )
     }
 
@@ -1486,7 +1502,8 @@ package actor SurfaceStore {
             revision: surface.revision,
             pixels: snapshotPixels,
             ioSurfaceFrame: ioSurfaceFrame,
-            materializationMetrics: materializationMetrics
+            materializationMetrics: materializationMetrics,
+            isAdvancedVideoFrame: surface.latestAdvancedVideoRevision == surface.revision
         )
     }
 

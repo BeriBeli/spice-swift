@@ -14,6 +14,7 @@ public enum SpiceCPUPresentationFallbackReason: String, Sendable, Equatable {
 /// Best-effort aggregate evidence about desktop frame presentation.
 public struct SpicePresentationMetrics: Sendable, Equatable {
     public internal(set) var metalPresentedFrames: UInt64 = 0
+    public internal(set) var advancedVideoPresentedFrames: UInt64 = 0
     public internal(set) var metalPresentationErrors: UInt64 = 0
     public internal(set) var cpuFallbackFrames: UInt64 = 0
     public internal(set) var metalUnavailableFallbackFrames: UInt64 = 0
@@ -61,81 +62,114 @@ public struct SpicePresentationMetrics: Sendable, Equatable {
 /// `SpiceDesktopView`, so SwiftUI never observes or forwards it. The recorder
 /// retains aggregate counters, bounded histograms, and fixed categories only.
 public final class SpicePresentationDiagnostics: Sendable {
-    private let state = Mutex(SpicePresentationMetrics())
+    private struct State {
+        var metrics = SpicePresentationMetrics()
+        var epoch: UInt64 = 0
+    }
+
+    private let state = Mutex(State())
 
     public init() {}
 
     public func snapshot() -> SpicePresentationMetrics {
-        state.withLock { $0 }
+        state.withLock { $0.metrics }
     }
 
-    package func recordMetalPresentedFrame() {
-        state.withLock { $0.metalPresentedFrames &+= 1 }
+    package func currentEpoch() -> UInt64 {
+        state.withLock { $0.epoch }
     }
 
-    package func recordMetalPresentationError() {
-        state.withLock { $0.metalPresentationErrors &+= 1 }
+    package func recordMetalPresentedFrame(
+        isAdvancedVideo: Bool = false,
+        epoch: UInt64? = nil
+    ) {
+        state.withLock { state in
+            guard epoch == nil || epoch == state.epoch else { return }
+            state.metrics.metalPresentedFrames &+= 1
+            if isAdvancedVideo {
+                state.metrics.advancedVideoPresentedFrames &+= 1
+            }
+        }
+    }
+
+    package func recordMetalPresentationError(epoch: UInt64? = nil) {
+        state.withLock { state in
+            guard epoch == nil || epoch == state.epoch else { return }
+            state.metrics.metalPresentationErrors &+= 1
+        }
     }
 
     package func recordMetalFramesSupersededBeforeDraw(_ count: UInt64) {
         guard count > 0 else { return }
-        state.withLock { $0.metalFramesSupersededBeforeDraw &+= count }
+        update { $0.metalFramesSupersededBeforeDraw &+= count }
     }
 
     package func recordMetalDrawableMiss() {
-        state.withLock { $0.metalDrawableMisses &+= 1 }
+        update { $0.metalDrawableMisses &+= 1 }
     }
 
     package func recordMetalCommandCreationFailure() {
-        state.withLock { $0.metalCommandCreationFailures &+= 1 }
+        update { $0.metalCommandCreationFailures &+= 1 }
     }
 
     package func recordMetalCommandBufferCommitted() {
-        state.withLock { $0.metalCommandBuffersCommitted &+= 1 }
+        update { $0.metalCommandBuffersCommitted &+= 1 }
     }
 
     package func recordMetalTextureCacheHit() {
-        state.withLock { $0.metalTextureCacheHits &+= 1 }
+        update { $0.metalTextureCacheHits &+= 1 }
     }
 
     package func recordMetalTextureCacheMiss() {
-        state.withLock { $0.metalTextureCacheMisses &+= 1 }
+        update { $0.metalTextureCacheMisses &+= 1 }
     }
 
     package func recordMetalTextureCacheEviction() {
-        state.withLock { $0.metalTextureCacheEvictions &+= 1 }
+        update { $0.metalTextureCacheEvictions &+= 1 }
     }
 
     package func recordMetalGPUBusySkip() {
-        state.withLock { $0.metalGPUBusySkips &+= 1 }
+        update { $0.metalGPUBusySkips &+= 1 }
     }
 
     package func recordDesktopDisplayLinkWakeup() {
-        state.withLock { $0.desktopDisplayLinkWakeups &+= 1 }
+        update { $0.desktopDisplayLinkWakeups &+= 1 }
     }
 
     package func recordDesktopDisplayLinkTick() {
-        state.withLock { $0.desktopDisplayLinkTicks &+= 1 }
+        update { $0.desktopDisplayLinkTicks &+= 1 }
     }
 
     package func recordDesktopDisplayLinkIdlePause() {
-        state.withLock { $0.desktopDisplayLinkIdlePauses &+= 1 }
+        update { $0.desktopDisplayLinkIdlePauses &+= 1 }
     }
 
     package func recordViewUpdateToMetalCommit(_ duration: Duration) {
-        state.withLock { $0.viewUpdateToMetalCommitHistogram.record(duration) }
+        update { $0.viewUpdateToMetalCommitHistogram.record(duration) }
     }
 
-    package func recordMetalCommitToCompletion(_ duration: Duration) {
-        state.withLock { $0.metalCommitToCompletionHistogram.record(duration) }
+    package func recordMetalCommitToCompletion(
+        _ duration: Duration,
+        epoch: UInt64? = nil
+    ) {
+        state.withLock { state in
+            guard epoch == nil || epoch == state.epoch else { return }
+            state.metrics.metalCommitToCompletionHistogram.record(duration)
+        }
     }
 
-    package func recordMetalRequestToPresented(_ duration: Duration) {
-        state.withLock { $0.metalRequestToPresentedHistogram.record(duration) }
+    package func recordMetalRequestToPresented(
+        _ duration: Duration,
+        epoch: UInt64? = nil
+    ) {
+        state.withLock { state in
+            guard epoch == nil || epoch == state.epoch else { return }
+            state.metrics.metalRequestToPresentedHistogram.record(duration)
+        }
     }
 
     package func recordCPUFallback(_ reason: SpiceCPUPresentationFallbackReason) {
-        state.withLock { metrics in
+        update { metrics in
             metrics.cpuFallbackFrames &+= 1
             metrics.lastCPUFallbackReason = reason
             switch reason {
@@ -156,6 +190,13 @@ public final class SpicePresentationDiagnostics: Sendable {
     }
 
     package func reset() {
-        state.withLock { $0 = SpicePresentationMetrics() }
+        state.withLock { state in
+            state.epoch &+= 1
+            state.metrics = SpicePresentationMetrics()
+        }
+    }
+
+    private func update(_ body: (inout SpicePresentationMetrics) -> Void) {
+        state.withLock { body(&$0.metrics) }
     }
 }

@@ -470,10 +470,11 @@ struct SpiceSessionTests {
         #expect(activeDiagnostics == activeDiagnostics)
         #expect(activeDiagnostics.displayChannelCount == 1)
 
-        session.presentationDiagnostics.recordMetalPresentedFrame()
+        session.presentationDiagnostics.recordMetalPresentedFrame(isAdvancedVideo: true)
         session.presentationDiagnostics.recordCPUFallback(.textureCreationFailed)
         let presentationDiagnostics = await session.diagnosticsSnapshot()
         #expect(presentationDiagnostics.metalPresentedFrames == 1)
+        #expect(presentationDiagnostics.advancedVideoPresentedFrames == 1)
         #expect(presentationDiagnostics.cpuFallbackFrames == 1)
         #expect(presentationDiagnostics.textureCreationFailedFallbackFrames == 1)
         #expect(presentationDiagnostics.lastCPUFallbackReason == .textureCreationFailed)

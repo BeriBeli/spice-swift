@@ -38,6 +38,7 @@ public struct SpiceFrame: Sendable, Equatable {
     public let bytesPerRow: Int
     private let pixelStorage: FramePixelStorage
     public let ioSurface: SpiceIOSurfaceFrame?
+    package let isAdvancedVideoFrame: Bool
 
     /// Copies IOSurface-backed frames only when a CPU consumer requests pixels.
     /// Metal presentation can retain and present the IOSurface without creating
@@ -53,6 +54,7 @@ public struct SpiceFrame: Sendable, Equatable {
         bytesPerRow = snapshot.bytesPerRow
         pixelStorage = snapshot.pixelStorage
         ioSurface = snapshot.ioSurfaceFrame.map(SpiceIOSurfaceFrame.init)
+        isAdvancedVideoFrame = snapshot.isAdvancedVideoFrame
     }
 
     public init(
@@ -68,13 +70,15 @@ public struct SpiceFrame: Sendable, Equatable {
         self.bytesPerRow = bytesPerRow
         pixelStorage = FramePixelStorage(pixels: pixels, ioSurfaceFrame: nil)
         self.ioSurface = nil
+        isAdvancedVideoFrame = false
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
         guard lhs.surfaceID == rhs.surfaceID,
               lhs.width == rhs.width,
               lhs.height == rhs.height,
-              lhs.bytesPerRow == rhs.bytesPerRow
+              lhs.bytesPerRow == rhs.bytesPerRow,
+              lhs.isAdvancedVideoFrame == rhs.isAdvancedVideoFrame
         else {
             return false
         }

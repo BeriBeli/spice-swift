@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-08-25
+
+### Added
+
+- Added `advancedVideoPresentedFrames` diagnostics that correlate a native
+  H.264/H.265 surface revision with its final CAMetalDrawable presentation.
+
+### Fixed
+
+- Fixed release-app Metal shader discovery by resolving metallib resources
+  through their embedded SwiftPM bundles instead of assuming bundle-root files.
+
 ## [0.2.0] — 2026-08-25
 
 ### Added
@@ -112,7 +124,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/BeriBeli/spice-swift/compare/v0.1.10...v0.2.0
 [0.1.10]: https://github.com/BeriBeli/spice-swift/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/BeriBeli/spice-swift/compare/v0.1.8...v0.1.9
