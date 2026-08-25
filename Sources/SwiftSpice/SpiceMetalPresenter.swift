@@ -427,9 +427,20 @@ package enum SpiceMetalCommandCompletion: Sendable, Equatable {
 
 @MainActor
 package final class SpiceMetalFrameView: MTKView {
+    private struct PendingPresentation {
+        let sourceTexture: any MTLTexture
+        let frame: SpiceFrame
+        let requestedAt: ContinuousClock.Instant
+        let onCompletion: @MainActor @Sendable (
+            SpiceMetalCommandCompletion
+        ) -> Void
+    }
+
     package let presenter: SpiceMetalPresenter
     private var presentationDiagnostics: SpicePresentationDiagnostics?
     private var wasUsingMetal = false
+    private var pendingPresentation: PendingPresentation?
+    private var pendingDrawResult: SpiceMetalFramePresentationResult?
     private let clock = ContinuousClock()
 
     package override var isOpaque: Bool { true }
@@ -491,6 +502,41 @@ package final class SpiceMetalFrameView: MTKView {
             return .gpuBusy
         }
 
+        // MTKView advances currentDrawable only after returning from one of its
+        // drawing callbacks. Keep the view paused, but enter an explicit draw
+        // cycle for every selected revision instead of reading currentDrawable
+        // repeatedly from the display-link callback.
+        guard pendingPresentation == nil else {
+            presenter.recordGPUBusySkip()
+            return .gpuBusy
+        }
+        pendingPresentation = PendingPresentation(
+            sourceTexture: sourceTexture,
+            frame: frame,
+            requestedAt: requestedAt,
+            onCompletion: onCompletion
+        )
+        pendingDrawResult = nil
+        draw()
+
+        guard let result = pendingDrawResult else {
+            pendingPresentation = nil
+            presentationDiagnostics?.recordMetalDrawableMiss()
+            return .drawableUnavailable
+        }
+        pendingDrawResult = nil
+        return result
+    }
+
+    package override func draw(_ dirtyRect: NSRect) {
+        guard let pendingPresentation else { return }
+        self.pendingPresentation = nil
+        pendingDrawResult = presentDuringDraw(pendingPresentation)
+    }
+
+    private func presentDuringDraw(
+        _ pending: PendingPresentation
+    ) -> SpiceMetalFramePresentationResult {
         isHidden = false
         guard let drawable = currentDrawable else {
             presentationDiagnostics?.recordMetalDrawableMiss()
@@ -498,9 +544,9 @@ package final class SpiceMetalFrameView: MTKView {
         }
         let presentationEpoch = presentationDiagnostics?.currentEpoch()
         guard let commandBuffer = presenter.makePresentationCommand(
-            source: sourceTexture,
+            source: pending.sourceTexture,
             destination: drawable.texture,
-            retaining: frame,
+            retaining: pending.frame,
             presentationEpoch: presentationEpoch
         ) else {
             if !presenter.hasAvailableCommandSlot() {
@@ -518,9 +564,10 @@ package final class SpiceMetalFrameView: MTKView {
 
         let committedAt = clock.now
         presentationDiagnostics?.recordViewUpdateToMetalCommit(
-            requestedAt.duration(to: committedAt)
+            pending.requestedAt.duration(to: committedAt)
         )
         let completionStartedAt = committedAt
+        let onCompletion = pending.onCompletion
         commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
             presentationDiagnostics?.recordMetalCommitToCompletion(
                 completionStartedAt.duration(to: ContinuousClock().now),
@@ -533,9 +580,12 @@ package final class SpiceMetalFrameView: MTKView {
             }
         }
         let completionMetrics = presenter.completionMetrics
-        let isAdvancedVideoFrame = frame.isAdvancedVideoFrame
+        let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
+        let requestToPresentedStartedAt = pending.requestedAt
         drawable.addPresentedHandler { [presentationDiagnostics] _ in
-            let duration = requestedAt.duration(to: ContinuousClock().now)
+            let duration = requestToPresentedStartedAt.duration(
+                to: ContinuousClock().now
+            )
             completionMetrics.recordDrawablePresented(duration)
             presentationDiagnostics?.recordMetalPresentedFrame(
                 isAdvancedVideo: isAdvancedVideoFrame,
@@ -562,6 +612,8 @@ package final class SpiceMetalFrameView: MTKView {
             spiceRenderingLogger.info("Metal presentation paused while desktop is not visible")
         }
         wasUsingMetal = false
+        pendingPresentation = nil
+        pendingDrawResult = nil
         isHidden = true
     }
 

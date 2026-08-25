@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Metal
 import SpiceIOSurface
@@ -465,6 +466,69 @@ struct SpiceMetalPresenterTests {
         #expect(view.framebufferOnly)
         #expect(!view.presentsWithTransaction)
         #expect(!view.autoResizeDrawable)
+    }
+
+    @Test func explicitDrawCycleAdvancesDrawableAcrossPresentedFrames() async throws {
+        let store = makeIOSurfaceStore()
+        try await store.create(id: 91, width: 32, height: 32, format: 32)
+        try await store.fill(
+            surfaceID: 91,
+            rectangle: PixelRect(x: 0, y: 0, width: 32, height: 32),
+            colorARGB: 0x0011_2233
+        )
+        let frame = SpiceFrame(try await store.snapshot(surfaceID: 91))
+        let diagnostics = SpicePresentationDiagnostics()
+        let view = try #require(SpiceMetalFrameView(
+            presentationDiagnostics: diagnostics
+        ))
+        view.frame = NSRect(x: 0, y: 0, width: 32, height: 32)
+        _ = view.updateDrawableSize(backingScaleFactor: 1)
+
+        let window = NSWindow(
+            contentRect: view.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        window.orderFrontRegardless()
+        defer {
+            window.orderOut(nil)
+            window.contentView = nil
+            window.close()
+        }
+
+        for _ in 0..<3 {
+            let outcome = await presentAndWait(frame, in: view)
+            #expect(outcome.result == .committed)
+            #expect(outcome.completion == .succeeded)
+        }
+
+        let metrics = diagnostics.snapshot()
+        #expect(metrics.metalCommandBuffersCommitted == 3)
+        #expect(metrics.metalPresentationErrors == 0)
+        #expect(metrics.cpuFallbackFrames == 0)
+    }
+
+    private func presentAndWait(
+        _ frame: SpiceFrame,
+        in view: SpiceMetalFrameView
+    ) async -> (
+        result: SpiceMetalFramePresentationResult,
+        completion: SpiceMetalCommandCompletion?
+    ) {
+        await withCheckedContinuation { continuation in
+            let result = view.present(
+                frame,
+                requestedAt: ContinuousClock().now
+            ) { completion in
+                continuation.resume(returning: (.committed, completion))
+            }
+            if result != .committed {
+                continuation.resume(returning: (result, nil))
+            }
+        }
     }
 }
 

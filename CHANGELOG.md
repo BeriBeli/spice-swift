@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-08-25
+
+### Fixed
+
+- Advanced paused `MTKView` presentation through one explicit draw cycle per
+  selected desktop revision, preventing reuse of an already-presented
+  `CAMetalDrawable`, GPU timeouts, and repeated AppKit CPU fallback.
+
 ## [0.2.2] — 2026-08-25
 
 ### Added
@@ -154,7 +162,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/BeriBeli/spice-swift/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/BeriBeli/spice-swift/compare/v0.1.10...v0.2.0
