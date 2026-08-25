@@ -194,39 +194,12 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         self.textureCache = cache
     }
 
-    private static func bundledShaderLibraryURL() -> URL? {
-        // Locate by relative bundle structure in packaged apps and SwiftPM test
-        // runs. Deliberately avoid Bundle.module here: its generated fallback
-        // embeds an absolute build-machine path in clients of a static library.
-        var searchRoots: [URL] = []
-        if let resourceURL = Bundle.main.resourceURL {
-            searchRoots.append(resourceURL)
-        }
-        if let executableURL = Bundle.main.executableURL {
-            searchRoots.append(executableURL.deletingLastPathComponent())
-        }
-        for root in searchRoots {
-            let resourceBundle = root.appending(
-                path: "SwiftSpice_SpiceMetalCompositor.bundle"
-            )
-            let libraryURL = resourceBundle.appending(
-                path: "SpiceVideoCompositor.metallib"
-            )
-            if FileManager.default.fileExists(atPath: libraryURL.path()) {
-                return libraryURL
-            }
-        }
-        #if DEBUG
-        // SwiftPM's test runner is not always Bundle.main. Its generated module
-        // accessor is safe as a debug-only fallback; release binaries retain
-        // only the relocatable app/resource lookup above.
-        return Bundle.module.url(
-            forResource: "SpiceVideoCompositor",
-            withExtension: "metallib"
+    package static func bundledShaderLibraryURL(searchRoots: [URL]? = nil) -> URL? {
+        return SpiceMetalShaderLibraryLocator.libraryURL(
+            resourceBundleName: "SwiftSpice_SpiceMetalCompositor.bundle",
+            searchRoots: searchRoots
+                ?? SpiceMetalShaderLibraryLocator.mainBundleSearchRoots()
         )
-        #else
-        return nil
-        #endif
     }
 
     /// Uses one compute pass for range expansion, YCbCr conversion, orientation,

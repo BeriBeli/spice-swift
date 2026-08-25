@@ -18,7 +18,9 @@ import SpiceChannels
 /// GPU-presentation timing without retaining individual samples.
 /// Presentation counters are populated when a desktop view subscribes to this
 /// session's desktop source. Advanced-video counters cover H.264/H.265 decoding
-/// and do not describe the MJPEG path.
+/// and do not describe the MJPEG path. `advancedVideoPresentedFrames` is the
+/// subset of Metal presentation events whose immutable canonical revision was
+/// committed by native H.264/H.265 composition.
 ///
 /// `totalIOSurfaceAllocatedBytes` is process-wide live state.
 /// `surfaceAllocatedBytes` is live session-budget usage, and
@@ -92,6 +94,7 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var surfaceAllocatedBytes: Int = 0
     public internal(set) var maximumSurfaceBytes: Int = 0
     public internal(set) var metalPresentedFrames: UInt64 = 0
+    public internal(set) var advancedVideoPresentedFrames: UInt64 = 0
     public internal(set) var metalPresentationErrors: UInt64 = 0
     public internal(set) var cpuFallbackFrames: UInt64 = 0
     public internal(set) var metalUnavailableFallbackFrames: UInt64 = 0

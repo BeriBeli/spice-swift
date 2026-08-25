@@ -736,7 +736,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                     frame: decodedFrame,
                     source: source,
                     topDown: stream.topDown,
-                    clippedDestinations: clipped
+                    clippedDestinations: clipped,
+                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265
                 )
                 usedNativeVideoPath = surfaceRevision != nil
             } catch {

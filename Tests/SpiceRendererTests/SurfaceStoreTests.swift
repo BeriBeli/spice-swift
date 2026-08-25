@@ -1172,11 +1172,13 @@ struct SurfaceStoreTests {
             frame: nativeFrame,
             source: PixelRect(x: 0, y: 0, width: 2, height: 2),
             topDown: true,
-            clippedDestinations: [PixelRect(x: 1, y: 1, width: 2, height: 2)]
+            clippedDestinations: [PixelRect(x: 1, y: 1, width: 2, height: 2)],
+            isAdvancedVideo: true
         ))
         #expect(nativeRevision.revision == 2)
         let gpuSnapshot = try await store.snapshot(surfaceID: 22)
         #expect(gpuSnapshot.ioSurfaceFrame != nil)
+        #expect(gpuSnapshot.isAdvancedVideoFrame)
         #expect(await store.metrics().cpuMaterializations == 0)
         #expect(pixel(gpuSnapshot, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         let white = pixel(gpuSnapshot, x: 1, y: 1)
@@ -1191,6 +1193,7 @@ struct SurfaceStoreTests {
         )
         #expect(await store.metrics().cpuMaterializations == 2)
         let resumed = try await store.snapshot(surfaceID: 22)
+        #expect(!resumed.isAdvancedVideoFrame)
         #expect(pixel(resumed, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
         #expect(pixel(resumed, x: 1, y: 1).allSatisfy { $0 >= 254 })
 
@@ -1263,6 +1266,7 @@ struct SurfaceStoreTests {
         #expect(metrics.gpuCopyBytes == 0)
         #expect(metrics.cpuMaterializations == 0)
         let newFrame = try await store.snapshot(surfaceID: 26)
+        #expect(!newFrame.isAdvancedVideoFrame)
         #expect(pixel(oldFrame, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         #expect(pixel(newFrame, x: 0, y: 0).allSatisfy { $0 >= 254 })
     }

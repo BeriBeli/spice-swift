@@ -4,6 +4,7 @@ import Metal
 import MetalKit
 import OSLog
 import SpiceIOSurface
+import SpiceMetalCompositor
 import Synchronization
 
 private let spiceRenderingLogger = Logger(
@@ -333,7 +334,8 @@ package final class SpiceMetalPresenter {
     package func makePresentationCommand(
         source: any MTLTexture,
         destination: any MTLTexture,
-        retaining frame: SpiceFrame
+        retaining frame: SpiceFrame,
+        presentationEpoch: UInt64? = nil
     ) -> (any MTLCommandBuffer)? {
         guard source.pixelFormat == .bgra8Unorm,
               destination.pixelFormat == .bgra8Unorm,
@@ -383,6 +385,7 @@ package final class SpiceMetalPresenter {
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
 
+        let commandEpoch = presentationEpoch ?? presentationDiagnostics?.currentEpoch()
         commandBuffer.addCompletedHandler {
             [completionMetrics, presentationDiagnostics] commandBuffer in
             defer {
@@ -395,37 +398,18 @@ package final class SpiceMetalPresenter {
                 )
             }
             if commandBuffer.status == .error {
-                presentationDiagnostics?.recordMetalPresentationError()
+                presentationDiagnostics?.recordMetalPresentationError(epoch: commandEpoch)
             }
         }
         return commandBuffer
     }
 
-    private static func bundledShaderLibraryURL() -> URL? {
-        var searchRoots: [URL] = []
-        if let resourceURL = Bundle.main.resourceURL {
-            searchRoots.append(resourceURL)
-        }
-        if let executableURL = Bundle.main.executableURL {
-            searchRoots.append(executableURL.deletingLastPathComponent())
-        }
-        for root in searchRoots {
-            let resourceBundle = root.appending(path: "SwiftSpice_SwiftSpice.bundle")
-            let libraryURL = resourceBundle.appending(
-                path: "SpiceVideoCompositor.metallib"
-            )
-            if FileManager.default.fileExists(atPath: libraryURL.path()) {
-                return libraryURL
-            }
-        }
-        #if DEBUG
-        return Bundle.module.url(
-            forResource: "SpiceVideoCompositor",
-            withExtension: "metallib"
+    package static func bundledShaderLibraryURL(searchRoots: [URL]? = nil) -> URL? {
+        return SpiceMetalShaderLibraryLocator.libraryURL(
+            resourceBundleName: "SwiftSpice_SwiftSpice.bundle",
+            searchRoots: searchRoots
+                ?? SpiceMetalShaderLibraryLocator.mainBundleSearchRoots()
         )
-        #else
-        return nil
-        #endif
     }
 }
 
@@ -512,10 +496,12 @@ package final class SpiceMetalFrameView: MTKView {
             presentationDiagnostics?.recordMetalDrawableMiss()
             return .drawableUnavailable
         }
+        let presentationEpoch = presentationDiagnostics?.currentEpoch()
         guard let commandBuffer = presenter.makePresentationCommand(
             source: sourceTexture,
             destination: drawable.texture,
-            retaining: frame
+            retaining: frame,
+            presentationEpoch: presentationEpoch
         ) else {
             if !presenter.hasAvailableCommandSlot() {
                 return .gpuBusy
@@ -537,7 +523,8 @@ package final class SpiceMetalFrameView: MTKView {
         let completionStartedAt = committedAt
         commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
             presentationDiagnostics?.recordMetalCommitToCompletion(
-                completionStartedAt.duration(to: ContinuousClock().now)
+                completionStartedAt.duration(to: ContinuousClock().now),
+                epoch: presentationEpoch
             )
             let completion: SpiceMetalCommandCompletion =
                 commandBuffer.status == .completed ? .succeeded : .failed
@@ -546,11 +533,18 @@ package final class SpiceMetalFrameView: MTKView {
             }
         }
         let completionMetrics = presenter.completionMetrics
+        let isAdvancedVideoFrame = frame.isAdvancedVideoFrame
         drawable.addPresentedHandler { [presentationDiagnostics] _ in
             let duration = requestedAt.duration(to: ContinuousClock().now)
             completionMetrics.recordDrawablePresented(duration)
-            presentationDiagnostics?.recordMetalPresentedFrame()
-            presentationDiagnostics?.recordMetalRequestToPresented(duration)
+            presentationDiagnostics?.recordMetalPresentedFrame(
+                isAdvancedVideo: isAdvancedVideoFrame,
+                epoch: presentationEpoch
+            )
+            presentationDiagnostics?.recordMetalRequestToPresented(
+                duration,
+                epoch: presentationEpoch
+            )
         }
         commandBuffer.present(drawable)
         presentationDiagnostics?.recordMetalCommandBufferCommitted()

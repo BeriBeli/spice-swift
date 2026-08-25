@@ -7,6 +7,20 @@ import Testing
 
 @Suite("Native NV12 Metal compositor", .serialized)
 struct SpiceMetalCompositorTests {
+    @Test func locatesShaderInsideStandardMacOSResourceBundle() throws {
+        let fixture = try makeResourceBundleFixture(
+            named: "SwiftSpice_SpiceMetalCompositor.bundle"
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let resolved = SpiceMetalCompositor.bundledShaderLibraryURL(
+            searchRoots: [fixture.root]
+        )
+
+        #expect(resolved?.standardizedFileURL == fixture.library.standardizedFileURL)
+        #expect(resolved?.deletingLastPathComponent().lastPathComponent == "Resources")
+    }
+
     @Test func distinguishesFrameFallbackFromGenerationDisable() {
         #expect(
             SpiceMetalCompositorError.sourceTextureMappingFailed(
@@ -184,6 +198,33 @@ struct SpiceMetalCompositorTests {
         } catch let error where error == .unsupportedDevice {
             return nil
         }
+    }
+
+    private func makeResourceBundleFixture(
+        named bundleName: String
+    ) throws -> (root: URL, library: URL) {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appending(
+            path: "swiftspice-metal-bundle-\(UUID().uuidString)"
+        )
+        let bundle = root.appending(path: bundleName)
+        let contents = bundle.appending(path: "Contents")
+        let resources = contents.appending(path: "Resources")
+        try fileManager.createDirectory(at: resources, withIntermediateDirectories: true)
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "CFBundleIdentifier": "org.swiftspice.tests.metal-compositor",
+                "CFBundleName": "SwiftSpiceMetalCompositorTests",
+                "CFBundlePackageType": "BNDL",
+                "CFBundleVersion": "1",
+            ],
+            format: .xml,
+            options: 0
+        )
+        try info.write(to: contents.appending(path: "Info.plist"))
+        let library = resources.appending(path: "SpiceVideoCompositor.metallib")
+        try Data("fixture".utf8).write(to: library)
+        return (root, library)
     }
 
     private func makeNV12PixelBuffer(

@@ -8,6 +8,18 @@ import Testing
 @Suite("Metal IOSurface presenter")
 @MainActor
 struct SpiceMetalPresenterTests {
+    @Test func locatesPresenterShaderInsideStandardMacOSResourceBundle() throws {
+        let fixture = try makeResourceBundleFixture(named: "SwiftSpice_SwiftSpice.bundle")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let resolved = SpiceMetalPresenter.bundledShaderLibraryURL(
+            searchRoots: [fixture.root]
+        )
+
+        #expect(resolved?.standardizedFileURL == fixture.library.standardizedFileURL)
+        #expect(resolved?.deletingLastPathComponent().lastPathComponent == "Resources")
+    }
+
     @Test func mapsAndPresentsIOSurfaceWithoutChangingPixels() async throws {
         let store = makeIOSurfaceStore()
         try await store.create(id: 12, width: 2, height: 1, format: 32)
@@ -77,10 +89,38 @@ struct SpiceMetalPresenterTests {
         }
     }
 
+    private func makeResourceBundleFixture(
+        named bundleName: String
+    ) throws -> (root: URL, library: URL) {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory.appending(
+            path: "swiftspice-presenter-bundle-\(UUID().uuidString)"
+        )
+        let bundle = root.appending(path: bundleName)
+        let contents = bundle.appending(path: "Contents")
+        let resources = contents.appending(path: "Resources")
+        try fileManager.createDirectory(at: resources, withIntermediateDirectories: true)
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "CFBundleIdentifier": "org.swiftspice.tests.metal-presenter",
+                "CFBundleName": "SwiftSpiceMetalPresenterTests",
+                "CFBundlePackageType": "BNDL",
+                "CFBundleVersion": "1",
+            ],
+            format: .xml,
+            options: 0
+        )
+        try info.write(to: contents.appending(path: "Info.plist"))
+        let library = resources.appending(path: "SpiceVideoCompositor.metallib")
+        try Data("fixture".utf8).write(to: library)
+        return (root, library)
+    }
+
     @Test func recordsContentFreeFallbackReasons() {
         let diagnostics = SpicePresentationDiagnostics()
 
         diagnostics.recordMetalPresentedFrame()
+        diagnostics.recordMetalPresentedFrame(isAdvancedVideo: true)
         diagnostics.recordCPUFallback(.missingIOSurface)
         diagnostics.recordCPUFallback(.pixelFormatMismatch)
         diagnostics.recordCPUFallback(.metalCommandFailure)
@@ -101,7 +141,8 @@ struct SpiceMetalPresenterTests {
         diagnostics.recordMetalRequestToPresented(.milliseconds(5))
 
         let metrics = diagnostics.snapshot()
-        #expect(metrics.metalPresentedFrames == 1)
+        #expect(metrics.metalPresentedFrames == 2)
+        #expect(metrics.advancedVideoPresentedFrames == 1)
         #expect(metrics.metalPresentationErrors == 1)
         #expect(metrics.cpuFallbackFrames == 3)
         #expect(metrics.missingIOSurfaceFallbackFrames == 1)
@@ -123,8 +164,18 @@ struct SpiceMetalPresenterTests {
         #expect(metrics.metalCommitToCompletion.p95Milliseconds == 4)
         #expect(metrics.metalRequestToPresented.p95Milliseconds == 5)
 
+        let staleEpoch = diagnostics.currentEpoch()
         diagnostics.reset()
         #expect(diagnostics.snapshot() == .empty)
+        diagnostics.recordMetalPresentedFrame(isAdvancedVideo: true, epoch: staleEpoch)
+        diagnostics.recordMetalPresentationError(epoch: staleEpoch)
+        diagnostics.recordMetalCommitToCompletion(.seconds(1), epoch: staleEpoch)
+        diagnostics.recordMetalRequestToPresented(.seconds(1), epoch: staleEpoch)
+        #expect(diagnostics.snapshot() == .empty)
+
+        let currentEpoch = diagnostics.currentEpoch()
+        diagnostics.recordMetalPresentedFrame(isAdvancedVideo: true, epoch: currentEpoch)
+        #expect(diagnostics.snapshot().advancedVideoPresentedFrames == 1)
     }
 
     @Test func scalesIOSurfaceIntoBackingSizedTexture() async throws {

@@ -113,6 +113,7 @@ let package = Package(
                 "SpiceCodecs",
                 "SpiceCryptoSecurity",
                 "SpiceIOSurface",
+                "SpiceMetalCompositor",
                 "SpiceProtocol",
                 "SpiceRenderer",
                 "SpiceTransport",

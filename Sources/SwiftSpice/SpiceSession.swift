@@ -514,6 +514,7 @@ public actor SpiceSession {
         result.maximumSurfaceBytes = surfaceBudget.maximumBytes
         let presentation = presentationDiagnostics.snapshot()
         result.metalPresentedFrames = presentation.metalPresentedFrames
+        result.advancedVideoPresentedFrames = presentation.advancedVideoPresentedFrames
         result.metalPresentationErrors = presentation.metalPresentationErrors
         result.cpuFallbackFrames = presentation.cpuFallbackFrames
         result.metalUnavailableFallbackFrames = presentation.metalUnavailableFallbackFrames

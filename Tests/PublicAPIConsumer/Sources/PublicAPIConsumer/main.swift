@@ -84,6 +84,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.surfaceAllocatedBytes
         _ = diagnostics.maximumSurfaceBytes
         _ = diagnostics.metalPresentedFrames
+        _ = diagnostics.advancedVideoPresentedFrames
         _ = diagnostics.metalPresentationErrors
         _ = diagnostics.cpuFallbackFrames
         _ = diagnostics.metalUnavailableFallbackFrames
