@@ -123,7 +123,8 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
     private var streams: [UInt32: VideoStream] = [:]
-    private var schedulesMJPEGAsynchronously = false
+    private var asynchronousMJPEGRunGeneration: UInt64?
+    private var nextRunGeneration: UInt64 = 0
     private var pendingMJPEGFrames: [UInt32: PendingMJPEGFrame] = [:]
     private var mjpegFrameTasks: [UInt32: Task<Void, Never>] = [:]
     private var nextSurfaceVideoSequences: [UInt32: UInt64] = [:]
@@ -184,6 +185,8 @@ package actor DisplayChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runGeneration = beginAsynchronousMJPEGScheduling()
+        defer { stopAsynchronousMJPEGScheduling(runGeneration: runGeneration) }
         try await connection.send(SpiceMsgcDisplayInit(
             pixmapCacheID: 1,
             pixmapCacheSize: Self.pixmapCachePixels,
@@ -202,7 +205,6 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
         )
         framePublishers[ObjectIdentifier(framePublisher)] = framePublisher
-        schedulesMJPEGAsynchronously = true
         let demandPipe = AsyncStream.makeStream(
             of: DisplayFrameDemandEvent.self,
             bufferingPolicy: .unbounded
@@ -227,7 +229,6 @@ package actor DisplayChannel: SpiceManagedChannel {
             _ = demandPipe.continuation.yield(event)
         }
         defer {
-            stopAsynchronousMJPEGScheduling()
             demandRegistration?.cancel()
             demandPipe.continuation.finish()
             demandTask.cancel()
@@ -350,7 +351,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamData(data):
-            if schedulesMJPEGAsynchronously,
+            if asynchronousMJPEGRunGeneration != nil,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
                     streamID: data.streamID,
@@ -373,7 +374,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamDataSized(data):
-            if schedulesMJPEGAsynchronously,
+            if asynchronousMJPEGRunGeneration != nil,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
                     streamID: data.streamID,
@@ -616,8 +617,21 @@ package actor DisplayChannel: SpiceManagedChannel {
         mjpegFrameTasks.removeValue(forKey: streamID)?.cancel()
     }
 
-    private func stopAsynchronousMJPEGScheduling() {
-        schedulesMJPEGAsynchronously = false
+    private func beginAsynchronousMJPEGScheduling() -> UInt64 {
+        nextRunGeneration &+= 1
+        if nextRunGeneration == 0 {
+            nextRunGeneration = 1
+        }
+        asynchronousMJPEGRunGeneration = nextRunGeneration
+        return nextRunGeneration
+    }
+
+    private func stopAsynchronousMJPEGScheduling(runGeneration: UInt64? = nil) {
+        if let runGeneration,
+           asynchronousMJPEGRunGeneration != runGeneration {
+            return
+        }
+        asynchronousMJPEGRunGeneration = nil
         pendingMJPEGFrames.removeAll(keepingCapacity: false)
         for task in mjpegFrameTasks.values {
             task.cancel()

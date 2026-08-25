@@ -91,6 +91,98 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
+    @Test func obsoleteRunCleanupKeepsMigratedMJPEGSchedulingActive() async throws {
+        let oldTransport = RetirableDisplayTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+        ])
+        try await oldTransport.connect()
+        let decoder = GatedPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: oldTransport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let oldRun = Task { try await channel.run { _ in } }
+        await oldTransport.waitUntilReadIsBlocked()
+        oldRun.cancel()
+
+        let targetTransport = GatedDisplayTransport(inbound: try [
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 1,
+                data: Data([1])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 2,
+                data: Data([2])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 3,
+                data: Data([3])
+            )),
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2,
+                width: 1,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+        ], gateAfterReads: 2)
+        try await targetTransport.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: targetTransport,
+            headerMode: .mini
+        ))
+        let targetRun = Task { try await channel.run { _ in } }
+        await targetTransport.waitUntilReadCount(2)
+        await decoder.waitUntilFirstDecodeStarts()
+
+        await oldTransport.releaseBlockedRead()
+        _ = try? await oldRun.value
+        await targetTransport.releaseRemainingReads()
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while await targetTransport.readCountSnapshot() < 5,
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let schedulingStayedAsynchronous = await targetTransport.readCountSnapshot() == 5
+        await decoder.releaseFirstDecode()
+        await decoder.waitUntilDecodeCount(2)
+
+        #expect(schedulingStayedAsynchronous)
+        let decodedPayloads = await decoder.payloads
+        #expect(
+            decodedPayloads == [Data([1]), Data([3])],
+            "decoded payloads: \(decodedPayloads.map(Array.init))"
+        )
+        targetRun.cancel()
+        _ = try? await targetRun.value
+        await channel.close()
+    }
+
     @Test func staleMJPEGDecodeCannotOverwriteLaterDrawCommand() async throws {
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
@@ -2732,6 +2824,61 @@ private actor GatedDisplayTransport: SpiceTransport {
     func waitUntilReadCount(_ target: Int) async {
         guard readCount < target else { return }
         await withCheckedContinuation { readCountWaiters.append((target, $0)) }
+    }
+
+    func readCountSnapshot() -> Int {
+        readCount
+    }
+}
+
+private actor RetirableDisplayTransport: SpiceTransport {
+    private var inbound: [Data]
+    private var connected = false
+    private var blockedRead: CheckedContinuation<Void, Never>?
+    private var blockedReadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(inbound: [Data]) {
+        self.inbound = inbound
+    }
+
+    func connect() throws(TransportError) {
+        connected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard connected else { throw .connectionClosed }
+        if !inbound.isEmpty {
+            let data = inbound.removeFirst()
+            guard data.count >= minimum, data.count <= maximum else {
+                throw .connectionFailed("invalid test read size")
+            }
+            return data
+        }
+        for continuation in blockedReadWaiters { continuation.resume() }
+        blockedReadWaiters.removeAll()
+        await withCheckedContinuation { blockedRead = $0 }
+        throw .connectionClosed
+    }
+
+    func write(_ data: sending Data) throws(TransportError) {
+        _ = data
+        guard connected else { throw .connectionClosed }
+    }
+
+    func close() {
+        connected = false
+        blockedRead?.resume()
+        blockedRead = nil
+    }
+
+    func waitUntilReadIsBlocked() async {
+        guard blockedRead == nil else { return }
+        await withCheckedContinuation { blockedReadWaiters.append($0) }
+    }
+
+    func releaseBlockedRead() {
+        blockedRead?.resume()
+        blockedRead = nil
     }
 }
 
