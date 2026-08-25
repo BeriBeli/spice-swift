@@ -1,7 +1,9 @@
 import AppKit
 import CoreGraphics
 import MetalKit
+import QuartzCore
 import SwiftUI
+import Synchronization
 
 public enum SpicePointerMode: Sendable, Equatable {
     case relative
@@ -21,9 +23,56 @@ package enum SpiceSystemCursorDescriptor: Equatable {
     case arrow
     case transparent
     case image(cursor: SpiceCursorImage, scaleX: CGFloat, scaleY: CGFloat)
+
+    package static func == (lhs: Self, rhs: Self) -> Bool {
+        switch (lhs, rhs) {
+        case (.arrow, .arrow), (.transparent, .transparent):
+            true
+        case let (.image(lhsCursor, lhsScaleX, lhsScaleY),
+                  .image(rhsCursor, rhsScaleX, rhsScaleY)):
+            lhsCursor.id == rhsCursor.id
+                && lhsCursor.format == rhsCursor.format
+                && lhsCursor.width == rhsCursor.width
+                && lhsCursor.height == rhsCursor.height
+                && lhsCursor.hotSpotX == rhsCursor.hotSpotX
+                && lhsCursor.hotSpotY == rhsCursor.hotSpotY
+                && lhsCursor.data.count == rhsCursor.data.count
+                && lhsScaleX == rhsScaleX
+                && lhsScaleY == rhsScaleY
+        default:
+            false
+        }
+    }
 }
 
 package enum SpiceDesktopPresentationPolicy {
+    package static func requiresFramebufferPresentation(
+        selectedRevision: SpiceFrameRevision?,
+        updateRevision: SpiceFrameRevision,
+        requiresRedraw: Bool
+    ) -> Bool {
+        requiresRedraw || selectedRevision != updateRevision
+    }
+
+    /// Keeps cursor-only aggregate snapshots out of the framebuffer command
+    /// path. The closure is invoked only for a new revision or an explicit
+    /// geometry/backing-store redraw.
+    package static func withFramebufferPresentationIfNeeded<Result>(
+        selectedRevision: SpiceFrameRevision?,
+        updateRevision: SpiceFrameRevision,
+        requiresRedraw: Bool,
+        _ presentation: () -> Result
+    ) -> Result? {
+        guard requiresFramebufferPresentation(
+            selectedRevision: selectedRevision,
+            updateRevision: updateRevision,
+            requiresRedraw: requiresRedraw
+        ) else {
+            return nil
+        }
+        return presentation()
+    }
+
     package static func cursorLayer(
         for pointerMode: SpicePointerMode,
         isPointerCaptured: Bool = true
@@ -85,7 +134,9 @@ package enum SpiceDesktopPresentationPolicy {
         else {
             return .arrow
         }
-        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(by: cursor.height)
+        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(
+            by: cursor.height
+        )
         let (byteCount, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
         guard !pixelOverflow, !byteOverflow, cursor.data.count == byteCount else {
             return .arrow
@@ -95,6 +146,86 @@ package enum SpiceDesktopPresentationPolicy {
             scaleX: destinationSize.width / frameSize.width,
             scaleY: destinationSize.height / frameSize.height
         )
+    }
+}
+
+/// Bounded recovery for command buffers that fail after their revision was
+/// accepted and acknowledged. Attempt identifiers make completion delivery
+/// idempotent and keep late completions from an older revision or source from
+/// reviving stale content.
+package struct SpiceMetalFailureRecoveryPolicy {
+    package struct Attempt: Sendable, Equatable {
+        package let revision: SpiceFrameRevision
+        fileprivate let identifier: UInt64
+    }
+
+    package enum Action: Sendable, Equatable {
+        case none
+        case requestLatest
+        case useCPUFallback
+    }
+
+    private var nextAttemptIdentifier: UInt64 = 0
+    private var trackedRevision: SpiceFrameRevision?
+    private var activeAttemptIdentifiers: Set<UInt64> = []
+    private var handledFailures = 0
+
+    package mutating func beginAttempt(
+        for revision: SpiceFrameRevision
+    ) -> Attempt {
+        if trackedRevision != revision {
+            trackedRevision = revision
+            activeAttemptIdentifiers.removeAll(keepingCapacity: true)
+            handledFailures = 0
+        }
+        nextAttemptIdentifier &+= 1
+        activeAttemptIdentifiers.insert(nextAttemptIdentifier)
+        return Attempt(
+            revision: revision,
+            identifier: nextAttemptIdentifier
+        )
+    }
+
+    package mutating func cancelAttempt(_ attempt: Attempt) {
+        activeAttemptIdentifiers.remove(attempt.identifier)
+    }
+
+    package mutating func commandCompleted(
+        _ attempt: Attempt,
+        completion: SpiceMetalCommandCompletion,
+        selectedRevision: SpiceFrameRevision?
+    ) -> Action {
+        guard trackedRevision == attempt.revision,
+              selectedRevision == attempt.revision,
+              activeAttemptIdentifiers.remove(attempt.identifier) != nil
+        else {
+            return .none
+        }
+
+        switch completion {
+        case .succeeded:
+            handledFailures = 0
+            return .none
+        case .failed:
+            handledFailures += 1
+            switch handledFailures {
+            case 1:
+                return .requestLatest
+            case 2:
+                // The revision will be redelivered once for CPU presentation.
+                // Ignore any other already in-flight attempts for this frame.
+                activeAttemptIdentifiers.removeAll(keepingCapacity: true)
+                return .useCPUFallback
+            default:
+                return .none
+            }
+        }
+    }
+
+    package mutating func reset() {
+        trackedRevision = nil
+        activeAttemptIdentifiers.removeAll(keepingCapacity: true)
+        handledFailures = 0
     }
 }
 
@@ -172,57 +303,116 @@ package final class SpicePointerCaptureController {
     }
 }
 
-/// A narrow SwiftUI-to-AppKit bridge for framebuffer drawing and physical
-/// input capture. SwiftUI owns the frame and cursor values; the wrapped NSView
-/// owns only transient responder and tracking state.
+private struct SpiceDesktopFrameGeometry: Sendable, Equatable {
+    let width: Int
+    let height: Int
+}
+
+package final class SpiceDesktopReadyLatch: Sendable {
+    private struct State: Sendable {
+        var pending: SpiceDesktopSnapshot?
+        var newestGeneration: UInt64?
+        var newestDeliverySequence: UInt64 = 0
+    }
+
+    private let state = Mutex(State())
+
+    /// Returns true only for the empty-to-ready transition.
+    package func offer(_ snapshot: SpiceDesktopSnapshot) -> Bool {
+        state.withLock { state in
+            if Self.isOlder(
+                snapshot,
+                thanGeneration: state.newestGeneration,
+                deliverySequence: state.newestDeliverySequence
+            ) {
+                return false
+            }
+            let wasEmpty = state.pending == nil
+            state.pending = state.pending.map {
+                SpiceDesktopSource.merging($0, snapshot)
+            } ?? snapshot
+            state.newestGeneration = state.pending?.generation
+            state.newestDeliverySequence = state.pending?.deliverySequence ?? 0
+            return wasEmpty
+        }
+    }
+
+    package func take() -> SpiceDesktopSnapshot? {
+        state.withLock { state in
+            defer { state.pending = nil }
+            return state.pending
+        }
+    }
+
+    /// Keeps a failed presentation pending without replacing a newer update.
+    package func restoreIfEmpty(_ snapshot: SpiceDesktopSnapshot) {
+        state.withLock { state in
+            guard state.pending == nil,
+                  !Self.isOlder(
+                      snapshot,
+                      thanGeneration: state.newestGeneration,
+                      deliverySequence: state.newestDeliverySequence
+                  )
+            else { return }
+            state.pending = snapshot
+            state.newestGeneration = snapshot.generation
+            state.newestDeliverySequence = snapshot.deliverySequence
+        }
+    }
+
+    package func discard() {
+        state.withLock { $0.pending = nil }
+    }
+
+    package var isEmpty: Bool {
+        state.withLock { $0.pending == nil }
+    }
+
+    private static func isOlder(
+        _ snapshot: SpiceDesktopSnapshot,
+        thanGeneration newestGeneration: UInt64?,
+        deliverySequence newestDeliverySequence: UInt64
+    ) -> Bool {
+        guard let newestGeneration else { return false }
+        if snapshot.generation != newestGeneration {
+            return snapshot.generation < newestGeneration
+        }
+        return snapshot.deliverySequence < newestDeliverySequence
+    }
+}
+
+/// A stable SwiftUI-to-AppKit boundary. Desktop frames, cursor movement, and
+/// pointer mode remain inside the source/subscription path and never become
+/// SwiftUI observation inputs.
 public struct SpiceDesktopView: NSViewRepresentable {
-    public var frame: SpiceFrame?
-    public var cursor: SpiceCursorState?
-    public var pointerMode: SpicePointerMode
-    public var presentationDiagnostics: SpicePresentationDiagnostics?
-    public var onFrameUpdate: (@MainActor @Sendable () -> Void)?
+    public var desktop: SpiceDesktopSource
+    public var surface: SpiceSurfaceSelection
     public var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
 
     public init(
-        frame: SpiceFrame?,
-        cursor: SpiceCursorState? = nil,
-        pointerMode: SpicePointerMode = .absolute,
-        presentationDiagnostics: SpicePresentationDiagnostics? = nil,
-        onFrameUpdate: (@MainActor @Sendable () -> Void)? = nil,
+        desktop: SpiceDesktopSource,
+        surface: SpiceSurfaceSelection = .primary,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
-        self.frame = frame
-        self.cursor = cursor
-        self.pointerMode = pointerMode
-        self.presentationDiagnostics = presentationDiagnostics
-        self.onFrameUpdate = onFrameUpdate
+        self.desktop = desktop
+        self.surface = surface
         self.onInput = onInput
     }
 
     public func makeNSView(context: Context) -> NSView {
         SpiceFramebufferView(
-            frame: frame,
-            cursorState: cursor,
-            pointerMode: pointerMode,
-            presentationDiagnostics: presentationDiagnostics,
+            desktop: desktop,
+            surface: surface,
             onInput: onInput
         )
     }
 
     public func updateNSView(_ nsView: NSView, context: Context) {
-        guard let framebufferView = nsView as? SpiceFramebufferView else {
-            return
-        }
-        let didUpdateFrame = framebufferView.update(
-            frame: frame,
-            cursorState: cursor,
-            pointerMode: pointerMode,
-            presentationDiagnostics: presentationDiagnostics,
+        (nsView as? SpiceFramebufferView)?.update(
+            desktop: desktop,
+            surface: surface,
             onInput: onInput
         )
-        if didUpdateFrame {
-            onFrameUpdate?()
-        }
     }
 
     public static func dismantleNSView(_ nsView: NSView, coordinator: Void) {
@@ -231,11 +421,42 @@ public struct SpiceDesktopView: NSViewRepresentable {
 }
 
 @MainActor
-private final class SpiceFramebufferView: NSView {
-    private var desktopFrame: SpiceFrame?
+private final class SpiceDisplayLinkTarget: NSObject {
+    weak var owner: SpiceFramebufferView?
+
+    @objc func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        owner?.displayLinkDidFire(displayLink)
+    }
+}
+
+@MainActor
+package final class SpiceFramebufferView: NSView {
+    private enum SnapshotApplicationResult {
+        case consumed
+        case retry
+    }
+
+    private var desktop: SpiceDesktopSource
+    private var surface: SpiceSurfaceSelection
+    private var subscription: SpiceDesktopSubscription?
+    private var subscriptionDemand: SpiceDesktopDemand = .none
+    private var readyLatch = SpiceDesktopReadyLatch()
+    private let displayLinkTarget = SpiceDisplayLinkTarget()
+    private var desktopDisplayLink: CADisplayLink?
+    private let clock = ContinuousClock()
+
+    private var desktopGeneration: UInt64?
+    private var selectedRevision: SpiceFrameRevision?
+    private var acknowledgedRevision: SpiceFrameRevision?
+    private var frameGeometry: SpiceDesktopFrameGeometry?
+    private var cpuFrame: SpiceFrame?
     private var cursorState: SpiceCursorState?
-    private var pointerMode: SpicePointerMode
+    private var pointerMode: SpicePointerMode = .absolute
+    private var requiresFrameRedraw = true
+    private var metalFailureRecovery = SpiceMetalFailureRecoveryPolicy()
+    private var forcedCPUFallbackRevision: SpiceFrameRevision?
     private var presentationDiagnostics: SpicePresentationDiagnostics?
+
     private var windowObservers: [NSObjectProtocol] = []
     private var onInput: @MainActor @Sendable (SpiceClientInput) -> Void
     private var trackingArea: NSTrackingArea?
@@ -243,34 +464,41 @@ private final class SpiceFramebufferView: NSView {
     private let metalView: SpiceMetalFrameView?
     private let cursorOverlay = SpiceCursorOverlayView()
     private var isUsingMetal = false
+    private var lastContentRectangle: NSRect = .zero
     private var systemCursorDescriptor: SpiceSystemCursorDescriptor?
     private var systemCursor: NSCursor = .arrow
     private let pointerCapture = SpicePointerCaptureController.system()
 
-    override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
+    package override var isFlipped: Bool { true }
+    package override var acceptsFirstResponder: Bool { true }
 
-    fileprivate init(
-        frame: SpiceFrame?,
-        cursorState: SpiceCursorState?,
-        pointerMode: SpicePointerMode,
-        presentationDiagnostics: SpicePresentationDiagnostics?,
+    package init(
+        desktop: SpiceDesktopSource,
+        surface: SpiceSurfaceSelection,
         onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
     ) {
-        desktopFrame = frame
-        self.cursorState = cursorState
-        self.pointerMode = pointerMode
-        self.presentationDiagnostics = presentationDiagnostics
+        self.desktop = desktop
+        self.surface = surface
         self.onInput = onInput
-        self.metalView = SpiceMetalFrameView(
-            presentationDiagnostics: presentationDiagnostics
+        presentationDiagnostics = desktop.presentationDiagnostics
+        metalView = SpiceMetalFrameView(
+            presentationDiagnostics: desktop.presentationDiagnostics
         )
         super.init(frame: .zero)
+
         if let metalView {
             addSubview(metalView)
         }
         addSubview(cursorOverlay)
-        updatePresentedFrame(frame)
+        displayLinkTarget.owner = self
+        let displayLink = displayLink(
+            target: displayLinkTarget,
+            selector: #selector(SpiceDisplayLinkTarget.displayLinkDidFire(_:))
+        )
+        displayLink.isPaused = true
+        displayLink.add(to: .main, forMode: .common)
+        desktopDisplayLink = displayLink
+        configureSubscription()
         updateCursorPresentation()
     }
 
@@ -279,80 +507,120 @@ private final class SpiceFramebufferView: NSView {
         nil
     }
 
-    @discardableResult
-    fileprivate func update(
-        frame: SpiceFrame?,
-        cursorState: SpiceCursorState?,
-        pointerMode: SpicePointerMode,
-        presentationDiagnostics: SpicePresentationDiagnostics?,
-        onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
-    ) -> Bool {
-        let frameChanged = !Self.framesSharePresentationStorage(desktopFrame, frame)
-        self.presentationDiagnostics = presentationDiagnostics
-        metalView?.setPresentationDiagnostics(presentationDiagnostics)
-        self.cursorState = cursorState
-        self.pointerMode = pointerMode
-        self.onInput = onInput
-        if pointerMode == .absolute {
-            releasePointerCapture()
-        }
-        if frameChanged {
-            updatePresentedFrame(frame)
-        } else {
-            desktopFrame = frame
-        }
-        updateCursorPresentation()
-        needsLayout = true
-        needsDisplay = true
-        return frameChanged
+    isolated deinit {
+        desktopDisplayLink?.invalidate()
     }
 
-    private func updatePresentedFrame(_ frame: SpiceFrame?) {
-        desktopFrame = frame
-        if let metalView {
-            isUsingMetal = metalView.present(frame)
+    package func update(
+        desktop: SpiceDesktopSource,
+        surface: SpiceSurfaceSelection,
+        onInput: @escaping @MainActor @Sendable (SpiceClientInput) -> Void
+    ) {
+        self.onInput = onInput
+        guard self.desktop !== desktop || self.surface != surface else {
             return
         }
+        self.desktop = desktop
+        self.surface = surface
+        presentationDiagnostics = desktop.presentationDiagnostics
+        metalView?.setPresentationDiagnostics(desktop.presentationDiagnostics)
+        configureSubscription()
+    }
+
+    private func configureSubscription() {
+        subscription?.setDemand(.none)
+        subscription?.setUpdateHandler(nil)
+        subscription?.cancel()
+        subscription = nil
+        subscriptionDemand = .none
+        readyLatch.discard()
+        readyLatch = SpiceDesktopReadyLatch()
+        resetDesktopState()
+
+        let subscription = desktop.subscribe(surface: surface)
+        self.subscription = subscription
+        let readyLatch = readyLatch
+        subscription.setUpdateHandler { [weak self] snapshot in
+            guard readyLatch.offer(snapshot) else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.readyLatch === readyLatch else { return }
+                self.wakeDisplayLinkIfNeeded()
+            }
+        }
+        updateDesktopDemand(force: true)
+    }
+
+    private func resetDesktopState() {
+        desktopGeneration = nil
+        selectedRevision = nil
+        acknowledgedRevision = nil
+        frameGeometry = nil
+        cpuFrame = nil
+        cursorState = nil
+        pointerMode = .absolute
+        requiresFrameRedraw = true
+        metalFailureRecovery.reset()
+        forcedCPUFallbackRevision = nil
         isUsingMetal = false
-        if frame != nil {
-            presentationDiagnostics?.recordCPUFallback(.metalUnavailable)
-        }
+        metalView?.discardPresentedContent()
+        updateSubviewGeometry(requestLatestFrame: false)
+        updateCursorPresentation()
+        needsDisplay = true
     }
 
-    private static func framesSharePresentationStorage(
-        _ lhs: SpiceFrame?,
-        _ rhs: SpiceFrame?
-    ) -> Bool {
-        switch (lhs, rhs) {
-        case (nil, nil):
-            true
-        case let (lhs?, rhs?):
-            lhs.sharesPresentationStorage(with: rhs)
-        default:
-            false
-        }
-    }
-
-    override func viewDidMoveToWindow() {
+    package override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         removeWindowObservers()
         guard let window else {
             releasePointerCapture()
+            updateDesktopDemand(force: true)
             return
         }
+
         window.acceptsMouseMovedEvents = true
         let center = NotificationCenter.default
-        let names: [Notification.Name] = [
+        let releaseNames: [Notification.Name] = [
             NSWindow.didResignKeyNotification,
             NSWindow.willCloseNotification,
         ]
-        windowObservers = names.map { name in
-            center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+        windowObservers.append(contentsOf: releaseNames.map { name in
+            center.addObserver(forName: name, object: window, queue: .main) {
+                [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.releasePointerCapture()
                 }
             }
-        }
+        })
+        let visibilityNames: [Notification.Name] = [
+            NSWindow.didChangeOcclusionStateNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+        ]
+        windowObservers.append(contentsOf: visibilityNames.map { name in
+            center.addObserver(forName: name, object: window, queue: .main) {
+                [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.updateDesktopDemand()
+                }
+            }
+        })
+        updateSubviewGeometry(requestLatestFrame: true)
+        updateDesktopDemand(force: true)
+    }
+
+    package override func viewDidHide() {
+        super.viewDidHide()
+        updateDesktopDemand()
+    }
+
+    package override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateDesktopDemand()
+    }
+
+    package override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateSubviewGeometry(requestLatestFrame: true)
     }
 
     private func removeWindowObservers() {
@@ -363,30 +631,303 @@ private final class SpiceFramebufferView: NSView {
         windowObservers.removeAll()
     }
 
-    override func layout() {
-        super.layout()
-        cursorOverlay.frame = bounds
-        guard let frame = desktopFrame else {
-            metalView?.frame = .zero
-            return
+    private func desiredDesktopDemand() -> SpiceDesktopDemand {
+        guard let window,
+              !window.isMiniaturized,
+              window.occlusionState.contains(.visible),
+              !isHiddenOrHasHiddenAncestor,
+              bounds.width > 0,
+              bounds.height > 0,
+              visibleRect.width > 0,
+              visibleRect.height > 0
+        else {
+            return .none
         }
-        metalView?.frame = contentRectangle(
-            frameWidth: frame.width,
-            frameHeight: frame.height
-        )
-        updateCursorPresentation()
-        cursorOverlay.needsDisplay = true
+        return .visible
     }
 
-    override func resetCursorRects() {
+    private func updateDesktopDemand(force: Bool = false) {
+        let demand = desiredDesktopDemand()
+        guard force || demand != subscriptionDemand else { return }
+        subscriptionDemand = demand
+        subscription?.setDemand(demand)
+        switch demand {
+        case .none:
+            readyLatch.discard()
+            pauseDisplayLinkIfIdle()
+            cpuFrame = nil
+            isUsingMetal = false
+            requiresFrameRedraw = true
+            metalView?.discardPresentedContent()
+        case .visible:
+            wakeDisplayLinkIfNeeded()
+        }
+    }
+
+    private func wakeDisplayLinkIfNeeded() {
+        guard subscriptionDemand == .visible,
+              !readyLatch.isEmpty,
+              let desktopDisplayLink,
+              desktopDisplayLink.isPaused
+        else {
+            return
+        }
+        presentationDiagnostics?.recordDesktopDisplayLinkWakeup()
+        desktopDisplayLink.isPaused = false
+    }
+
+    private func pauseDisplayLinkIfIdle() {
+        guard let desktopDisplayLink, !desktopDisplayLink.isPaused else { return }
+        desktopDisplayLink.isPaused = true
+        presentationDiagnostics?.recordDesktopDisplayLinkIdlePause()
+    }
+
+    fileprivate func displayLinkDidFire(_ displayLink: CADisplayLink) {
+        presentationDiagnostics?.recordDesktopDisplayLinkTick()
+        guard subscriptionDemand == .visible else {
+            pauseDisplayLinkIfIdle()
+            return
+        }
+        guard let snapshot = readyLatch.take() else {
+            pauseDisplayLinkIfIdle()
+            return
+        }
+
+        switch apply(snapshot, requestedAt: clock.now) {
+        case .consumed:
+            if readyLatch.isEmpty {
+                pauseDisplayLinkIfIdle()
+            }
+        case .retry:
+            readyLatch.restoreIfEmpty(snapshot)
+            wakeDisplayLinkIfNeeded()
+        }
+    }
+
+    private func apply(
+        _ snapshot: SpiceDesktopSnapshot,
+        requestedAt: ContinuousClock.Instant
+    ) -> SnapshotApplicationResult {
+        if let desktopGeneration, snapshot.generation < desktopGeneration {
+            return .consumed
+        }
+        if desktopGeneration != snapshot.generation {
+            desktopGeneration = snapshot.generation
+            selectedRevision = nil
+            acknowledgedRevision = nil
+            frameGeometry = nil
+            cpuFrame = nil
+            requiresFrameRedraw = true
+            metalFailureRecovery.reset()
+            forcedCPUFallbackRevision = nil
+            isUsingMetal = false
+            metalView?.discardPresentedContent()
+        }
+
+        cursorState = snapshot.cursor
+        pointerMode = snapshot.pointerMode
+        if pointerMode == .absolute {
+            releasePointerCapture()
+        }
+
+        guard let update = snapshot.frame else {
+            let hadFrame = frameGeometry != nil || selectedRevision != nil
+            selectedRevision = nil
+            acknowledgedRevision = nil
+            frameGeometry = nil
+            cpuFrame = nil
+            requiresFrameRedraw = false
+            metalFailureRecovery.reset()
+            forcedCPUFallbackRevision = nil
+            isUsingMetal = false
+            metalView?.discardPresentedContent()
+            if hadFrame {
+                updateSubviewGeometry(requestLatestFrame: false)
+                needsDisplay = true
+            }
+            updateCursorPresentation()
+            return .consumed
+        }
+
+        if let forcedCPUFallbackRevision,
+           forcedCPUFallbackRevision != update.revision {
+            self.forcedCPUFallbackRevision = nil
+        }
+
+        let result: SpiceMetalFramePresentationResult? = SpiceDesktopPresentationPolicy
+            .withFramebufferPresentationIfNeeded(
+            selectedRevision: selectedRevision,
+            updateRevision: update.revision,
+            requiresRedraw: requiresFrameRedraw
+        ) {
+            let updatedGeometry = SpiceDesktopFrameGeometry(
+                width: update.frame.width,
+                height: update.frame.height
+            )
+            if self.frameGeometry != updatedGeometry {
+                self.frameGeometry = updatedGeometry
+                self.updateSubviewGeometry(requestLatestFrame: false)
+            }
+            if self.forcedCPUFallbackRevision == update.revision {
+                self.presentationDiagnostics?.recordCPUFallback(.metalCommandFailure)
+                self.metalView?.discardPresentedContent()
+                return .cpuFallback(.metalCommandFailure)
+            }
+            if let metalView = self.metalView {
+                let attempt = self.metalFailureRecovery.beginAttempt(
+                    for: update.revision
+                )
+                let result = metalView.present(
+                    update.frame,
+                    requestedAt: requestedAt
+                ) { [weak self] completion in
+                    self?.metalCommandCompleted(
+                        attempt,
+                        completion: completion
+                    )
+                }
+                if result != .committed {
+                    self.metalFailureRecovery.cancelAttempt(attempt)
+                }
+                return result
+            }
+            self.presentationDiagnostics?.recordCPUFallback(.metalUnavailable)
+            return .cpuFallback(.metalUnavailable)
+        }
+        guard let result else {
+            updateCursorPresentation()
+            return .consumed
+        }
+
+        switch result {
+        case .committed:
+            accept(update.revision)
+            cpuFrame = nil
+            isUsingMetal = true
+            requiresFrameRedraw = false
+            acknowledgeIfNeeded(update.revision)
+            updateCursorPresentation()
+            return .consumed
+        case .cpuFallback:
+            accept(update.revision)
+            cpuFrame = update.frame
+            isUsingMetal = false
+            requiresFrameRedraw = false
+            acknowledgeIfNeeded(update.revision)
+            updateCursorPresentation()
+            needsDisplay = true
+            return .consumed
+        case .gpuBusy, .drawableUnavailable:
+            updateCursorPresentation()
+            return .retry
+        }
+    }
+
+    private func acknowledgeIfNeeded(_ revision: SpiceFrameRevision) {
+        guard acknowledgedRevision != revision else { return }
+        acknowledgedRevision = revision
+        subscription?.acknowledgeFrame(revision)
+    }
+
+    private func metalCommandCompleted(
+        _ attempt: SpiceMetalFailureRecoveryPolicy.Attempt,
+        completion: SpiceMetalCommandCompletion
+    ) {
+        let action = metalFailureRecovery.commandCompleted(
+            attempt,
+            completion: completion,
+            selectedRevision: selectedRevision
+        )
+        switch action {
+        case .none:
+            return
+        case .requestLatest:
+            requiresFrameRedraw = true
+            subscription?.requestLatest()
+        case .useCPUFallback:
+            forcedCPUFallbackRevision = attempt.revision
+            requiresFrameRedraw = true
+            subscription?.requestLatest()
+        }
+    }
+
+    private func accept(_ revision: SpiceFrameRevision) {
+        if let selectedRevision,
+           selectedRevision.surface == revision.surface,
+           revision.value > selectedRevision.value {
+            let revisionDelta = revision.value - selectedRevision.value
+            guard revisionDelta > 1 else {
+                self.selectedRevision = revision
+                return
+            }
+            presentationDiagnostics?.recordMetalFramesSupersededBeforeDraw(
+                revisionDelta - 1
+            )
+        }
+        selectedRevision = revision
+    }
+
+    package override func layout() {
+        super.layout()
+        updateDesktopDemand()
+        updateSubviewGeometry(requestLatestFrame: true)
+    }
+
+    @discardableResult
+    private func updateSubviewGeometry(requestLatestFrame: Bool) -> Bool {
+        if cursorOverlay.frame != bounds {
+            cursorOverlay.frame = bounds
+        }
+        let contentRectangle: NSRect
+        if let frameGeometry {
+            contentRectangle = SpiceFrameDrawing.contentRectangle(
+                in: bounds,
+                frameWidth: frameGeometry.width,
+                frameHeight: frameGeometry.height
+            )
+        } else {
+            contentRectangle = .zero
+        }
+        let contentChanged = contentRectangle != lastContentRectangle
+        lastContentRectangle = contentRectangle
+        if metalView?.frame != contentRectangle {
+            metalView?.frame = contentRectangle
+        }
+        let backingScaleFactor = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 1
+        let drawableChanged = metalView?.updateDrawableSize(
+            backingScaleFactor: backingScaleFactor
+        ) ?? false
+        cursorOverlay.update(
+            frameGeometry: frameGeometry,
+            cursorState: cursorState
+        )
+        updateSystemCursor()
+
+        let presentationGeometryChanged = contentChanged || drawableChanged
+        if contentChanged {
+            needsDisplay = true
+        }
+        if requestLatestFrame,
+           presentationGeometryChanged,
+           selectedRevision != nil,
+           subscriptionDemand == .visible {
+            requiresFrameRedraw = true
+            subscription?.requestLatest()
+        }
+        return presentationGeometryChanged
+    }
+
+    package override func resetCursorRects() {
         addCursorRect(bounds, cursor: systemCursor)
     }
 
-    override func hitTest(_ point: NSPoint) -> NSView? {
+    package override func hitTest(_ point: NSPoint) -> NSView? {
         super.hitTest(point) == nil ? nil : self
     }
 
-    override func updateTrackingAreas() {
+    package override func updateTrackingAreas() {
         if let trackingArea {
             removeTrackingArea(trackingArea)
         }
@@ -400,16 +941,20 @@ private final class SpiceFramebufferView: NSView {
         super.updateTrackingAreas()
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    package override func draw(_ dirtyRect: NSRect) {
         NSColor.black.setFill()
         dirtyRect.fill()
         guard !isUsingMetal,
-              let frame = desktopFrame,
-              let image = SpiceFrameDrawing.makeImage(frame)
+              let cpuFrame,
+              let image = SpiceFrameDrawing.makeImage(cpuFrame)
         else {
             return
         }
-        let destination = contentRectangle(frameWidth: frame.width, frameHeight: frame.height)
+        let destination = SpiceFrameDrawing.contentRectangle(
+            in: bounds,
+            frameWidth: cpuFrame.width,
+            frameHeight: cpuFrame.height
+        )
         NSGraphicsContext.current?.imageInterpolation = .none
         NSImage(cgImage: image, size: destination.size).draw(
             in: destination,
@@ -421,7 +966,7 @@ private final class SpiceFramebufferView: NSView {
         )
     }
 
-    override func keyDown(with event: NSEvent) {
+    package override func keyDown(with event: NSEvent) {
         guard let scanCode = MacXTScanCode.map[event.keyCode] else {
             super.keyDown(with: event)
             return
@@ -430,7 +975,7 @@ private final class SpiceFramebufferView: NSView {
         onInput(.keyDown(scanCode: scanCode))
     }
 
-    override func keyUp(with event: NSEvent) {
+    package override func keyUp(with event: NSEvent) {
         guard let scanCode = MacXTScanCode.map[event.keyCode] else {
             super.keyUp(with: event)
             return
@@ -439,7 +984,7 @@ private final class SpiceFramebufferView: NSView {
         onInput(.keyUp(scanCode: scanCode))
     }
 
-    override func flagsChanged(with event: NSEvent) {
+    package override func flagsChanged(with event: NSEvent) {
         guard let scanCode = MacXTScanCode.map[event.keyCode] else {
             super.flagsChanged(with: event)
             return
@@ -452,7 +997,7 @@ private final class SpiceFramebufferView: NSView {
         }
     }
 
-    override func resignFirstResponder() -> Bool {
+    package override func resignFirstResponder() -> Bool {
         for scanCode in pressedScanCodes {
             onInput(.keyUp(scanCode: scanCode))
         }
@@ -461,45 +1006,43 @@ private final class SpiceFramebufferView: NSView {
         return super.resignFirstResponder()
     }
 
-    override func mouseDown(with event: NSEvent) {
+    package override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         capturePointerIfNeeded()
         onInput(.mousePress(.left))
     }
 
-    override func mouseUp(with event: NSEvent) {
+    package override func mouseUp(with event: NSEvent) {
         onInput(.mouseRelease(.left))
     }
 
-    override func rightMouseDown(with event: NSEvent) {
+    package override func rightMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         capturePointerIfNeeded()
         onInput(.mousePress(.right))
     }
 
-    override func rightMouseUp(with event: NSEvent) {
+    package override func rightMouseUp(with event: NSEvent) {
         onInput(.mouseRelease(.right))
     }
 
-    override func otherMouseDown(with event: NSEvent) {
+    package override func otherMouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         capturePointerIfNeeded()
         onInput(.mousePress(mouseButton(number: event.buttonNumber)))
     }
 
-    override func otherMouseUp(with event: NSEvent) {
+    package override func otherMouseUp(with event: NSEvent) {
         onInput(.mouseRelease(mouseButton(number: event.buttonNumber)))
     }
 
-    override func mouseMoved(with event: NSEvent) { sendMotion(event) }
-    override func mouseDragged(with event: NSEvent) { sendMotion(event) }
-    override func rightMouseDragged(with event: NSEvent) { sendMotion(event) }
-    override func otherMouseDragged(with event: NSEvent) { sendMotion(event) }
+    package override func mouseMoved(with event: NSEvent) { sendMotion(event) }
+    package override func mouseDragged(with event: NSEvent) { sendMotion(event) }
+    package override func rightMouseDragged(with event: NSEvent) { sendMotion(event) }
+    package override func otherMouseDragged(with event: NSEvent) { sendMotion(event) }
 
-    override func scrollWheel(with event: NSEvent) {
-        guard event.scrollingDeltaY != 0 else {
-            return
-        }
+    package override func scrollWheel(with event: NSEvent) {
+        guard event.scrollingDeltaY != 0 else { return }
         let button: SpiceMouseButton = event.scrollingDeltaY > 0 ? .scrollUp : .scrollDown
         onInput(.mousePress(button))
         onInput(.mouseRelease(button))
@@ -514,22 +1057,26 @@ private final class SpiceFramebufferView: NSView {
             guard dx != 0 || dy != 0 else { return }
             onInput(.mouseMotion(dx: dx, dy: dy))
         case .absolute:
-            guard let frame = desktopFrame else {
-                return
-            }
-            guard frame.width > 0, frame.height > 0 else {
+            guard let frameGeometry,
+                  frameGeometry.width > 0,
+                  frameGeometry.height > 0
+            else {
                 return
             }
             let point = convert(event.locationInWindow, from: nil)
-            let destination = contentRectangle(frameWidth: frame.width, frameHeight: frame.height)
-            guard destination.contains(point) else {
-                return
-            }
-            let x = min(frame.width - 1, max(0, Int(
-                ((point.x - destination.minX) / destination.width) * CGFloat(frame.width)
+            let destination = SpiceFrameDrawing.contentRectangle(
+                in: bounds,
+                frameWidth: frameGeometry.width,
+                frameHeight: frameGeometry.height
+            )
+            guard destination.contains(point) else { return }
+            let x = min(frameGeometry.width - 1, max(0, Int(
+                ((point.x - destination.minX) / destination.width)
+                    * CGFloat(frameGeometry.width)
             )))
-            let y = min(frame.height - 1, max(0, Int(
-                ((point.y - destination.minY) / destination.height) * CGFloat(frame.height)
+            let y = min(frameGeometry.height - 1, max(0, Int(
+                ((point.y - destination.minY) / destination.height)
+                    * CGFloat(frameGeometry.height)
             )))
             onInput(.mousePosition(x: UInt32(x), y: UInt32(y), displayID: 0))
         }
@@ -542,7 +1089,7 @@ private final class SpiceFramebufferView: NSView {
         }
     }
 
-    fileprivate func releasePointerCapture() {
+    package func releasePointerCapture() {
         pointerCapture.release()
         updateCursorPresentation()
     }
@@ -551,17 +1098,19 @@ private final class SpiceFramebufferView: NSView {
         releasePointerCapture()
     }
 
-    fileprivate func prepareForDismantle() {
+    package func prepareForDismantle() {
         releasePointerCapture()
         removeWindowObservers()
-    }
-
-    private func contentRectangle(frameWidth: Int, frameHeight: Int) -> NSRect {
-        SpiceFrameDrawing.contentRectangle(
-            in: bounds,
-            frameWidth: frameWidth,
-            frameHeight: frameHeight
-        )
+        subscriptionDemand = .none
+        subscription?.setDemand(.none)
+        subscription?.setUpdateHandler(nil)
+        subscription?.cancel()
+        subscription = nil
+        readyLatch.discard()
+        desktopDisplayLink?.invalidate()
+        desktopDisplayLink = nil
+        displayLinkTarget.owner = nil
+        metalView?.discardPresentedContent()
     }
 
     private func updateCursorPresentation() {
@@ -571,33 +1120,37 @@ private final class SpiceFramebufferView: NSView {
         ) == .overlay
         cursorOverlay.isHidden = !usesOverlay
         cursorOverlay.update(
-            frame: desktopFrame,
+            frameGeometry: frameGeometry,
             cursorState: usesOverlay ? cursorState : nil
         )
-        let destinationSize = desktopFrame.map {
-            contentRectangle(frameWidth: $0.width, frameHeight: $0.height).size
+        updateSystemCursor()
+    }
+
+    private func updateSystemCursor() {
+        let destinationSize = frameGeometry.map {
+            SpiceFrameDrawing.contentRectangle(
+                in: bounds,
+                frameWidth: $0.width,
+                frameHeight: $0.height
+            ).size
         } ?? .zero
         let descriptor = SpiceDesktopPresentationPolicy.systemCursorDescriptor(
             for: pointerMode,
             cursorState: cursorState,
-            frameSize: desktopFrame.map {
+            frameSize: frameGeometry.map {
                 CGSize(width: $0.width, height: $0.height)
             },
             destinationSize: destinationSize,
             isPointerCaptured: pointerCapture.isCaptured
         )
-        guard descriptor != systemCursorDescriptor else {
-            return
-        }
+        guard descriptor != systemCursorDescriptor else { return }
         systemCursorDescriptor = descriptor
         systemCursor = SpiceFrameDrawing.makeSystemCursor(descriptor)
         window?.invalidateCursorRects(for: self)
     }
 
     private func clampedInt32(_ value: CGFloat) -> Int32 {
-        guard value.isFinite else {
-            return 0
-        }
+        guard value.isFinite else { return 0 }
         let bounded = min(CGFloat(Int32.max), max(CGFloat(Int32.min), value))
         return Int32(bounded)
     }
@@ -613,34 +1166,115 @@ private final class SpiceFramebufferView: NSView {
 
 @MainActor
 private final class SpiceCursorOverlayView: NSView {
-    private var desktopFrame: SpiceFrame?
+    private struct ImageKey: Equatable {
+        let id: UInt64
+        let format: SpiceCursorImageFormat
+        let width: Int
+        let height: Int
+        let hotSpotX: Int
+        let hotSpotY: Int
+        let byteCount: Int
+    }
+
+    private let cursorLayer = CALayer()
+    private var frameGeometry: SpiceDesktopFrameGeometry?
     private var cursorState: SpiceCursorState?
+    private var imageKey: ImageKey?
+    private var cachedImage: CGImage?
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
 
-    fileprivate func update(frame: SpiceFrame?, cursorState: SpiceCursorState?) {
-        desktopFrame = frame
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+        let rootLayer = CALayer()
+        rootLayer.masksToBounds = true
+        layer = rootLayer
+        cursorLayer.contentsGravity = .resize
+        cursorLayer.magnificationFilter = .nearest
+        cursorLayer.minificationFilter = .nearest
+        cursorLayer.isHidden = true
+        rootLayer.addSublayer(cursorLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    fileprivate func update(
+        frameGeometry: SpiceDesktopFrameGeometry?,
+        cursorState: SpiceCursorState?
+    ) {
+        self.frameGeometry = frameGeometry
         self.cursorState = cursorState
-        needsDisplay = true
+        refreshCursorLayer()
+    }
+
+    override func layout() {
+        super.layout()
+        refreshCursorLayer()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    override func draw(_ dirtyRect: NSRect) {
-        guard let desktopFrame else {
+    private func refreshCursorLayer() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        guard let frameGeometry,
+              frameGeometry.width > 0,
+              frameGeometry.height > 0,
+              let cursorState,
+              cursorState.isVisible,
+              let cursor = cursorState.image,
+              cursor.format == .alpha,
+              cursor.width > 0,
+              cursor.height > 0
+        else {
+            cursorLayer.isHidden = true
             return
         }
+
+        let key = ImageKey(
+            id: cursor.id,
+            format: cursor.format,
+            width: cursor.width,
+            height: cursor.height,
+            hotSpotX: cursor.hotSpotX,
+            hotSpotY: cursor.hotSpotY,
+            byteCount: cursor.data.count
+        )
+        if imageKey != key {
+            cachedImage = SpiceFrameDrawing.makeCursorImage(cursor)
+            imageKey = key
+            cursorLayer.contents = cachedImage
+        }
+        guard cachedImage != nil else {
+            cursorLayer.isHidden = true
+            return
+        }
+
         let destination = SpiceFrameDrawing.contentRectangle(
             in: bounds,
-            frameWidth: desktopFrame.width,
-            frameHeight: desktopFrame.height
+            frameWidth: frameGeometry.width,
+            frameHeight: frameGeometry.height
         )
-        SpiceFrameDrawing.drawCursor(
-            cursorState,
-            in: destination,
-            frame: desktopFrame
+        let scaleX = destination.width / CGFloat(frameGeometry.width)
+        let scaleY = destination.height / CGFloat(frameGeometry.height)
+        cursorLayer.frame = CGRect(
+            x: destination.minX
+                + (CGFloat(cursorState.x) - CGFloat(cursor.hotSpotX)) * scaleX,
+            y: destination.minY
+                + (CGFloat(cursorState.y) - CGFloat(cursor.hotSpotY)) * scaleY,
+            width: CGFloat(cursor.width) * scaleX,
+            height: CGFloat(cursor.height) * scaleY
         )
+        cursorLayer.contentsScale = window?.backingScaleFactor ?? 1
+        cursorLayer.isHidden = false
     }
 }
 
@@ -656,14 +1290,21 @@ private enum SpiceFrameDrawing {
         frameWidth: Int,
         frameHeight: Int
     ) -> NSRect {
-        guard frameWidth > 0, frameHeight > 0, bounds.width > 0, bounds.height > 0 else {
+        guard frameWidth > 0,
+              frameHeight > 0,
+              bounds.width > 0,
+              bounds.height > 0
+        else {
             return .zero
         }
         let scale = min(
             bounds.width / CGFloat(frameWidth),
             bounds.height / CGFloat(frameHeight)
         )
-        let size = NSSize(width: CGFloat(frameWidth) * scale, height: CGFloat(frameHeight) * scale)
+        let size = NSSize(
+            width: CGFloat(frameWidth) * scale,
+            height: CGFloat(frameHeight) * scale
+        )
         return NSRect(
             x: bounds.midX - size.width / 2,
             y: bounds.midY - size.height / 2,
@@ -673,14 +1314,39 @@ private enum SpiceFrameDrawing {
     }
 
     static func makeImage(_ frame: SpiceFrame) -> CGImage? {
-        let (minimumBytesPerRow, rowOverflow) = frame.width.multipliedReportingOverflow(by: 4)
-        let (expectedBytes, sizeOverflow) = frame.bytesPerRow.multipliedReportingOverflow(
-            by: frame.height
+        makeBGRAImage(
+            width: frame.width,
+            height: frame.height,
+            bytesPerRow: frame.bytesPerRow,
+            pixels: frame.pixels
         )
-        let pixels = frame.pixels
-        guard frame.width > 0, frame.height > 0,
-              !rowOverflow, !sizeOverflow,
-              frame.bytesPerRow >= minimumBytesPerRow,
+    }
+
+    static func makeCursorImage(_ cursor: SpiceCursorImage) -> CGImage? {
+        guard cursor.format == .alpha else { return nil }
+        let (bytesPerRow, rowOverflow) = cursor.width.multipliedReportingOverflow(by: 4)
+        guard !rowOverflow else { return nil }
+        return makeBGRAImage(
+            width: cursor.width,
+            height: cursor.height,
+            bytesPerRow: bytesPerRow,
+            pixels: cursor.data
+        )
+    }
+
+    private static func makeBGRAImage(
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        pixels: Data
+    ) -> CGImage? {
+        let (minimumBytesPerRow, rowOverflow) = width.multipliedReportingOverflow(by: 4)
+        let (expectedBytes, sizeOverflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+        guard width > 0,
+              height > 0,
+              !rowOverflow,
+              !sizeOverflow,
+              bytesPerRow >= minimumBytesPerRow,
               pixels.count == expectedBytes,
               let provider = CGDataProvider(data: pixels as CFData)
         else {
@@ -690,11 +1356,11 @@ private enum SpiceFrameDrawing {
             rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
         ))
         return CGImage(
-            width: frame.width,
-            height: frame.height,
+            width: width,
+            height: height,
             bitsPerComponent: 8,
             bitsPerPixel: 32,
-            bytesPerRow: frame.bytesPerRow,
+            bytesPerRow: bytesPerRow,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: bitmapInfo,
             provider: provider,
@@ -720,23 +1386,12 @@ private enum SpiceFrameDrawing {
         scaleX: CGFloat,
         scaleY: CGFloat
     ) -> NSCursor {
-        let cursorFrame = SpiceFrame(
-            surfaceID: 0,
-            width: cursor.width,
-            height: cursor.height,
-            bytesPerRow: cursor.width * 4,
-            pixels: cursor.data
-        )
-        guard let image = makeImage(cursorFrame) else {
-            return .arrow
-        }
+        guard let image = makeCursorImage(cursor) else { return .arrow }
         let size = NSSize(
             width: CGFloat(cursor.width) * scaleX,
             height: CGFloat(cursor.height) * scaleY
         )
-        guard size.width > 0, size.height > 0 else {
-            return .arrow
-        }
+        guard size.width > 0, size.height > 0 else { return .arrow }
         return NSCursor(
             image: NSImage(cgImage: image, size: size),
             hotSpot: NSPoint(
@@ -745,52 +1400,6 @@ private enum SpiceFrameDrawing {
             )
         )
     }
-
-    static func drawCursor(
-        _ cursorState: SpiceCursorState?,
-        in destination: NSRect,
-        frame: SpiceFrame
-    ) {
-        guard let cursorState, cursorState.isVisible,
-              let cursor = cursorState.image,
-              cursor.format == .alpha,
-              cursor.width > 0, cursor.height > 0
-        else {
-            return
-        }
-        let (pixels, pixelOverflow) = cursor.width.multipliedReportingOverflow(by: cursor.height)
-        let (byteCount, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
-        guard !pixelOverflow, !byteOverflow, cursor.data.count == byteCount else {
-            return
-        }
-        let cursorFrame = SpiceFrame(
-            surfaceID: 0,
-            width: cursor.width,
-            height: cursor.height,
-            bytesPerRow: cursor.width * 4,
-            pixels: cursor.data
-        )
-        guard let image = makeImage(cursorFrame) else {
-            return
-        }
-        let scaleX = destination.width / CGFloat(frame.width)
-        let scaleY = destination.height / CGFloat(frame.height)
-        let rectangle = NSRect(
-            x: destination.minX + CGFloat(cursorState.x - cursor.hotSpotX) * scaleX,
-            y: destination.minY + CGFloat(cursorState.y - cursor.hotSpotY) * scaleY,
-            width: CGFloat(cursor.width) * scaleX,
-            height: CGFloat(cursor.height) * scaleY
-        )
-        NSImage(cgImage: image, size: rectangle.size).draw(
-            in: rectangle,
-            from: .zero,
-            operation: .sourceOver,
-            fraction: 1,
-            respectFlipped: true,
-            hints: [.interpolation: NSImageInterpolation.none]
-        )
-    }
-
 }
 
 package enum MacXTScanCode {

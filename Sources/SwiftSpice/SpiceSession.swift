@@ -37,6 +37,26 @@ public enum SpiceVideoCodecPolicy: Sendable, Equatable {
     case h265AndMJPEG
 }
 
+public enum SpiceVideoCodec: Sendable, Equatable {
+    case h264
+    case h265
+}
+
+public enum SpiceVideoCodecFailureReason: Sendable, Equatable {
+    case hardwareUnavailable(status: Int32?)
+    case unsupportedFormat(status: Int32)
+}
+
+public struct SpiceVideoCodecFailure: Sendable, Equatable {
+    public let codec: SpiceVideoCodec
+    public let reason: SpiceVideoCodecFailureReason
+
+    public init(codec: SpiceVideoCodec, reason: SpiceVideoCodecFailureReason) {
+        self.codec = codec
+        self.reason = reason
+    }
+}
+
 public enum TLSTrustPolicy: Sendable, Equatable {
     case system
     /// Trust only the supplied CA certificates. Values may be DER or PEM data;
@@ -105,6 +125,7 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
     case connectionFailed(String)
     case authenticationFailed(String)
     case protocolError(String)
+    case videoCodecUnavailable(SpiceVideoCodecFailure)
     case cancelled
 
     public var description: String {
@@ -117,6 +138,8 @@ public enum SpiceError: Error, Sendable, Equatable, CustomStringConvertible {
             "authentication failed: \(reason)"
         case let .protocolError(reason):
             "protocol error: \(reason)"
+        case let .videoCodecUnavailable(failure):
+            "video codec unavailable: \(failure.codec) (\(failure.reason))"
         case .cancelled:
             "connection cancelled"
         }
@@ -130,7 +153,9 @@ public actor SpiceSession {
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
-    public nonisolated let presentationDiagnostics = SpicePresentationDiagnostics()
+    private let mjpegDecodeLimiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
+    package nonisolated let presentationDiagnostics: SpicePresentationDiagnostics
+    public nonisolated let desktop: SpiceDesktopSource
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
     public nonisolated let playbackEvents: AsyncStream<SpicePlaybackEvent>
@@ -190,6 +215,9 @@ public actor SpiceSession {
     }
 
     public init() {
+        let presentationDiagnostics = SpicePresentationDiagnostics()
+        self.presentationDiagnostics = presentationDiagnostics
+        desktop = SpiceDesktopSource(presentationDiagnostics: presentationDiagnostics)
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
         events = AsyncStream(unfolding: { await eventMailbox.next() })
@@ -239,6 +267,9 @@ public actor SpiceSession {
         ticketEncryptor: any TicketEncrypting,
         migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
     ) {
+        let presentationDiagnostics = SpicePresentationDiagnostics()
+        self.presentationDiagnostics = presentationDiagnostics
+        desktop = SpiceDesktopSource(presentationDiagnostics: presentationDiagnostics)
         let eventMailbox = SpiceSessionEventMailbox()
         self.eventMailbox = eventMailbox
         events = AsyncStream(unfolding: { await eventMailbox.next() })
@@ -365,7 +396,9 @@ public actor SpiceSession {
                     connection: connected,
                     glzDecoder: glzDecoder,
                     multimediaClock: multimediaClock,
-                    surfaceMemoryBudget: surfaceMemoryBudget
+                    surfaceMemoryBudget: surfaceMemoryBudget,
+                    frameDemandCoordinator: desktop.frameDemandCoordinator,
+                    mjpegDecodeLimiter: mjpegDecodeLimiter
                 )
             }
             try Task.checkCancellation()
@@ -405,6 +438,9 @@ public actor SpiceSession {
         currentBootstrap = prepared.bootstrap
         credentialStorage = credentials
         isAgentConnected = prepared.bootstrap.agentConnected
+        desktop.beginSession(
+            pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
+        )
         startSupervision(mainChannel: prepared.mainChannel)
         if prepared.bootstrap.agentConnected {
             agentEventContinuation.yield(.connected)
@@ -432,6 +468,7 @@ public actor SpiceSession {
         credentialStorage = nil
         currentEndpoint = nil
         currentBootstrap = nil
+        desktop.endSession()
         eventMailbox.send(.disconnected)
     }
 
@@ -448,10 +485,10 @@ public actor SpiceSession {
     /// Cumulative counters start at the most recent `connect` attempt. The
     /// snapshot has no timing before a complete framed message returns from the
     /// transport and does not retain per-frame timestamps. It includes bounded
-    /// receive-to-surface-apply, publisher, mailbox, and GPU-presentation timing
-    /// summaries. Presentation counters require passing
-    /// `presentationDiagnostics` to `SpiceDesktopView`. Advanced-video counters
-    /// do not cover MJPEG.
+    /// receive-to-surface-apply, publisher, and GPU-presentation timing
+    /// summaries. `SpiceDesktopView` receives the presentation recorder through
+    /// this session's stable desktop source; callers do not forward it through
+    /// SwiftUI. Advanced-video counters do not cover MJPEG.
     public func diagnosticsSnapshot() async -> SpiceSessionDiagnostics {
         var result = retiredDisplayDiagnostics
 
@@ -464,12 +501,12 @@ public actor SpiceSession {
             result.accumulate(await display.diagnosticsSnapshot())
         }
 
-        let mailbox = eventMailbox.metrics()
-        result.mailboxFramesSent = mailbox.framesSent
-        result.mailboxFramesDelivered = mailbox.framesDelivered
-        result.mailboxFramesCoalesced = mailbox.framesCoalesced
-        result.mailboxFramesEvicted = mailbox.framesEvicted
-        result.mailboxFrameQueueDelayHistogram = mailbox.frameQueueDelay
+        let desktopMetrics = desktop.metrics()
+        result.desktopDeliveredSnapshots = desktopMetrics.deliveredSnapshots
+        result.desktopStreamCoalesces = desktopMetrics.streamCoalesces
+        result.desktopHandlerDeliveries = desktopMetrics.handlerDeliveries
+        result.desktopSubscriptions = desktopMetrics.subscriptions
+        result.desktopVisibleSubscriptions = desktopMetrics.visibleSubscriptions
 
         result.totalIOSurfaceAllocatedBytes = IOSurfaceAllocationBudget.shared.allocatedBytes
         let surfaceBudget = surfaceMemoryBudget.metrics()
@@ -486,14 +523,26 @@ public actor SpiceSession {
         result.pixelFormatMismatchFallbackFrames = presentation.pixelFormatMismatchFallbackFrames
         result.textureCreationFailedFallbackFrames =
             presentation.textureCreationFailedFallbackFrames
+        result.metalCommandFailureFallbackFrames =
+            presentation.metalCommandFailureFallbackFrames
         result.lastCPUFallbackReason = presentation.lastCPUFallbackReason
         result.metalFramesSupersededBeforeDraw = presentation.metalFramesSupersededBeforeDraw
         result.metalDrawableMisses = presentation.metalDrawableMisses
         result.metalCommandCreationFailures = presentation.metalCommandCreationFailures
+        result.metalCommandBuffersCommitted = presentation.metalCommandBuffersCommitted
+        result.metalTextureCacheHits = presentation.metalTextureCacheHits
+        result.metalTextureCacheMisses = presentation.metalTextureCacheMisses
+        result.metalTextureCacheEvictions = presentation.metalTextureCacheEvictions
+        result.metalGPUBusySkips = presentation.metalGPUBusySkips
+        result.desktopDisplayLinkWakeups = presentation.desktopDisplayLinkWakeups
+        result.desktopDisplayLinkTicks = presentation.desktopDisplayLinkTicks
+        result.desktopDisplayLinkIdlePauses = presentation.desktopDisplayLinkIdlePauses
         result.viewUpdateToMetalCommitHistogram =
             presentation.viewUpdateToMetalCommitHistogram
         result.metalCommitToCompletionHistogram =
             presentation.metalCommitToCompletionHistogram
+        result.metalRequestToPresentedHistogram =
+            presentation.metalRequestToPresentedHistogram
         return result
     }
 
@@ -1087,13 +1136,13 @@ public actor SpiceSession {
         }
         switch event {
         case let .frame(snapshot):
-            eventMailbox.send(.frame(SpiceFrame(snapshot)), displayChannelID: key.id)
+            desktop.receiveFrame(snapshot, displayChannelID: key.id)
         case let .surfaceDestroyed(surfaceID):
-            eventMailbox.send(.surfaceDestroyed(surfaceID), displayChannelID: key.id)
+            desktop.surfaceDestroyed(displayChannelID: key.id, surfaceID: surfaceID)
         case let .cursor(cursorEvent):
             switch cursorEvent {
             case let .initialized(snapshot), let .updated(snapshot), let .reset(snapshot):
-                eventMailbox.send(.cursor(SpiceCursorState(snapshot)))
+                desktop.updateCursor(SpiceCursorState(snapshot))
             case .cacheInvalidated, .ignored:
                 break
             }
@@ -1109,7 +1158,8 @@ public actor SpiceSession {
         case let .main(mainEvent):
             switch mainEvent {
             case let .mouseMode(supported, current):
-                eventMailbox.send(.mouseMode(supported: supported, current: current))
+                _ = supported
+                desktop.updatePointerMode(SpicePointerMode(spiceMouseMode: current))
             case let .migration(command):
                 let actions = migrationCoordinator.receive(command)
                 await processMigrationActions(actions, generation: generation)
@@ -1537,7 +1587,9 @@ public actor SpiceSession {
                     connection: connected,
                     glzDecoder: glzDecoder,
                     multimediaClock: multimediaClock,
-                    surfaceMemoryBudget: surfaceMemoryBudget
+                    surfaceMemoryBudget: surfaceMemoryBudget,
+                    frameDemandCoordinator: desktop.frameDemandCoordinator,
+                    mjpegDecodeLimiter: mjpegDecodeLimiter
                 )
             }
             try Task.checkCancellation()
@@ -1681,6 +1733,9 @@ public actor SpiceSession {
         currentEndpoint = prepared.endpoint
         currentBootstrap = prepared.bootstrap
         credentialStorage = credentials
+        desktop.beginSeamlessMigration(
+            pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
+        )
         for connection in previousConnections.values {
             await connection.close()
         }
@@ -1709,6 +1764,9 @@ public actor SpiceSession {
         currentBootstrap = prepared.bootstrap
         credentialStorage = credentials
         isAgentConnected = prepared.bootstrap.agentConnected
+        desktop.beginSession(
+            pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
+        )
         startSupervision(mainChannel: prepared.mainChannel)
 
         if oldAgentConnected {
@@ -1824,6 +1882,7 @@ public actor SpiceSession {
         credentialStorage = nil
         currentEndpoint = nil
         currentBootstrap = nil
+        desktop.endSession()
         eventMailbox.send(.failed(Self.map(channelError: error)))
     }
 
@@ -1952,7 +2011,9 @@ public actor SpiceSession {
         connection: ChannelConnection,
         glzDecoder: SpiceGLZDecoder,
         multimediaClock: any MultimediaClockScheduling,
-        surfaceMemoryBudget: SurfaceMemoryBudget
+        surfaceMemoryBudget: SurfaceMemoryBudget,
+        frameDemandCoordinator: DisplayFrameDemandCoordinator,
+        mjpegDecodeLimiter: SpiceMJPEGDecodeLimiter
     ) -> any SpiceManagedChannel {
         switch SpiceChannelKind(rawValue: key.type) {
         case .display:
@@ -1960,7 +2021,9 @@ public actor SpiceSession {
                 connection: connection,
                 surfaces: SurfaceStore(memoryBudget: surfaceMemoryBudget),
                 glzDecoder: glzDecoder,
-                multimediaClock: multimediaClock
+                multimediaClock: multimediaClock,
+                frameDemandCoordinator: frameDemandCoordinator,
+                mjpegDecodeLimiter: mjpegDecodeLimiter
             )
         case .inputs:
             InputsChannel(connection: connection)
@@ -2029,26 +2092,41 @@ public actor SpiceSession {
         }
     }
 
-    private nonisolated static func map(channelError: ChannelError) -> SpiceError {
+    package nonisolated static func map(channelError: ChannelError) -> SpiceError {
         switch channelError {
         case let .transport(error):
-            map(transportError: error)
+            return map(transportError: error)
         case let .authentication(error):
-            .authenticationFailed(String(describing: error))
+            return .authenticationFailed(String(describing: error))
         case let .wire(error):
-            .protocolError(String(describing: error))
+            return .protocolError(String(describing: error))
         case let .linkRejected(code):
-            .protocolError("link rejected with code \(code)")
+            return .protocolError("link rejected with code \(code)")
         case let .migrationRequested(key, _):
-            .protocolError(
+            return .protocolError(
                 "unexpected migration request on channel type=\(key.type) id=\(key.id)"
             )
         case .invalidState:
-            .protocolError("invalid channel state")
+            return .protocolError("invalid channel state")
         case .unsupportedCapability:
-            .protocolError("unsupported server capability")
+            return .protocolError("unsupported server capability")
+        case let .videoCodecFailure(codec, reason):
+            let publicCodec: SpiceVideoCodec = switch codec {
+            case .h264: .h264
+            case .h265: .h265
+            }
+            let publicReason: SpiceVideoCodecFailureReason = switch reason {
+            case let .hardwareUnavailable(status):
+                .hardwareUnavailable(status: status)
+            case let .unsupportedFormat(status):
+                .unsupportedFormat(status: status)
+            }
+            return .videoCodecUnavailable(SpiceVideoCodecFailure(
+                codec: publicCodec,
+                reason: publicReason
+            ))
         case let .protocolViolation(reason):
-            .protocolError(reason)
+            return .protocolError(reason)
         }
     }
 }

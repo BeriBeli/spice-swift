@@ -487,6 +487,8 @@ struct SpiceProbe {
     ) async throws {
         let observations = ProbeObservations()
         let observationCPUStart = processCPUSeconds()
+        let desktopSubscription = session.desktop.subscribe()
+        desktopSubscription.setDemand(.visible)
         let eventTask = Task {
             for await event in session.events {
                 await observations.record(event)
@@ -495,7 +497,20 @@ struct SpiceProbe {
                 }
             }
         }
-        defer { eventTask.cancel() }
+        let desktopTask = Task {
+            for await snapshot in desktopSubscription.updates {
+                await observations.record(snapshot)
+                if !benchmarkJSON {
+                    print(description(of: snapshot))
+                }
+            }
+        }
+        defer {
+            desktopSubscription.setDemand(.none)
+            desktopSubscription.cancel()
+            desktopTask.cancel()
+            eventTask.cancel()
+        }
 
         if exerciseInput {
             try await session.send(.keyDown(scanCode: 0x1e))
@@ -593,22 +608,13 @@ struct SpiceProbe {
 
     private static func description(of event: SpiceSessionEvent) -> String {
         switch event {
-        case let .frame(frame):
-            "frame surface=\(frame.surfaceID) size=\(frame.width)x\(frame.height) "
-                + "bytes=\(frame.bytesPerRow * frame.height)"
-        case let .surfaceDestroyed(surfaceID):
-            "surface destroyed id=\(surfaceID)"
         case let .displayConfiguration(configuration):
             "display configuration channel=\(configuration.channelID) "
                 + "monitors=\(configuration.monitors.count)"
-        case let .cursor(cursor):
-            "cursor position=\(cursor.x),\(cursor.y) visible=\(cursor.isVisible)"
         case let .keyboardModifiers(modifiers):
             "keyboard modifiers=\(modifiers)"
         case .mouseMotionAcknowledged:
             "mouse motion acknowledged"
-        case let .mouseMode(supported, current):
-            "mouse mode supported=\(supported) current=\(current)"
         case let .migration(event):
             "migration event=\(event)"
         case let .failed(error):
@@ -616,6 +622,18 @@ struct SpiceProbe {
         case .disconnected:
             "session disconnected"
         }
+    }
+
+    private static func description(of snapshot: SpiceDesktopSnapshot) -> String {
+        guard let update = snapshot.frame else {
+            return "desktop generation=\(snapshot.generation) frame=none "
+                + "pointer=\(snapshot.pointerMode)"
+        }
+        return "desktop generation=\(snapshot.generation) "
+            + "surface=\(update.revision.surface.surfaceID) "
+            + "revision=\(update.revision.value) "
+            + "size=\(update.frame.width)x\(update.frame.height) "
+            + "bytes=\(update.frame.bytesPerRow * update.frame.height)"
     }
 
     private static func description(of event: SpiceFileTransferEvent) -> String {
@@ -976,13 +994,27 @@ private actor ProbeObservations {
     private var keyboardEvents = 0
     private var motionAcknowledgements = 0
     private var sessionFailure: String?
+    private var lastFrameRevision: SpiceFrameRevision?
+    private var lastCursor: SpiceCursorState?
 
     func record(_ event: SpiceSessionEvent) {
         switch event {
-        case let .frame(frame):
+        case .keyboardModifiers:
+            keyboardEvents += 1
+        case .mouseMotionAcknowledged:
+            motionAcknowledgements += 1
+        case let .failed(error):
+            sessionFailure = error.description
+        default:
+            break
+        }
+    }
+
+    func record(_ snapshot: SpiceDesktopSnapshot) {
+        if let update = snapshot.frame, update.revision != lastFrameRevision {
             let now = ContinuousClock().now
             frames += 1
-            frameBytes += frame.bytesPerRow * frame.height
+            frameBytes += update.frame.bytesPerRow * update.frame.height
             if firstFrameMilliseconds == nil {
                 firstFrameMilliseconds = Self.milliseconds(from: start.duration(to: now))
             }
@@ -992,16 +1024,15 @@ private actor ProbeObservations {
                 )
             }
             previousFrameInstant = now
-        case .cursor:
-            cursors += 1
-        case .keyboardModifiers:
-            keyboardEvents += 1
-        case .mouseMotionAcknowledged:
-            motionAcknowledgements += 1
-        case let .failed(error):
-            sessionFailure = error.description
-        default:
-            break
+            lastFrameRevision = update.revision
+        } else if snapshot.frame == nil {
+            lastFrameRevision = nil
+        }
+        if snapshot.cursor != lastCursor {
+            if snapshot.cursor != nil {
+                cursors += 1
+            }
+            lastCursor = snapshot.cursor
         }
     }
 

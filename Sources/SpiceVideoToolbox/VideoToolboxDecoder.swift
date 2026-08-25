@@ -201,6 +201,7 @@ package final class SpiceVideoToolboxFrame: SpiceDecodedVideoFrame, @unchecked S
 }
 
 private final class SynchronousDecodeOutput {
+    let codec: SpiceAdvancedVideoCodec
     let expectedWidth: Int
     let expectedHeight: Int
     let maximumDecodedBytes: Int
@@ -208,11 +209,13 @@ private final class SynchronousDecodeOutput {
     var result: Result<SpiceVideoToolboxFrame?, SpiceCodecError>?
 
     init(
+        codec: SpiceAdvancedVideoCodec,
         expectedWidth: Int,
         expectedHeight: Int,
         maximumDecodedBytes: Int,
         diagnostics: VideoToolboxDiagnosticsCounter
     ) {
+        self.codec = codec
         self.expectedWidth = expectedWidth
         self.expectedHeight = expectedHeight
         self.maximumDecodedBytes = maximumDecodedBytes
@@ -229,7 +232,10 @@ private let synchronousDecodeCallback: VTDecompressionOutputCallback = {
         .fromOpaque(sourceFrameRefCon)
         .takeUnretainedValue()
     if status != noErr {
-        output.result = .failure(.backendFailure("VideoToolbox decode status \(status)"))
+        output.result = .failure(
+            videoToolboxCompatibilityError(codec: output.codec, status: status)
+                ?? .backendFailure("VideoToolbox decode status \(status)")
+        )
     } else if flags.contains(.frameDropped) || imageBuffer == nil {
         output.diagnostics.recordDroppedFrame()
         output.result = .success(nil)
@@ -284,7 +290,12 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
     private var session: VTDecompressionSession?
     private var sessionRebuildRequired = false
     private let sessionCreationFailureForAttempt: @Sendable (Int) -> OSStatus?
+    private let hardwareStateForSession: @Sendable (
+        VTDecompressionSession
+    ) -> SpiceVideoToolboxHardwareDecoderState
+    private let formatDescriptionFailureForAttempt: @Sendable (Int) -> OSStatus?
     private var sessionCreationAttempt = 0
+    private var formatDescriptionCreationAttempt = 0
     private let diagnosticsCounter = VideoToolboxDiagnosticsCounter()
 
     package init(
@@ -292,7 +303,15 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         width: Int,
         height: Int,
         limits: SpiceAdvancedVideoDecodeLimits = .init(),
-        sessionCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = { _ in nil }
+        sessionCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = { _ in nil },
+        hardwareStateForSession: @escaping @Sendable (
+            VTDecompressionSession
+        ) -> SpiceVideoToolboxHardwareDecoderState = {
+            SpiceVideoToolboxDecoder.hardwareDecoderState(for: $0)
+        },
+        formatDescriptionFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        }
     ) throws(SpiceCodecError) {
         guard width > 0, height > 0,
               width <= limits.maximumDimension,
@@ -317,6 +336,8 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         self.limits = limits
         self.parser = SpiceAnnexBParser(limits: limits)
         self.sessionCreationFailureForAttempt = sessionCreationFailureForAttempt
+        self.hardwareStateForSession = hardwareStateForSession
+        self.formatDescriptionFailureForAttempt = formatDescriptionFailureForAttempt
     }
 
     package func decode(
@@ -366,6 +387,7 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             formatDescription: formatDescription
         )
         let output = SynchronousDecodeOutput(
+            codec: codec,
             expectedWidth: expectedWidth,
             expectedHeight: expectedHeight,
             maximumDecodedBytes: limits.maximumDecodedBytes,
@@ -380,7 +402,8 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             infoFlagsOut: &infoFlags
         )
         guard status == noErr else {
-            throw .backendFailure("VideoToolbox submission status \(status)")
+            throw videoToolboxCompatibilityError(codec: codec, status: status)
+                ?? .backendFailure("VideoToolbox submission status \(status)")
         }
         guard let result = output.result else {
             throw .backendFailure("VideoToolbox synchronous decode produced no callback")
@@ -436,30 +459,45 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         let pointers = sets.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
         let sizes = sets.map(\.length)
         var description: CMFormatDescription?
+        formatDescriptionCreationAttempt &+= 1
         let status: OSStatus
-        switch codec {
-        case .h264:
-            status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                allocator: nil,
-                parameterSetCount: pointers.count,
-                parameterSetPointers: pointers,
-                parameterSetSizes: sizes,
-                nalUnitHeaderLength: 4,
-                formatDescriptionOut: &description
-            )
-        case .h265:
-            status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                allocator: nil,
-                parameterSetCount: pointers.count,
-                parameterSetPointers: pointers,
-                parameterSetSizes: sizes,
-                nalUnitHeaderLength: 4,
-                extensions: nil,
-                formatDescriptionOut: &description
-            )
+        if let injectedStatus = formatDescriptionFailureForAttempt(
+            formatDescriptionCreationAttempt
+        ) {
+            status = injectedStatus
+        } else {
+            switch codec {
+            case .h264:
+                status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: nil,
+                    parameterSetCount: pointers.count,
+                    parameterSetPointers: pointers,
+                    parameterSetSizes: sizes,
+                    nalUnitHeaderLength: 4,
+                    formatDescriptionOut: &description
+                )
+            case .h265:
+                status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    allocator: nil,
+                    parameterSetCount: pointers.count,
+                    parameterSetPointers: pointers,
+                    parameterSetSizes: sizes,
+                    nalUnitHeaderLength: 4,
+                    extensions: nil,
+                    formatDescriptionOut: &description
+                )
+            }
         }
         guard status == noErr, let description else {
-            throw .backendFailure("CoreMedia format description status \(status)")
+            if status == noErr {
+                throw .backendFailure(
+                    "CoreMedia returned no format description without an error"
+                )
+            }
+            if status == kCMFormatDescriptionError_AllocationFailed {
+                throw .backendFailure("CoreMedia format description status \(status)")
+            }
+            throw .unsupportedVideoFormat(codec: codec, status: status)
         }
 
         var newSession: VTDecompressionSession?
@@ -478,8 +516,10 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         ] as CFDictionary
         sessionCreationAttempt &+= 1
         if let injectedStatus = sessionCreationFailureForAttempt(sessionCreationAttempt) {
-            throw .backendFailure(
-                "VideoToolbox session creation status \(injectedStatus) (injected)"
+            throw Self.sessionCreationError(
+                codec: codec,
+                status: injectedStatus,
+                context: "injected"
             )
         }
         let sessionStatus = VTDecompressionSessionCreate(
@@ -493,12 +533,40 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         guard sessionStatus == noErr, let newSession else {
             let dimensions = CMVideoFormatDescriptionGetDimensions(description)
             let subtype = CMFormatDescriptionGetMediaSubType(description)
-            throw .backendFailure(
-                "VideoToolbox session creation status \(sessionStatus) " +
-                "for subtype \(subtype), dimensions \(dimensions.width)x\(dimensions.height)"
+            throw Self.sessionCreationError(
+                codec: codec,
+                status: sessionStatus,
+                context: "subtype \(subtype), dimensions " +
+                    "\(dimensions.width)x\(dimensions.height)"
             )
         }
-        diagnosticsCounter.recordSession(state: Self.hardwareDecoderState(for: newSession))
+        let realTimeStatus = VTSessionSetProperty(
+            newSession,
+            key: kVTDecompressionPropertyKey_RealTime,
+            value: kCFBooleanTrue
+        )
+        guard realTimeStatus == noErr else {
+            VTDecompressionSessionInvalidate(newSession)
+            throw .backendFailure(
+                "VideoToolbox real-time configuration status \(realTimeStatus)"
+            )
+        }
+
+        let hardwareState = hardwareStateForSession(newSession)
+        diagnosticsCounter.recordSession(state: hardwareState)
+        switch hardwareState {
+        case .hardware:
+            break
+        case .software:
+            VTDecompressionSessionInvalidate(newSession)
+            throw .videoHardwareUnavailable(codec: codec, status: nil)
+        case let .queryFailed(status):
+            VTDecompressionSessionInvalidate(newSession)
+            throw .videoHardwareUnavailable(codec: codec, status: status)
+        case .notCreated:
+            VTDecompressionSessionInvalidate(newSession)
+            throw .videoHardwareUnavailable(codec: codec, status: nil)
+        }
         let previousSession = self.session
         self.formatDescription = description
         self.session = newSession
@@ -527,6 +595,22 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             return .queryFailed(kVTPropertyNotSupportedErr)
         }
         return number.boolValue ? .hardware : .software
+    }
+
+    private nonisolated static func sessionCreationError(
+        codec: SpiceAdvancedVideoCodec,
+        status: OSStatus,
+        context: String
+    ) -> SpiceCodecError {
+        if let compatibilityError = videoToolboxCompatibilityError(
+            codec: codec,
+            status: status
+        ) {
+            return compatibilityError
+        }
+        return .backendFailure(
+            "VideoToolbox session creation status \(status) (\(context))"
+        )
     }
 
     private func makeSampleBuffer(
@@ -758,5 +842,27 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             bytesPerRow: bytesPerRow,
             pixelsBGRA: pixels
         ))
+    }
+}
+
+private func videoToolboxCompatibilityError(
+    codec: SpiceAdvancedVideoCodec,
+    status: OSStatus
+) -> SpiceCodecError? {
+    switch status {
+    case kVTVideoDecoderUnsupportedDataFormatErr,
+         kVTFormatDescriptionChangeNotSupportedErr:
+        .unsupportedVideoFormat(codec: codec, status: status)
+    case kVTCouldNotFindVideoDecoderErr,
+         kVTCouldNotCreateInstanceErr,
+         kVTVideoDecoderMalfunctionErr,
+         kVTVideoDecoderNotAvailableNowErr,
+         kVTVideoDecoderAuthorizationErr,
+         kVTVideoDecoderRemovedErr,
+         kVTSessionMalfunctionErr,
+         kVTVideoDecoderNeedsRosettaErr:
+        .videoHardwareUnavailable(codec: codec, status: status)
+    default:
+        nil
     }
 }

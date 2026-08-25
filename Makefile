@@ -60,7 +60,7 @@ all: ## Run environment, metadata, generation, build, API, and test gates
 	@$(MAKE) sanitize
 	@$(MAKE) coverage
 
-release: ## Cut a release: make release VERSION=0.1.11
+release: ## Cut a release: make release VERSION=0.2.1
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=X.Y.Z"; exit 1; }
 	@./Scripts/release.sh $(VERSION)
 

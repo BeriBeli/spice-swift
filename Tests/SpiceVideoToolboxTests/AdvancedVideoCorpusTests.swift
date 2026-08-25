@@ -2,6 +2,7 @@ import CoreVideo
 import Foundation
 import IOSurface
 import Testing
+import VideoToolbox
 @testable import SpiceCodecs
 @testable import SpiceMetalCompositor
 @testable import SpiceVideoToolbox
@@ -27,11 +28,9 @@ struct AdvancedVideoCorpusTests {
             #expect(nativeDiagnostics.sessionCreationCount == 1)
             #expect(nativeDiagnostics.decodedFrameCount == 1)
             #expect(nativeDiagnostics.cpuMaterializationCount == 0)
-            #expect(
-                nativeDiagnostics.hardwareSessionCount +
-                    nativeDiagnostics.softwareSessionCount +
-                    nativeDiagnostics.hardwareQueryFailureCount == 1
-            )
+            #expect(nativeDiagnostics.hardwareSessionCount == 1)
+            #expect(nativeDiagnostics.softwareSessionCount == 0)
+            #expect(nativeDiagnostics.hardwareQueryFailureCount == 0)
 
             if let compositor = try makeCompositorIfSupported() {
                 let destination = try makeBGRAIOSurface(
@@ -163,6 +162,77 @@ struct AdvancedVideoCorpusTests {
             matches: try #require(Data(base64Encoded: baseline.expectedBGRABase64)),
             maximumColorDelta: 4
         )
+    }
+
+    @Test func reportsSoftwareSessionAsTypedHardwareUnavailability() async throws {
+        let fixture = try loadFixture(named: "h264-baseline-128x128")
+        let payload = try #require(Data(base64Encoded: fixture.annexBBase64))
+        let decoder = try SpiceVideoToolboxDecoder(
+            codec: .h264,
+            width: fixture.width,
+            height: fixture.height,
+            hardwareStateForSession: { _ in .software }
+        )
+
+        do {
+            _ = try await decoder.decodeVideoFrame(payload: payload, multimediaTime: 1)
+            Issue.record("software VideoToolbox session was accepted")
+        } catch let error {
+            #expect(error == .videoHardwareUnavailable(codec: .h264, status: nil))
+        }
+        let diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.sessionCreationCount == 1)
+        #expect(diagnostics.softwareSessionCount == 1)
+        #expect(diagnostics.decodedFrameCount == 0)
+        await decoder.close()
+    }
+
+    @Test func mapsUnsupportedFormatBeforeBitstreamFailures() async throws {
+        let fixture = try loadFixture(named: "h264-baseline-128x128")
+        let payload = try #require(Data(base64Encoded: fixture.annexBBase64))
+        let decoder = try SpiceVideoToolboxDecoder(
+            codec: .h264,
+            width: fixture.width,
+            height: fixture.height,
+            sessionCreationFailureForAttempt: { attempt in
+                attempt == 1 ? kVTVideoDecoderUnsupportedDataFormatErr : nil
+            }
+        )
+
+        do {
+            _ = try await decoder.decodeVideoFrame(payload: payload, multimediaTime: 1)
+            Issue.record("unsupported hardware format was accepted")
+        } catch let error {
+            #expect(error == .unsupportedVideoFormat(
+                codec: .h264,
+                status: kVTVideoDecoderUnsupportedDataFormatErr
+            ))
+        }
+        await decoder.close()
+    }
+
+    @Test func mapsRejectedParameterSetProfileToUnsupportedFormat() async throws {
+        let fixture = try loadFixture(named: "h264-high-128x128")
+        let payload = try #require(Data(base64Encoded: fixture.annexBBase64))
+        let decoder = try SpiceVideoToolboxDecoder(
+            codec: .h264,
+            width: fixture.width,
+            height: fixture.height,
+            formatDescriptionFailureForAttempt: { attempt in
+                attempt == 1 ? kCMFormatDescriptionError_ValueNotAvailable : nil
+            }
+        )
+
+        do {
+            _ = try await decoder.decodeVideoFrame(payload: payload, multimediaTime: 1)
+            Issue.record("unsupported parameter-set profile was accepted")
+        } catch let error {
+            #expect(error == .unsupportedVideoFormat(
+                codec: .h264,
+                status: kCMFormatDescriptionError_ValueNotAvailable
+            ))
+        }
+        await decoder.close()
     }
 
     private func loadFixture(named name: String) throws -> AdvancedVideoFixture {

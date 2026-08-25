@@ -4,6 +4,14 @@ import SwiftSpice
 struct PublicAPIConsumer {
     static func main() async {
         let session = SpiceSession()
+        let desktop: SpiceDesktopSource = session.desktop
+        requireSendable(desktop)
+        let subscription: SpiceDesktopSubscription = desktop.subscribe(surface: .primary)
+        let updates: AsyncStream<SpiceDesktopSnapshot> = subscription.updates
+        requireSendable(updates)
+        subscription.setDemand(.none)
+        subscription.cancel()
+
         let diagnostics: SpiceSessionDiagnostics = await session.diagnosticsSnapshot()
         requireSendable(diagnostics)
         let _: Bool = diagnostics == .empty
@@ -38,6 +46,11 @@ struct PublicAPIConsumer {
         _ = diagnostics.publisherPendingSurfaces
         _ = diagnostics.publisherFlushes
         _ = diagnostics.publisherFlushesWithoutEmission
+        _ = diagnostics.publisherDemandSuppressedSubmissions
+        _ = diagnostics.publisherPendingRevisionCoalesces
+        _ = diagnostics.publisherPreparedFrameCoalesces
+        _ = diagnostics.publisherDemandedSurfaces
+        _ = diagnostics.publisherPreparedFrames
         _ = diagnostics.publisherBatchStartGap
         _ = diagnostics.publisherFramedReceiveBatchStartGap
         _ = diagnostics.publisherMessageReceiveToSurfaceReady
@@ -46,11 +59,11 @@ struct PublicAPIConsumer {
         _ = diagnostics.publisherFlushSchedulingDelay
         _ = diagnostics.publisherSnapshotDuration
         _ = diagnostics.publisherEmitDuration
-        _ = diagnostics.mailboxFramesSent
-        _ = diagnostics.mailboxFramesDelivered
-        _ = diagnostics.mailboxFramesCoalesced
-        _ = diagnostics.mailboxFramesEvicted
-        _ = diagnostics.mailboxFrameQueueDelay
+        _ = diagnostics.desktopDeliveredSnapshots
+        _ = diagnostics.desktopStreamCoalesces
+        _ = diagnostics.desktopHandlerDeliveries
+        _ = diagnostics.desktopSubscriptions
+        _ = diagnostics.desktopVisibleSubscriptions
         _ = diagnostics.videoDecoderSessionCreations
         _ = diagnostics.videoHardwareSessions
         _ = diagnostics.videoSoftwareSessions
@@ -58,6 +71,13 @@ struct PublicAPIConsumer {
         _ = diagnostics.videoDecodedFrames
         _ = diagnostics.videoDroppedFrames
         _ = diagnostics.videoCPUMaterializations
+        _ = diagnostics.mjpegDecoderHandleCreations
+        _ = diagnostics.mjpegDecodedFrames
+        _ = diagnostics.mjpegIOSurfaceFrames
+        _ = diagnostics.mjpegDataFallbacks
+        _ = diagnostics.mjpegIOSurfaceAllocations
+        _ = diagnostics.mjpegPeakBuffersInUse
+        _ = diagnostics.mjpegPeakConcurrentDecodes
         _ = diagnostics.advancedCPUFallbackFrames
         _ = diagnostics.metalGenerationDisableCount
         _ = diagnostics.firstMetalGenerationDisableReason
@@ -71,26 +91,26 @@ struct PublicAPIConsumer {
         _ = diagnostics.ioSurfaceDimensionMismatchFallbackFrames
         _ = diagnostics.pixelFormatMismatchFallbackFrames
         _ = diagnostics.textureCreationFailedFallbackFrames
+        _ = diagnostics.metalCommandFailureFallbackFrames
         _ = diagnostics.lastCPUFallbackReason
         _ = diagnostics.metalFramesSupersededBeforeDraw
         _ = diagnostics.metalDrawableMisses
         _ = diagnostics.metalCommandCreationFailures
+        _ = diagnostics.metalCommandBuffersCommitted
+        _ = diagnostics.metalTextureCacheHits
+        _ = diagnostics.metalTextureCacheMisses
+        _ = diagnostics.metalTextureCacheEvictions
+        _ = diagnostics.metalGPUBusySkips
+        _ = diagnostics.desktopDisplayLinkWakeups
+        _ = diagnostics.desktopDisplayLinkTicks
+        _ = diagnostics.desktopDisplayLinkIdlePauses
         let timing: SpiceTimingSummary = diagnostics.viewUpdateToMetalCommit
         requireSendable(timing)
         _ = timing.sampleCount
         _ = timing.p95Milliseconds
         _ = timing.maximumMilliseconds
         _ = diagnostics.metalCommitToCompletion
-
-        let presentation: SpicePresentationMetrics =
-            session.presentationDiagnostics.snapshot()
-        requireSendable(presentation)
-        let _: Bool = presentation == .empty
-        _ = presentation.metalFramesSupersededBeforeDraw
-        _ = presentation.metalDrawableMisses
-        _ = presentation.metalCommandCreationFailures
-        _ = presentation.viewUpdateToMetalCommit
-        _ = presentation.metalCommitToCompletion
+        _ = diagnostics.metalRequestToPresented
 
         let agentManager = SpiceAgentManager()
         let agentDiagnostics: SpiceAgentWireDiagnostics =

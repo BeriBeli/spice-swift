@@ -1,5 +1,246 @@
 import Foundation
 import SpiceRenderer
+import Synchronization
+
+package struct DisplaySurfaceKey: Sendable, Hashable {
+    package let channelID: UInt8
+    package let surfaceID: UInt32
+
+    package init(channelID: UInt8, surfaceID: UInt32) {
+        self.channelID = channelID
+        self.surfaceID = surfaceID
+    }
+}
+
+package enum DisplayFrameDemandEvent: Sendable {
+    case demandChanged(surfaceID: UInt32, isDemanded: Bool)
+    case frameConsumed(SurfaceRevision)
+}
+
+/// Thread-safe bridge between public desktop subscriptions and Display
+/// channels. It contains demand and acknowledgements only; no frame lease is
+/// retained at this layer.
+package final class DisplayFrameDemandCoordinator: Sendable {
+    package typealias Handler = @Sendable (DisplayFrameDemandEvent) -> Void
+    package typealias DemandMutationHook = @Sendable (
+        DisplaySurfaceKey,
+        UInt64,
+        Bool
+    ) -> Void
+
+    private struct HandlerRecord: Sendable {
+        let channelID: UInt8
+        let handler: Handler
+    }
+
+    private struct PendingDelivery: Sendable {
+        let sequence: UInt64
+        let handlerID: UInt64
+        let event: DisplayFrameDemandEvent
+    }
+
+    private struct State: Sendable {
+        var subscribersBySurface: [DisplaySurfaceKey: Set<UInt64>] = [:]
+        var handlers: [UInt64: HandlerRecord] = [:]
+        var nextHandlerID: UInt64 = 0
+        var pendingDeliveries: [PendingDelivery] = []
+        var pendingDeliveryIndex = 0
+        var nextDeliverySequence: UInt64 = 0
+    }
+
+    private let state = Mutex(State())
+    private let callbackLock = DisplayFrameDemandCallbackLock()
+    private let beforeDemandMutation: DemandMutationHook?
+    private let afterDemandMutation: DemandMutationHook?
+
+    package init(
+        beforeDemandMutation: DemandMutationHook? = nil,
+        afterDemandMutation: DemandMutationHook? = nil
+    ) {
+        self.beforeDemandMutation = beforeDemandMutation
+        self.afterDemandMutation = afterDemandMutation
+    }
+
+    package func setDemand(
+        for key: DisplaySurfaceKey,
+        subscriberID: UInt64,
+        isDemanded: Bool
+    ) {
+        let dispatch = prepareDemandChange(
+            for: key,
+            subscriberID: subscriberID,
+            isDemanded: isDemanded
+        )
+        afterDemandMutation?(key, subscriberID, isDemanded)
+        dispatch.deliver()
+    }
+
+    /// Commits one demand mutation to the coordinator's total event order
+    /// without invoking handlers. `SpiceDesktopSource` uses this while its own
+    /// state lock is held, then drains only after unlocking so subscription
+    /// state and coordinator demand cannot be observed in opposite orders.
+    package func prepareDemandChange(
+        for key: DisplaySurfaceKey,
+        subscriberID: UInt64,
+        isDemanded: Bool
+    ) -> DisplayFrameDemandDispatch {
+        beforeDemandMutation?(key, subscriberID, isDemanded)
+        state.withLock { state in
+            let wasDemanded = !(state.subscribersBySurface[key]?.isEmpty ?? true)
+            if isDemanded {
+                state.subscribersBySurface[key, default: []].insert(subscriberID)
+            } else {
+                state.subscribersBySurface[key]?.remove(subscriberID)
+                if state.subscribersBySurface[key]?.isEmpty == true {
+                    state.subscribersBySurface.removeValue(forKey: key)
+                }
+            }
+            let nowDemanded = !(state.subscribersBySurface[key]?.isEmpty ?? true)
+            guard wasDemanded != nowDemanded else { return }
+            let handlerIDs = state.handlers.compactMap { identifier, record in
+                record.channelID == key.channelID ? identifier : nil
+            }
+            Self.enqueue(
+                .demandChanged(surfaceID: key.surfaceID, isDemanded: nowDemanded),
+                for: handlerIDs,
+                state: &state
+            )
+        }
+        return DisplayFrameDemandDispatch(coordinator: self)
+    }
+
+    package func acknowledge(channelID: UInt8, revision: SurfaceRevision) {
+        state.withLock { state in
+            let handlerIDs = state.handlers.compactMap { identifier, record in
+                record.channelID == channelID ? identifier : nil
+            }
+            Self.enqueue(
+                .frameConsumed(revision),
+                for: handlerIDs,
+                state: &state
+            )
+        }
+        drain()
+    }
+
+    package func register(
+        channelID: UInt8,
+        handler: @escaping Handler
+    ) -> DisplayFrameDemandRegistration {
+        let identifier = state.withLock { state -> UInt64 in
+            let identifier = state.nextHandlerID
+            state.nextHandlerID &+= 1
+            state.handlers[identifier] = HandlerRecord(
+                channelID: channelID,
+                handler: handler
+            )
+            let demandedSurfaces = state.subscribersBySurface.keys.compactMap { key in
+                key.channelID == channelID ? key.surfaceID : nil
+            }.sorted()
+            for surfaceID in demandedSurfaces {
+                Self.enqueue(
+                    .demandChanged(surfaceID: surfaceID, isDemanded: true),
+                    for: [identifier],
+                    state: &state
+                )
+            }
+            return identifier
+        }
+        drain()
+        return DisplayFrameDemandRegistration { [weak self] in
+            self?.removeHandler(identifier)
+        }
+    }
+
+    private func removeHandler(_ identifier: UInt64) {
+        _ = state.withLock { state in
+            state.handlers.removeValue(forKey: identifier)
+        }
+    }
+
+    fileprivate func drain() {
+        callbackLock.withLock {
+            while let (handler, event) = nextDelivery() {
+                handler(event)
+            }
+        }
+    }
+
+    private func nextDelivery() -> (Handler, DisplayFrameDemandEvent)? {
+        state.withLock { state in
+            while state.pendingDeliveryIndex < state.pendingDeliveries.count {
+                let pending = state.pendingDeliveries[state.pendingDeliveryIndex]
+                state.pendingDeliveryIndex += 1
+                if state.pendingDeliveryIndex == state.pendingDeliveries.count {
+                    state.pendingDeliveries.removeAll(keepingCapacity: true)
+                    state.pendingDeliveryIndex = 0
+                }
+                if let record = state.handlers[pending.handlerID] {
+                    return (record.handler, pending.event)
+                }
+            }
+            return nil
+        }
+    }
+
+    private static func enqueue(
+        _ event: DisplayFrameDemandEvent,
+        for handlerIDs: [UInt64],
+        state: inout State
+    ) {
+        for handlerID in handlerIDs.sorted() {
+            let sequence = state.nextDeliverySequence
+            state.nextDeliverySequence &+= 1
+            state.pendingDeliveries.append(PendingDelivery(
+                sequence: sequence,
+                handlerID: handlerID,
+                event: event
+            ))
+        }
+    }
+}
+
+package struct DisplayFrameDemandDispatch: Sendable {
+    private let coordinator: DisplayFrameDemandCoordinator
+
+    fileprivate init(coordinator: DisplayFrameDemandCoordinator) {
+        self.coordinator = coordinator
+    }
+
+    package func deliver() {
+        coordinator.drain()
+    }
+}
+
+private final class DisplayFrameDemandCallbackLock: @unchecked Sendable {
+    private let lock = NSRecursiveLock()
+
+    func withLock(_ operation: () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        operation()
+    }
+}
+
+package final class DisplayFrameDemandRegistration: Sendable {
+    private let cancellation: Mutex<(@Sendable () -> Void)?>
+
+    fileprivate init(cancellation: @escaping @Sendable () -> Void) {
+        self.cancellation = Mutex(cancellation)
+    }
+
+    package func cancel() {
+        let action = cancellation.withLock { action in
+            defer { action = nil }
+            return action
+        }
+        action?()
+    }
+
+    deinit {
+        cancel()
+    }
+}
 
 package struct DisplayFrameSourceTiming: Sendable, Equatable {
     package let messageReceivedAt: ContinuousClock.Instant
@@ -25,6 +266,11 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var pendingSurfaces: Int
     package var flushes: UInt64
     package var flushesWithoutEmission: UInt64
+    package var demandSuppressedSubmissions: UInt64
+    package var pendingRevisionCoalesces: UInt64
+    package var preparedFrameCoalesces: UInt64
+    package var demandedSurfaces: Int
+    package var preparedFrames: Int
     package var batchStartGap = SpiceTimingHistogram()
     package var framedReceiveBatchStartGap = SpiceTimingHistogram()
     package var messageReceiveToSurfaceReady = SpiceTimingHistogram()
@@ -45,6 +291,11 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         pendingSurfaces: Int = 0,
         flushes: UInt64 = 0,
         flushesWithoutEmission: UInt64 = 0,
+        demandSuppressedSubmissions: UInt64 = 0,
+        pendingRevisionCoalesces: UInt64 = 0,
+        preparedFrameCoalesces: UInt64 = 0,
+        demandedSurfaces: Int = 0,
+        preparedFrames: Int = 0,
         batchStartGap: SpiceTimingHistogram = .init(),
         framedReceiveBatchStartGap: SpiceTimingHistogram = .init(),
         messageReceiveToSurfaceReady: SpiceTimingHistogram = .init(),
@@ -64,6 +315,11 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         self.pendingSurfaces = pendingSurfaces
         self.flushes = flushes
         self.flushesWithoutEmission = flushesWithoutEmission
+        self.demandSuppressedSubmissions = demandSuppressedSubmissions
+        self.pendingRevisionCoalesces = pendingRevisionCoalesces
+        self.preparedFrameCoalesces = preparedFrameCoalesces
+        self.demandedSurfaces = demandedSurfaces
+        self.preparedFrames = preparedFrames
         self.batchStartGap = batchStartGap
         self.framedReceiveBatchStartGap = framedReceiveBatchStartGap
         self.messageReceiveToSurfaceReady = messageReceiveToSurfaceReady
@@ -85,6 +341,11 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
         pendingSurfaces += other.pendingSurfaces
         flushes &+= other.flushes
         flushesWithoutEmission &+= other.flushesWithoutEmission
+        demandSuppressedSubmissions &+= other.demandSuppressedSubmissions
+        pendingRevisionCoalesces &+= other.pendingRevisionCoalesces
+        preparedFrameCoalesces &+= other.preparedFrameCoalesces
+        demandedSurfaces += other.demandedSurfaces
+        preparedFrames += other.preparedFrames
         batchStartGap.accumulate(other.batchStartGap)
         framedReceiveBatchStartGap.accumulate(other.framedReceiveBatchStartGap)
         messageReceiveToSurfaceReady.accumulate(other.messageReceiveToSurfaceReady)
@@ -107,6 +368,8 @@ package actor DisplayFramePublisher {
 
     private let interval: Duration
     private let maximumPendingSurfaces: Int
+    private let requiresExplicitDemand: Bool
+    private let waitsForConsumption: Bool
     private let snapshot: Snapshot
     private let emit: Emit
     private let clock = ContinuousClock()
@@ -114,6 +377,10 @@ package actor DisplayFramePublisher {
     private var order: [UInt32] = []
     private var invalidationGenerations: [UInt32: UInt64] = [:]
     private var lastEmittedRevisions: [UInt32: SurfaceRevision] = [:]
+    private var latestSubmittedRevisions: [UInt32: SurfaceRevision] = [:]
+    private var demandedSurfaces: Set<UInt32> = []
+    private var preparedRevisions: [UInt32: SurfaceRevision] = [:]
+    private var forceFullDamage: Set<UInt32> = []
     private var flushTask: Task<Void, Never>?
     private var isFlushing = false
     private var isCancelled = false
@@ -130,6 +397,9 @@ package actor DisplayFramePublisher {
     private var pendingEvictions: UInt64 = 0
     private var flushes: UInt64 = 0
     private var flushesWithoutEmission: UInt64 = 0
+    private var demandSuppressedSubmissions: UInt64 = 0
+    private var pendingRevisionCoalesces: UInt64 = 0
+    private var preparedFrameCoalesces: UInt64 = 0
     private var batchStartGap = SpiceTimingHistogram()
     private var framedReceiveBatchStartGap = SpiceTimingHistogram()
     private var messageReceiveToSurfaceReady = SpiceTimingHistogram()
@@ -142,11 +412,15 @@ package actor DisplayFramePublisher {
     package init(
         interval: Duration = .milliseconds(16),
         maximumPendingSurfaces: Int = 16,
+        requiresExplicitDemand: Bool = false,
+        waitsForConsumption: Bool = false,
         snapshot: @escaping Snapshot,
         emit: @escaping Emit
     ) {
         self.interval = interval
         self.maximumPendingSurfaces = max(1, maximumPendingSurfaces)
+        self.requiresExplicitDemand = requiresExplicitDemand
+        self.waitsForConsumption = waitsForConsumption
         self.snapshot = snapshot
         self.emit = emit
     }
@@ -167,6 +441,17 @@ package actor DisplayFramePublisher {
         }
         guard !isCancelled else { return }
         let surfaceID = surfaceRevision.surfaceID
+        if let latest = latestSubmittedRevisions[surfaceID],
+           isNewer(latest, than: surfaceRevision)
+        {
+            return
+        }
+        latestSubmittedRevisions[surfaceID] = surfaceRevision
+        if !requiresExplicitDemand {
+            demandedSurfaces.insert(surfaceID)
+        } else if !demandedSurfaces.contains(surfaceID) {
+            demandSuppressedSubmissions &+= 1
+        }
         if let lastEmitted = lastEmittedRevisions[surfaceID],
            !isNewer(surfaceRevision, than: lastEmitted)
         {
@@ -203,6 +488,11 @@ package actor DisplayFramePublisher {
                 pendingEvictions &+= 1
             }
             order.append(surfaceID)
+        } else {
+            pendingRevisionCoalesces &+= 1
+        }
+        if preparedRevisions[surfaceID] != nil {
+            preparedFrameCoalesces &+= 1
         }
         pending[surfaceID] = Request(
             surfaceRevision: surfaceRevision,
@@ -214,7 +504,7 @@ package actor DisplayFramePublisher {
 
     private func scheduleFlushIfNeeded() {
         guard !isCancelled,
-              !pending.isEmpty,
+              pending.keys.contains(where: canPrepare),
               flushTask == nil,
               !isFlushing
         else {
@@ -239,8 +529,62 @@ package actor DisplayFramePublisher {
     package func remove(surfaceID: UInt32) {
         invalidationGenerations[surfaceID, default: 0] &+= 1
         lastEmittedRevisions.removeValue(forKey: surfaceID)
+        latestSubmittedRevisions.removeValue(forKey: surfaceID)
         pending.removeValue(forKey: surfaceID)
         order.removeAll { $0 == surfaceID }
+        // Desktop demand belongs to the selected surface identity, not to one
+        // server-side create/destroy lifetime. Keep explicit demand across a
+        // same-ID recreation; otherwise a visible subscriber would never
+        // receive the recreated surface until it toggled visibility.
+        if !requiresExplicitDemand {
+            demandedSurfaces.remove(surfaceID)
+        }
+        preparedRevisions.removeValue(forKey: surfaceID)
+        forceFullDamage.remove(surfaceID)
+    }
+
+    package func setDemand(surfaceID: UInt32, isDemanded: Bool) {
+        guard !isCancelled else { return }
+        if isDemanded {
+            demandedSurfaces.insert(surfaceID)
+            scheduleFlushIfNeeded()
+        } else {
+            demandedSurfaces.remove(surfaceID)
+            if preparedRevisions.removeValue(forKey: surfaceID) != nil {
+                forceFullDamage.insert(surfaceID)
+            }
+            // Preserve a full redraw request even when the canonical surface
+            // does not mutate while hidden. Resume must publish one fresh
+            // authoritative lease instead of replaying a retained UI frame.
+            if let latest = latestSubmittedRevisions[surfaceID] {
+                let request = Request(
+                    surfaceRevision: latest,
+                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0
+                )
+                if pending[surfaceID] == nil {
+                    if pending.count >= maximumPendingSurfaces, let oldest = order.first {
+                        pending.removeValue(forKey: oldest)
+                        order.removeFirst()
+                        pendingEvictions &+= 1
+                    }
+                    order.append(surfaceID)
+                }
+                pending[surfaceID] = request
+                forceFullDamage.insert(surfaceID)
+            }
+        }
+    }
+
+    package func acknowledge(_ revision: SurfaceRevision) {
+        guard waitsForConsumption,
+              let prepared = preparedRevisions[revision.surfaceID],
+              prepared.lifecycleGeneration == revision.lifecycleGeneration,
+              revision.revision >= prepared.revision
+        else {
+            return
+        }
+        preparedRevisions.removeValue(forKey: revision.surfaceID)
+        scheduleFlushIfNeeded()
     }
 
     package func flushNow() async {
@@ -262,6 +606,10 @@ package actor DisplayFramePublisher {
         pending.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
         lastEmittedRevisions.removeAll(keepingCapacity: false)
+        latestSubmittedRevisions.removeAll(keepingCapacity: false)
+        demandedSurfaces.removeAll(keepingCapacity: false)
+        preparedRevisions.removeAll(keepingCapacity: false)
+        forceFullDamage.removeAll(keepingCapacity: false)
     }
 
     package func metrics() -> DisplayFramePublisherMetrics {
@@ -276,6 +624,11 @@ package actor DisplayFramePublisher {
             pendingSurfaces: pending.count,
             flushes: flushes,
             flushesWithoutEmission: flushesWithoutEmission,
+            demandSuppressedSubmissions: demandSuppressedSubmissions,
+            pendingRevisionCoalesces: pendingRevisionCoalesces,
+            preparedFrameCoalesces: preparedFrameCoalesces,
+            demandedSurfaces: demandedSurfaces.count,
+            preparedFrames: preparedRevisions.count,
             batchStartGap: batchStartGap,
             framedReceiveBatchStartGap: framedReceiveBatchStartGap,
             messageReceiveToSurfaceReady: messageReceiveToSurfaceReady,
@@ -303,9 +656,13 @@ package actor DisplayFramePublisher {
         lastFlushStart = flushStartedAt
         flushes &+= 1
         let emittedAtFlushStart = emittedFrames
-        let requests = order.compactMap { pending[$0] }
-        pending.removeAll(keepingCapacity: true)
-        order.removeAll(keepingCapacity: true)
+        let eligibleSurfaceIDs = order.filter(canPrepare)
+        let requests = eligibleSurfaceIDs.compactMap { pending[$0] }
+        for surfaceID in eligibleSurfaceIDs {
+            pending.removeValue(forKey: surfaceID)
+        }
+        let eligibleSet = Set(eligibleSurfaceIDs)
+        order.removeAll { eligibleSet.contains($0) }
         flushTask = nil
 
         for request in requests {
@@ -318,8 +675,12 @@ package actor DisplayFramePublisher {
             }
             snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
             guard generation == flushGeneration else { return }
-            guard isCurrent(request), frameCovers(frame, request: request) else {
+            guard isCurrent(request),
+                  canPrepare(request.surfaceRevision.surfaceID),
+                  frameCovers(frame, request: request)
+            else {
                 staleSnapshots &+= 1
+                forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
             }
             let replacement = pending[request.surfaceRevision.surfaceID]
@@ -340,6 +701,7 @@ package actor DisplayFramePublisher {
                 // The surface advanced beyond every revision this publisher
                 // observed. Wait for its commit event instead of publishing a
                 // possible intermediate state from a multi-rectangle command.
+                forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
             }
             if replacement != nil {
@@ -350,8 +712,20 @@ package actor DisplayFramePublisher {
                 // A different revision from this lifecycle that is not covered
                 // remains pending; it does not invalidate the immutable snapshot.
             }
+            var publishedFrame = frame
+            if forceFullDamage.remove(frame.surfaceID) != nil {
+                var fullDamage = SurfaceDamageJournal(
+                    width: frame.width,
+                    height: frame.height
+                )
+                fullDamage.markFull()
+                publishedFrame = frame.withPublicationDamage(fullDamage)
+            }
+            if waitsForConsumption {
+                preparedRevisions[frame.surfaceID] = frame.surfaceRevision
+            }
             let emitStartedAt = clock.now
-            await emit(frame)
+            await emit(publishedFrame)
             emitDuration.record(emitStartedAt.duration(to: clock.now))
             guard generation == flushGeneration else { return }
             if isCurrent(request) {
@@ -379,6 +753,11 @@ package actor DisplayFramePublisher {
     private func isCurrent(_ request: Request) -> Bool {
         (invalidationGenerations[request.surfaceRevision.surfaceID] ?? 0)
             == request.invalidationGeneration
+    }
+
+    private func canPrepare(_ surfaceID: UInt32) -> Bool {
+        demandedSurfaces.contains(surfaceID)
+            && (!waitsForConsumption || preparedRevisions[surfaceID] == nil)
     }
 
     private func frameCovers(_ frame: FrameSnapshot, request: Request) -> Bool {

@@ -18,9 +18,33 @@ package struct DisplayChannelDiagnostics: Sendable, Equatable {
     package let surfaces: SurfaceStoreMetrics
     package let publisher: DisplayFramePublisherMetrics
     package let advancedVideo: SpiceAdvancedVideoDecoderDiagnostics
+    package let mjpeg: DisplayMJPEGDiagnostics
     package let advancedCPUFallbackFrames: UInt64
     package let metalGenerationDisableCount: UInt64
     package let firstMetalGenerationDisableReason: String?
+}
+
+package struct DisplayMJPEGDiagnostics: Sendable, Equatable {
+    package var handleCreations: UInt64 = 0
+    package var decodedFrames: UInt64 = 0
+    package var ioSurfaceFrames: UInt64 = 0
+    package var dataFallbacks: UInt64 = 0
+    package var ioSurfaceAllocations: UInt64 = 0
+    package var peakBuffersInUse: Int = 0
+    package var peakConcurrentDecodes: Int = 0
+
+    package mutating func accumulate(_ diagnostics: SpiceMJPEGDecoderDiagnostics) {
+        handleCreations &+= diagnostics.handleCreationCount
+        decodedFrames &+= diagnostics.decodedFrameCount
+        ioSurfaceFrames &+= diagnostics.ioSurfaceFrameCount
+        dataFallbacks &+= diagnostics.dataFallbackCount
+        ioSurfaceAllocations &+= diagnostics.ioSurfaceAllocationCount
+        peakBuffersInUse = max(peakBuffersInUse, diagnostics.peakBuffersInUse)
+        peakConcurrentDecodes = max(
+            peakConcurrentDecodes,
+            diagnostics.decodeLimiter.peakDecodeCount
+        )
+    }
 }
 
 package actor DisplayChannel: SpiceManagedChannel {
@@ -55,6 +79,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         let destination: SpiceRect
         let codec: SpiceVideoCodec
         var advancedDecoder: (any SpiceAdvancedVideoDecoder)?
+        var mjpegDecoder: SpiceMJPEGStreamDecoder?
         var clip: SpiceClip
         var nextFrameSequence: UInt64
         var lastPresentedSequence: UInt64
@@ -71,12 +96,15 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let paletteLZDecoder: any SpicePaletteImageDecoder
     private let quicDecoder: any SpiceImageDecoder
     private let advancedVideoDecoderFactory: any SpiceAdvancedVideoDecoderFactory
+    private let mjpegDecodeLimiter: SpiceMJPEGDecodeLimiter
+    private let usesInjectedJPEGDecoder: Bool
     private let multimediaClock: (any MultimediaClockScheduling)?
     private let maximumCachedPalettes: Int
     private let maximumCachedImages: Int
     private let maximumCachedImageBytes: Int
     private let maximumStreams: Int
     private let framePublicationInterval: Duration
+    private let frameDemandCoordinator: DisplayFrameDemandCoordinator?
     private var palettes: [UInt64: SpiceLZPalette] = [:]
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
@@ -89,6 +117,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var currentMessageReceivedAt: ContinuousClock.Instant?
     private var completedFrameSourceTiming: DisplayFrameSourceTiming?
     private var retiredAdvancedVideoDiagnostics = SpiceAdvancedVideoDecoderDiagnostics()
+    private var retiredMJPEGDiagnostics = DisplayMJPEGDiagnostics()
     private var advancedCPUFallbackFrames: UInt64 = 0
     private var metalGenerationDisableCount: UInt64 = 0
     private var firstMetalGenerationDisableReason: String?
@@ -108,7 +137,9 @@ package actor DisplayChannel: SpiceManagedChannel {
         maximumCachedImages: Int = 256,
         maximumCachedImageBytes: Int = 256 * 1_024 * 1_024,
         maximumStreams: Int = 64,
-        framePublicationInterval: Duration = .milliseconds(16)
+        framePublicationInterval: Duration = .milliseconds(16),
+        frameDemandCoordinator: DisplayFrameDemandCoordinator? = nil,
+        mjpegDecodeLimiter: SpiceMJPEGDecodeLimiter = .init(maximumConcurrent: 2)
     ) {
         self.connection = connection
         self.surfaces = surfaces
@@ -119,12 +150,15 @@ package actor DisplayChannel: SpiceManagedChannel {
         self.paletteLZDecoder = paletteLZDecoder
         self.quicDecoder = quicDecoder
         self.advancedVideoDecoderFactory = advancedVideoDecoderFactory
+        usesInjectedJPEGDecoder = !(jpegDecoder is SpiceJPEGDecoder)
         self.multimediaClock = multimediaClock
         self.maximumCachedPalettes = max(1, maximumCachedPalettes)
         self.maximumCachedImages = max(1, maximumCachedImages)
         self.maximumCachedImageBytes = max(1, maximumCachedImageBytes)
         self.maximumStreams = min(64, max(1, maximumStreams))
         self.framePublicationInterval = framePublicationInterval
+        self.frameDemandCoordinator = frameDemandCoordinator
+        self.mjpegDecodeLimiter = mjpegDecodeLimiter
     }
 
     package func run(
@@ -137,15 +171,45 @@ package actor DisplayChannel: SpiceManagedChannel {
             glzDictionaryWindowSize: Self.glzDictionaryWindowPixels
         ))
         let framePublisher = DisplayFramePublisher(
-            interval: framePublicationInterval,
+            interval: frameDemandCoordinator == nil ? framePublicationInterval : .zero,
+            requiresExplicitDemand: frameDemandCoordinator != nil,
+            waitsForConsumption: frameDemandCoordinator != nil,
             snapshot: { [surfaces] surfaceRevision in
-                await surfaces.snapshot(atLeast: surfaceRevision)
+                await surfaces.publicationSnapshot(atLeast: surfaceRevision)
             },
             emit: { frame in
                 await emit(.frame(frame))
             }
         )
         framePublishers[ObjectIdentifier(framePublisher)] = framePublisher
+        let demandPipe = AsyncStream.makeStream(
+            of: DisplayFrameDemandEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let demandTask = Task {
+            for await event in demandPipe.stream {
+                guard !Task.isCancelled else { return }
+                switch event {
+                case let .demandChanged(surfaceID, isDemanded):
+                    await framePublisher.setDemand(
+                        surfaceID: surfaceID,
+                        isDemanded: isDemanded
+                    )
+                case let .frameConsumed(revision):
+                    await framePublisher.acknowledge(revision)
+                }
+            }
+        }
+        let demandRegistration = frameDemandCoordinator?.register(
+            channelID: connection.key.id
+        ) { event in
+            _ = demandPipe.continuation.yield(event)
+        }
+        defer {
+            demandRegistration?.cancel()
+            demandPipe.continuation.finish()
+            demandTask.cancel()
+        }
         do {
             while !Task.isCancelled {
                 let event = try await processNext()
@@ -215,6 +279,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
                 await retireAdvancedDecoder(stream.advancedDecoder)
+                await retireMJPEGDecoder(stream.mjpegDecoder)
             }
             try await acknowledgeIfNeeded()
             return .surfaceDestroyed(destroy.surfaceID)
@@ -224,6 +289,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
                 await retireAdvancedDecoder(stream.advancedDecoder)
+                await retireMJPEGDecoder(stream.mjpegDecoder)
             }
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
@@ -285,6 +351,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation("destroy of unknown stream \(streamID)")
             }
             await retireAdvancedDecoder(removed.advancedDecoder)
+            await retireMJPEGDecoder(removed.mjpegDecoder)
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case .displayStreamDestroyAll:
@@ -292,6 +359,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
                 await retireAdvancedDecoder(stream.advancedDecoder)
+                await retireMJPEGDecoder(stream.mjpegDecoder)
             }
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
@@ -381,6 +449,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         streams.removeAll(keepingCapacity: false)
         for stream in removedStreams {
             await retireAdvancedDecoder(stream.advancedDecoder)
+            await retireMJPEGDecoder(stream.mjpegDecoder)
         }
         await surfaces.close()
     }
@@ -396,10 +465,16 @@ package actor DisplayChannel: SpiceManagedChannel {
         for publisher in activePublishers {
             publisherMetrics.accumulate(await publisher.metrics())
         }
+        var mjpeg = retiredMJPEGDiagnostics
+        let activeMJPEGDecoders = streams.values.compactMap(\.mjpegDecoder)
+        for decoder in activeMJPEGDecoders {
+            mjpeg.accumulate(await decoder.diagnosticsSnapshot())
+        }
         return DisplayChannelDiagnostics(
             surfaces: await surfaces.metrics(),
             publisher: publisherMetrics,
             advancedVideo: advancedVideo,
+            mjpeg: mjpeg,
             advancedCPUFallbackFrames: advancedCPUFallbackFrames,
             metalGenerationDisableCount: metalGenerationDisableCount,
             firstMetalGenerationDisableReason: firstMetalGenerationDisableReason
@@ -445,6 +520,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         _ = try clippedRectangles(destination: create.destination, clip: create.clip)
 
         let advancedDecoder: (any SpiceAdvancedVideoDecoder)?
+        let mjpegDecoder: SpiceMJPEGStreamDecoder?
         do {
             switch create.codec {
             case .h264:
@@ -459,11 +535,18 @@ package actor DisplayChannel: SpiceManagedChannel {
                     width: streamWidth,
                     height: streamHeight
                 )
+            case .mjpeg:
+                advancedDecoder = nil
             default:
                 advancedDecoder = nil
             }
-        } catch let error {
-            throw .protocolViolation("advanced video decoder creation failed: \(error.description)")
+            if create.codec == .mjpeg, !usesInjectedJPEGDecoder {
+                mjpegDecoder = try SpiceMJPEGStreamDecoder(limiter: mjpegDecodeLimiter)
+            } else {
+                mjpegDecoder = nil
+            }
+        } catch {
+            throw Self.channelError(for: error)
         }
 
         let generation = nextStreamGeneration
@@ -484,6 +567,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             destination: create.destination,
             codec: create.codec,
             advancedDecoder: advancedDecoder,
+            mjpegDecoder: mjpegDecoder,
             clip: create.clip,
             nextFrameSequence: 0,
             lastPresentedSequence: 0,
@@ -554,10 +638,33 @@ package actor DisplayChannel: SpiceManagedChannel {
         let decodedFrame: any SpiceDecodedVideoFrame
         do {
             if stream.codec == .mjpeg {
-                decodedFrame = try await jpegDecoder.decode(
-                    descriptor: SpiceCodecImageDescriptor(width: frameWidth, height: frameHeight),
-                    payload: data
+                let descriptor = SpiceCodecImageDescriptor(
+                    width: frameWidth,
+                    height: frameHeight
                 )
+                if let decoder = stream.mjpegDecoder {
+                    decodedFrame = try await decoder.decodeVideoFrame(
+                        descriptor: descriptor,
+                        payload: data
+                    )
+                } else {
+                    await mjpegDecodeLimiter.acquire()
+                    let result: Result<SpiceDecodedImage, SpiceCodecError>
+                    if Task.isCancelled {
+                        result = .failure(.cancelled)
+                    } else {
+                        do {
+                            result = .success(try await jpegDecoder.decode(
+                                descriptor: descriptor,
+                                payload: data
+                            ))
+                        } catch {
+                            result = .failure(error)
+                        }
+                    }
+                    await mjpegDecodeLimiter.release()
+                    decodedFrame = try result.get()
+                }
             } else {
                 guard let decoder = stream.advancedDecoder else {
                     throw SpiceCodecError.backendFailure("advanced stream has no decoder")
@@ -570,6 +677,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                 }
                 decodedFrame = advanced
             }
+        } catch let error as SpiceCodecError {
+            throw Self.channelError(for: error)
         } catch {
             throw .protocolViolation("video decode failed: \(String(describing: error))")
         }
@@ -617,7 +726,9 @@ package actor DisplayChannel: SpiceManagedChannel {
         )
         var usedNativeVideoPath = false
         var surfaceRevision: SurfaceRevision?
-        if stream.codec != .mjpeg, !stream.metalCompositorDisabled {
+        if (stream.codec != .mjpeg || decodedFrame is SpiceMJPEGFrame),
+           !stream.metalCompositorDisabled
+        {
             do {
                 surfaceRevision = try await surfaces.drawNativeVideoFrame(
                     surfaceID: stream.surfaceID,
@@ -698,6 +809,31 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard let decoder else { return }
         retiredAdvancedVideoDiagnostics.accumulate(await decoder.diagnosticsSnapshot())
         await decoder.close()
+    }
+
+    private func retireMJPEGDecoder(_ decoder: SpiceMJPEGStreamDecoder?) async {
+        guard let decoder else { return }
+        retiredMJPEGDiagnostics.accumulate(await decoder.diagnosticsSnapshot())
+        await decoder.close()
+    }
+
+    private nonisolated static func channelError(
+        for error: SpiceCodecError
+    ) -> ChannelError {
+        switch error {
+        case let .videoHardwareUnavailable(codec, status):
+            .videoCodecFailure(
+                codec: codec == .h264 ? .h264 : .h265,
+                reason: .hardwareUnavailable(status: status)
+            )
+        case let .unsupportedVideoFormat(codec, status):
+            .videoCodecFailure(
+                codec: codec == .h264 ? .h264 : .h265,
+                reason: .unsupportedFormat(status: status)
+            )
+        default:
+            .protocolViolation("video decode failed: \(error.description)")
+        }
     }
 
     private func retireFramePublisher(_ publisher: DisplayFramePublisher) async {

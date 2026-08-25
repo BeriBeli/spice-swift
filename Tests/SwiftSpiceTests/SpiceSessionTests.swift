@@ -6,11 +6,62 @@ import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
 @testable import SpiceProtocol
+@testable import SpiceRenderer
 @testable import SpiceWire
 @testable import SwiftSpice
 
 @Suite("SpiceSession bootstrap")
 struct SpiceSessionTests {
+    @Test func seamlessMigrationPreservesStaticDesktopWithoutNewDamage() async throws {
+        let source = SpiceDesktopSource()
+        source.beginSession(pointerMode: .absolute)
+        let subscription = source.subscribe()
+        subscription.setDemand(.visible)
+        defer { subscription.cancel() }
+        var updates = subscription.updates.makeAsyncIterator()
+        _ = await updates.next()
+
+        source.receiveFrame(FrameSnapshot(
+            surfaceID: 0,
+            width: 2,
+            height: 1,
+            bytesPerRow: 8,
+            lifecycleGeneration: 4,
+            revision: 9,
+            pixels: Data([1, 2, 3, 255, 4, 5, 6, 255]),
+            ioSurfaceFrame: nil
+        ), displayChannelID: 0)
+        let before = try #require(await updates.next())
+
+        // A seamless target reuses the active DisplayChannel and SurfaceStore;
+        // no create/draw command is required after the connection handoff.
+        source.beginSeamlessMigration(pointerMode: .relative)
+        let after = try #require(await updates.next())
+
+        #expect(after.generation > before.generation)
+        #expect(after.pointerMode == .relative)
+        #expect(after.frame?.revision == before.frame?.revision)
+        #expect(after.frame?.frame.pixels == before.frame?.frame.pixels)
+        #expect(after.frame?.damage == .full)
+    }
+
+    @Test func preservesStructuredVideoCodecFailures() {
+        #expect(SpiceSession.map(channelError: .videoCodecFailure(
+            codec: .h264,
+            reason: .hardwareUnavailable(status: -12_950)
+        )) == .videoCodecUnavailable(SpiceVideoCodecFailure(
+            codec: .h264,
+            reason: .hardwareUnavailable(status: -12_950)
+        )))
+        #expect(SpiceSession.map(channelError: .videoCodecFailure(
+            codec: .h265,
+            reason: .unsupportedFormat(status: -12_909)
+        )) == .videoCodecUnavailable(SpiceVideoCodecFailure(
+            codec: .h265,
+            reason: .unsupportedFormat(status: -12_909)
+        )))
+    }
+
     @Test func requestsClientMouseModeAndPublishesServerDecisions() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
@@ -21,6 +72,9 @@ struct SpiceSessionTests {
             transportFactory: { _ in transport },
             ticketEncryptor: SessionTicketEncryptor()
         )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
 
         let info = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -33,17 +87,18 @@ struct SpiceSessionTests {
         #expect(try decodeMiniMessageID(outbound[3]) == 105)
         #expect(try decodeMiniBody(outbound[3]) == Data([0x02, 0x00]))
         #expect(try decodeMiniMessageID(outbound[4]) == 104)
+        #expect(try #require(await desktopUpdates.next()).pointerMode == .relative)
 
-        var events = session.events.makeAsyncIterator()
         await transport.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 2)
         ))
-        #expect(await events.next() == .mouseMode(supported: 3, current: 2))
+        #expect(try #require(await desktopUpdates.next()).pointerMode == .absolute)
 
         await transport.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
         ))
-        #expect(await events.next() == .mouseMode(supported: 3, current: 1))
+        #expect(try #require(await desktopUpdates.next()).pointerMode == .relative)
+        desktop.cancel()
         await session.disconnect()
     }
 
@@ -347,9 +402,15 @@ struct SpiceSessionTests {
             transportFactory: { _ in transports.take() },
             ticketEncryptor: SessionTicketEncryptor()
         )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        let desktopTask = Task {
+            var iterator = desktop.updates.makeAsyncIterator()
+            return [await iterator.next(), await iterator.next()]
+        }
         let eventTask = Task {
             var iterator = session.events.makeAsyncIterator()
-            return [await iterator.next(), await iterator.next()]
+            return await iterator.next()
         }
 
         _ = try await session.connect(
@@ -357,12 +418,13 @@ struct SpiceSessionTests {
             credentials: SpiceCredentials(password: "secret")
         )
 
-        let events = await eventTask.value
-        #expect(events[0] == .mouseMode(supported: 3, current: 2))
-        guard case .failed = events[1] else {
+        let desktopSnapshots = await desktopTask.value.compactMap { $0 }
+        #expect(desktopSnapshots.last?.pointerMode == .absolute)
+        guard case .failed = await eventTask.value else {
             Issue.record("expected supervised Main failure")
             return
         }
+        desktop.cancel()
         #expect(await mainTransport.isClosed)
     }
 
@@ -1044,6 +1106,9 @@ struct SpiceSessionTests {
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
         var events = session.events.makeAsyncIterator()
         try await session.send(.keyDown(scanCode: 0x1e))
         await sourceInputs.waitForOutboundCount(3)
@@ -1064,21 +1129,14 @@ struct SpiceSessionTests {
         await source.enqueue(encodeMini(id: 112, body: Data()))
         #expect(await events.next() == .migration(.committing(offer)))
 
-        var sawCompletion = false
-        var sawTargetMouseMode = false
-        for _ in 0 ..< 2 {
-            switch await events.next() {
-            case let .migration(.completed(completedOffer)):
-                #expect(completedOffer == offer)
-                sawCompletion = true
-            case .mouseMode(supported: 7, current: 1):
-                sawTargetMouseMode = true
-            default:
-                Issue.record("unexpected post-adoption event")
-            }
+        #expect(await events.next() == .migration(.completed(offer)))
+        var targetPointerMode: SpicePointerMode?
+        for _ in 0..<4 {
+            guard let snapshot = await desktopUpdates.next() else { break }
+            targetPointerMode = snapshot.pointerMode
+            if targetPointerMode == .relative { break }
         }
-        #expect(sawCompletion)
-        #expect(sawTargetMouseMode)
+        #expect(targetPointerMode == .relative)
         // Runtime mouse-mode renegotiation adds a target-side
         // MAIN_MOUSE_MODE_REQUEST before the final MIGRATE_END acknowledgement.
         await target.waitForOutboundCount(5)
@@ -1088,6 +1146,7 @@ struct SpiceSessionTests {
         #expect(await target.isConnected)
         #expect(!(await sourceInputs.isConnected))
         #expect(await targetInputs.isConnected)
+        desktop.cancel()
         let targetInputLink = try decodeLinkRequest(
             try #require((await targetInputs.outbound).first)
         )
@@ -1331,6 +1390,9 @@ struct SpiceSessionTests {
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
         var events = session.events.makeAsyncIterator()
         await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
             host: "broken-target.example"
@@ -1354,8 +1416,9 @@ struct SpiceSessionTests {
         await source.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 2)
         ))
-        #expect(await events.next() == .mouseMode(supported: 3, current: 2))
+        #expect(try #require(await desktopUpdates.next()).pointerMode == .absolute)
         #expect(await session.currentAgentConnectionState() == false)
+        desktop.cancel()
         await session.disconnect()
     }
 
@@ -1371,6 +1434,9 @@ struct SpiceSessionTests {
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
         var events = session.events.makeAsyncIterator()
         await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
             host: "slow-target.example"
@@ -1387,7 +1453,14 @@ struct SpiceSessionTests {
         await source.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 1, currentMode: 1)
         ))
-        #expect(await events.next() == .mouseMode(supported: 1, current: 1))
+        var resumedPointerMode: SpicePointerMode?
+        for _ in 0..<4 {
+            guard let snapshot = await desktopUpdates.next() else { break }
+            resumedPointerMode = snapshot.pointerMode
+            if resumedPointerMode == .relative { break }
+        }
+        #expect(resumedPointerMode == .relative)
+        desktop.cancel()
         await session.disconnect()
     }
 

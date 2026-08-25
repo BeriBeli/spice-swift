@@ -1,10 +1,70 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import SpiceChannels
 @testable import SpiceRenderer
 
 @Suite("Display frame publisher")
 struct DisplayFramePublisherTests {
+    @Test func registrationSnapshotCannotOvertakeConcurrentDemandRemoval() async {
+        let initialHandlerEntered = DispatchSemaphore(value: 0)
+        let releaseInitialHandler = DispatchSemaphore(value: 0)
+        let removalPrepared = DispatchSemaphore(value: 0)
+        let removalHandlerEntered = DispatchSemaphore(value: 0)
+        let deliveredDemand = Mutex<[Bool]>([])
+        let key = DisplaySurfaceKey(channelID: 3, surfaceID: 9)
+        let coordinator = DisplayFrameDemandCoordinator(
+            afterDemandMutation: { _, _, isDemanded in
+                if !isDemanded {
+                    removalPrepared.signal()
+                }
+            }
+        )
+        coordinator.setDemand(for: key, subscriberID: 41, isDemanded: true)
+
+        let registrationTask = Task.detached {
+            coordinator.register(channelID: key.channelID) { event in
+                guard case let .demandChanged(_, isDemanded) = event else { return }
+                if isDemanded {
+                    initialHandlerEntered.signal()
+                    releaseInitialHandler.wait()
+                } else {
+                    removalHandlerEntered.signal()
+                }
+                deliveredDemand.withLock { $0.append(isDemanded) }
+            }
+        }
+        let initialEntered = await waitForDemandSemaphore(
+            initialHandlerEntered,
+            timeout: .seconds(1)
+        )
+        #expect(initialEntered == .success)
+
+        let removalTask = Task.detached {
+            coordinator.setDemand(for: key, subscriberID: 41, isDemanded: false)
+        }
+        #expect(await waitForDemandSemaphore(
+            removalPrepared,
+            timeout: .seconds(1)
+        ) == .success)
+        #expect(
+            await waitForDemandSemaphore(
+                removalHandlerEntered,
+                timeout: .milliseconds(50)
+            ) == .timedOut
+        )
+
+        releaseInitialHandler.signal()
+        let registration = await registrationTask.value
+        await removalTask.value
+        #expect(await waitForDemandSemaphore(
+            removalHandlerEntered,
+            timeout: .seconds(1)
+        ) == .success)
+        #expect(deliveredDemand.withLock { $0 } == [true, false])
+        registration.cancel()
+    }
+
     @Test func timingHistogramMergesWithoutRetainingIndividualSamples() {
         var first = SpiceTimingHistogram()
         first.record(.milliseconds(1))
@@ -121,6 +181,34 @@ struct DisplayFramePublisherTests {
         await publisher.flushNow()
 
         #expect(await observations.emittedRevisions == [recreated])
+    }
+
+    @Test func explicitDemandSurvivesSameIDSurfaceRecreation() async {
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            requiresExplicitDemand: true,
+            waitsForConsumption: true,
+            snapshot: { revision in
+                await observations.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        let original = surfaceRevision(surfaceID: 1, lifecycle: 1, revision: 4)
+        let recreated = surfaceRevision(surfaceID: 1, lifecycle: 2, revision: 0)
+
+        await publisher.setDemand(surfaceID: 1, isDemanded: true)
+        await publisher.submit(original)
+        await publisher.flushNow()
+        await publisher.acknowledge(original)
+        await publisher.remove(surfaceID: 1)
+        await publisher.submit(recreated)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [original, recreated])
+        #expect(await publisher.metrics().demandedSurfaces == 1)
     }
 
     @Test func updateDuringSnapshotEmitsCapturedRevisionThenLatestRevision() async {
@@ -331,6 +419,50 @@ struct DisplayFramePublisherTests {
         #expect(await publisher.metrics().pendingEvictions == 1)
     }
 
+    @Test func hiddenMutationsDoNotSnapshotAndResumePublishesOnlyLatestFullFrame() async {
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            requiresExplicitDemand: true,
+            waitsForConsumption: true,
+            snapshot: { revision in
+                await observations.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        let first = surfaceRevision(surfaceID: 1, revision: 1)
+        await publisher.setDemand(surfaceID: 1, isDemanded: true)
+        await publisher.submit(first)
+        await publisher.flushNow()
+        #expect(await observations.emittedRevisions == [first])
+        await publisher.acknowledge(first)
+
+        await publisher.setDemand(surfaceID: 1, isDemanded: false)
+        for revision in 2...1_001 {
+            await publisher.submit(surfaceRevision(surfaceID: 1, revision: UInt64(revision)))
+        }
+        await publisher.flushNow()
+
+        #expect(await observations.snapshotCount == 1)
+        var metrics = await publisher.metrics()
+        #expect(metrics.demandSuppressedSubmissions == 1_000)
+        #expect(metrics.pendingSurfaces == 1)
+        #expect(metrics.preparedFrames == 0)
+
+        await publisher.setDemand(surfaceID: 1, isDemanded: true)
+        await publisher.flushNow()
+        let latest = surfaceRevision(surfaceID: 1, revision: 1_001)
+        #expect(await observations.emittedRevisions == [first, latest])
+        #expect(await observations.emittedFullDamage == [true, true])
+        #expect(await observations.snapshotCount == 2)
+        metrics = await publisher.metrics()
+        #expect(metrics.pendingSurfaces == 0)
+        #expect(metrics.preparedFrames == 1)
+        #expect(metrics.pendingRevisionCoalesces >= 999)
+    }
+
     private func makePublisher(
         observations: FramePublisherObservations,
         maximumPendingSurfaces: Int = 16
@@ -372,6 +504,22 @@ struct DisplayFramePublisherTests {
     }
 }
 
+private func waitForDemandSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: DispatchTimeInterval
+) async -> DispatchTimeoutResult {
+    await Task.detached {
+        blockingWaitForDemandSemaphore(semaphore, timeout: timeout)
+    }.value
+}
+
+private func blockingWaitForDemandSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: DispatchTimeInterval
+) -> DispatchTimeoutResult {
+    semaphore.wait(timeout: .now() + timeout)
+}
+
 private actor FramePublisherObservations {
     private var shouldBlockNextSnapshot: Bool
     private var shouldBlockNextEmit: Bool
@@ -381,6 +529,7 @@ private actor FramePublisherObservations {
     private(set) var snapshotCount = 0
     private(set) var emitCount = 0
     private(set) var emittedRevisions: [SurfaceRevision] = []
+    private(set) var emittedFullDamage: [Bool] = []
 
     init(
         blockNextSnapshot: Bool = false,
@@ -429,6 +578,7 @@ private actor FramePublisherObservations {
             }
         }
         emittedRevisions.append(frame.surfaceRevision)
+        emittedFullDamage.append(frame.publicationDamage.isFullFrame)
     }
 
     func resumeEmit() {

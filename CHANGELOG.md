@@ -7,8 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-25
+
+### Added
+
+- Added the demand-driven `SpiceDesktopSource` subscription API with bounded
+  latest-only desktop snapshots, per-subscriber damage, lifecycle generations,
+  visibility demand, and unified frame, cursor, and pointer-mode state.
+- Added content-free diagnostics for desktop coalescing, suppressed snapshots,
+  display-link scheduling, texture reuse, GPU back-pressure, MJPEG allocation,
+  and hardware-codec session selection and failure classification.
+
 ### Changed
 
+- Replaced frame, surface, cursor, and mouse-mode session events with the
+  breaking desktop-source API; display commands now advance canonical surfaces
+  independently from snapshot and presentation demand.
+- Reworked macOS presentation around one-shot `NSView` display links, explicit
+  MTKView draws, cached IOSurface textures, and a single full-screen Metal pass.
+- Reused bounded MJPEG decoder and IOSurface resources with stream-only fast
+  DCT/upsampling, while retaining bit-exact static JPEG decoding and ordered
+  VideoToolbox decoding.
 - Strengthened the trusted baseline with exclusion-free tests,
   security-focused C static analysis, AddressSanitizer, and a merged production
   line coverage floor enforced locally, in CI, and before releases.
@@ -93,7 +112,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/BeriBeli/spice-swift/compare/v0.1.10...v0.2.0
 [0.1.10]: https://github.com/BeriBeli/spice-swift/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/BeriBeli/spice-swift/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/BeriBeli/spice-swift/compare/v0.1.7...v0.1.8

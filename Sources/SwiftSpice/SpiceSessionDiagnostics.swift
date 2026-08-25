@@ -14,12 +14,11 @@ import SpiceChannels
 /// This type intentionally contains no per-frame log or timestamp, pixel data,
 /// or native buffer handles. It does not measure server or transport latency
 /// before `ChannelConnection.receive()` returns a complete framed message.
-/// Bounded histograms summarize receive-to-surface-apply, publisher, mailbox,
-/// and GPU-presentation timing without retaining individual samples. Publisher
-/// emission occurs before the downstream mailbox and presentation stages.
-/// Presentation counters are populated only when the desktop view receives
-/// this session's `presentationDiagnostics` recorder. Advanced-video counters
-/// cover H.264/H.265 decoding and do not describe the MJPEG path.
+/// Bounded histograms summarize receive-to-surface-apply, publisher, and
+/// GPU-presentation timing without retaining individual samples.
+/// Presentation counters are populated when a desktop view subscribes to this
+/// session's desktop source. Advanced-video counters cover H.264/H.265 decoding
+/// and do not describe the MJPEG path.
 ///
 /// `totalIOSurfaceAllocatedBytes` is process-wide live state.
 /// `surfaceAllocatedBytes` is live session-budget usage, and
@@ -55,6 +54,11 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var publisherPendingSurfaces: Int = 0
     public internal(set) var publisherFlushes: UInt64 = 0
     public internal(set) var publisherFlushesWithoutEmission: UInt64 = 0
+    public internal(set) var publisherDemandSuppressedSubmissions: UInt64 = 0
+    public internal(set) var publisherPendingRevisionCoalesces: UInt64 = 0
+    public internal(set) var publisherPreparedFrameCoalesces: UInt64 = 0
+    public internal(set) var publisherDemandedSurfaces: Int = 0
+    public internal(set) var publisherPreparedFrames: Int = 0
     package var publisherBatchStartGapHistogram = SpiceTimingHistogram()
     package var publisherFramedReceiveBatchStartGapHistogram = SpiceTimingHistogram()
     package var publisherMessageReceiveToSurfaceReadyHistogram = SpiceTimingHistogram()
@@ -63,11 +67,11 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     package var publisherFlushSchedulingDelayHistogram = SpiceTimingHistogram()
     package var publisherSnapshotDurationHistogram = SpiceTimingHistogram()
     package var publisherEmitDurationHistogram = SpiceTimingHistogram()
-    public internal(set) var mailboxFramesSent: UInt64 = 0
-    public internal(set) var mailboxFramesDelivered: UInt64 = 0
-    public internal(set) var mailboxFramesCoalesced: UInt64 = 0
-    public internal(set) var mailboxFramesEvicted: UInt64 = 0
-    package var mailboxFrameQueueDelayHistogram = SpiceTimingHistogram()
+    public internal(set) var desktopDeliveredSnapshots: UInt64 = 0
+    public internal(set) var desktopStreamCoalesces: UInt64 = 0
+    public internal(set) var desktopHandlerDeliveries: UInt64 = 0
+    public internal(set) var desktopSubscriptions: Int = 0
+    public internal(set) var desktopVisibleSubscriptions: Int = 0
     public internal(set) var videoDecoderSessionCreations: UInt64 = 0
     public internal(set) var videoHardwareSessions: UInt64 = 0
     public internal(set) var videoSoftwareSessions: UInt64 = 0
@@ -75,6 +79,13 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var videoDecodedFrames: UInt64 = 0
     public internal(set) var videoDroppedFrames: UInt64 = 0
     public internal(set) var videoCPUMaterializations: UInt64 = 0
+    public internal(set) var mjpegDecoderHandleCreations: UInt64 = 0
+    public internal(set) var mjpegDecodedFrames: UInt64 = 0
+    public internal(set) var mjpegIOSurfaceFrames: UInt64 = 0
+    public internal(set) var mjpegDataFallbacks: UInt64 = 0
+    public internal(set) var mjpegIOSurfaceAllocations: UInt64 = 0
+    public internal(set) var mjpegPeakBuffersInUse: Int = 0
+    public internal(set) var mjpegPeakConcurrentDecodes: Int = 0
     public internal(set) var advancedCPUFallbackFrames: UInt64 = 0
     public internal(set) var metalGenerationDisableCount: UInt64 = 0
     public internal(set) var firstMetalGenerationDisableReason: String?
@@ -88,12 +99,22 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var ioSurfaceDimensionMismatchFallbackFrames: UInt64 = 0
     public internal(set) var pixelFormatMismatchFallbackFrames: UInt64 = 0
     public internal(set) var textureCreationFailedFallbackFrames: UInt64 = 0
+    public internal(set) var metalCommandFailureFallbackFrames: UInt64 = 0
     public internal(set) var lastCPUFallbackReason: SpiceCPUPresentationFallbackReason?
     public internal(set) var metalFramesSupersededBeforeDraw: UInt64 = 0
     public internal(set) var metalDrawableMisses: UInt64 = 0
     public internal(set) var metalCommandCreationFailures: UInt64 = 0
+    public internal(set) var metalCommandBuffersCommitted: UInt64 = 0
+    public internal(set) var metalTextureCacheHits: UInt64 = 0
+    public internal(set) var metalTextureCacheMisses: UInt64 = 0
+    public internal(set) var metalTextureCacheEvictions: UInt64 = 0
+    public internal(set) var metalGPUBusySkips: UInt64 = 0
+    public internal(set) var desktopDisplayLinkWakeups: UInt64 = 0
+    public internal(set) var desktopDisplayLinkTicks: UInt64 = 0
+    public internal(set) var desktopDisplayLinkIdlePauses: UInt64 = 0
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
+    package var metalRequestToPresentedHistogram = SpiceTimingHistogram()
 
     public static let empty = Self()
 
@@ -134,16 +155,16 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         publisherEmitDurationHistogram.summary
     }
 
-    public var mailboxFrameQueueDelay: SpiceTimingSummary {
-        mailboxFrameQueueDelayHistogram.summary
-    }
-
     public var viewUpdateToMetalCommit: SpiceTimingSummary {
         viewUpdateToMetalCommitHistogram.summary
     }
 
     public var metalCommitToCompletion: SpiceTimingSummary {
         metalCommitToCompletionHistogram.summary
+    }
+
+    public var metalRequestToPresented: SpiceTimingSummary {
+        metalRequestToPresentedHistogram.summary
     }
 
     mutating func accumulate(_ diagnostics: DisplayChannelDiagnostics) {
@@ -193,6 +214,11 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         publisherPendingSurfaces += publisher.pendingSurfaces
         publisherFlushes &+= publisher.flushes
         publisherFlushesWithoutEmission &+= publisher.flushesWithoutEmission
+        publisherDemandSuppressedSubmissions &+= publisher.demandSuppressedSubmissions
+        publisherPendingRevisionCoalesces &+= publisher.pendingRevisionCoalesces
+        publisherPreparedFrameCoalesces &+= publisher.preparedFrameCoalesces
+        publisherDemandedSurfaces += publisher.demandedSurfaces
+        publisherPreparedFrames += publisher.preparedFrames
         publisherBatchStartGapHistogram.accumulate(publisher.batchStartGap)
         publisherFramedReceiveBatchStartGapHistogram.accumulate(
             publisher.framedReceiveBatchStartGap
@@ -215,6 +241,19 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         videoDecodedFrames &+= video.decodedFrameCount
         videoDroppedFrames &+= video.droppedFrameCount
         videoCPUMaterializations &+= video.cpuMaterializationCount
+        mjpegDecoderHandleCreations &+= diagnostics.mjpeg.handleCreations
+        mjpegDecodedFrames &+= diagnostics.mjpeg.decodedFrames
+        mjpegIOSurfaceFrames &+= diagnostics.mjpeg.ioSurfaceFrames
+        mjpegDataFallbacks &+= diagnostics.mjpeg.dataFallbacks
+        mjpegIOSurfaceAllocations &+= diagnostics.mjpeg.ioSurfaceAllocations
+        mjpegPeakBuffersInUse = max(
+            mjpegPeakBuffersInUse,
+            diagnostics.mjpeg.peakBuffersInUse
+        )
+        mjpegPeakConcurrentDecodes = max(
+            mjpegPeakConcurrentDecodes,
+            diagnostics.mjpeg.peakConcurrentDecodes
+        )
         advancedCPUFallbackFrames &+= diagnostics.advancedCPUFallbackFrames
         metalGenerationDisableCount &+= diagnostics.metalGenerationDisableCount
         if firstMetalGenerationDisableReason == nil {
