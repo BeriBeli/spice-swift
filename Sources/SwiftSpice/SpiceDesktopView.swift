@@ -323,6 +323,35 @@ private struct SpiceDesktopFrameGeometry: Sendable, Equatable {
     let height: Int
 }
 
+package struct SpiceDesktopPresentationPacingPolicy: Sendable {
+    package enum Action: Sendable, Equatable {
+        case selectImmediately
+        case waitForDisplayLink
+        case selectOnDisplayLink
+        case pauseDisplayLink
+    }
+
+    private var isDisplayLinkActive = false
+
+    package mutating func readyBecameAvailable() -> Action {
+        guard !isDisplayLinkActive else { return .waitForDisplayLink }
+        isDisplayLinkActive = true
+        return .selectImmediately
+    }
+
+    package mutating func displayLinkFired(hasReadySnapshot: Bool) -> Action {
+        guard isDisplayLinkActive, hasReadySnapshot else {
+            isDisplayLinkActive = false
+            return .pauseDisplayLink
+        }
+        return .selectOnDisplayLink
+    }
+
+    package mutating func reset() {
+        isDisplayLinkActive = false
+    }
+}
+
 package final class SpiceDesktopReadyLatch: Sendable {
     private struct State: Sendable {
         var pending: SpiceDesktopSnapshot?
@@ -485,6 +514,7 @@ package final class SpiceFramebufferView: NSView {
     private var subscription: SpiceDesktopSubscription?
     private var subscriptionDemand: SpiceDesktopDemand = .none
     private var readyLatch = SpiceDesktopReadyLatch()
+    private var presentationPacing = SpiceDesktopPresentationPacingPolicy()
     private let displayLinkTarget = SpiceDisplayLinkTarget()
     private var desktopDisplayLink: CADisplayLink?
     private let clock = ContinuousClock()
@@ -579,6 +609,7 @@ package final class SpiceFramebufferView: NSView {
         subscriptionDemand = .none
         readyLatch.discard()
         readyLatch = SpiceDesktopReadyLatch()
+        presentationPacing.reset()
         resetDesktopState()
 
         let subscription = desktop.subscribe(surface: surface)
@@ -588,7 +619,7 @@ package final class SpiceFramebufferView: NSView {
             guard readyLatch.offer(snapshot) else { return }
             Task { @MainActor [weak self] in
                 guard let self, self.readyLatch === readyLatch else { return }
-                self.wakeDisplayLinkIfNeeded()
+                self.selectReadySnapshotImmediatelyIfIdle()
             }
         }
         updateDesktopDemand(force: true)
@@ -698,14 +729,62 @@ package final class SpiceFramebufferView: NSView {
         switch demand {
         case .none:
             readyLatch.discard()
+            presentationPacing.reset()
             pauseDisplayLinkIfIdle()
             cpuFrame = nil
             isUsingMetal = false
             requiresFrameRedraw = true
             metalView?.discardPresentedContent()
         case .visible:
+            selectReadySnapshotImmediatelyIfIdle()
+        }
+    }
+
+    /// Selects the first update in an idle interval immediately. Core Animation
+    /// still presents the committed drawable on a display refresh, so waiting
+    /// for a display-link callback here would synchronize the same frame twice.
+    ///
+    /// The display link remains active for one empty tick after this fast path.
+    /// A continuous producer is therefore still coalesced to at most one
+    /// selection per subsequent display tick, while sparse desktop/input updates
+    /// avoid an otherwise unconditional refresh-period delay.
+    private func selectReadySnapshotImmediatelyIfIdle() {
+        guard subscriptionDemand == .visible, !readyLatch.isEmpty else { return }
+        switch presentationPacing.readyBecameAvailable() {
+        case .waitForDisplayLink:
+            wakeDisplayLinkIfNeeded()
+            return
+        case .selectImmediately:
+            break
+        case .selectOnDisplayLink, .pauseDisplayLink:
+            assertionFailure("Unexpected pacing action for a ready update")
+            return
+        }
+        guard let ready = readyLatch.takeReady(at: clock.now) else { return }
+        presentationDiagnostics?.recordDesktopReadyToDisplayLink(
+            ready.waitingDuration
+        )
+        presentationDiagnostics?.recordDesktopImmediateSelection()
+
+        switch apply(ready.snapshot, requestedAt: clock.now) {
+        case .consumed:
+            // Keep one display tick armed as a pacing fence. If no newer update
+            // arrived, that tick pauses the link; otherwise it selects only the
+            // newest pending revision.
+            startDisplayLinkPacing()
+        case .retry:
+            readyLatch.restoreIfEmpty(ready.snapshot)
             wakeDisplayLinkIfNeeded()
         }
+    }
+
+    private func startDisplayLinkPacing() {
+        guard subscriptionDemand == .visible,
+              let desktopDisplayLink,
+              desktopDisplayLink.isPaused
+        else { return }
+        presentationDiagnostics?.recordDesktopDisplayLinkWakeup()
+        desktopDisplayLink.isPaused = false
     }
 
     private func wakeDisplayLinkIfNeeded() {
@@ -729,13 +808,24 @@ package final class SpiceFramebufferView: NSView {
     fileprivate func displayLinkDidFire(_ displayLink: CADisplayLink) {
         presentationDiagnostics?.recordDesktopDisplayLinkTick()
         guard subscriptionDemand == .visible else {
+            presentationPacing.reset()
             pauseDisplayLinkIfIdle()
             return
         }
-        guard let ready = readyLatch.takeReady(at: clock.now) else {
+        switch presentationPacing.displayLinkFired(
+            hasReadySnapshot: !readyLatch.isEmpty
+        ) {
+        case .pauseDisplayLink:
+            pauseDisplayLinkIfIdle()
+            return
+        case .selectOnDisplayLink:
+            break
+        case .selectImmediately, .waitForDisplayLink:
+            assertionFailure("Unexpected pacing action for a display-link tick")
             pauseDisplayLinkIfIdle()
             return
         }
+        guard let ready = readyLatch.takeReady(at: clock.now) else { return }
         presentationDiagnostics?.recordDesktopReadyToDisplayLink(
             ready.waitingDuration
         )
@@ -743,9 +833,10 @@ package final class SpiceFramebufferView: NSView {
 
         switch apply(snapshot, requestedAt: clock.now) {
         case .consumed:
-            if readyLatch.isEmpty {
-                pauseDisplayLinkIfIdle()
-            }
+            // Keep the link active until a later tick observes no pending
+            // update. This is the pacing fence that prevents a 120 Hz producer
+            // from repeatedly taking the immediate idle fast path.
+            break
         case .retry:
             readyLatch.restoreIfEmpty(snapshot)
             wakeDisplayLinkIfNeeded()
