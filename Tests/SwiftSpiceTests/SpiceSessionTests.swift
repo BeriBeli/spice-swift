@@ -12,6 +12,51 @@ import Testing
 
 @Suite("SpiceSession bootstrap")
 struct SpiceSessionTests {
+    @Test func fullAgentBufferRetainsReconnectLifecycleBoundaries() async {
+        let mailbox = SpiceAgentEventMailbox(capacity: 4)
+        let stale = SpiceAgentMessage(protocolID: 1, type: 2, opaque: 3, data: Data([4]))
+        #expect(mailbox.send(.message(stale)) == .enqueued)
+        #expect(mailbox.send(.message(stale)) == .enqueued)
+        #expect(mailbox.send(.message(stale)) == .enqueued)
+        #expect(mailbox.send(.message(stale)) == .enqueued)
+        #expect(mailbox.send(.message(stale)) == .full)
+        mailbox.sendLifecycle(.disconnected(errorCode: 0), disconnectRevision: 7)
+        mailbox.sendLifecycle(.connected)
+
+        let disconnected = await mailbox.next()
+        #expect(disconnected?.event == .disconnected(errorCode: 0))
+        #expect(disconnected?.disconnectRevision == 7)
+        #expect((await mailbox.next())?.event == .connected)
+        mailbox.finish()
+    }
+
+    @Test func cancelledAgentConsumerCanBeReplacedWithoutReportingOverflow() async {
+        let mailbox = SpiceAgentEventMailbox(capacity: 2)
+        let message = SpiceAgentMessage(
+            protocolID: 1,
+            type: 2,
+            opaque: 3,
+            data: Data([4])
+        )
+        #expect(mailbox.send(.message(message)) == .enqueued)
+        let gate = AgentMessageProcessingGate()
+        let consumer = Task {
+            await gate.block()
+            return await mailbox.next()
+        }
+        await gate.waitUntilEntered()
+        consumer.cancel()
+        await gate.release()
+        #expect(await consumer.value == nil)
+        #expect(mailbox.send(.message(message)) == .enqueued)
+        #expect(mailbox.send(.message(message)) == .terminated)
+
+        #expect((await mailbox.next())?.event == .message(message))
+        #expect((await mailbox.next())?.event == .message(message))
+        #expect(mailbox.send(.message(message)) == .enqueued)
+        mailbox.finish()
+    }
+
     @Test func seamlessMigrationPreservesStaticDesktopWithoutNewDamage() async throws {
         let source = SpiceDesktopSource()
         source.beginSession(pointerMode: .absolute)
@@ -710,6 +755,805 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func agentManagerRetainsItsSessionEventConsumerAcrossReconnect() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        var supportEvents = manager.displayConfigurationSupportEvents.makeAsyncIterator()
+        try await manager.start(session: session)
+
+        let connected = SpiceDisplayConfigurationSupport(
+            agentConnected: true,
+            hasExplicitPeerCapabilities: false,
+            supportsMonitorConfiguration: true,
+            supportsSparseMonitors: false,
+            supportsMonitorPositions: false
+        )
+        #expect(await supportEvents.next() == connected)
+
+        async let reconnectBoundary: Void = manager.waitForSessionReconnectBoundary()
+        await session.disconnect()
+        await reconnectBoundary
+        #expect(await supportEvents.next() == SpiceDisplayConfigurationSupport(
+            agentConnected: false,
+            hasExplicitPeerCapabilities: false,
+            supportsMonitorConfiguration: false,
+            supportsSparseMonitors: false,
+            supportsMonitorPositions: false
+        ))
+
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        #expect(await supportEvents.next() == connected)
+        await second.waitForOutboundCount(6)
+        #expect((await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 2)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryQuiescesConnectionWithoutAgentLifecycle() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 0,
+            agentTokens: 0
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+
+        #expect(await session.currentAgentDisconnectRevision() == 0)
+        await session.disconnect()
+        await manager.waitForSessionReconnectBoundary()
+        #expect(await session.currentAgentDisconnectRevision() == 0)
+        await #expect(throws: SpiceDisplayConfigurationError.agentManagerNotRunning) {
+            try await manager.requestResolution(width: 800, height: 600)
+        }
+
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 1 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect((await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 1)
+        try await manager.requestResolution(width: 800, height: 600)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func dequeuedAgentMessageCannotSendAcrossConnectionGeneration() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setMessageProcessingHookForTesting { await gate.block() }
+        try await manager.start(session: session)
+        await first.waitForOutboundCount(6)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: true,
+            capabilities: .desktopIntegration
+        ))
+        let oldPacket = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await first.enqueue(encodeMini(id: 109, body: oldPacket))
+        await gate.waitUntilEntered()
+
+        await session.disconnect()
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        await gate.release()
+
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 2 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let outbound = await second.outbound
+        let agentPackets = try outbound.compactMap { packet -> Data? in
+            guard packet.count >= 6, try decodeMiniMessageID(packet) == 107 else {
+                return nil
+            }
+            return try decodeMiniBody(packet)
+        }
+        var decoder = VDAgentStreamDecoder()
+        let messages = try agentPackets.flatMap { try decoder.append(packet: $0) }
+        #expect(messages.filter {
+            $0.type == VDAgentMessageType.announceCapabilities.rawValue
+        }.count == 1)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func dequeuedAgentMessageCannotSendAfterRuntimeAgentRestart() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setMessageProcessingHookForTesting { await gate.block() }
+        try await manager.start(session: session)
+        await transport.waitForOutboundCount(6)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: true,
+            capabilities: .desktopIntegration
+        ))
+        let oldPacket = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await transport.enqueue(encodeMini(id: 109, body: oldPacket))
+        await gate.waitUntilEntered()
+        await transport.enqueue(encodeMini(id: 108, body: uint32(0)))
+        await transport.enqueue(encodeMini(id: 115, body: uint32(8)))
+        await gate.release()
+
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).capabilityAnnouncementsSent == 2 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let outbound = await transport.outbound
+        let agentPackets = try outbound.compactMap { packet -> Data? in
+            guard packet.count >= 6, try decodeMiniMessageID(packet) == 107 else {
+                return nil
+            }
+            return try decodeMiniBody(packet)
+        }
+        var decoder = VDAgentStreamDecoder()
+        let messages = try agentPackets.flatMap { try decoder.append(packet: $0) }
+        #expect(messages.filter {
+            $0.type == VDAgentMessageType.announceCapabilities.rawValue
+        }.count == 2)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func agentManagerCanRestartItsSessionEventConsumer() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        await transport.waitForOutboundCount(6)
+        for _ in 0..<10 { await Task.yield() }
+
+        await manager.stop()
+        try await manager.start(session: session)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        let packet = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await transport.enqueue(encodeMini(id: 109, body: packet))
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).inboundMessages == 1 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect((await manager.diagnosticsSnapshot()).inboundMessages == 1)
+
+        async let reconnectBoundary: Void = manager.waitForSessionReconnectBoundary()
+        await session.disconnect()
+        await reconnectBoundary
+        await manager.stop()
+    }
+
+    @Test func reconnectBoundaryWaitsForDequeuedOldConnectedEvent() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setEventProcessingHookForTesting { _ in await gate.block() }
+        try await manager.start(session: session)
+        await gate.waitUntilEntered()
+
+        await session.disconnect()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        _ = try await retry.value
+        #expect(await second.isConnected)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryWaitsWhileAgentManagerStartIsSuspended() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setStartProcessingHookForTesting { await gate.block() }
+        let start = Task { try await manager.start(session: session) }
+        await gate.waitUntilEntered()
+
+        await session.disconnect()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        try await start.value
+        _ = try await retry.value
+        #expect(await second.isConnected)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryWaitsForSuspendedStartWithoutAgentRevision() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 0,
+            agentTokens: 0
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setStartProcessingHookForTesting { await gate.block() }
+        let start = Task { try await manager.start(session: session) }
+        await gate.waitUntilEntered()
+
+        await session.disconnect()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        try await start.value
+        _ = try await retry.value
+        #expect(await second.isConnected)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func agentManagerStopDrainsDequeuedBoundaryBeforeRestart() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setEventProcessingHookForTesting { event in
+            if case .disconnected = event { await gate.block() }
+        }
+        try await manager.start(session: session)
+
+        await session.disconnect()
+        await gate.waitUntilEntered()
+        let stop = Task { await manager.stop() }
+        for _ in 0..<10 { await Task.yield() }
+        await #expect(throws: SpiceClipboardError.alreadyRunning) {
+            try await manager.start(session: session)
+        }
+
+        await gate.release()
+        await stop.value
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        try await manager.start(session: session)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        let packet = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await second.enqueue(encodeMini(id: 109, body: packet))
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).inboundMessages == 1 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect((await manager.diagnosticsSnapshot()).inboundMessages == 1)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func stoppingSuspendedAgentManagerStartLeavesNoZombiePump() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setStartProcessingHookForTesting { await gate.block() }
+        let start = Task { try await manager.start(session: session) }
+        await gate.waitUntilEntered()
+        let stop = Task { await manager.stop() }
+        for _ in 0..<10 { await Task.yield() }
+        await #expect(throws: SpiceClipboardError.alreadyRunning) {
+            try await manager.start(session: session)
+        }
+
+        await gate.release()
+        try await start.value
+        await stop.value
+        try await manager.start(session: session)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        let packet = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await transport.enqueue(encodeMini(id: 109, body: packet))
+        for _ in 0..<100 {
+            if (await manager.diagnosticsSnapshot()).inboundMessages == 1 { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect((await manager.diagnosticsSnapshot()).inboundMessages == 1)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func agentManagerStopDrainsPublicOperationsAndConcurrentStopCallers() async throws {
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "swiftspice-stop-drain-\(UUID().uuidString).txt"
+        )
+        try Data("drain".utf8).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setFileInspectionHookForTesting { await gate.block() }
+        try await manager.start(session: session)
+
+        let transfer = Task { try await manager.sendFile(at: source) }
+        await gate.waitUntilEntered()
+        let firstStop = Task { await manager.stop() }
+        for _ in 0..<10 { await Task.yield() }
+        await #expect(throws: SpiceClipboardError.alreadyRunning) {
+            try await manager.start(session: session)
+        }
+
+        let secondStopCompleted = Mutex(false)
+        let secondStop = Task {
+            await manager.stop()
+            secondStopCompleted.withLock { $0 = true }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!secondStopCompleted.withLock { $0 })
+
+        await gate.release()
+        await #expect(throws: SpiceFileTransferError.agentUnavailable) {
+            try await transfer.value
+        }
+        await firstStop.value
+        await secondStop.value
+        #expect(secondStopCompleted.withLock { $0 })
+
+        try await manager.start(session: session)
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryQuiescesAndDrainsPublicOperations() async throws {
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "swiftspice-reconnect-drain-\(UUID().uuidString).txt"
+        )
+        try Data("boundary".utf8).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setFileInspectionHookForTesting { await gate.block() }
+        try await manager.start(session: session)
+
+        let transfer = Task { try await manager.sendFile(at: source) }
+        await gate.waitUntilEntered()
+        await session.disconnect()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        await #expect(throws: SpiceFileTransferError.agentUnavailable) {
+            try await transfer.value
+        }
+        _ = try await retry.value
+        #expect(await second.isConnected)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func reconnectBoundaryRevisionIsScopedToManagerRun() async throws {
+        let firstSessionTransport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let firstSession = SpiceSession(
+            transportFactory: { _ in firstSessionTransport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await firstSession.connect(
+            endpoint: SpiceEndpoint(host: "first.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: firstSession)
+        await firstSession.disconnect()
+        await manager.waitForSessionReconnectBoundary()
+        await manager.stop()
+
+        let secondSource = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let secondTarget = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let secondTransports = TransportPool([secondSource, secondTarget])
+        let secondSession = SpiceSession(
+            transportFactory: { _ in secondTransports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await secondSession.connect(
+            endpoint: SpiceEndpoint(host: "second.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        await manager.setEventProcessingHookForTesting { event in
+            if case .disconnected = event { await gate.block() }
+        }
+        try await manager.start(session: secondSession)
+
+        await secondSession.disconnect()
+        await gate.waitUntilEntered()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await secondSession.connect(
+                endpoint: SpiceEndpoint(host: "second.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await secondTarget.isConnected))
+
+        await gate.release()
+        _ = try await retry.value
+        #expect(await secondTarget.isConnected)
+
+        await manager.stop()
+        await secondSession.disconnect()
+    }
+
+    @Test func reconnectBoundaryWaitsForInFlightOldAgentMessage() async throws {
+        let first = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let second = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let transports = TransportPool([first, second])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setMessageProcessingHookForTesting { await gate.block() }
+        try await manager.start(session: session)
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        let packet = try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        await first.enqueue(encodeMini(id: 109, body: packet))
+        await gate.waitUntilEntered()
+
+        await session.disconnect()
+        let retry = Task {
+            await manager.waitForSessionReconnectBoundary()
+            return try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(!(await second.isConnected))
+
+        await gate.release()
+        _ = try await retry.value
+        #expect(await second.isConnected)
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func disconnectEndsPlaybackLifecycleWithoutTerminatingItsEventStream() async throws {
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [SpiceChannelID(type: 5, id: 0)]
+        ))
+        let playback = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([main, playback])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        var events = session.playbackEvents.makeAsyncIterator()
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+
+        await session.disconnect()
+
+        #expect(await events.next() == .stopped)
+    }
+
+    @Test func switchHostEndsOldPlaybackBeforeCompletingHandoff() async throws {
+        let playbackChannel = [SpiceChannelID(type: 5, id: 0)]
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: playbackChannel
+        ))
+        let sourcePlayback = StreamingSessionTransport(initial: try makeLinkResponses())
+        let target = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: playbackChannel
+        ))
+        let targetPlayback = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([
+            source,
+            sourcePlayback,
+            target,
+            targetPlayback,
+        ])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var sessionEvents = session.events.makeAsyncIterator()
+        var playbackEvents = session.playbackEvents.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 111,
+            body: migrationDestinationBody(host: "target.example")
+        ))
+        guard case let .migration(.switching(offer)) = await sessionEvents.next() else {
+            Issue.record("expected switch-host migration event")
+            return
+        }
+
+        #expect(await playbackEvents.next() == .stopped)
+        #expect(await sessionEvents.next() == .migration(.completed(offer)))
+        #expect(!(await source.isConnected))
+        #expect(!(await sourcePlayback.isConnected))
+        #expect(await target.isConnected)
+        #expect(await targetPlayback.isConnected)
+
+        await session.disconnect()
+    }
+
     @Test func agentManagerClassifiesClipboardWireFailuresWithoutContent() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
@@ -914,6 +1758,69 @@ struct SpiceSessionTests {
         let successPacket = try #require(VDAgentWireEncoder.fragments(for: success).first)
         await transport.enqueue(encodeMini(id: 109, body: successPacket))
         #expect(await events.next() == .completed(id: id))
+
+        await manager.stop()
+        await session.disconnect()
+    }
+
+    @Test func runtimeAgentRestartCannotReviveCompletedFileSend() async throws {
+        let transport = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let session = SpiceSession(
+            transportFactory: { _ in transport },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let gate = AgentMessageProcessingGate()
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        await manager.setFileMessageCompletionHookForTesting { await gate.block() }
+        var supportEvents = manager.displayConfigurationSupportEvents.makeAsyncIterator()
+        try await manager.start(session: session)
+        _ = await supportEvents.next()
+        var clipboardEvents = manager.events.makeAsyncIterator()
+
+        let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
+            requestReply: false,
+            capabilities: .desktopIntegration
+        ))
+        await transport.enqueue(encodeMini(
+            id: 109,
+            body: try #require(VDAgentWireEncoder.fragments(for: capabilities).first)
+        ))
+        #expect(await clipboardEvents.next() == .ready)
+        _ = await supportEvents.next()
+
+        let source = FileManager.default.temporaryDirectory.appending(
+            path: "spice-swift-agent-restart-\(UUID().uuidString).bin"
+        )
+        try Data([1, 2, 3]).write(to: source, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: source) }
+        var fileEvents = manager.fileTransferEvents.makeAsyncIterator()
+        let transfer = Task { try await manager.sendFile(at: source) }
+        let queued = try #require(await fileEvents.next())
+        guard case let .queued(id, _, _) = queued else {
+            Issue.record("expected queued file transfer")
+            return
+        }
+        await gate.waitUntilEntered()
+
+        await transport.enqueue(encodeMini(id: 108, body: uint32(0)))
+        await transport.enqueue(encodeMini(id: 115, body: uint32(8)))
+        #expect((await supportEvents.next())?.agentConnected == false)
+        #expect(await fileEvents.next() == .failed(id: id, .agentUnavailable))
+        #expect((await supportEvents.next())?.agentConnected == true)
+
+        await gate.release()
+        await #expect(throws: SpiceFileTransferError.agentUnavailable) {
+            try await transfer.value
+        }
+        #expect(await manager.activeFileTransferCountForTesting() == 0)
 
         await manager.stop()
         await session.disconnect()
@@ -1238,6 +2145,69 @@ struct SpiceSessionTests {
         #expect(try decodeMiniMessageID(reboundInput) == 112)
         var reboundBody = try ByteReader(try decodeMiniBody(reboundInput), offset: 8)
         #expect(try reboundBody.readUInt16LE() == 1)
+        await session.disconnect()
+    }
+
+    @Test func agentManagerRemainsUsableAfterSeamlessMigration() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 8
+        ))
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let transports = TransportPool([source, target])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let manager = SpiceAgentManager(automaticallySynchronizesPasteboard: false)
+        try await manager.start(session: session)
+        await source.waitForOutboundCount(6)
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+        for _ in 0..<100 {
+            if try (await source.outbound).contains(where: {
+                try decodeMiniMessageID($0) == 111
+            }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+
+        await source.enqueue(encodeMini(id: 1, body: uint32(3)))
+        await source.enqueue(encodeMini(id: 2, body: Data("main-state".utf8)))
+        #expect(await events.next() == .migration(.committing(offer)))
+        #expect(await events.next() == .migration(.completed(offer)))
+
+        try await manager.requestResolution(width: 1_280, height: 720)
+        for _ in 0..<100 {
+            if try (await target.outbound).contains(where: {
+                try decodeMiniMessageID($0) == 107
+            }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let agentPackets = try (await target.outbound).compactMap { packet -> Data? in
+            guard try decodeMiniMessageID(packet) == 107 else { return nil }
+            return try decodeMiniBody(packet)
+        }
+        var decoder = VDAgentStreamDecoder()
+        let messages = try agentPackets.flatMap { try decoder.append(packet: $0) }
+        #expect(messages.contains(where: {
+            $0.type == VDAgentMessageType.monitorsConfig.rawValue
+        }))
+
+        await manager.stop()
         await session.disconnect()
     }
 
@@ -1785,6 +2755,38 @@ private struct SessionTicketEncryptor: TicketEncrypting {
         #expect(password == Data("secret".utf8))
         #expect(publicKeyDER.count == 162)
         return Data(repeating: 0x5a, count: 128)
+    }
+}
+
+private actor AgentMessageProcessingGate {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func block() async {
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
     }
 }
 

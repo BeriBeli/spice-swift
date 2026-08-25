@@ -39,6 +39,7 @@ package actor MainChannel: SpiceManagedChannel {
     private var ackController = AckController()
     private var agentDecoder: VDAgentStreamDecoder
     private var isAgentConnected = false
+    private var agentGeneration: UInt64 = 0
     private var clientAgentTokens: UInt64 = 0
     private var serverAgentTokens: UInt32 = 0
     private var pendingEvents: [MainEvent] = []
@@ -179,15 +180,48 @@ package actor MainChannel: SpiceManagedChannel {
         } catch let error {
             throw .wire(error)
         }
-        guard UInt64(fragments.count) <= clientAgentTokens else {
+        let requiredTokens = UInt64(fragments.count)
+        guard requiredTokens <= clientAgentTokens else {
             return false
         }
-        for fragment in fragments {
-            try await connection.send(
-                messageType: SpiceMainAgentWire.clientData,
-                body: fragment
-            )
-            clientAgentTokens -= 1
+        // Reserve the complete message before the first suspension point.
+        // MainChannel is reentrant while ChannelConnection sends, so checking
+        // and decrementing one fragment at a time can overcommit the same token
+        // window when two Agent producers run concurrently.
+        let messageConnection = connection
+        let messageAgentGeneration = agentGeneration
+        clientAgentTokens -= requiredTokens
+        var unsentReservedTokens = requiredTokens
+        do {
+            for fragment in fragments {
+                guard agentGeneration == messageAgentGeneration else {
+                    throw ChannelError.protocolViolation(
+                        "agent lifecycle changed during message send"
+                    )
+                }
+                try await messageConnection.send(
+                    messageType: SpiceMainAgentWire.clientData,
+                    body: fragment
+                )
+                unsentReservedTokens -= 1
+                guard agentGeneration == messageAgentGeneration else {
+                    throw ChannelError.protocolViolation(
+                        "agent lifecycle changed during message send"
+                    )
+                }
+            }
+        } catch {
+            let channelError = error as? ChannelError ?? .invalidState
+            if agentGeneration == messageAgentGeneration {
+                let (restoredTokens, overflow) = clientAgentTokens.addingReportingOverflow(
+                    unsentReservedTokens
+                )
+                guard !overflow else {
+                    throw .protocolViolation("agent token accounting overflow after send failure")
+                }
+                clientAgentTokens = restoredTokens
+            }
+            throw channelError
         }
         return true
     }
@@ -339,6 +373,7 @@ package actor MainChannel: SpiceManagedChannel {
             messageType: SpiceMainAgentWire.clientStart,
             body: writer.data
         )
+        agentGeneration &+= 1
         isAgentConnected = true
         clientAgentTokens = UInt64(clientTokens)
         serverAgentTokens = serverTokenWindow
@@ -360,6 +395,7 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func resetAgent() {
+        agentGeneration &+= 1
         isAgentConnected = false
         clientAgentTokens = 0
         serverAgentTokens = 0

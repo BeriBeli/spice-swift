@@ -5,6 +5,17 @@ import Testing
 
 @Suite("Bounded audio playback buffering")
 struct PlaybackBufferControllerTests {
+    @Test func lateCompletionFromPreviousPlaybackStreamIsRejected() {
+        #expect(SpiceAudioPlaybackSink.isCurrentPlaybackCompletion(
+            completedStreamEpoch: 7,
+            currentStreamEpoch: 7
+        ))
+        #expect(!SpiceAudioPlaybackSink.isCurrentPlaybackCompletion(
+            completedStreamEpoch: 6,
+            currentStreamEpoch: 7
+        ))
+    }
+
     @Test func waitsForMinimumLatencyBeforeStarting() {
         var controller = PlaybackBufferController(
             sampleRate: 1_000,

@@ -1,5 +1,6 @@
 import Foundation
 import SpiceTestSupport
+import SpiceTransport
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
@@ -258,6 +259,41 @@ struct MainChannelTests {
         #expect(try decodeMiniBody(outbound[3]).count == 972)
     }
 
+    @Test func concurrentAgentSendsCannotOvercommitTokenWindow() async throws {
+        let inbound = try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 1,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+
+        async let first = channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([1]))
+        )
+        async let second = channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([2]))
+        )
+        let results = try await [first, second]
+
+        #expect(results.filter(\.self).count == 1)
+        #expect(try (await transport.outbound).map(decodeMiniMessageID) == [106, 104, 107])
+    }
+
     @Test func rebindingPreservesAgentConnectionAndTokenState() async throws {
         let source = FakeTransport(inbound: try [
             encodeMiniServerMessage(SpiceMsgMainInit(
@@ -296,6 +332,105 @@ struct MainChannelTests {
         )) {
             try await channel.sendAgentMessage(VDAgentMessage(type: 3, data: Data([3])))
         }
+    }
+
+    @Test func multiFragmentAgentMessageStaysOnCapturedConnectionDuringRebind() async throws {
+        let source = GatedWriteTransport(inbound: try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 2,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+        ].map(Result.success))
+        try await source.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await source.blockNextWrite()
+
+        let send = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 6,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        await source.waitUntilWriteIsBlocked()
+
+        let target = FakeTransport()
+        try await target.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: target,
+            headerMode: .mini
+        ))
+        await source.releaseBlockedWrite()
+        try await send.value
+
+        #expect(try (await source.outbound).map(decodeMiniMessageID) == [106, 104, 107, 107])
+        #expect(await target.outbound.isEmpty)
+    }
+
+    @Test func agentRestartAbortsBlockedMessageWithoutRestoringOldTokens() async throws {
+        let source = GatedWriteTransport(inbound: try [
+            encodeMiniServerMessage(SpiceMsgMainInit(
+                sessionID: 42,
+                displayChannelsHint: 0,
+                supportedMouseModes: 3,
+                currentMouseMode: 2,
+                agentConnected: 1,
+                agentTokens: 2,
+                multimediaTime: 100,
+                ramHint: 0
+            )),
+            encodeMiniServerMessage(SpiceMsgMainChannelsList(channels: [])),
+            encodeMiniServerMessage(id: 108, body: uint32(0)),
+            encodeMiniServerMessage(id: 115, body: uint32(2)),
+        ].map(Result.success))
+        try await source.connect()
+        let channel = MainChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: source,
+            headerMode: .mini
+        ))
+        _ = try await channel.bootstrap()
+        await source.blockNextWrite()
+
+        let staleSend = Task {
+            try await channel.sendAgentMessage(VDAgentMessage(
+                type: 6,
+                data: Data(repeating: 0xa5, count: 3_000)
+            ))
+        }
+        await source.waitUntilWriteIsBlocked()
+        await #expect(throws: ChannelError.transport(.connectionClosed)) {
+            try await channel.run { _ in }
+        }
+        await source.releaseBlockedWrite()
+        await #expect(throws: ChannelError.protocolViolation(
+            "agent lifecycle changed during message send"
+        )) {
+            try await staleSend.value
+        }
+
+        #expect(try (await source.outbound).map(decodeMiniMessageID) == [106, 104, 107, 106])
+        #expect(try await channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([1]))
+        ))
+        #expect(try await channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([2]))
+        ))
+        #expect(try await !channel.sendAgentMessageIfTokensAvailable(
+            VDAgentMessage(type: 3, data: Data([3]))
+        ))
     }
 
     @Test func reassemblesRuntimeAgentStreamAndReplenishesEveryPacket() async throws {
@@ -623,6 +758,75 @@ struct MainChannelTests {
         writer.writeBytes(hostBytes)
         writer.writeUInt32LE(0)
         return writer.data
+    }
+}
+
+private actor GatedWriteTransport: SpiceTransport {
+    private var inbound: [Result<Data, TransportError>]
+    private var blockAtWriteCount: Int?
+    private var writeIsBlocked = false
+    private var blockedWriteContinuation: CheckedContinuation<Void, Never>?
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var outbound: [Data] = []
+    private var isConnected = false
+    private var isClosed = false
+
+    init(inbound: [Result<Data, TransportError>]) {
+        self.inbound = inbound
+    }
+
+    func connect() async throws(TransportError) {
+        guard !isClosed else { throw .connectionClosed }
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected, !isClosed, minimum >= 0, maximum >= minimum,
+              !inbound.isEmpty else {
+            throw .connectionClosed
+        }
+        let data = try inbound.removeFirst().get()
+        guard data.count <= maximum else {
+            throw .connectionFailed("fixture exceeds requested maximum")
+        }
+        return data
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected, !isClosed else { throw .connectionClosed }
+        outbound.append(data)
+        guard outbound.count == blockAtWriteCount else { return }
+        writeIsBlocked = true
+        let waiters = blockedWaiters
+        blockedWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { continuation in
+            blockedWriteContinuation = continuation
+        }
+    }
+
+    func close() async {
+        isClosed = true
+        isConnected = false
+        releaseBlockedWrite()
+    }
+
+    func blockNextWrite() {
+        blockAtWriteCount = outbound.count + 1
+        writeIsBlocked = false
+    }
+
+    func waitUntilWriteIsBlocked() async {
+        if writeIsBlocked { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func releaseBlockedWrite() {
+        blockAtWriteCount = nil
+        blockedWriteContinuation?.resume()
+        blockedWriteContinuation = nil
     }
 }
 
