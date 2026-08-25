@@ -1208,6 +1208,7 @@ struct SpiceSessionTests {
         await manager.setMessageProcessingHookForTesting { await gate.block() }
         try await manager.start(session: session)
         await transport.waitForOutboundCount(6)
+        let initialGeneration = await session.currentAgentConnectionSnapshot().generation
 
         let capabilities = try VDAgentClipboardCodec.encode(.announceCapabilities(
             requestReply: true,
@@ -1218,6 +1219,16 @@ struct SpiceSessionTests {
         await gate.waitUntilEntered()
         await transport.enqueue(encodeMini(id: 108, body: uint32(0)))
         await transport.enqueue(encodeMini(id: 115, body: uint32(8)))
+        let restartedGeneration = initialGeneration &+ 2
+        for _ in 0..<100 {
+            if await session.currentAgentConnectionSnapshot().generation
+                == restartedGeneration { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        #expect(
+            await session.currentAgentConnectionSnapshot().generation
+                == restartedGeneration
+        )
         await gate.release()
 
         for _ in 0..<100 {
