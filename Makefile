@@ -27,6 +27,7 @@ debug: ## Build and run the SpiceViewer integration client
 
 test: prepare ## Run the SwiftSpice test suite
 	@swift test --disable-sandbox \
+		--no-parallel \
 		-Xswiftc -warnings-as-errors
 
 test-public-api: prepare ## Compile the standalone public API consumer

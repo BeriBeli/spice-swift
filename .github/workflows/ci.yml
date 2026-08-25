@@ -63,6 +63,7 @@ jobs:
       - name: Test
         run: >-
           swift test --disable-sandbox
+          --no-parallel
           -Xswiftc -warnings-as-errors
 
       - name: Test with AddressSanitizer

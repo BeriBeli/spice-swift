@@ -102,6 +102,7 @@ swift build --disable-sandbox \
 
 log "running tests"
 swift test --disable-sandbox \
+    --no-parallel \
     -Xswiftc -warnings-as-errors
 
 log "running AddressSanitizer tests"
