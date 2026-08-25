@@ -19,6 +19,26 @@ package enum SpiceCursorLayer: Sendable, Equatable {
     case overlay
 }
 
+package struct SpiceCursorImageCacheKey: Equatable {
+    package let id: UInt64
+    package let format: SpiceCursorImageFormat
+    package let width: Int
+    package let height: Int
+    package let hotSpotX: Int
+    package let hotSpotY: Int
+    package let pixels: Data
+
+    package init(_ cursor: SpiceCursorImage) {
+        id = cursor.id
+        format = cursor.format
+        width = cursor.width
+        height = cursor.height
+        hotSpotX = cursor.hotSpotX
+        hotSpotY = cursor.hotSpotY
+        pixels = cursor.data
+    }
+}
+
 package enum SpiceSystemCursorDescriptor: Equatable {
     case arrow
     case transparent
@@ -30,13 +50,8 @@ package enum SpiceSystemCursorDescriptor: Equatable {
             true
         case let (.image(lhsCursor, lhsScaleX, lhsScaleY),
                   .image(rhsCursor, rhsScaleX, rhsScaleY)):
-            lhsCursor.id == rhsCursor.id
-                && lhsCursor.format == rhsCursor.format
-                && lhsCursor.width == rhsCursor.width
-                && lhsCursor.height == rhsCursor.height
-                && lhsCursor.hotSpotX == rhsCursor.hotSpotX
-                && lhsCursor.hotSpotY == rhsCursor.hotSpotY
-                && lhsCursor.data.count == rhsCursor.data.count
+            SpiceCursorImageCacheKey(lhsCursor)
+                == SpiceCursorImageCacheKey(rhsCursor)
                 && lhsScaleX == rhsScaleX
                 && lhsScaleY == rhsScaleY
         default:
@@ -1166,20 +1181,10 @@ package final class SpiceFramebufferView: NSView {
 
 @MainActor
 private final class SpiceCursorOverlayView: NSView {
-    private struct ImageKey: Equatable {
-        let id: UInt64
-        let format: SpiceCursorImageFormat
-        let width: Int
-        let height: Int
-        let hotSpotX: Int
-        let hotSpotY: Int
-        let byteCount: Int
-    }
-
     private let cursorLayer = CALayer()
     private var frameGeometry: SpiceDesktopFrameGeometry?
     private var cursorState: SpiceCursorState?
-    private var imageKey: ImageKey?
+    private var imageKey: SpiceCursorImageCacheKey?
     private var cachedImage: CGImage?
 
     override var isFlipped: Bool { true }
@@ -1239,15 +1244,7 @@ private final class SpiceCursorOverlayView: NSView {
             return
         }
 
-        let key = ImageKey(
-            id: cursor.id,
-            format: cursor.format,
-            width: cursor.width,
-            height: cursor.height,
-            hotSpotX: cursor.hotSpotX,
-            hotSpotY: cursor.hotSpotY,
-            byteCount: cursor.data.count
-        )
+        let key = SpiceCursorImageCacheKey(cursor)
         if imageKey != key {
             cachedImage = SpiceFrameDrawing.makeCursorImage(cursor)
             imageKey = key

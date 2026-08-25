@@ -291,6 +291,57 @@ struct SpiceDesktopPresentationPolicyTests {
         #expect(first == moved)
         #expect(first != resized)
     }
+
+    @Test func cursorCacheIdentityIncludesPixelContents() {
+        let original = SpiceCursorImage(
+            id: 42,
+            format: .alpha,
+            width: 2,
+            height: 2,
+            hotSpotX: 1,
+            hotSpotY: 1,
+            data: Data(repeating: 0x00, count: 16)
+        )
+        let replacement = SpiceCursorImage(
+            id: 42,
+            format: .alpha,
+            width: 2,
+            height: 2,
+            hotSpotX: 1,
+            hotSpotY: 1,
+            data: Data(repeating: 0xff, count: 16)
+        )
+
+        #expect(
+            SpiceCursorImageCacheKey(original)
+                != SpiceCursorImageCacheKey(replacement)
+        )
+
+        let first = SpiceDesktopPresentationPolicy.systemCursorDescriptor(
+            for: .absolute,
+            cursorState: SpiceCursorState(
+                x: 10,
+                y: 20,
+                isVisible: true,
+                image: original
+            ),
+            frameSize: CGSize(width: 640, height: 480),
+            destinationSize: CGSize(width: 320, height: 240)
+        )
+        let replaced = SpiceDesktopPresentationPolicy.systemCursorDescriptor(
+            for: .absolute,
+            cursorState: SpiceCursorState(
+                x: 10,
+                y: 20,
+                isVisible: true,
+                image: replacement
+            ),
+            frameSize: CGSize(width: 640, height: 480),
+            destinationSize: CGSize(width: 320, height: 240)
+        )
+
+        #expect(first != replaced)
+    }
 }
 
 @Suite("Pointer capture controller")
