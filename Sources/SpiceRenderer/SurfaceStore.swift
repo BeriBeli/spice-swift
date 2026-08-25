@@ -65,6 +65,16 @@ package struct SurfaceRevision: Sendable, Hashable {
     }
 }
 
+/// Identifies the latest non-video mutation applied to a surface. Stream frames
+/// may advance the public revision without invalidating later frames from the
+/// same wire-ordered stream, while any subsequent draw/copy command changes
+/// this barrier and makes an older asynchronous decode stale.
+package struct SurfaceMutationBarrier: Sendable, Hashable {
+    package let surfaceID: UInt32
+    package let lifecycleGeneration: UInt64
+    package let generation: UInt64
+}
+
 /// Surface geometry and identity without materializing a frame snapshot.
 package struct SurfaceDescriptor: Sendable, Equatable {
     package let surfaceID: UInt32
@@ -74,12 +84,21 @@ package struct SurfaceDescriptor: Sendable, Equatable {
     package let format: SurfacePixelFormat
     package let lifecycleGeneration: UInt64
     package let revision: UInt64
+    package let mutationGeneration: UInt64
 
     package var surfaceRevision: SurfaceRevision {
         SurfaceRevision(
             surfaceID: surfaceID,
             lifecycleGeneration: lifecycleGeneration,
             revision: revision
+        )
+    }
+
+    package var mutationBarrier: SurfaceMutationBarrier {
+        SurfaceMutationBarrier(
+            surfaceID: surfaceID,
+            lifecycleGeneration: lifecycleGeneration,
+            generation: mutationGeneration
         )
     }
 }
@@ -365,6 +384,7 @@ package actor SurfaceStore {
         let lifecycleGeneration: UInt64
         let memoryLease: SurfaceMemoryLease
         var revision: UInt64
+        var mutationGeneration: UInt64
         var latestAdvancedVideoRevision: UInt64?
         var storage: SurfaceStorage
 
@@ -495,6 +515,7 @@ package actor SurfaceStore {
             lifecycleGeneration: lifecycleGeneration,
             memoryLease: memoryLease,
             revision: 0,
+            mutationGeneration: 0,
             latestAdvancedVideoRevision: nil,
             storage: SurfaceStorage(
                 pixels: Data(repeating: 0, count: byteCount),
@@ -577,6 +598,7 @@ package actor SurfaceStore {
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         let destinationBytesPerRow = surface.bytesPerRow
         surface.pixels.withUnsafeMutableBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
@@ -639,6 +661,7 @@ package actor SurfaceStore {
             copied.append(surface.pixels[start..<(start + rowBytes)])
         }
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         for row in 0..<destination.height {
             let sourceStart = row * rowBytes
             let destinationStart = (destination.y + row) * surface.bytesPerRow + destination.x * 4
@@ -726,6 +749,7 @@ package actor SurfaceStore {
            let committed = writable.finish(revision: nextRevision)
         {
             surface.revision = nextRevision
+            surface.mutationGeneration &+= 1
             unified.current = committed
             unified.damageJournal.clear()
             unified.damageHistory.reset(at: nextRevision)
@@ -740,6 +764,7 @@ package actor SurfaceStore {
 
         try prepareForMutation(&surface)
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
             guard let destinationBase = destinationBytes.baseAddress else { return }
             copyRawBitmap(
@@ -820,6 +845,7 @@ package actor SurfaceStore {
             copied.append(sourceSurface.pixels[start..<(start + rowBytes)])
         }
         destinationSurface.revision = nextRevision
+        destinationSurface.mutationGeneration &+= 1
         for row in 0..<destination.height {
             let sourceStart = row * rowBytes
             let destinationStart = (destination.y + row) * destinationSurface.bytesPerRow
@@ -845,11 +871,17 @@ package actor SurfaceStore {
         destination: PixelRect,
         bitmap: RawBitmap,
         source: PixelRect,
-        clippedDestinations: [PixelRect]
+        clippedDestinations: [PixelRect],
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil
     ) async throws(RenderError) -> SurfaceRevision? {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
+        if let expectedMutationBarrier,
+           mutationBarrier(of: surface) != expectedMutationBarrier
+        {
+            return nil
+        }
         try validate(destination, in: surface)
         guard source.x >= 0, source.y >= 0,
               source.width > 0, source.height > 0,
@@ -952,7 +984,8 @@ package actor SurfaceStore {
         source: PixelRect,
         topDown: Bool,
         clippedDestinations: [PixelRect],
-        isAdvancedVideo: Bool = false
+        isAdvancedVideo: Bool = false,
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil
     ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
         guard let compositor = metalCompositor else {
             throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
@@ -964,6 +997,11 @@ package actor SurfaceStore {
         }
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         guard let surface = surfaces[surfaceID] else {
+            throw .staleSurface
+        }
+        if let expectedMutationBarrier,
+           mutationBarrier(of: surface) != expectedMutationBarrier
+        {
             throw .staleSurface
         }
         do {
@@ -1265,7 +1303,8 @@ package actor SurfaceStore {
             bytesPerRow: surface.bytesPerRow,
             format: surface.format,
             lifecycleGeneration: surface.lifecycleGeneration,
-            revision: surface.revision
+            revision: surface.revision,
+            mutationGeneration: surface.mutationGeneration
         )
     }
 
@@ -1523,6 +1562,14 @@ package actor SurfaceStore {
             surfaceID: surface.id,
             lifecycleGeneration: surface.lifecycleGeneration,
             revision: surface.revision
+        )
+    }
+
+    private func mutationBarrier(of surface: Surface) -> SurfaceMutationBarrier {
+        SurfaceMutationBarrier(
+            surfaceID: surface.id,
+            lifecycleGeneration: surface.lifecycleGeneration,
+            generation: surface.mutationGeneration
         )
     }
 

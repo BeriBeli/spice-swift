@@ -91,6 +91,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     private struct PendingMJPEGFrame: Sendable {
         let streamID: UInt32
         let streamGeneration: UInt64
+        let expectedMutationBarrier: SurfaceMutationBarrier
         let multimediaTime: UInt32
         let sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?
         let data: Data
@@ -348,7 +349,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         case let .displayStreamData(data):
             if schedulesMJPEGAsynchronously,
                streams[data.streamID]?.codec == .mjpeg {
-                try enqueueMJPEGFrame(
+                try await enqueueMJPEGFrame(
                     streamID: data.streamID,
                     multimediaTime: data.multimediaTime,
                     sizing: nil,
@@ -370,7 +371,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         case let .displayStreamDataSized(data):
             if schedulesMJPEGAsynchronously,
                streams[data.streamID]?.codec == .mjpeg {
-                try enqueueMJPEGFrame(
+                try await enqueueMJPEGFrame(
                     streamID: data.streamID,
                     multimediaTime: data.multimediaTime,
                     sizing: (data.width, data.height, data.destination),
@@ -494,9 +495,20 @@ package actor DisplayChannel: SpiceManagedChannel {
         sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
         data: Data,
         receivedAt: ContinuousClock.Instant
-    ) throws(ChannelError) {
+    ) async throws(ChannelError) {
         guard let stream = streams[streamID], stream.codec == .mjpeg else {
             throw .protocolViolation("data for unknown MJPEG stream \(streamID)")
+        }
+        let expectedMutationBarrier: SurfaceMutationBarrier
+        do {
+            expectedMutationBarrier = try await surfaces.descriptor(
+                surfaceID: stream.surfaceID
+            ).mutationBarrier
+        } catch {
+            throw .protocolViolation(String(describing: error))
+        }
+        guard streams[streamID]?.generation == stream.generation else {
+            return
         }
         if pendingMJPEGFrames[streamID] != nil {
             mjpegFramesSupersededBeforeDecode &+= 1
@@ -504,6 +516,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         pendingMJPEGFrames[streamID] = PendingMJPEGFrame(
             streamID: streamID,
             streamGeneration: stream.generation,
+            expectedMutationBarrier: expectedMutationBarrier,
             multimediaTime: multimediaTime,
             sizing: sizing,
             data: data,
@@ -534,7 +547,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                     streamID: pending.streamID,
                     multimediaTime: pending.multimediaTime,
                     sizing: pending.sizing,
-                    data: pending.data
+                    data: pending.data,
+                    expectedMutationBarrier: pending.expectedMutationBarrier
                 ) else {
                     continue
                 }
@@ -547,6 +561,11 @@ package actor DisplayChannel: SpiceManagedChannel {
                     await publisher.submit(revision, sourceTiming: timing)
                 }
             } catch {
+                guard !Task.isCancelled,
+                      streams[streamID]?.generation == streamGeneration
+                else {
+                    break
+                }
                 asynchronousFailure = error
                 await connection.close()
                 break
@@ -730,7 +749,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         streamID: UInt32,
         multimediaTime: UInt32,
         sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
-        data: Data
+        data: Data,
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil
     ) async throws(ChannelError) -> SurfaceRevision? {
         guard var stream = streams[streamID] else {
             throw .protocolViolation("data for unknown stream \(streamID)")
@@ -878,7 +898,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                     source: source,
                     topDown: stream.topDown,
                     clippedDestinations: clipped,
-                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265
+                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265,
+                    expectedMutationBarrier: expectedMutationBarrier
                 )
                 usedNativeVideoPath = surfaceRevision != nil
             } catch {
@@ -929,7 +950,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                     destination: destination,
                     bitmap: bitmap,
                     source: source,
-                    clippedDestinations: clipped
+                    clippedDestinations: clipped,
+                    expectedMutationBarrier: expectedMutationBarrier
                 )
             } catch {
                 throw .protocolViolation(String(describing: error))

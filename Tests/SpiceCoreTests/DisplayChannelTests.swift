@@ -58,8 +58,15 @@ struct DisplayChannelTests {
             jpegDecoder: decoder,
             framePublicationInterval: .zero
         )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
         let runTask = Task {
-            try await channel.run { _ in }
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
         }
 
         await decoder.waitUntilFirstDecodeStarts()
@@ -68,8 +75,173 @@ struct DisplayChannelTests {
         await decoder.releaseFirstDecode()
         await decoder.waitUntilDecodeCount(2)
 
+        var eventIterator = events.stream.makeAsyncIterator()
+        var finalFrame: FrameSnapshot?
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event, frame.pixels.first == 90 else { continue }
+            finalFrame = frame
+            break
+        }
+
         #expect(await decoder.payloads == [Data([1]), Data([3])])
         #expect(await channel.diagnosticsSnapshot().mjpeg.supersededBeforeDecode == 1)
+        #expect(finalFrame?.revision == 2)
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+    }
+
+    @Test func staleMJPEGDecodeCannotOverwriteLaterDrawCommand() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 4,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 4,
+                streamHeight: 2,
+                sourceWidth: 4,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 4),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 1,
+                data: Data([1])
+            )),
+            encodeMini(id: 302, body: drawFillBody()),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 2,
+                data: Data([2])
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 3)
+        try await transport.connect()
+        let decoder = GatedPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+
+        await decoder.waitUntilFirstDecodeStarts()
+        await transport.releaseRemainingReads()
+        await transport.waitUntilReadCount(5)
+
+        var eventIterator = events.stream.makeAsyncIterator()
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event,
+                  pixel(frame, x: 0, y: 0) == [0, 0, 255, 255]
+            else {
+                continue
+            }
+            break
+        }
+
+        await decoder.releaseFirstDecode()
+        var finalFrame: FrameSnapshot?
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event, frame.pixels.first == 50 else { continue }
+            finalFrame = frame
+            break
+        }
+
+        #expect(await decoder.payloads == [Data([1]), Data([2])])
+        #expect(finalFrame?.revision == 2)
+        #expect(finalFrame.map { pixel($0, x: 0, y: 0) } == [50, 0, 0, 255])
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+    }
+
+    @Test func streamDestroyCancellationDoesNotCloseDisplayChannel() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 1,
+                data: Data([1])
+            )),
+            encodeMini(id: 125, body: streamDestroyBody(streamID: 7)),
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2,
+                width: 1,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 3)
+        try await transport.connect()
+        let decoder = CancellationAwareJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+
+        await decoder.waitUntilDecodeStarts()
+        await transport.releaseRemainingReads()
+
+        var eventIterator = events.stream.makeAsyncIterator()
+        var sawSentinelSurface = false
+        while let event = await eventIterator.next() {
+            guard event == .surfaceCreated(2) else { continue }
+            sawSentinelSurface = true
+            break
+        }
+
+        #expect(sawSentinelSurface)
+        #expect(await decoder.wasCancelled)
         runTask.cancel()
         _ = try? await runTask.value
         await channel.close()
@@ -2442,6 +2614,36 @@ private actor GatedPatternJPEGDecoder: SpiceImageDecoder {
     func waitUntilDecodeCount(_ target: Int) async {
         guard payloads.count < target else { return }
         await withCheckedContinuation { decodeCountWaiters.append((target, $0)) }
+    }
+}
+
+private actor CancellationAwareJPEGDecoder: SpiceImageDecoder {
+    nonisolated let format = SpiceImageFormat.jpeg
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var wasCancelled = false
+
+    func decode(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data
+    ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        _ = descriptor
+        _ = payload
+        started = true
+        for continuation in startedWaiters { continuation.resume() }
+        startedWaiters.removeAll()
+        do {
+            try await Task.sleep(for: .seconds(60))
+        } catch {
+            wasCancelled = true
+            throw .cancelled
+        }
+        throw .decodeFailed
+    }
+
+    func waitUntilDecodeStarts() async {
+        guard !started else { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
     }
 }
 
