@@ -114,6 +114,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.metalRequestToPresented
 
         let agentManager = SpiceAgentManager()
+        await agentManager.waitForSessionReconnectBoundary()
         let agentDiagnostics: SpiceAgentWireDiagnostics =
             await agentManager.diagnosticsSnapshot()
         requireSendable(agentDiagnostics)

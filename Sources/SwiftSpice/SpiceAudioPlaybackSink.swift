@@ -62,6 +62,7 @@ public actor SpiceAudioPlaybackSink {
     private var isMuted = false
     private var scheduledPackets: UInt64 = 0
     private var scheduledFrames: UInt64 = 0
+    private var streamEpoch: UInt64 = 0
 
     public init(
         maximumQueuedMilliseconds: UInt32 = 500,
@@ -223,6 +224,7 @@ public actor SpiceAudioPlaybackSink {
                 milliseconds: Self.milliseconds(frames: frames, sampleRate: controller.sampleRate)
             ))
         case let .schedule(generation, flush, startPlayback, droppedFrames):
+            let scheduledStreamEpoch = streamEpoch
             if flush {
                 player.stop()
                 eventContinuation.yield(.overflowResynchronized(
@@ -238,7 +240,11 @@ public actor SpiceAudioPlaybackSink {
                 completionCallbackType: .dataPlayedBack
             ) { [weak self] _ in
                 Task {
-                    await self?.bufferPlayed(frames: frameCount, generation: generation)
+                    await self?.bufferPlayed(
+                        frames: frameCount,
+                        generation: generation,
+                        streamEpoch: scheduledStreamEpoch
+                    )
                 }
             }
             scheduledPackets &+= 1
@@ -249,8 +255,15 @@ public actor SpiceAudioPlaybackSink {
         }
     }
 
-    private func bufferPlayed(frames: UInt64, generation: UInt64) {
-        guard var controller else {
+    private func bufferPlayed(
+        frames: UInt64,
+        generation: UInt64,
+        streamEpoch completedStreamEpoch: UInt64
+    ) {
+        guard Self.isCurrentPlaybackCompletion(
+            completedStreamEpoch: completedStreamEpoch,
+            currentStreamEpoch: streamEpoch
+        ), var controller else {
             return
         }
         let completion = controller.completed(frames: frames, generation: generation)
@@ -265,7 +278,15 @@ public actor SpiceAudioPlaybackSink {
         self.controller = controller
     }
 
+    package nonisolated static func isCurrentPlaybackCompletion(
+        completedStreamEpoch: UInt64,
+        currentStreamEpoch: UInt64
+    ) -> Bool {
+        completedStreamEpoch == currentStreamEpoch
+    }
+
     private func stopStream(emit: Bool) {
+        streamEpoch &+= 1
         player.stop()
         engine.stop()
         engine.disconnectNodeOutput(player)

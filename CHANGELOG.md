@@ -7,6 +7,36 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-08-25
+
+### Added
+
+- Added a revision-backed Agent reconnect-boundary acknowledgement so
+  applications can wait for session disconnect cleanup and old connection work
+  to drain before reusing a `SpiceSession`, including startup, in-progress
+  disconnect, and dequeued-event races.
+
+### Fixed
+
+- Added ordered Agent-disconnected and playback-stopped boundaries before a
+  session failure/disconnect, preserving fixed consumers across reconnects.
+- Added a bounded Agent mailbox that atomically discards stale payloads at a
+  disconnect boundary, preserves ordered lifecycle events across reconnects,
+  and permits a consumer to stop and restart without terminating the session.
+- Fenced Agent work by lifecycle generation so dequeued messages cannot reply
+  after a transport reconnect, migration, or in-place guest Agent restart.
+- Serialized complete client Agent messages, reserved their tokens atomically,
+  and kept every fragment on one captured Main Channel connection during
+  seamless rebinding; a failed partial message now invalidates the byte stream
+  before any queued message can write.
+- Serialized connection attempts with disconnect cleanup and bound reconnect
+  fences to exact session lifecycle IDs, preventing late adoption, actor-hop
+  ABA waits, and cancellation or stop leaks.
+- Isolated AVAudio completion handlers by playback epoch so a late completion
+  from the old connection cannot mutate the new stream's buffer controller.
+- Ended the old playback lifecycle before a non-seamless migration adopts its
+  target, while leaving seamless channel rebinding uninterrupted.
+
 ## [0.2.1] — 2026-08-25
 
 ### Added
@@ -124,7 +154,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/BeriBeli/spice-swift/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/BeriBeli/spice-swift/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/BeriBeli/spice-swift/compare/v0.1.10...v0.2.0
 [0.1.10]: https://github.com/BeriBeli/spice-swift/compare/v0.1.9...v0.1.10

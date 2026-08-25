@@ -45,6 +45,37 @@ public struct SpiceAgentWireDiagnostics: Sendable, Equatable {
 /// This is a data-transfer path. It does not synthesize keyboard scan codes or
 /// expose guest IME composition and candidate state.
 public actor SpiceAgentManager {
+    private struct RunKey: Sendable, Equatable {
+        let identifier: UInt64
+        let sessionIdentifier: ObjectIdentifier
+    }
+
+    private struct ProcessedBoundary: Sendable {
+        let runKey: RunKey
+        var revision: UInt64
+    }
+
+    private struct ReconnectBoundaryWaiter {
+        let runKey: RunKey
+        let targetRevision: UInt64
+        let operationToken: UInt64
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct ReconnectBoundaryOperation {
+        let runKey: RunKey
+        let connectionGeneration: UInt64
+        var sessionLifecycleID: UInt64?
+        var sessionWaitTask: Task<Void, Never>?
+        var superseded = false
+    }
+
+    private struct ActiveAgentOperation {
+        let session: SpiceSession
+        let runKey: RunKey
+        let connectionGeneration: UInt64
+    }
+
     public static let maximumWireTextBytes = 16 * 1_024 * 1_024 - 4
 
     public nonisolated let events: AsyncStream<SpiceClipboardEvent>
@@ -67,6 +98,16 @@ public actor SpiceAgentManager {
     private var eventTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var session: SpiceSession?
+    private var nextRunIdentifier: UInt64 = 0
+    private var currentRunKey: RunKey?
+    private var isStarting = false
+    private var isStopping = false
+    private var startCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var reconnectStartWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+    private var stopCompletionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activeOperationCount = 0
+    private var nextOperationDrainWaiterToken: UInt64 = 0
+    private var operationDrainWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
     private var pendingActions: [ClipboardStateMachine.Action] = []
     private var displayCoordinator = DisplayConfigurationCoordinator()
     private var lastDisplayConfigurationSupport: SpiceDisplayConfigurationSupport?
@@ -78,6 +119,23 @@ public actor SpiceAgentManager {
     private var fileTransferReaders: [SpiceFileTransferID: FileTransferReader] = [:]
     private var nextFileTransferID: UInt32 = 1
     private var wireDiagnostics = SpiceAgentWireDiagnostics()
+    private var currentAgentConnectionGeneration: UInt64 = 0
+    private var currentSessionLifecycleID: UInt64?
+    private var processedBoundary: ProcessedBoundary?
+    private var reconnectQuiescingRunKey: RunKey?
+    private var reconnectQuiescingConnectionGeneration: UInt64?
+    private var nextReconnectBoundaryToken: UInt64 = 0
+    private var activeReconnectBoundaries: [UInt64: ReconnectBoundaryOperation] = [:]
+    private var committedReconnectQuiesceRunKey: RunKey?
+    private var committedReconnectQuiesceGeneration: UInt64?
+    private var committedReconnectQuiesceLifecycleID: UInt64?
+    private var reconnectBoundaryWaiters: [ReconnectBoundaryWaiter] = []
+    private var reconnectBoundarySnapshotHook: (@Sendable () async -> Void)?
+    private var messageProcessingHook: (@Sendable () async -> Void)?
+    private var eventProcessingHook: (@Sendable (SpiceAgentEvent) async -> Void)?
+    private var startProcessingHook: (@Sendable () async -> Void)?
+    private var fileInspectionHook: (@Sendable () async -> Void)?
+    private var fileMessageCompletionHook: (@Sendable () async -> Void)?
 
     public init(
         maximumTextBytes: Int = SpiceAgentManager.maximumWireTextBytes,
@@ -130,27 +188,77 @@ public actor SpiceAgentManager {
     deinit {
         eventTask?.cancel()
         pollTask?.cancel()
+        for operation in activeReconnectBoundaries.values {
+            operation.sessionWaitTask?.cancel()
+        }
         eventContinuation.finish()
         displayConfigurationContinuation.finish()
         displayConfigurationSupportContinuation.finish()
         fileTransferContinuation.finish()
+        for waiter in reconnectBoundaryWaiters {
+            waiter.continuation.resume()
+        }
+        for waiter in startCompletionWaiters {
+            waiter.resume()
+        }
+        for waiter in reconnectStartWaiters.values {
+            waiter.resume()
+        }
+        for waiter in stopCompletionWaiters {
+            waiter.resume()
+        }
+        for waiter in operationDrainWaiters.values {
+            waiter.resume()
+        }
     }
 
     public func start(session: SpiceSession) async throws(SpiceClipboardError) {
-        guard eventTask == nil else {
+        guard eventTask == nil, !isStarting, !isStopping else {
             throw .alreadyRunning
         }
+        nextRunIdentifier &+= 1
+        let runKey = RunKey(
+            identifier: nextRunIdentifier,
+            sessionIdentifier: ObjectIdentifier(session)
+        )
+        currentRunKey = runKey
+        isStarting = true
+        defer { finishStart() }
         self.session = session
-        if await session.currentAgentConnectionState() {
-            await execute(state.connected(), using: session)
+        // The first await establishes this run's ownership boundary. A
+        // disconnect ordered before it predates this consumer; one ordered
+        // after it carries a strictly newer envelope revision that must be
+        // processed before reconnect.
+        let baselineRevision = await session.currentAgentDisconnectRevision()
+        guard isCurrentStartingRun(runKey, session: session) else { return }
+        processedBoundary = ProcessedBoundary(
+            runKey: runKey,
+            revision: baselineRevision
+        )
+        if let startProcessingHook {
+            await startProcessingHook()
+            guard isCurrentStartingRun(runKey, session: session) else { return }
         }
+        let agentConnection = await session.currentAgentConnectionSnapshot()
+        guard isCurrentStartingRun(runKey, session: session) else { return }
+        currentAgentConnectionGeneration = agentConnection.generation
+        currentSessionLifecycleID = agentConnection.sessionLifecycleID
+        if agentConnection.isConnected {
+            await execute(
+                state.connected(),
+                using: session,
+                expectedConnectionGeneration: agentConnection.generation
+            )
+            guard isCurrentStartingRun(runKey, session: session) else { return }
+        }
+        guard isCurrentStartingRun(runKey, session: session) else { return }
         emitDisplayConfigurationSupportIfChanged()
         eventTask = Task { [weak self] in
-            for await event in session.agentEvents {
-                guard !Task.isCancelled else {
-                    return
-                }
-                await self?.receive(event, from: session)
+            for await envelope in session.agentEventEnvelopes {
+                // Once dequeued, an envelope belongs to this run. Finish it
+                // even if stop() cancels the pump, then cancellation ends the
+                // following next() while stop() drains this task.
+                await self?.receive(envelope, from: session, runKey: runKey)
             }
         }
         let pollInterval = self.pollInterval
@@ -167,17 +275,266 @@ public actor SpiceAgentManager {
         }
     }
 
-    public func stop() {
-        eventTask?.cancel()
+    public func stop() async {
+        if isStopping {
+            await withCheckedContinuation { continuation in
+                stopCompletionWaiters.append(continuation)
+            }
+            return
+        }
+        isStopping = true
+        for operation in activeReconnectBoundaries.values {
+            operation.sessionWaitTask?.cancel()
+        }
+        let oldEventTask = eventTask
         eventTask = nil
-        pollTask?.cancel()
+        let oldPollTask = pollTask
         pollTask = nil
+        oldEventTask?.cancel()
+        oldPollTask?.cancel()
+
+        if isStarting {
+            await withCheckedContinuation { continuation in
+                startCompletionWaiters.append(continuation)
+            }
+        }
+        // A start suspended before task installation must not leave a late
+        // pump behind. The normal generation guards prevent this; recapturing
+        // here also makes stop's drain fence defensive against future awaits.
+        let lateEventTask = eventTask
+        eventTask = nil
+        let latePollTask = pollTask
+        pollTask = nil
+        lateEventTask?.cancel()
+        latePollTask?.cancel()
+        await oldEventTask?.value
+        await oldPollTask?.value
+        await lateEventTask?.value
+        await latePollTask?.value
+        await waitForActiveOperationsToDrain()
+
         session = nil
         pendingActions.removeAll(keepingCapacity: false)
         displayCoordinator.reset()
         cancelAllFileTransfers()
         emitActions(state.disconnected())
         emitDisplayConfigurationSupportIfChanged()
+        resumeReconnectBoundaryWaiters()
+        currentRunKey = nil
+        currentAgentConnectionGeneration = 0
+        currentSessionLifecycleID = nil
+        processedBoundary = nil
+        reconnectQuiescingRunKey = nil
+        reconnectQuiescingConnectionGeneration = nil
+        activeReconnectBoundaries.removeAll(keepingCapacity: false)
+        committedReconnectQuiesceRunKey = nil
+        committedReconnectQuiesceGeneration = nil
+        committedReconnectQuiesceLifecycleID = nil
+        isStopping = false
+        let stopWaiters = stopCompletionWaiters
+        stopCompletionWaiters.removeAll(keepingCapacity: false)
+        for waiter in stopWaiters {
+            waiter.resume()
+        }
+    }
+
+    /// Waits until the manager's single Agent event pump has processed the
+    /// latest disconnect boundary emitted by its session. The session
+    /// disconnect itself and every old-session message ordered before that
+    /// revision have then finished, so the same `SpiceSession` may safely
+    /// reconnect without carrying Agent work into the new connection.
+    public func waitForSessionReconnectBoundary() async {
+        guard !isStopping, let session, let runKey = currentRunKey else { return }
+        nextReconnectBoundaryToken &+= 1
+        let operationToken = nextReconnectBoundaryToken
+        activeReconnectBoundaries[operationToken] = ReconnectBoundaryOperation(
+            runKey: runKey,
+            connectionGeneration: currentAgentConnectionGeneration,
+            sessionLifecycleID: currentSessionLifecycleID
+        )
+        refreshReconnectQuiesce(for: runKey)
+        defer { finishReconnectBoundaryOperation(operationToken, runKey: runKey) }
+
+        if let reconnectBoundarySnapshotHook {
+            await reconnectBoundarySnapshotHook()
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
+        }
+        let connection = await session.currentAgentConnectionSnapshot()
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        let boundaryLifecycleID = activeReconnectBoundaries[operationToken]?.sessionLifecycleID
+        let lifecycleToWait: UInt64?
+        if let currentLifecycleID = connection.sessionLifecycleID {
+            if let boundaryLifecycleID {
+                // A different live lifecycle means disconnect/reconnect won
+                // the actor hop. Never attach this old boundary to the new
+                // session and wait for its next disconnect.
+                lifecycleToWait = currentLifecycleID == boundaryLifecycleID
+                    ? currentLifecycleID
+                    : nil
+            } else {
+                activeReconnectBoundaries[operationToken]?.sessionLifecycleID = currentLifecycleID
+                currentSessionLifecycleID = currentLifecycleID
+                lifecycleToWait = currentLifecycleID
+            }
+        } else {
+            lifecycleToWait = nil
+        }
+        refreshReconnectQuiesce(for: runKey)
+
+        if let lifecycleID = lifecycleToWait {
+            // Bind the wait to the exact lifecycle seen by the first snapshot.
+            // A complete disconnect/reconnect between these actor hops then
+            // returns immediately instead of waiting on the new connection.
+            let sessionWaitTask = Task {
+                await session.waitUntilConnectionInactiveForReconnect(
+                    observedLifecycleID: lifecycleID
+                )
+            }
+            activeReconnectBoundaries[operationToken]?.sessionWaitTask = sessionWaitTask
+            await withTaskCancellationHandler {
+                await sessionWaitTask.value
+            } onCancel: {
+                sessionWaitTask.cancel()
+            }
+            activeReconnectBoundaries[operationToken]?.sessionWaitTask = nil
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
+        }
+        if isStarting {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if Task.isCancelled || !isStarting || self.session !== session
+                        || currentRunKey != runKey || isStopping {
+                        continuation.resume()
+                    } else {
+                        reconnectStartWaiters[operationToken] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelReconnectStartWaiter(operationToken) }
+            }
+            guard isCurrentReconnectBoundaryOperation(
+                operationToken,
+                runKey: runKey,
+                session: session
+            ) else { return }
+        }
+        let targetRevision = await session.currentAgentDisconnectRevision()
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        let processedRevision = processedBoundary?.runKey == runKey
+            ? processedBoundary?.revision ?? 0
+            : 0
+        if processedRevision < targetRevision {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    let currentProcessedRevision = processedBoundary?.runKey == runKey
+                    ? processedBoundary?.revision ?? 0
+                    : 0
+                    if Task.isCancelled || self.session !== session
+                        || currentRunKey != runKey || isStopping
+                        || currentProcessedRevision >= targetRevision {
+                        continuation.resume()
+                    } else {
+                        reconnectBoundaryWaiters.append(ReconnectBoundaryWaiter(
+                            runKey: runKey,
+                            targetRevision: targetRevision,
+                            operationToken: operationToken,
+                            continuation: continuation
+                        ))
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelReconnectBoundaryWaiter(operationToken) }
+            }
+        }
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        await waitForActiveOperationsToDrain(cancellable: true)
+        guard isCurrentReconnectBoundaryOperation(
+            operationToken,
+            runKey: runKey,
+            session: session
+        ) else { return }
+        guard let operation = activeReconnectBoundaries[operationToken] else { return }
+        committedReconnectQuiesceRunKey = runKey
+        committedReconnectQuiesceGeneration = connection.generation
+        committedReconnectQuiesceLifecycleID = operation.sessionLifecycleID
+        if currentSessionLifecycleID == operation.sessionLifecycleID {
+            currentSessionLifecycleID = nil
+        }
+        refreshReconnectQuiesce(for: runKey)
+    }
+
+    package func setMessageProcessingHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        messageProcessingHook = hook
+    }
+
+    package func setEventProcessingHookForTesting(
+        _ hook: (@Sendable (SpiceAgentEvent) async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        eventProcessingHook = hook
+    }
+
+    package func setStartProcessingHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        startProcessingHook = hook
+    }
+
+    package func setFileInspectionHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        fileInspectionHook = hook
+    }
+
+    package func setFileMessageCompletionHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        fileMessageCompletionHook = hook
+    }
+
+    package func setReconnectBoundarySnapshotHookForTesting(
+        _ hook: (@Sendable () async -> Void)?
+    ) {
+        precondition(eventTask == nil)
+        reconnectBoundarySnapshotHook = hook
+    }
+
+    package func isReconnectBoundaryQuiescingForTesting() -> Bool {
+        reconnectQuiescingRunKey == currentRunKey
+    }
+
+    package func isReconnectBoundaryWaitingForOperationsForTesting() -> Bool {
+        !operationDrainWaiters.isEmpty
+    }
+
+    package func activeFileTransferCountForTesting() -> Int {
+        fileTransfers.count
     }
 
     /// Returns content-free aggregate observations of the Agent wire and
@@ -189,22 +546,40 @@ public actor SpiceAgentManager {
     /// Checks the current pasteboard immediately rather than waiting for the
     /// optional polling loop.
     public func synchronizePasteboard() async {
-        guard pasteboardSynchronizationEnabled, let session else {
+        guard pasteboardSynchronizationEnabled,
+              let operation = beginActiveAgentOperation() else {
             return
         }
-        await execute(state.announcementIfNeeded(), using: session)
+        defer { finishActiveAgentOperation() }
+        await execute(
+            state.announcementIfNeeded(),
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
+        guard isCurrent(operation) else { return }
         let snapshot = await SpicePasteboardBridge.snapshot()
+        guard isCurrent(operation) else { return }
         await execute(state.localPasteboardChanged(
             changeCount: snapshot.changeCount,
             text: snapshot.text
-        ), using: session)
-        await sendPendingDisplayConfiguration(using: session)
-        await driveFileTransfers(using: session)
+        ), using: operation.session, expectedConnectionGeneration: operation.connectionGeneration)
+        await sendPendingDisplayConfiguration(
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
+        await driveFileTransfers(
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
     }
 
     /// Publishes text locally and offers it to the guest without polling delay.
     public func publish(_ text: String) async {
         guard pasteboardSynchronizationEnabled else { return }
+        let operation = beginActiveAgentOperation()
+        defer {
+            if operation != nil { finishActiveAgentOperation() }
+        }
         let snapshot: SpicePasteboardSnapshot
         do {
             snapshot = try await SpicePasteboardBridge.write(text: text)
@@ -212,13 +587,13 @@ public actor SpiceAgentManager {
             emit(.failed(error))
             return
         }
-        guard let session else {
+        guard let operation, isCurrent(operation) else {
             return
         }
         await execute(state.localPasteboardChanged(
             changeCount: snapshot.changeCount,
             text: snapshot.text
-        ), using: session)
+        ), using: operation.session, expectedConnectionGeneration: operation.connectionGeneration)
     }
 
     /// Changes whether this manager may advertise clipboard support or access
@@ -226,12 +601,17 @@ public actor SpiceAgentManager {
     public func setPasteboardSynchronizationEnabled(_ enabled: Bool) async {
         guard pasteboardSynchronizationEnabled != enabled else { return }
         pasteboardSynchronizationEnabled = enabled
-        guard let session else {
+        guard let operation = beginActiveAgentOperation() else {
             _ = state.setClipboardEnabled(enabled)
             return
         }
-        await execute(state.setClipboardEnabled(enabled), using: session)
-        if enabled {
+        defer { finishActiveAgentOperation() }
+        await execute(
+            state.setClipboardEnabled(enabled),
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
+        if enabled, isCurrent(operation) {
             await synchronizePasteboard()
         }
     }
@@ -258,9 +638,10 @@ public actor SpiceAgentManager {
     public func requestDisplayConfiguration(
         _ configuration: SpiceDisplayConfiguration
     ) async throws(SpiceDisplayConfigurationError) {
-        guard let session else {
+        guard let operation = beginActiveAgentOperation() else {
             throw .agentManagerNotRunning
         }
+        defer { finishActiveAgentOperation() }
         if state.hasExplicitPeerCapabilities,
            !state.supportsMonitorConfiguration {
             throw .unsupportedByAgent
@@ -268,7 +649,10 @@ public actor SpiceAgentManager {
         _ = try makeWireDisplayConfiguration(configuration)
         displayCoordinator.queue(configuration)
         emitDisplay(.queued(configuration))
-        await sendPendingDisplayConfiguration(using: session)
+        await sendPendingDisplayConfiguration(
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
     }
 
     /// Explicitly authorizes one host-to-guest transfer. No directory is
@@ -277,9 +661,10 @@ public actor SpiceAgentManager {
         at source: URL,
         name: String? = nil
     ) async throws(SpiceFileTransferError) -> SpiceFileTransferID {
-        guard let session else {
+        guard let operation = beginActiveAgentOperation() else {
             throw .agentManagerNotRunning
         }
+        defer { finishActiveAgentOperation() }
         guard state.isAgentConnected else {
             throw .agentUnavailable
         }
@@ -289,8 +674,11 @@ public actor SpiceAgentManager {
         guard fileTransfers.count < maximumConcurrentFileTransfers else {
             throw .tooManyConcurrentTransfers(maximum: maximumConcurrentFileTransfers)
         }
+        if let fileInspectionHook {
+            await fileInspectionHook()
+        }
         let info = try await Self.inspectFile(source, overrideName: name)
-        guard self.session != nil, state.isAgentConnected else {
+        guard isCurrent(operation), state.isAgentConnected else {
             info.reader.close()
             throw .agentUnavailable
         }
@@ -315,11 +703,17 @@ public actor SpiceAgentManager {
         )
         fileTransferReaders[id] = info.reader
         emitFileTransfer(.queued(id: id, name: info.name, totalBytes: info.size))
-        await driveFileTransfers(using: session)
+        await driveFileTransfers(
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
+        guard isCurrent(operation) else { throw .agentUnavailable }
         return id
     }
 
     public func cancelFileTransfer(_ id: SpiceFileTransferID) async {
+        guard let operation = beginActiveAgentOperation() else { return }
+        defer { finishActiveAgentOperation() }
         guard var job = fileTransfers[id] else {
             return
         }
@@ -339,37 +733,75 @@ public actor SpiceAgentManager {
             job.phase = .queuedCancellation
             fileTransfers[id] = job
         }
-        if let session {
-            await driveFileTransfers(using: session)
-        }
+        await driveFileTransfers(
+            using: operation.session,
+            expectedConnectionGeneration: operation.connectionGeneration
+        )
     }
 
-    private func receive(_ event: SpiceAgentEvent, from session: SpiceSession) async {
+    private func receive(
+        _ envelope: SpiceAgentEventEnvelope,
+        from session: SpiceSession,
+        runKey: RunKey
+    ) async {
+        guard isCurrentRun(runKey, session: session) else { return }
+        let event = envelope.event
+        let expectedConnectionGeneration = envelope.connectionGeneration
+        if let eventProcessingHook {
+            await eventProcessingHook(event)
+            guard isCurrentRun(runKey, session: session) else { return }
+        }
         switch event {
         case .connected:
+            currentAgentConnectionGeneration = expectedConnectionGeneration
+            currentSessionLifecycleID = envelope.sessionLifecycleID
+            // Retire old-session fences before capability, pasteboard, or
+            // display work introduces an actor reentrancy window.
+            reconnectDidConnect(
+                generation: expectedConnectionGeneration,
+                sessionLifecycleID: envelope.sessionLifecycleID,
+                runKey: runKey
+            )
             guard !state.isAgentConnected else {
                 return
             }
             pendingActions.removeAll(keepingCapacity: false)
             displayCoordinator.disconnected()
-            await execute(state.connected(), using: session)
+            await execute(
+                state.connected(),
+                using: session,
+                expectedConnectionGeneration: expectedConnectionGeneration
+            )
             emitDisplayConfigurationSupportIfChanged()
             if automaticallySynchronizesPasteboard, pasteboardSynchronizationEnabled {
                 let snapshot = await SpicePasteboardBridge.snapshot()
                 await execute(state.localPasteboardChanged(
                     changeCount: snapshot.changeCount,
                     text: snapshot.text
-                ), using: session)
+                ), using: session, expectedConnectionGeneration: expectedConnectionGeneration)
             }
-            await sendPendingDisplayConfiguration(using: session)
-            await driveFileTransfers(using: session)
+            await sendPendingDisplayConfiguration(
+                using: session,
+                expectedConnectionGeneration: expectedConnectionGeneration
+            )
+            await driveFileTransfers(
+                using: session,
+                expectedConnectionGeneration: expectedConnectionGeneration
+            )
         case .disconnected:
-            pendingActions.removeAll(keepingCapacity: false)
-            displayCoordinator.disconnected()
-            failAllFileTransfers(with: .agentUnavailable)
-            emitActions(state.disconnected())
-            emitDisplayConfigurationSupportIfChanged()
+            currentAgentConnectionGeneration = expectedConnectionGeneration
+            if let sessionLifecycleID = envelope.sessionLifecycleID {
+                currentSessionLifecycleID = sessionLifecycleID
+            }
+            transitionToDisconnected()
+            if let revision = envelope.disconnectRevision {
+                acknowledgeReconnectBoundary(revision: revision, runKey: runKey)
+            }
         case let .message(message):
+            if let messageProcessingHook {
+                await messageProcessingHook()
+                guard isCurrentRun(runKey, session: session) else { return }
+            }
             recordInboundMessage(message)
             let wireMessage = VDAgentMessage(
                 protocolID: message.protocolID,
@@ -380,7 +812,11 @@ public actor SpiceAgentManager {
             if message.type == VDAgentMessageType.reply.rawValue {
                 do {
                     if let reply = try VDAgentMonitorCodec.decodeReply(wireMessage) {
-                        await receiveMonitorReply(reply, using: session)
+                        await receiveMonitorReply(
+                            reply,
+                            using: session,
+                            expectedConnectionGeneration: expectedConnectionGeneration
+                        )
                     }
                 } catch {
                     emitDisplay(.protocolFailure(.invalidAgentReply(
@@ -395,7 +831,11 @@ public actor SpiceAgentManager {
                     guard let command = try fileTransferCodec.decode(wireMessage) else {
                         return
                     }
-                    await receiveFileTransfer(command, using: session)
+                    await receiveFileTransfer(
+                        command,
+                        using: session,
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    )
                 } catch {
                     emitFileTransfer(.failed(
                         id: nil,
@@ -418,10 +858,20 @@ public actor SpiceAgentManager {
                     return
                 }
                 recordPeerClipboardCapabilities(command)
-                await execute(try state.receive(command), using: session)
+                await execute(
+                    try state.receive(command),
+                    using: session,
+                    expectedConnectionGeneration: expectedConnectionGeneration
+                )
                 emitDisplayConfigurationSupportIfChanged()
-                await sendPendingDisplayConfiguration(using: session)
-                await driveFileTransfers(using: session)
+                await sendPendingDisplayConfiguration(
+                    using: session,
+                    expectedConnectionGeneration: expectedConnectionGeneration
+                )
+                await driveFileTransfers(
+                    using: session,
+                    expectedConnectionGeneration: expectedConnectionGeneration
+                )
             } catch let failure {
                 recordClipboardFailure(failure.category)
                 emit(.failed(failure.error))
@@ -429,9 +879,259 @@ public actor SpiceAgentManager {
         }
     }
 
+    private func transitionToDisconnected() {
+        pendingActions.removeAll(keepingCapacity: false)
+        displayCoordinator.disconnected()
+        failAllFileTransfers(with: .agentUnavailable)
+        emitActions(state.disconnected())
+        emitDisplayConfigurationSupportIfChanged()
+    }
+
+    private func resumeReconnectBoundaryWaiters() {
+        let waiters = reconnectBoundaryWaiters
+        reconnectBoundaryWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.continuation.resume()
+        }
+    }
+
+    private func acknowledgeReconnectBoundary(revision: UInt64, runKey: RunKey) {
+        guard currentRunKey == runKey else { return }
+        let processedRevision = processedBoundary?.runKey == runKey
+            ? processedBoundary?.revision ?? 0
+            : 0
+        let updatedRevision = max(processedRevision, revision)
+        processedBoundary = ProcessedBoundary(
+            runKey: runKey,
+            revision: updatedRevision
+        )
+        var remaining: [ReconnectBoundaryWaiter] = []
+        for waiter in reconnectBoundaryWaiters {
+            if waiter.runKey == runKey,
+               waiter.targetRevision <= updatedRevision {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        reconnectBoundaryWaiters = remaining
+    }
+
+    private func isCurrentRun(
+        _ runKey: RunKey,
+        session: SpiceSession
+    ) -> Bool {
+        currentRunKey == runKey && self.session === session
+    }
+
+    private func isCurrentStartingRun(
+        _ runKey: RunKey,
+        session: SpiceSession
+    ) -> Bool {
+        isStarting && !isStopping && isCurrentRun(runKey, session: session)
+    }
+
+    private func finishStart() {
+        isStarting = false
+        let waiters = startCompletionWaiters
+        startCompletionWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+        let reconnectWaiters = Array(reconnectStartWaiters.values)
+        reconnectStartWaiters.removeAll(keepingCapacity: false)
+        for waiter in reconnectWaiters {
+            waiter.resume()
+        }
+    }
+
+    private func isCurrentReconnectBoundaryOperation(
+        _ token: UInt64,
+        runKey: RunKey,
+        session: SpiceSession
+    ) -> Bool {
+        guard !Task.isCancelled, !isStopping,
+              currentRunKey == runKey, self.session === session,
+              let operation = activeReconnectBoundaries[token] else {
+            return false
+        }
+        return operation.runKey == runKey && !operation.superseded
+    }
+
+    private func finishReconnectBoundaryOperation(
+        _ token: UInt64,
+        runKey: RunKey
+    ) {
+        activeReconnectBoundaries.removeValue(forKey: token)?.sessionWaitTask?.cancel()
+        reconnectStartWaiters.removeValue(forKey: token)?.resume()
+        cancelReconnectBoundaryWaiter(token)
+        refreshReconnectQuiesce(for: runKey)
+    }
+
+    private func cancelReconnectStartWaiter(_ token: UInt64) {
+        reconnectStartWaiters.removeValue(forKey: token)?.resume()
+    }
+
+    private func cancelReconnectBoundaryWaiter(_ operationToken: UInt64) {
+        var remaining: [ReconnectBoundaryWaiter] = []
+        for waiter in reconnectBoundaryWaiters {
+            if waiter.operationToken == operationToken {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        reconnectBoundaryWaiters = remaining
+    }
+
+    private func refreshReconnectQuiesce(for runKey: RunKey) {
+        guard !isStopping, currentRunKey == runKey else {
+            if reconnectQuiescingRunKey == runKey {
+                reconnectQuiescingRunKey = nil
+                reconnectQuiescingConnectionGeneration = nil
+            }
+            return
+        }
+        var generations = activeReconnectBoundaries.values.compactMap { operation in
+            operation.runKey == runKey && !operation.superseded
+                ? operation.connectionGeneration
+                : nil
+        }
+        if committedReconnectQuiesceRunKey == runKey,
+           let generation = committedReconnectQuiesceGeneration {
+            generations.append(generation)
+        }
+        guard let generation = generations.max() else {
+            if reconnectQuiescingRunKey == runKey {
+                reconnectQuiescingRunKey = nil
+                reconnectQuiescingConnectionGeneration = nil
+            }
+            return
+        }
+        reconnectQuiescingRunKey = runKey
+        reconnectQuiescingConnectionGeneration = generation
+    }
+
+    private func reconnectDidConnect(
+        generation: UInt64,
+        sessionLifecycleID: UInt64?,
+        runKey: RunKey
+    ) {
+        guard reconnectQuiescingRunKey == runKey else { return }
+        if committedReconnectQuiesceRunKey == runKey,
+           let committedGeneration = committedReconnectQuiesceGeneration,
+           isNewSessionConnection(
+               generation: generation,
+               sessionLifecycleID: sessionLifecycleID,
+               relativeToGeneration: committedGeneration,
+               relativeToLifecycleID: committedReconnectQuiesceLifecycleID
+           ) {
+            committedReconnectQuiesceRunKey = nil
+            committedReconnectQuiesceGeneration = nil
+            committedReconnectQuiesceLifecycleID = nil
+        }
+        for token in Array(activeReconnectBoundaries.keys) {
+            guard var operation = activeReconnectBoundaries[token],
+                  operation.runKey == runKey,
+                  isNewSessionConnection(
+                      generation: generation,
+                      sessionLifecycleID: sessionLifecycleID,
+                      relativeToGeneration: operation.connectionGeneration,
+                      relativeToLifecycleID: operation.sessionLifecycleID
+                  ) else { continue }
+            operation.superseded = true
+            operation.sessionWaitTask?.cancel()
+            activeReconnectBoundaries[token] = operation
+        }
+        refreshReconnectQuiesce(for: runKey)
+    }
+
+    private func isNewSessionConnection(
+        generation: UInt64,
+        sessionLifecycleID: UInt64?,
+        relativeToGeneration oldGeneration: UInt64,
+        relativeToLifecycleID oldLifecycleID: UInt64?
+    ) -> Bool {
+        if let sessionLifecycleID {
+            return sessionLifecycleID != oldLifecycleID
+        }
+        return generation > oldGeneration
+    }
+
+    private func beginActiveAgentOperation() -> ActiveAgentOperation? {
+        guard !isStarting, !isStopping,
+              let currentRunKey,
+              reconnectQuiescingRunKey != currentRunKey,
+              eventTask != nil,
+              let session else {
+            return nil
+        }
+        activeOperationCount += 1
+        return ActiveAgentOperation(
+            session: session,
+            runKey: currentRunKey,
+            connectionGeneration: currentAgentConnectionGeneration
+        )
+    }
+
+    private func isCurrent(_ operation: ActiveAgentOperation) -> Bool {
+        !isStopping
+            && currentRunKey == operation.runKey
+            && session === operation.session
+            && currentAgentConnectionGeneration == operation.connectionGeneration
+    }
+
+    private func isAgentGenerationCurrent(_ expected: UInt64?) -> Bool {
+        guard let expected else { return true }
+        return currentAgentConnectionGeneration == expected
+    }
+
+    private func finishActiveAgentOperation() {
+        precondition(activeOperationCount > 0)
+        activeOperationCount -= 1
+        guard activeOperationCount == 0 else { return }
+        let waiters = Array(operationDrainWaiters.values)
+        operationDrainWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func waitForActiveOperationsToDrain(cancellable: Bool = false) async {
+        guard activeOperationCount > 0 else { return }
+        let token = nextOperationDrainWaiterToken
+        nextOperationDrainWaiterToken &+= 1
+        guard cancellable else {
+            await withCheckedContinuation { continuation in
+                if activeOperationCount == 0 {
+                    continuation.resume()
+                } else {
+                    operationDrainWaiters[token] = continuation
+                }
+            }
+            return
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled || activeOperationCount == 0 {
+                    continuation.resume()
+                } else {
+                    operationDrainWaiters[token] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelOperationDrainWaiter(token) }
+        }
+    }
+
+    private func cancelOperationDrainWaiter(_ token: UInt64) {
+        operationDrainWaiters.removeValue(forKey: token)?.resume()
+    }
+
     private func receiveMonitorReply(
         _ reply: VDAgentMonitorReply,
-        using session: SpiceSession
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
     ) async {
         guard let configuration = displayCoordinator.didReceiveReply() else {
             emitDisplay(.protocolFailure(.invalidAgentReply(
@@ -445,11 +1145,18 @@ public actor SpiceAgentManager {
         case .error:
             emitDisplay(.rejected(configuration))
         }
-        await sendPendingDisplayConfiguration(using: session)
+        await sendPendingDisplayConfiguration(
+            using: session,
+            expectedConnectionGeneration: expectedConnectionGeneration
+        )
     }
 
-    private func sendPendingDisplayConfiguration(using session: SpiceSession) async {
-        guard pendingActions.isEmpty,
+    private func sendPendingDisplayConfiguration(
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
+    ) async {
+        guard isAgentGenerationCurrent(expectedConnectionGeneration),
+              pendingActions.isEmpty,
               let configuration = displayCoordinator.nextToSend,
               state.isAgentConnected else {
             return
@@ -466,17 +1173,23 @@ public actor SpiceAgentManager {
                 return
             }
             let message = try VDAgentMonitorCodec.encode(wireConfiguration)
-            try await session.sendAgentMessage(SpiceAgentMessage(
-                protocolID: message.protocolID,
-                type: message.type,
-                opaque: message.opaque,
-                data: message.data
-            ))
+            try await session.sendAgentMessage(
+                SpiceAgentMessage(
+                    protocolID: message.protocolID,
+                    type: message.type,
+                    opaque: message.opaque,
+                    data: message.data
+                ),
+                expectedConnectionGeneration: expectedConnectionGeneration
+            )
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             displayCoordinator.didSend(configuration)
             emitDisplay(.sent(configuration))
         } catch let error as SpiceError {
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             emitDisplay(.failed(configuration, .transport(error)))
         } catch let error as SpiceDisplayConfigurationError {
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             displayCoordinator.discardDesired()
             if error == .unsupportedByAgent {
                 emitDisplay(.unsupported(configuration))
@@ -484,6 +1197,7 @@ public actor SpiceAgentManager {
                 emitDisplay(.failed(configuration, error))
             }
         } catch {
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             displayCoordinator.discardDesired()
             emitDisplay(.failed(configuration, .invalidAgentReply(
                 String(describing: error)
@@ -491,20 +1205,35 @@ public actor SpiceAgentManager {
         }
     }
 
-    private func retryPendingAgentWork() async {
-        guard let session else {
-            return
-        }
-        await execute(state.announcementIfNeeded(), using: session)
-        await sendPendingDisplayConfiguration(using: session)
-        await driveFileTransfers(using: session)
+    private func retryPendingAgentWork(
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64
+    ) async {
+        await execute(
+            state.announcementIfNeeded(),
+            using: session,
+            expectedConnectionGeneration: expectedConnectionGeneration
+        )
+        await sendPendingDisplayConfiguration(
+            using: session,
+            expectedConnectionGeneration: expectedConnectionGeneration
+        )
+        await driveFileTransfers(
+            using: session,
+            expectedConnectionGeneration: expectedConnectionGeneration
+        )
     }
 
     private func performPeriodicWork() async {
+        guard let operation = beginActiveAgentOperation() else { return }
+        defer { finishActiveAgentOperation() }
         if automaticallySynchronizesPasteboard, pasteboardSynchronizationEnabled {
-            await synchronizePasteboard()
+            if isCurrent(operation) { await synchronizePasteboard() }
         } else {
-            await retryPendingAgentWork()
+            await retryPendingAgentWork(
+                using: operation.session,
+                expectedConnectionGeneration: operation.connectionGeneration
+            )
         }
     }
 
@@ -593,7 +1322,8 @@ public actor SpiceAgentManager {
 
     private func receiveFileTransfer(
         _ command: VDAgentFileTransferCommand,
-        using session: SpiceSession
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
     ) async {
         switch command {
         case let .status(status):
@@ -616,7 +1346,10 @@ public actor SpiceAgentManager {
                 }
                 job.phase = .readyToRead
                 fileTransfers[id] = job
-                await driveFileTransfers(using: session)
+                await driveFileTransfers(
+                    using: session,
+                    expectedConnectionGeneration: expectedConnectionGeneration
+                )
             case .cancelled:
                 removeFileTransfer(id)
                 emitFileTransfer(.cancelled(id: id))
@@ -663,13 +1396,20 @@ public actor SpiceAgentManager {
         }
     }
 
-    private func driveFileTransfers(using session: SpiceSession) async {
-        guard pendingActions.isEmpty, state.isAgentConnected else {
+    private func driveFileTransfers(
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
+    ) async {
+        guard isAgentGenerationCurrent(expectedConnectionGeneration),
+              pendingActions.isEmpty,
+              state.isAgentConnected else {
             return
         }
         while true {
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             var progressed = false
             for id in fileTransfers.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+                guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                 guard var job = fileTransfers[id] else {
                     continue
                 }
@@ -695,9 +1435,15 @@ public actor SpiceAgentManager {
                         progressed = true
                         continue
                     }
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    guard await sendFileTransferMessage(
+                        message,
+                        using: session,
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    ) else {
                         return
                     }
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration),
+                          fileTransfers[id] == job else { return }
                     job.phase = .awaitingGuestApproval
                     fileTransfers[id] = job
                     emitFileTransfer(.awaitingGuestApproval(id: id))
@@ -720,6 +1466,7 @@ public actor SpiceAgentManager {
                             count: requested
                         )
                     } catch {
+                        guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                         guard var current = fileTransfers[id], current.phase == .reading else {
                             progressed = true
                             continue
@@ -731,6 +1478,7 @@ public actor SpiceAgentManager {
                         progressed = true
                         continue
                     }
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     guard var current = fileTransfers[id], current.phase == .reading else {
                         progressed = true
                         continue
@@ -748,9 +1496,15 @@ public actor SpiceAgentManager {
                         progressed = true
                         continue
                     }
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    guard await sendFileTransferMessage(
+                        message,
+                        using: session,
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    ) else {
                         return
                     }
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration),
+                          fileTransfers[id] == job else { return }
                     job.sentBytes += UInt64(data.count)
                     job.phase = job.sentBytes == job.totalBytes
                         ? .awaitingCompletion
@@ -767,9 +1521,15 @@ public actor SpiceAgentManager {
                         id: id.rawValue,
                         result: .cancelled
                     )
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    guard await sendFileTransferMessage(
+                        message,
+                        using: session,
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    ) else {
                         return
                     }
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration),
+                          fileTransfers[id] == job else { return }
                     job.phase = .awaitingCancellation
                     fileTransfers[id] = job
                     progressed = true
@@ -778,9 +1538,15 @@ public actor SpiceAgentManager {
                         id: id.rawValue,
                         result: .error
                     )
-                    guard await sendFileTransferMessage(message, using: session) else {
+                    guard await sendFileTransferMessage(
+                        message,
+                        using: session,
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    ) else {
                         return
                     }
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration),
+                          fileTransfers[id] == job else { return }
                     removeFileTransfer(id)
                     emitFileTransfer(.failed(id: id, error))
                     progressed = true
@@ -799,17 +1565,25 @@ public actor SpiceAgentManager {
 
     private func sendFileTransferMessage(
         _ message: VDAgentMessage,
-        using session: SpiceSession
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
     ) async -> Bool {
         do {
-            return try await session.sendAgentMessageIfTokensAvailable(SpiceAgentMessage(
-                protocolID: message.protocolID,
-                type: message.type,
-                opaque: message.opaque,
-                data: message.data
-            ))
+            let sent = try await session.sendAgentMessageIfTokensAvailable(
+                SpiceAgentMessage(
+                    protocolID: message.protocolID,
+                    type: message.type,
+                    opaque: message.opaque,
+                    data: message.data
+                ),
+                expectedConnectionGeneration: expectedConnectionGeneration
+            )
+            if let fileMessageCompletionHook { await fileMessageCompletionHook() }
+            return sent && isAgentGenerationCurrent(expectedConnectionGeneration)
         } catch let error {
-            failAllFileTransfers(with: .transport(error))
+            if isAgentGenerationCurrent(expectedConnectionGeneration) {
+                failAllFileTransfers(with: .transport(error))
+            }
             return false
         }
     }
@@ -917,8 +1691,10 @@ public actor SpiceAgentManager {
 
     private func execute(
         _ actions: [ClipboardStateMachine.Action],
-        using session: SpiceSession
+        using session: SpiceSession,
+        expectedConnectionGeneration: UInt64? = nil
     ) async {
+        guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
         var work = pendingActions
         pendingActions.removeAll(keepingCapacity: true)
         for action in actions where !work.contains(action) {
@@ -926,6 +1702,7 @@ public actor SpiceAgentManager {
         }
 
         for (index, action) in work.enumerated() {
+            guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
             switch action {
             case let .send(command):
                 let isCapabilityAnnouncement: Bool
@@ -937,17 +1714,22 @@ public actor SpiceAgentManager {
                 }
                 do {
                     let message = try VDAgentClipboardCodec.encode(command)
-                    try await session.sendAgentMessage(SpiceAgentMessage(
-                        protocolID: message.protocolID,
-                        type: message.type,
-                        opaque: message.opaque,
-                        data: message.data
-                    ))
+                    try await session.sendAgentMessage(
+                        SpiceAgentMessage(
+                            protocolID: message.protocolID,
+                            type: message.type,
+                            opaque: message.opaque,
+                            data: message.data
+                        ),
+                        expectedConnectionGeneration: expectedConnectionGeneration
+                    )
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     state.didSend(command)
                     if isCapabilityAnnouncement {
                         wireDiagnostics.capabilityAnnouncementsSent &+= 1
                     }
                 } catch let error as SpiceError {
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     if isCapabilityAnnouncement {
                         wireDiagnostics.capabilityAnnouncementFailures &+= 1
                     }
@@ -956,6 +1738,7 @@ public actor SpiceAgentManager {
                     emit(.failed(.transport(error)))
                     return
                 } catch {
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     if isCapabilityAnnouncement {
                         wireDiagnostics.capabilityAnnouncementFailures &+= 1
                     }
@@ -966,8 +1749,10 @@ public actor SpiceAgentManager {
             case let .writeGuestText(text):
                 do {
                     let snapshot = try await SpicePasteboardBridge.write(text: text)
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     state.didWriteGuestText(changeCount: snapshot.changeCount)
                 } catch {
+                    guard isAgentGenerationCurrent(expectedConnectionGeneration) else { return }
                     pendingActions = Array(work[index...])
                     recordClipboardFailure(.pasteboardWrite)
                     emit(.failed(error))
