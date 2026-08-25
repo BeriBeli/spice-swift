@@ -248,6 +248,165 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
+    @Test func surfaceVideoSequenceRejectsLateFrameFromAnotherStream() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 4, height: 2, format: 32, flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 4,
+                streamHeight: 2,
+                sourceWidth: 4,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 4),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 8,
+                streamWidth: 4,
+                streamHeight: 2,
+                sourceWidth: 4,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 4),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 1, data: Data([1])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 8, multimediaTime: 2, data: Data([2])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 3, data: Data([3])
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 4)
+        try await transport.connect()
+        let decoder = GatedPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+
+        await decoder.waitUntilFirstDecodeStarts()
+        await transport.releaseRemainingReads()
+        await transport.waitUntilReadCount(6)
+
+        var eventIterator = events.stream.makeAsyncIterator()
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event, frame.pixels.first == 50 else { continue }
+            #expect(frame.revision == 1)
+            break
+        }
+
+        await decoder.releaseFirstDecode()
+        var finalFrame: FrameSnapshot?
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event, frame.pixels.first == 90 else { continue }
+            finalFrame = frame
+            break
+        }
+
+        #expect(await decoder.payloads == [Data([1]), Data([2]), Data([3])])
+        #expect(finalFrame?.revision == 2)
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+    }
+
+    @Test func queuedMJPEGFrameKeepsClipFromItsDataMessage() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 4, height: 2, format: 32, flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 4,
+                streamHeight: 2,
+                sourceWidth: 4,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 4),
+                clipRectangles: [(top: 0, left: 0, bottom: 2, right: 2)]
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 1, data: Data([1])
+            )),
+            encodeMini(id: 124, body: streamClipBody(
+                streamID: 7,
+                rectangles: [(top: 0, left: 2, bottom: 2, right: 4)]
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 2, data: Data([2])
+            )),
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2, width: 1, height: 1, format: 32, flags: 1
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 3)
+        try await transport.connect()
+        let decoder = GatedPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+
+        await decoder.waitUntilFirstDecodeStarts()
+        await transport.releaseRemainingReads()
+        var eventIterator = events.stream.makeAsyncIterator()
+        while let event = await eventIterator.next() {
+            guard event == .surfaceCreated(2) else { continue }
+            break
+        }
+        await decoder.releaseFirstDecode()
+
+        var finalFrame: FrameSnapshot?
+        while let event = await eventIterator.next() {
+            guard case let .frame(frame) = event, frame.pixels.first == 10 else { continue }
+            if pixel(frame, x: 2, y: 0) == [70, 0, 0, 255] {
+                finalFrame = frame
+                break
+            }
+        }
+
+        #expect(finalFrame?.revision == 2)
+        #expect(finalFrame.map { pixel($0, x: 0, y: 0) } == [10, 0, 0, 255])
+        #expect(finalFrame.map { pixel($0, x: 2, y: 0) } == [70, 0, 0, 255])
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+    }
+
     @Test func sendsDisplayInitializationBeforeReceivingServerMessages() async throws {
         let transport = FakeTransport(inbound: [.failure(.connectionClosed)])
         try await transport.connect()

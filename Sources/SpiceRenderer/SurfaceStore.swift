@@ -75,6 +75,19 @@ package struct SurfaceMutationBarrier: Sendable, Hashable {
     package let generation: UInt64
 }
 
+/// Surface-wide wire order shared by every video stream targeting the surface.
+package struct SurfaceVideoSequence: Sendable, Hashable {
+    package let surfaceID: UInt32
+    package let lifecycleGeneration: UInt64
+    package let value: UInt64
+
+    package init(surfaceID: UInt32, lifecycleGeneration: UInt64, value: UInt64) {
+        self.surfaceID = surfaceID
+        self.lifecycleGeneration = lifecycleGeneration
+        self.value = value
+    }
+}
+
 /// Surface geometry and identity without materializing a frame snapshot.
 package struct SurfaceDescriptor: Sendable, Equatable {
     package let surfaceID: UInt32
@@ -385,6 +398,7 @@ package actor SurfaceStore {
         let memoryLease: SurfaceMemoryLease
         var revision: UInt64
         var mutationGeneration: UInt64
+        var latestVideoSequence: UInt64
         var latestAdvancedVideoRevision: UInt64?
         var storage: SurfaceStorage
 
@@ -516,6 +530,7 @@ package actor SurfaceStore {
             memoryLease: memoryLease,
             revision: 0,
             mutationGeneration: 0,
+            latestVideoSequence: 0,
             latestAdvancedVideoRevision: nil,
             storage: SurfaceStorage(
                 pixels: Data(repeating: 0, count: byteCount),
@@ -872,7 +887,8 @@ package actor SurfaceStore {
         bitmap: RawBitmap,
         source: PixelRect,
         clippedDestinations: [PixelRect],
-        expectedMutationBarrier: SurfaceMutationBarrier? = nil
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil
     ) async throws(RenderError) -> SurfaceRevision? {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
@@ -880,6 +896,9 @@ package actor SurfaceStore {
         if let expectedMutationBarrier,
            mutationBarrier(of: surface) != expectedMutationBarrier
         {
+            return nil
+        }
+        if let videoSequence, !canCommit(videoSequence, to: surface) {
             return nil
         }
         try validate(destination, in: surface)
@@ -929,6 +948,9 @@ package actor SurfaceStore {
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
+        if let videoSequence {
+            surface.latestVideoSequence = videoSequence.value
+        }
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
@@ -985,7 +1007,8 @@ package actor SurfaceStore {
         topDown: Bool,
         clippedDestinations: [PixelRect],
         isAdvancedVideo: Bool = false,
-        expectedMutationBarrier: SurfaceMutationBarrier? = nil
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil
     ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
         guard let compositor = metalCompositor else {
             throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
@@ -1002,6 +1025,9 @@ package actor SurfaceStore {
         if let expectedMutationBarrier,
            mutationBarrier(of: surface) != expectedMutationBarrier
         {
+            throw .staleSurface
+        }
+        if let videoSequence, !canCommit(videoSequence, to: surface) {
             throw .staleSurface
         }
         do {
@@ -1160,6 +1186,9 @@ package actor SurfaceStore {
         }
 
         liveSurface.revision = nextRevision
+        if let videoSequence {
+            liveSurface.latestVideoSequence = videoSequence.value
+        }
         if isAdvancedVideo {
             liveSurface.latestAdvancedVideoRevision = nextRevision
         }
@@ -1571,6 +1600,12 @@ package actor SurfaceStore {
             lifecycleGeneration: surface.lifecycleGeneration,
             generation: surface.mutationGeneration
         )
+    }
+
+    private func canCommit(_ sequence: SurfaceVideoSequence, to surface: Surface) -> Bool {
+        sequence.surfaceID == surface.id
+            && sequence.lifecycleGeneration == surface.lifecycleGeneration
+            && sequence.value > surface.latestVideoSequence
     }
 
     private func isCurrent(_ requested: SurfaceRevision) -> Bool {
