@@ -12,6 +12,18 @@ package enum AuthenticationError: Error, Sendable, Equatable {
     case rejected(code: UInt32)
 }
 
+/// Dependency-neutral advanced-video identity used to carry a recoverable
+/// decoder compatibility failure from SpiceChannels into the public session.
+package enum VideoCodecIdentifier: Sendable, Equatable {
+    case h264
+    case h265
+}
+
+package enum VideoCodecFailureReason: Sendable, Equatable {
+    case hardwareUnavailable(status: Int32?)
+    case unsupportedFormat(status: Int32)
+}
+
 package enum ChannelError: Error, Sendable, Equatable {
     case transport(TransportError)
     case wire(WireError)
@@ -20,6 +32,10 @@ package enum ChannelError: Error, Sendable, Equatable {
     case migrationRequested(key: ChannelKey, data: Data?)
     case invalidState
     case unsupportedCapability
+    case videoCodecFailure(
+        codec: VideoCodecIdentifier,
+        reason: VideoCodecFailureReason
+    )
     case protocolViolation(String)
 }
 

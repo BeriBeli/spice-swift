@@ -178,6 +178,7 @@ package struct FrameSnapshot: Sendable, Equatable {
     package let revision: UInt64
     package let pixelStorage: FramePixelStorage
     package let ioSurfaceFrame: IOSurfaceFrame?
+    package let publicationDamage: SurfaceDamageJournal
 
     package var pixels: Data {
         pixelStorage.pixels()
@@ -200,7 +201,8 @@ package struct FrameSnapshot: Sendable, Equatable {
         revision: UInt64 = 0,
         pixels: consuming Data?,
         ioSurfaceFrame: IOSurfaceFrame?,
-        materializationMetrics: FrameMaterializationMetrics? = nil
+        materializationMetrics: FrameMaterializationMetrics? = nil,
+        publicationDamage: SurfaceDamageJournal? = nil
     ) {
         self.surfaceID = surfaceID
         self.width = width
@@ -215,6 +217,11 @@ package struct FrameSnapshot: Sendable, Equatable {
             materializationMetrics: materializationMetrics
         )
         self.ioSurfaceFrame = ioSurfaceFrame
+        self.publicationDamage = publicationDamage ?? SurfaceDamageJournal(
+            width: width,
+            height: height,
+            initiallyFull: true
+        )
     }
 
     package init(
@@ -225,7 +232,8 @@ package struct FrameSnapshot: Sendable, Equatable {
         lifecycleGeneration: UInt64,
         revision: UInt64,
         pixelStorage: FramePixelStorage,
-        ioSurfaceFrame: IOSurfaceFrame
+        ioSurfaceFrame: IOSurfaceFrame,
+        publicationDamage: SurfaceDamageJournal? = nil
     ) {
         self.surfaceID = surfaceID
         self.width = width
@@ -235,6 +243,40 @@ package struct FrameSnapshot: Sendable, Equatable {
         self.revision = revision
         self.pixelStorage = pixelStorage
         self.ioSurfaceFrame = ioSurfaceFrame
+        self.publicationDamage = publicationDamage ?? SurfaceDamageJournal(
+            width: width,
+            height: height,
+            initiallyFull: true
+        )
+    }
+
+    package func withPublicationDamage(
+        _ damage: SurfaceDamageJournal
+    ) -> FrameSnapshot {
+        if let ioSurfaceFrame {
+            return FrameSnapshot(
+                surfaceID: surfaceID,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                lifecycleGeneration: lifecycleGeneration,
+                revision: revision,
+                pixelStorage: pixelStorage,
+                ioSurfaceFrame: ioSurfaceFrame,
+                publicationDamage: damage
+            )
+        }
+        return FrameSnapshot(
+            surfaceID: surfaceID,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            lifecycleGeneration: lifecycleGeneration,
+            revision: revision,
+            pixels: pixelStorage.pixels(),
+            ioSurfaceFrame: nil,
+            publicationDamage: damage
+        )
     }
 
     package static func == (lhs: Self, rhs: Self) -> Bool {
@@ -244,6 +286,7 @@ package struct FrameSnapshot: Sendable, Equatable {
             && lhs.bytesPerRow == rhs.bytesPerRow
             && lhs.lifecycleGeneration == rhs.lifecycleGeneration
             && lhs.revision == rhs.revision
+            && lhs.publicationDamage == rhs.publicationDamage
             && lhs.pixels == rhs.pixels
     }
 }
@@ -1062,6 +1105,9 @@ package actor SurfaceStore {
         liveUnified.damageJournal.clear()
         liveUnified.damageHistory.reset(at: nextRevision)
         liveSurface.storage.unifiedBacking = liveUnified
+        for clipped in clippedDestinations {
+            liveSurface.storage.recordPublicationDamage(clipped)
+        }
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = liveSurface
         if uploadedBytes > 0 {
@@ -1137,6 +1183,50 @@ package actor SurfaceStore {
             matching: surfaceRevision(of: surface),
             surfaceOperationAlreadyAcquired: true
         )
+    }
+
+    /// Creates the immutable frame used by desktop presentation and atomically
+    /// transfers all canonical damage accumulated since the previous
+    /// publication. Hidden desktops never call this method, so their damage is
+    /// retained and bounded until visibility returns.
+    package func publicationSnapshot(
+        atLeast requested: SurfaceRevision
+    ) async -> FrameSnapshot? {
+        guard !rejectsNewOperations,
+              let eligible = surfaces[requested.surfaceID],
+              eligible.lifecycleGeneration == requested.lifecycleGeneration,
+              eligible.revision >= requested.revision
+        else {
+            return nil
+        }
+        do {
+            try await acquireSurfaceOperation(surfaceID: requested.surfaceID)
+        } catch {
+            return nil
+        }
+        defer { releaseSurfaceOperation(surfaceID: requested.surfaceID) }
+        guard let surface = surfaces[requested.surfaceID],
+              surface.lifecycleGeneration == requested.lifecycleGeneration,
+              surface.revision >= requested.revision
+        else {
+            return nil
+        }
+        let publicationRevision = surfaceRevision(of: surface)
+        let damage = surface.storage.publicationDamageJournal
+        guard let snapshot = await makeSnapshot(
+            from: surface,
+            matching: publicationRevision,
+            surfaceOperationAlreadyAcquired: true
+        ),
+            var liveSurface = surfaces[requested.surfaceID],
+            liveSurface.lifecycleGeneration == snapshot.lifecycleGeneration,
+            liveSurface.revision == snapshot.revision
+        else {
+            return nil
+        }
+        liveSurface.storage.publicationDamageJournal.clear()
+        surfaces[requested.surfaceID] = liveSurface
+        return snapshot.withPublicationDamage(damage)
     }
 
     package func descriptor(surfaceID: UInt32) throws(RenderError) -> SurfaceDescriptor {

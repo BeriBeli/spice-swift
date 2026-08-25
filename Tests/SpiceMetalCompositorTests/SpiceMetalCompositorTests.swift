@@ -138,6 +138,46 @@ struct SpiceMetalCompositorTests {
         }
     }
 
+    @Test func copiesAndScalesPackedBGRAWithinClip() async throws {
+        guard let compositor = try makeCompositorIfSupported() else { return }
+        let sourcePixels = Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+            7, 8, 9, 255, 10, 11, 12, 255,
+        ])
+        let pixelBuffer = try makeBGRAPixelBuffer(
+            width: 2,
+            height: 2,
+            pixels: sourcePixels
+        )
+        let destination = try makeBGRAIOSurface(width: 6, height: 6, fill: 0x5a)
+
+        try await compositor.composite(
+            pixelBuffer: pixelBuffer,
+            pixelFormat: .bgra8,
+            colorMatrix: .unknown(nil),
+            colorRange: .full,
+            orientation: .bottomUp,
+            into: destination,
+            destinationRect: .init(x: 1, y: 1, width: 4, height: 4),
+            clip: .init(x: 2, y: 2, width: 2, height: 2)
+        )
+
+        let pixels = try copyPixels(from: destination, width: 6, height: 6)
+        let expected: [Int: [UInt8]] = [
+            (2 * 6 + 2) * 4: [7, 8, 9, 255],
+            (2 * 6 + 3) * 4: [10, 11, 12, 255],
+            (3 * 6 + 2) * 4: [1, 2, 3, 255],
+            (3 * 6 + 3) * 4: [4, 5, 6, 255],
+        ]
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            if let expectedPixel = expected[offset] {
+                #expect(Array(pixels[offset..<(offset + 4)]) == expectedPixel)
+            } else {
+                #expect(Array(pixels[offset..<(offset + 4)]) == [0x5a, 0x5a, 0x5a, 0x5a])
+            }
+        }
+    }
+
     private func makeCompositorIfSupported() throws -> SpiceMetalCompositor? {
         do {
             return try SpiceMetalCompositor()
@@ -188,6 +228,43 @@ struct SpiceMetalCompositorTests {
             for column in 0..<((width + 1) / 2) {
                 chroma[row * chromaStride + column * 2] = chromaU
                 chroma[row * chromaStride + column * 2 + 1] = chromaV
+            }
+        }
+        return buffer
+    }
+
+    private func makeBGRAPixelBuffer(
+        width: Int,
+        height: Int,
+        pixels: Data
+    ) throws -> CVPixelBuffer {
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        ]
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+        #expect(status == kCVReturnSuccess)
+        let buffer = try #require(pixelBuffer)
+        #expect(CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let destination = try #require(CVPixelBufferGetBaseAddress(buffer))
+        let destinationStride = CVPixelBufferGetBytesPerRow(buffer)
+        let sourceStride = width * 4
+        pixels.withUnsafeBytes { sourceBytes in
+            guard let source = sourceBytes.baseAddress else { return }
+            for row in 0..<height {
+                destination.advanced(by: row * destinationStride).copyMemory(
+                    from: source.advanced(by: row * sourceStride),
+                    byteCount: sourceStride
+                )
             }
         }
         return buffer

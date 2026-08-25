@@ -145,24 +145,30 @@ Agent behavior, including system-trusted TLS.
 - Session now supervises Main, Display, Inputs, and Cursor receive loops after
   bootstrap. A channel failure cancels its peers, closes every connection,
   clears credentials, and publishes a typed failure event.
-- The public Session event stream exposes mouse-mode, keyboard-modifier,
-  cursor, surface-destroy, failure, disconnect, and immutable frame events with
-  an ordered mailbox. Control events are never evicted by frame pressure;
-  pending frames are bounded to 64 display/surface entries and coalesce only
-  within their surrounding control-event segment.
-- Display frame bursts are scheduled at a 16 ms cadence with at most 16
-  surfaces pending per publisher. Snapshots commit only an exact
-  lifecycle/revision match; damage during a snapshot is requeued, while
-  destroy or same-ID reconstruction suppresses the stale frame.
+- The public Session event stream is reserved for ordered control state:
+  display configuration, keyboard modifiers, mouse-motion acknowledgements,
+  migration, failure, and disconnect. Frame, surface-lifecycle, cursor, and
+  pointer-mode state use the stable `SpiceDesktopSource` instead of the event
+  mailbox or SwiftUI Observation.
+- Display commands always advance the canonical Surface and its damage journal.
+  A visible desktop subscription enables snapshot preparation; hidden,
+  occluded, detached, or zero-size views suppress snapshots without pausing
+  protocol drawing. Each Surface keeps at most one prepared frame and one
+  latest pending revision. Consumption unlocks the next preparation, while a
+  lifecycle change, damage-history gap, or visibility resume forces full
+  damage. Exact lifecycle/revision matching suppresses stale snapshots.
 - `SpiceDesktopView` is a thin `NSViewRepresentable` around one private AppKit
-  framebuffer view. It performs aspect-fit BGRA drawing, alpha-cursor overlay,
-  first-responder handling, physical macOS-keycode to PC-XT mapping, relative
-  or absolute pointer input, buttons, and scroll-wheel events.
+  framebuffer view. It owns a normally paused `NSView` display link and an
+  explicit-draw `MTKView`; the ready latch selects at most the newest desktop
+  revision per display tick. It also handles first-responder state, physical
+  macOS-keycode to PC-XT mapping, relative or absolute pointer input, buttons,
+  and scroll-wheel events.
 
 Inputs transports physical key transitions, not Unicode text or IME
-composition. The AppKit bridge draws the supported alpha cursor as a remote
-overlay; native host-cursor replacement and other cursor pixel formats remain
-pending. Cursor color8 and color24 payloads are explicitly rejected until their
+composition. The AppKit bridge uses `NSCursor` for supported absolute alpha
+cursors and a cached Core Animation overlay for captured relative cursors, so a
+cursor-only update does not redraw the framebuffer. Other cursor pixel formats
+remain pending; color8 and color24 payloads are explicitly rejected until their
 palette/pixel formats are implemented.
 
 ## Deferred Stage C enhancements
@@ -335,20 +341,25 @@ The LZ RGB family is locally closed.
   the protocol's `[0, 64)` range; flags, codec enums, dimensions, clip counts,
   payload lengths, truncation, and trailing bytes are validated before state is
   changed.
-- Display Link now advertises only the implemented stream capabilities:
-  `SIZED_STREAM`, `MULTI_CODEC`, and `CODEC_MJPEG`. VP8/H.264/VP9/H.265 and
-  stream reporting remain unadvertised.
+- Display Link advertises `SIZED_STREAM`, `MULTI_CODEC`, and `CODEC_MJPEG`.
+  H.264 or H.265 is added only by the corresponding explicit endpoint policy;
+  the two advanced codecs are mutually exclusive. VP8, VP9, and stream
+  reporting remain unadvertised.
 - DisplayChannel owns at most 64 active stream records. Duplicate creation,
   unknown data/clip/destroy, capacity overflow, unsupported codecs, and invalid
   Surface destinations are typed protocol failures. RESET, Surface Destroy,
   explicit Destroy, and Destroy All release the relevant state.
-- Every MJPEG packet is decoded by the existing exact TurboJPEG backend. Normal
-  frames use the create-time source/destination geometry; sized frames carry
-  their own frame dimensions and destination. TOP_DOWN and bottom-up streams,
-  including a source shorter than the decode buffer, follow spice-common's row
-  semantics.
-- SurfaceStore performs nearest-neighbor stream scaling and all clip writes in
-  one actor transaction. A malformed JPEG, invalid bitmap, bad geometry, or
+- Each MJPEG stream owns one persistent TurboJPEG handle and at most three
+  IOSurface-backed BGRA buffers. Stream decoding enables fast DCT/upsampling and
+  writes directly into a locked buffer; standalone JPEG continues through the
+  bit-exact decoder. A session-wide limiter permits at most two concurrent
+  MJPEG decodes, and pool pressure takes a bounded Data fallback without
+  waiting. Normal frames use create-time geometry; sized frames carry their own
+  dimensions and destination. TOP_DOWN and bottom-up streams follow
+  spice-common's row semantics.
+- The Metal compositor performs BGRA-to-BGRA nearest scaling and clip writes
+  directly into a candidate Surface. The existing actor-isolated Data path is
+  the nonblocking fallback. A malformed JPEG, invalid bitmap, bad geometry, or
   capacity failure leaves the previous Surface unchanged. Empty clips advance
   stream order without publishing a redundant frame.
 - A session-wide multimedia clock is anchored from `MAIN_INIT.multimedia_time`
@@ -589,14 +600,15 @@ such by an embedding application.
   classified without parsing unbounded Exp-Golomb payloads.
 - Added the isolated `SpiceVideoToolbox` target. Its actor accumulates parameter
   sets, creates the matching CoreMedia format description, and owns a
-  synchronous `VTDecompressionSession`. It requests Metal-compatible,
-  IOSurface-backed NV12 and emits a package-only frame that retains the
-  immutable `CVPixelBuffer`. Every plane, stride, matrix, and range is bounded;
-  `copyBGRA()` is a one-time lazy cached fallback. Hardware decode is allowed
-  but not required, and aggregate diagnostics record hardware, software, and
-  query-failed session selection after creation. Parameter-set replacement
-  creates and validates the new session before atomically swapping it with the
-  old one; a failed creation remains marked for retry on the next frame.
+  synchronous, ordered `VTDecompressionSession`. It requests real-time,
+  Metal-compatible, IOSurface-backed NV12 and emits a package-only frame that
+  retains the immutable `CVPixelBuffer`. Every plane, stride, matrix, and range
+  is bounded; `copyBGRA()` is a one-time lazy cached fallback. The decoder
+  checks `UsingHardwareAcceleratedVideoDecoder` and rejects software or
+  unqueryable sessions. Unsupported formats and unavailable hardware become
+  typed codec failures. Parameter-set replacement creates and validates the new
+  session before atomically swapping it with the old one; a failed creation
+  remains marked for retry on the next frame.
 - DisplayChannel now owns an advanced decoder per H.264/H.265 stream, routes
   decoded output first through the package-only native Metal compositor and
   then, when required, through the existing BGRA clip/scale transaction,
@@ -668,8 +680,9 @@ such by an embedding application.
 - The session-wide CPU budget counts every live canonical Surface across all
   Display channels. A Data fallback snapshot makes an independent packed-BGRA
   copy at the publication boundary, so a caller retaining only `pixels` cannot
-  participate in a later canonical Surface COW. Frame backlog remains bounded
-  separately by the session mailbox.
+  participate in a later canonical Surface COW. Desktop backlog remains bounded
+  by one prepared frame, one latest pending revision, and each subscriber's
+  `bufferingNewest(1)` stream.
 - `SpiceMetalCompositor` maps NV12 Y as `r8Unorm` and UV as `rg8Unorm`; one
   command encoder applies BT.601/709, video/full range, top/bottom orientation,
   nearest scaling, all clips, and writes the candidate IOSurface. The source
@@ -682,30 +695,36 @@ such by an embedding application.
   viewer does not materialize it.
 - Aggregate diagnostics cover damage and copy bytes, CPU materialization, pool
   exhaustion and leases, GPU copies/errors, native/fallback video, publisher
-  suppression, mailbox coalescing/eviction, Metal presentation failures, and
-  actual VideoToolbox decoder selection. Bounded content-free histograms expose
-  publisher, mailbox, and Metal timing without retaining individual samples or
-  per-frame logs. `spice-probe --require-native-video` turns the zero-BGRA and
-  zero-GPU-error expectations into a live gate. Fault-injection regressions
-  prove failed VT session creation retries and a Metal command error disables
-  only the current stream generation before CPU fallback.
+  demand suppression/coalescing, desktop-source delivery, display-link wakeups,
+  texture-cache behavior, GPU-busy skips, Metal presentation failures, MJPEG
+  allocation/reuse, and actual VideoToolbox hardware selection. Bounded
+  content-free histograms expose publisher and Metal commit/completion/presented
+  timing without retaining individual samples or per-frame logs.
+  `spice-probe --require-native-video` turns the zero-BGRA and zero-GPU-error
+  expectations into a live gate. Fault-injection regressions prove failed VT
+  session creation and unsupported formats become typed codec failures, while a
+  Metal command error disables only the current stream generation before CPU
+  fallback.
 - The SwiftPM `CompileMetalShaders` build-tool plugin produces the resource
   `.metallib`; package consumers receive it through SwiftPM. The native artifact
   closure verifier requires exact arm64 static frameworks and rejects absolute
   build-machine or Homebrew paths.
-- `SpiceDesktopView` keeps its existing narrow `NSViewRepresentable` and AppKit
-  responder boundary, but its private framebuffer view now owns an on-demand
-  `MTKView` child. IOSurface-backed BGRA frames become Metal textures and are
-  blitted into same-sized drawables; CPU-only frames continue through the
-  existing AppKit/CGImage implementation.
+- `SpiceDesktopView` keeps a narrow `NSViewRepresentable` and AppKit responder
+  boundary. Its private framebuffer view owns a normally paused display link
+  and explicit-draw `MTKView`. IOSurface-backed BGRA frames reuse up to three
+  texture wrappers and are sampled directly by one full-screen-triangle pass;
+  1:1/integer scaling is nearest and other scaling is linear. There is no MPS,
+  blit-only presentation, depth/MSAA attachment, or intermediate texture.
+  CPU-only frames continue through the AppKit/CGImage fallback.
 - The command-buffer completion callback retains the source `SpiceFrame`, so an
-  in-flight GPU read cannot race frame-pool recycling. Cursor composition stays
-  in a transparent AppKit overlay and therefore behaves identically on Metal
-  and CPU fallback paths.
+  in-flight GPU read cannot race frame-pool recycling. At most two commands are
+  in flight; a busy GPU skips the tick rather than blocking the main actor.
+  `CAMetalDrawable` presented handlers record confirmed on-screen latency.
 - IOSurface now chooses its aligned row stride rather than inheriting the packed
-  CPU stride. A real Metal test maps the IOSurface, performs the GPU blit, and
-  reads back byte-exact BGRA. CPU-only rejection and the complete existing suite
-  are also covered.
+  CPU stride. Real Metal tests map IOSurfaces, exercise compositor writes and
+  direct render-pipeline presentation, and verify byte-exact BGRA where the
+  operation is required to be exact. CPU-only rejection and the complete
+  existing suite are also covered.
 - Added the `spice-viewer` SwiftPM GUI executable as a project-local debug and
   integration client, with terminal logging and native-closure verification
   scripts for its library dependencies.
@@ -718,10 +737,11 @@ such by an embedding application.
   synthetic mode as `Offline Validation`. `Remote Session` exposes validated
   host/port input, TCP, system-trust TLS, and explicitly unsafe test TLS, plus a
   non-persisted ticket password and connection/error state.
-- The viewer owns one supervised session-event task and consumes frame, surface,
-  cursor, mouse-mode, failure, and disconnect events on the main presentation
-  boundary. Input enters one bounded 256-event FIFO and one sequential sender
-  task rather than creating a task per key or pointer event.
+- The viewer owns one supervised control-event task and passes the stable
+  session desktop source directly to `SpiceDesktopView`; frames, cursor, and
+  pointer mode never become observed application properties. Input enters one
+  bounded 256-event FIFO and one sequential sender task rather than creating a
+  task per key or pointer event.
 - Real-window inspection covered mode switching, the session form, immediate
   connection cancellation, local validation errors, and continued IOSurface
   Metal presentation near 30 fps. The endpoint/TLS mapping has focused tests;
@@ -897,6 +917,14 @@ such by an embedding application.
 
 ## Apple Silicon optimization acceptance status
 
+- The 0.2 display refactor is locally covered for latest-only desktop delivery,
+  hidden-demand snapshot suppression and full-damage resume, one-shot
+  display-link scheduling, cursor-only updates, texture-cache bounds, two-frame
+  GPU back-pressure, MJPEG handle/buffer reuse, pre-decode late drop, and typed
+  VideoToolbox hardware/format failures. Its live 60-second idle/occluded CPU
+  targets and the new active comparison against spice-gtk have not yet been
+  measured; the older benchmark below is retained as historical evidence, not
+  a result for the refactored presenter.
 - The latest current-tree five-second Rocky smoke used an arm64 Release probe
   containing the uncommitted publisher revision-race fixes. SwiftSpice
   published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911

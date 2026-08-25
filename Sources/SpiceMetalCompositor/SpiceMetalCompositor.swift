@@ -94,7 +94,7 @@ extension SpiceMetalCompositorError: CustomStringConvertible {
         case .unsupportedColorRange:
             "Metal compositor does not recognize the source color range"
         case let .unsupportedGeometry(width, height):
-            "Metal compositor requires positive, even NV12 dimensions; got \(width)x\(height)"
+            "Metal compositor does not support source dimensions \(width)x\(height)"
         case .invalidSourceRectangle:
             "Metal compositor source rectangle is outside the decoded frame"
         case let .invalidDestination(reason):
@@ -113,14 +113,16 @@ extension SpiceMetalCompositorError: CustomStringConvertible {
     }
 }
 
-/// Converts an IOSurface-backed NV12 `CVPixelBuffer` directly into a candidate
-/// BGRA IOSurface. The caller remains responsible for transactional publication:
-/// only make the candidate canonical after this method returns successfully.
+/// Converts IOSurface-backed NV12 or packed-BGRA `CVPixelBuffer` frames directly
+/// into a candidate BGRA IOSurface. The caller remains responsible for
+/// transactional publication: only make the candidate canonical after this
+/// method returns successfully.
 package final class SpiceMetalCompositor: @unchecked Sendable {
     package let device: any MTLDevice
 
     private let commandQueue: any MTLCommandQueue
-    private let pipeline: any MTLComputePipelineState
+    private let nv12Pipeline: any MTLComputePipelineState
+    private let bgraPipeline: any MTLComputePipelineState
     private let textureCache: CVMetalTextureCache
     private let textureCacheLock = Mutex(())
 
@@ -157,13 +159,18 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         } catch {
             throw .shaderLibraryUnavailable(String(describing: error))
         }
-        guard let function = library.makeFunction(name: "spice_nv12_to_bgra") else {
+        guard let nv12Function = library.makeFunction(name: "spice_nv12_to_bgra") else {
             throw .shaderLibraryUnavailable("spice_nv12_to_bgra entry point is missing")
         }
+        guard let bgraFunction = library.makeFunction(name: "spice_bgra_to_bgra") else {
+            throw .shaderLibraryUnavailable("spice_bgra_to_bgra entry point is missing")
+        }
 
-        let pipeline: any MTLComputePipelineState
+        let nv12Pipeline: any MTLComputePipelineState
+        let bgraPipeline: any MTLComputePipelineState
         do {
-            pipeline = try device.makeComputePipelineState(function: function)
+            nv12Pipeline = try device.makeComputePipelineState(function: nv12Function)
+            bgraPipeline = try device.makeComputePipelineState(function: bgraFunction)
         } catch {
             throw .pipelineCreationFailed(String(describing: error))
         }
@@ -182,7 +189,8 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
 
         self.device = device
         self.commandQueue = commandQueue
-        self.pipeline = pipeline
+        self.nv12Pipeline = nv12Pipeline
+        self.bgraPipeline = bgraPipeline
         self.textureCache = cache
     }
 
@@ -253,11 +261,20 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         destinationRect: SpiceMetalVideoRectangle,
         clips: [SpiceMetalVideoRectangle]
     ) async throws(SpiceMetalCompositorError) {
-        guard let frame = frame as? SpiceVideoToolboxFrame else {
+        let pixelBuffer: CVPixelBuffer
+        if let frame = frame as? SpiceVideoToolboxFrame {
+            pixelBuffer = frame.pixelBuffer
+        } else if let frame = frame as? SpiceMJPEGFrame {
+            pixelBuffer = frame.pixelBuffer
+        } else {
             throw .unsupportedPixelFormat(0)
         }
+        // In particular, SpiceMJPEGFrame owns the pool lease that prevents a
+        // decoder from reusing this pixel buffer. Keep the frame itself alive
+        // through Metal completion, not only its CVPixelBuffer view.
+        defer { withExtendedLifetime(frame) {} }
         try await composite(
-            pixelBuffer: frame.pixelBuffer,
+            pixelBuffer: pixelBuffer,
             pixelFormat: frame.pixelFormat,
             colorMatrix: frame.colorMatrix,
             colorRange: frame.colorRange,
@@ -304,6 +321,17 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         destinationRect: SpiceMetalVideoRectangle,
         clips: [SpiceMetalVideoRectangle]
     ) async throws(SpiceMetalCompositorError) {
+        if pixelFormat == .bgra8 {
+            try await compositePackedBGRA(
+                pixelBuffer: pixelBuffer,
+                sourceRect: requestedSourceRect,
+                orientation: orientation,
+                into: destination,
+                destinationRect: destinationRect,
+                clips: clips
+            )
+            return
+        }
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
         guard sourceWidth > 0,
@@ -425,13 +453,16 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             throw .commandEncoderUnavailable
         }
 
-        encoder.setComputePipelineState(pipeline)
+        encoder.setComputePipelineState(nv12Pipeline)
         encoder.setTexture(sourceTextures.lumaTexture, index: 0)
         encoder.setTexture(sourceTextures.chromaTexture, index: 1)
         encoder.setTexture(destinationTexture, index: 2)
 
-        let threadWidth = pipeline.threadExecutionWidth
-        let threadHeight = max(1, pipeline.maxTotalThreadsPerThreadgroup / threadWidth)
+        let threadWidth = nv12Pipeline.threadExecutionWidth
+        let threadHeight = max(
+            1,
+            nv12Pipeline.maxTotalThreadsPerThreadgroup / threadWidth
+        )
         for clippedRect in clippedRectangles {
             var uniforms = ShaderUniforms(
                 sourceAndFlags: SIMD4(
@@ -485,6 +516,203 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             commandBuffer.commit()
         }
         try result.get()
+    }
+
+    /// Copies an IOSurface-backed packed-BGRA stream frame into the candidate
+    /// surface while applying the same orientation, nearest scaling, and clip
+    /// semantics as the CPU SurfaceStore path. No intermediate texture or Data
+    /// allocation is created.
+    private func compositePackedBGRA(
+        pixelBuffer: CVPixelBuffer,
+        sourceRect requestedSourceRect: SpiceMetalVideoRectangle?,
+        orientation: SpiceMetalVideoOrientation,
+        into destination: IOSurfaceRef,
+        destinationRect: SpiceMetalVideoRectangle,
+        clips: [SpiceMetalVideoRectangle]
+    ) async throws(SpiceMetalCompositorError) {
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let cvPixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard sourceWidth > 0,
+              sourceHeight > 0,
+              UInt32(exactly: sourceWidth) != nil,
+              UInt32(exactly: sourceHeight) != nil
+        else {
+            throw .unsupportedGeometry(width: sourceWidth, height: sourceHeight)
+        }
+        guard cvPixelFormat == kCVPixelFormatType_32BGRA else {
+            throw .unsupportedPixelFormat(cvPixelFormat)
+        }
+        let sourceBounds = SpiceMetalVideoRectangle(
+            x: 0,
+            y: 0,
+            width: sourceWidth,
+            height: sourceHeight
+        )
+        let sourceRect = requestedSourceRect ?? sourceBounds
+        guard sourceRect.isValid,
+              sourceRect.fitsShaderCoordinates,
+              sourceRect.intersection(sourceBounds) == sourceRect
+        else {
+            throw .invalidSourceRectangle
+        }
+
+        let destinationWidth = IOSurfaceGetWidth(destination)
+        let destinationHeight = IOSurfaceGetHeight(destination)
+        let (destinationRowBytes, destinationRowOverflow) = destinationWidth
+            .multipliedReportingOverflow(by: 4)
+        guard destinationWidth > 0, destinationHeight > 0,
+              !destinationRowOverflow,
+              UInt32(exactly: destinationWidth) != nil,
+              UInt32(exactly: destinationHeight) != nil,
+              IOSurfaceGetPixelFormat(destination) == kCVPixelFormatType_32BGRA,
+              IOSurfaceGetBytesPerRow(destination) >= destinationRowBytes
+        else {
+            throw .invalidDestination("IOSurface is not a valid packed BGRA surface")
+        }
+        let surfaceBounds = SpiceMetalVideoRectangle(
+            x: 0,
+            y: 0,
+            width: destinationWidth,
+            height: destinationHeight
+        )
+        guard destinationRect.isValid,
+              destinationRect.fitsShaderCoordinates,
+              destinationRect.intersection(surfaceBounds) == destinationRect
+        else {
+            throw .invalidDestination("destination rectangle is outside the IOSurface")
+        }
+        let (_, horizontalScaleOverflow) = UInt32(destinationRect.width - 1)
+            .multipliedReportingOverflow(by: UInt32(sourceRect.width))
+        let (_, verticalScaleOverflow) = UInt32(destinationRect.height - 1)
+            .multipliedReportingOverflow(by: UInt32(sourceRect.height))
+        guard !horizontalScaleOverflow, !verticalScaleOverflow else {
+            throw .invalidDestination("scale geometry exceeds shader coordinates")
+        }
+        var clippedRectangles: [SpiceMetalVideoRectangle] = []
+        clippedRectangles.reserveCapacity(clips.count)
+        for clip in clips {
+            guard clip.isValid else {
+                throw .invalidDestination("clip rectangle is invalid")
+            }
+            guard let clipped = clip.intersection(destinationRect) else {
+                continue
+            }
+            guard clipped.fitsShaderCoordinates else {
+                throw .invalidDestination("clip rectangle exceeds shader coordinates")
+            }
+            clippedRectangles.append(clipped)
+        }
+        guard !clippedRectangles.isEmpty else {
+            return
+        }
+
+        let sourceTexture = try makePackedSourceTexture(
+            pixelBuffer: pixelBuffer,
+            width: sourceWidth,
+            height: sourceHeight
+        )
+        let destinationTexture = try makeDestinationTexture(
+            surface: destination,
+            width: destinationWidth,
+            height: destinationHeight
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+
+        encoder.setComputePipelineState(bgraPipeline)
+        encoder.setTexture(sourceTexture.texture, index: 0)
+        encoder.setTexture(destinationTexture, index: 2)
+        let threadWidth = bgraPipeline.threadExecutionWidth
+        let threadHeight = max(
+            1,
+            bgraPipeline.maxTotalThreadsPerThreadgroup / threadWidth
+        )
+        for clippedRect in clippedRectangles {
+            var uniforms = ShaderUniforms(
+                sourceAndFlags: SIMD4(
+                    UInt32(sourceWidth),
+                    UInt32(sourceHeight),
+                    orientation == .bottomUp ? 1 : 0,
+                    0
+                ),
+                sourceRect: sourceRect.unsignedComponents,
+                destinationRect: destinationRect.unsignedComponents,
+                clipRect: clippedRect.unsignedComponents,
+                rangeParameters: .zero,
+                redCoefficients: .zero,
+                greenCoefficients: .zero,
+                blueCoefficients: .zero
+            )
+            encoder.setBytes(
+                &uniforms,
+                length: MemoryLayout<ShaderUniforms>.stride,
+                index: 0
+            )
+            encoder.dispatchThreads(
+                MTLSize(width: clippedRect.width, height: clippedRect.height, depth: 1),
+                threadsPerThreadgroup: MTLSize(
+                    width: threadWidth,
+                    height: threadHeight,
+                    depth: 1
+                )
+            )
+        }
+        encoder.endEncoding()
+
+        let retainedResources = RetainedPackedVideoResources(
+            pixelBuffer: pixelBuffer,
+            sourceBinding: sourceTexture.binding,
+            sourceTexture: sourceTexture.texture,
+            destinationSurface: destination,
+            destinationTexture: destinationTexture
+        )
+        let result: Result<Void, SpiceMetalCompositorError> = await withCheckedContinuation {
+            continuation in
+            commandBuffer.addCompletedHandler { completedBuffer in
+                defer { withExtendedLifetime(retainedResources) {} }
+                if completedBuffer.status == .completed {
+                    continuation.resume(returning: .success(()))
+                } else {
+                    let reason = completedBuffer.error.map(String.init(describing:))
+                        ?? "command status \(completedBuffer.status.rawValue)"
+                    continuation.resume(returning: .failure(.commandExecutionFailed(reason)))
+                }
+            }
+            commandBuffer.commit()
+        }
+        try result.get()
+    }
+
+    private func makePackedSourceTexture(
+        pixelBuffer: CVPixelBuffer,
+        width: Int,
+        height: Int
+    ) throws(SpiceMetalCompositorError) -> PackedSourceTexture {
+        let result: Result<PackedSourceTexture, SpiceMetalCompositorError> = textureCacheLock.withLock { _ in
+            do {
+                let source = try makeSourceTexture(
+                    pixelBuffer: pixelBuffer,
+                    pixelFormat: .bgra8Unorm,
+                    width: width,
+                    height: height,
+                    plane: 0
+                )
+                return .success(PackedSourceTexture(
+                    binding: source.binding,
+                    texture: source.texture
+                ))
+            } catch let error as SpiceMetalCompositorError {
+                return .failure(error)
+            } catch {
+                return .failure(.pipelineCreationFailed(String(describing: error)))
+            }
+        }
+        return try result.get()
     }
 
     private func makeSourceTextures(
@@ -650,6 +878,11 @@ private struct SourceTextures: @unchecked Sendable {
     let chromaTexture: any MTLTexture
 }
 
+private struct PackedSourceTexture: @unchecked Sendable {
+    let binding: CVMetalTexture
+    let texture: any MTLTexture
+}
+
 /// Core Video requires the CVPixelBuffer and CVMetalTexture wrappers to remain
 /// alive while their MTLTexture views are in use by the command buffer.
 private final class RetainedVideoResources: @unchecked Sendable {
@@ -669,6 +902,30 @@ private final class RetainedVideoResources: @unchecked Sendable {
         self.pixelBuffer = pixelBuffer
         self.lumaBinding = lumaBinding
         self.chromaBinding = chromaBinding
+        self.destinationSurface = destinationSurface
+        self.destinationTexture = destinationTexture
+    }
+}
+
+/// Packed stream frames use one CVMetalTexture view instead of the two-plane
+/// NV12 binding, but retain the same command-buffer lifetime guarantees.
+private final class RetainedPackedVideoResources: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let sourceBinding: CVMetalTexture
+    let sourceTexture: any MTLTexture
+    let destinationSurface: IOSurfaceRef
+    let destinationTexture: any MTLTexture
+
+    init(
+        pixelBuffer: CVPixelBuffer,
+        sourceBinding: CVMetalTexture,
+        sourceTexture: any MTLTexture,
+        destinationSurface: IOSurfaceRef,
+        destinationTexture: any MTLTexture
+    ) {
+        self.pixelBuffer = pixelBuffer
+        self.sourceBinding = sourceBinding
+        self.sourceTexture = sourceTexture
         self.destinationSurface = destinationSurface
         self.destinationTexture = destinationTexture
     }

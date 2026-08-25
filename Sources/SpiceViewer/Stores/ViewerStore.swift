@@ -48,9 +48,7 @@ private enum ViewerLifecycleError: Error {
 package final class ViewerStore {
     package private(set) var mode: ViewerMode = .offline
     package private(set) var connectionState: ViewerConnectionState = .disconnected
-    package private(set) var frame: SpiceFrame?
-    package private(set) var cursor: SpiceCursorState?
-    package private(set) var pointerMode: SpicePointerMode = .absolute
+    package private(set) var desktop: SpiceDesktopSource
     package private(set) var submittedFPS = 0.0
     package private(set) var presentationPath = "Starting…"
     package private(set) var playbackStatus = ViewerPlaybackStatus()
@@ -60,6 +58,7 @@ package final class ViewerStore {
     package private(set) var monitorStatus = ViewerMonitorStatus()
 
     @ObservationIgnored private let surfaceStore = SurfaceStore()
+    @ObservationIgnored private let offlineDesktop: SpiceDesktopSource
     @ObservationIgnored private let reconnectBackoff: ViewerReconnectBackoff
     @ObservationIgnored private var syntheticTask: Task<Void, Never>?
     @ObservationIgnored private var connectionTask: Task<Void, Never>?
@@ -88,13 +87,15 @@ package final class ViewerStore {
     @ObservationIgnored private var session: SpiceSession?
     @ObservationIgnored private var generation: UInt64 = 0
     @ObservationIgnored private var isSurfaceInitialized = false
-    @ObservationIgnored private var sessionFrameCount = 0
 
     package init(
         reconnectBackoff: ViewerReconnectBackoff = ViewerReconnectBackoff(),
         microphoneAuthorizer: any ViewerMicrophoneAuthorizing = SystemViewerMicrophoneAuthorizer(),
         fileSelector: any ViewerFileSelecting = SystemViewerFileSelector()
     ) {
+        let offlineDesktop = SpiceDesktopSource()
+        self.offlineDesktop = offlineDesktop
+        desktop = offlineDesktop
         self.reconnectBackoff = reconnectBackoff
         self.microphoneAuthorizer = microphoneAuthorizer
         self.fileSelector = fileSelector
@@ -122,14 +123,14 @@ package final class ViewerStore {
         guard mode != nextMode else { return }
         mode = nextMode
         navigationLogger.info("Selected viewer mode \(nextMode.rawValue, privacy: .public)")
-        frame = nil
-        cursor = nil
         switch nextMode {
         case .offline:
             releaseRemoteSession(setDisconnected: true, reason: "offline mode selected")
+            desktop = offlineDesktop
             startSyntheticFrames()
         case .remote:
             stopSyntheticFrames()
+            desktop = SpiceDesktopSource()
             presentationPath = "Waiting for session"
         }
     }
@@ -152,9 +153,7 @@ package final class ViewerStore {
         generation &+= 1
         let connectionGeneration = generation
         connectionState = .connecting
-        frame = nil
-        cursor = nil
-        pointerMode = .absolute
+        desktop = SpiceDesktopSource()
         sessionLogger.info(
             "Connection lifecycle started; transport=\(configuration.tlsMode.rawValue, privacy: .public) autoReconnect=\(automaticallyReconnect, privacy: .public)"
         )
@@ -334,6 +333,7 @@ package final class ViewerStore {
                 bufferingPolicy: .bufferingNewest(1)
             )
             session = nextSession
+            desktop = nextSession.desktop
             sessionExitContinuation = exitPipe.continuation
             startEventSupervision(for: nextSession, generation: generation)
             sessionLogger.info("Connection attempt \(retry + 1, privacy: .public) started")
@@ -365,8 +365,6 @@ package final class ViewerStore {
 
             await finishAttempt(nextSession)
             guard !Task.isCancelled, generation == self.generation else { return }
-            frame = nil
-            cursor = nil
 
             let error = switch exit {
             case let .failed(error): error
@@ -463,9 +461,8 @@ package final class ViewerStore {
         generation: UInt64
     ) {
         guard generation == self.generation, self.session === session else { return }
-        pointerMode = SpicePointerMode(spiceMouseMode: info.currentMouseMode)
         connectionState = .connected(sessionID: info.sessionID)
-        sessionFrameCount = 0
+        presentationPath = "Demand-driven Metal IOSurface"
         startInputPump(for: session, generation: generation)
         if info.channels.contains(where: { $0.type == 5 && $0.id == 0 }) {
             startPlayback(for: session, generation: generation)
@@ -491,23 +488,13 @@ package final class ViewerStore {
         guard generation == self.generation else { return }
         connectionState = .failed(error.description)
         sessionLogger.error(
-            "Connection lifecycle exhausted after \(self.sessionFrameCount, privacy: .public) frames; cause=\(error.description, privacy: .private)"
+            "Connection lifecycle exhausted; cause=\(error.description, privacy: .private)"
         )
     }
 
     private func consume(_ event: SpiceSessionEvent, generation: UInt64) {
         guard generation == self.generation else { return }
         switch event {
-        case let .frame(frame):
-            self.frame = frame
-            sessionFrameCount &+= 1
-            presentationPath = frame.ioSurface == nil ? "AppKit CPU fallback" : "Metal IOSurface"
-        case let .surfaceDestroyed(surfaceID):
-            if frame?.surfaceID == surfaceID { frame = nil }
-        case let .cursor(cursor):
-            self.cursor = cursor
-        case let .mouseMode(_, current):
-            pointerMode = SpicePointerMode(spiceMouseMode: current)
         case let .failed(error):
             sessionExitContinuation?.yield(.failed(error))
         case .disconnected:
@@ -954,16 +941,13 @@ package final class ViewerStore {
         sessionExitContinuation = nil
         let oldSession = session
         session = nil
-        frame = nil
-        cursor = nil
-        pointerMode = .absolute
+        desktop = mode == .offline ? offlineDesktop : SpiceDesktopSource()
         if setDisconnected { connectionState = .disconnected }
         if hadLifecycle {
             sessionLogger.info(
-                "Connection lifecycle cancelled; reason=\(reason, privacy: .public) frames=\(self.sessionFrameCount, privacy: .public)"
+                "Connection lifecycle cancelled; reason=\(reason, privacy: .public)"
             )
         }
-        sessionFrameCount = 0
         if oldPlaybackSink != nil
             || oldRecordSource != nil
             || oldAgentManager != nil
@@ -979,6 +963,8 @@ package final class ViewerStore {
 
     private func startSyntheticFrames() {
         guard syntheticTask == nil else { return }
+        desktop = offlineDesktop
+        offlineDesktop.beginSyntheticDesktop()
         sessionLogger.info("Offline validation started")
         syntheticTask = Task { [weak self] in
             await self?.animateSyntheticFrames()
@@ -993,9 +979,9 @@ package final class ViewerStore {
     private func animateSyntheticFrames() async {
         do {
             if !isSurfaceInitialized {
-                try await surfaceStore.create(id: 1, width: 640, height: 360, format: 32)
+                try await surfaceStore.create(id: 0, width: 640, height: 360, format: 32)
                 try await surfaceStore.fill(
-                    surfaceID: 1,
+                    surfaceID: 0,
                     rectangle: PixelRect(x: 0, y: 0, width: 640, height: 360),
                     colorARGB: 0x0010_1520
                 )
@@ -1010,7 +996,7 @@ package final class ViewerStore {
             var nextFrameDeadline = clock.now
             while !Task.isCancelled {
                 try await surfaceStore.fill(
-                    surfaceID: 1,
+                    surfaceID: 0,
                     rectangle: PixelRect(x: previousX, y: 130, width: 96, height: 96),
                     colorARGB: 0x0010_1520
                 )
@@ -1019,13 +1005,16 @@ package final class ViewerStore {
                 let green = UInt32((frameNumber * 3 + 80) & 0xff)
                 let blue = UInt32((frameNumber * 7 + 160) & 0xff)
                 try await surfaceStore.fill(
-                    surfaceID: 1,
+                    surfaceID: 0,
                     rectangle: PixelRect(x: x, y: 130, width: 96, height: 96),
                     colorARGB: (red << 16) | (green << 8) | blue
                 )
-                let nextFrame = SpiceFrame(try await surfaceStore.snapshot(surfaceID: 1))
+                let nextFrame = SpiceFrame(try await surfaceStore.snapshot(surfaceID: 0))
                 guard mode == .offline else { return }
-                frame = nextFrame
+                offlineDesktop.publishSyntheticFrame(
+                    nextFrame,
+                    revision: UInt64(frameNumber + 1)
+                )
                 presentationPath = nextFrame.ioSurface == nil
                     ? "AppKit CPU fallback"
                     : "Metal IOSurface"

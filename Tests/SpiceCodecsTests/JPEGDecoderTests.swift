@@ -106,6 +106,131 @@ struct JPEGDecoderTests {
         }
     }
 
+    @Test func mjpegStreamKeepsOneHandleAndReusesThreeIOSurfaces() async throws {
+        let fixture = try loadFixture(named: "jpeg-420-9x7")
+        let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
+        let limiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
+        let decoder = try SpiceMJPEGStreamDecoder(limiter: limiter)
+        let descriptor = SpiceCodecImageDescriptor(
+            width: fixture.width,
+            height: fixture.height
+        )
+
+        var leasedFrames: [any SpiceDecodedVideoFrame] = []
+        for _ in 0..<3 {
+            let frame = try await decoder.decodeVideoFrame(
+                descriptor: descriptor,
+                payload: jpeg
+            )
+            #expect(frame is SpiceMJPEGFrame)
+            leasedFrames.append(frame)
+        }
+
+        // None of the three slots can be stolen while a renderer retains it.
+        // The fourth frame takes the bounded Data fallback immediately.
+        let fallback = try await decoder.decodeVideoFrame(
+            descriptor: descriptor,
+            payload: jpeg
+        )
+        #expect(fallback is SpiceDecodedImage)
+        var diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.handleCreationCount == 1)
+        #expect(diagnostics.ioSurfaceAllocationCount == 3)
+        #expect(diagnostics.ioSurfaceFrameCount == 3)
+        #expect(diagnostics.dataFallbackCount == 1)
+        #expect(diagnostics.peakBuffersInUse == 3)
+
+        leasedFrames.removeAll()
+        do {
+            let reused = try await decoder.decodeVideoFrame(
+                descriptor: descriptor,
+                payload: jpeg
+            )
+            #expect(reused is SpiceMJPEGFrame)
+        }
+        for _ in 0..<100 {
+            let warmedFrame = try await decoder.decodeVideoFrame(
+                descriptor: descriptor,
+                payload: jpeg
+            )
+            #expect(warmedFrame is SpiceMJPEGFrame)
+        }
+        diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.handleCreationCount == 1)
+        #expect(diagnostics.ioSurfaceAllocationCount == 3)
+        #expect(diagnostics.decodedFrameCount == 105)
+        #expect(diagnostics.ioSurfaceFrameCount == 104)
+        #expect(diagnostics.dataFallbackCount == 1)
+        await decoder.close()
+    }
+
+    @Test func mjpegFastPathHasExplicitBoundedColorDifference() async throws {
+        let fixture = try loadFixture(named: "jpeg-420-9x7")
+        let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
+        let expectedRGB = try #require(Data(base64Encoded: fixture.expectedRGBBase64))
+        let expectedBGRA = bgra(fromRGB: expectedRGB)
+        let decoder = try SpiceMJPEGStreamDecoder(
+            limiter: SpiceMJPEGDecodeLimiter(),
+            poolCapacity: 0
+        )
+
+        let frame = try await decoder.decodeVideoFrame(
+            descriptor: SpiceCodecImageDescriptor(
+                width: fixture.width,
+                height: fixture.height
+            ),
+            payload: jpeg
+        )
+        let actual = try frame.copyBGRA().pixelsBGRA
+        #expect(actual.count == expectedBGRA.count)
+        var largestColorDelta = 0
+        for offset in actual.indices where offset % 4 != 3 {
+            largestColorDelta = max(
+                largestColorDelta,
+                abs(Int(actual[offset]) - Int(expectedBGRA[offset]))
+            )
+        }
+        // FAST_DCT plus FAST_UPSAMPLE is intentionally not bit-exact. Keep the
+        // stream profile bounded so a backend/flag regression remains visible.
+        #expect(largestColorDelta <= 144, "largest RGB delta was \(largestColorDelta)")
+        await decoder.close()
+    }
+
+    @Test func mjpegSessionLimiterCapsConcurrentStreamDecodesAtTwo() async throws {
+        let fixture = try loadFixture(named: "jpeg-420-9x7")
+        let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
+        let descriptor = SpiceCodecImageDescriptor(
+            width: fixture.width,
+            height: fixture.height
+        )
+        let limiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
+        let decoders = try (0..<4).map { _ in
+            try SpiceMJPEGStreamDecoder(limiter: limiter)
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for decoder in decoders {
+                group.addTask {
+                    for _ in 0..<50 {
+                        _ = try await decoder.decodeVideoFrame(
+                            descriptor: descriptor,
+                            payload: jpeg
+                        )
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        let diagnostics = await limiter.diagnosticsSnapshot()
+        #expect(diagnostics.activeDecodeCount == 0)
+        #expect(diagnostics.queuedDecodeCount == 0)
+        #expect(diagnostics.peakDecodeCount <= 2)
+        for decoder in decoders {
+            await decoder.close()
+        }
+    }
+
     private func loadFixture() throws -> JPEGFixture {
         try loadFixture(named: "jpeg-8x8")
     }

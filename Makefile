@@ -27,6 +27,7 @@ debug: ## Build and run the SpiceViewer integration client
 
 test: prepare ## Run the SwiftSpice test suite
 	@swift test --disable-sandbox \
+		--no-parallel \
 		-Xswiftc -warnings-as-errors
 
 test-public-api: prepare ## Compile the standalone public API consumer
@@ -60,7 +61,7 @@ all: ## Run environment, metadata, generation, build, API, and test gates
 	@$(MAKE) sanitize
 	@$(MAKE) coverage
 
-release: ## Cut a release: make release VERSION=0.1.11
+release: ## Cut a release: make release VERSION=0.2.1
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=X.Y.Z"; exit 1; }
 	@./Scripts/release.sh $(VERSION)
 

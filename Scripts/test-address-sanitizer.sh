@@ -10,6 +10,7 @@ SCRATCH_PATH="${SWIFTSPICE_ASAN_SCRATCH_PATH:-$ROOT_DIR/.build/address-sanitizer
 printf '[address-sanitizer] running the complete test suite\n'
 swift test --disable-sandbox \
     --scratch-path "$SCRATCH_PATH" \
+    --no-parallel \
     --sanitize address \
     -Xswiftc -warnings-as-errors \
     -q

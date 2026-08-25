@@ -21,7 +21,7 @@ struct OfflineViewerView: View {
             .frame(height: 38)
             .background(.bar)
 
-            SpiceDesktopView(frame: store.frame) { _ in }
+            SpiceDesktopView(desktop: store.desktop) { _ in }
                 .background(.black)
         }
     }

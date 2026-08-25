@@ -38,8 +38,6 @@ public struct SpiceFrame: Sendable, Equatable {
     public let bytesPerRow: Int
     private let pixelStorage: FramePixelStorage
     public let ioSurface: SpiceIOSurfaceFrame?
-    /// Content-free timestamp used to measure the in-process event handoff.
-    package var diagnosticsMailboxSentAt: ContinuousClock.Instant?
 
     /// Copies IOSurface-backed frames only when a CPU consumer requests pixels.
     /// Metal presentation can retain and present the IOSurface without creating
@@ -48,17 +46,13 @@ public struct SpiceFrame: Sendable, Equatable {
         pixelStorage.pixels()
     }
 
-    package init(
-        _ snapshot: FrameSnapshot,
-        diagnosticsMailboxSentAt: ContinuousClock.Instant? = nil
-    ) {
+    package init(_ snapshot: FrameSnapshot) {
         surfaceID = snapshot.surfaceID
         width = snapshot.width
         height = snapshot.height
         bytesPerRow = snapshot.bytesPerRow
         pixelStorage = snapshot.pixelStorage
         ioSurface = snapshot.ioSurfaceFrame.map(SpiceIOSurfaceFrame.init)
-        self.diagnosticsMailboxSentAt = diagnosticsMailboxSentAt
     }
 
     public init(
@@ -74,7 +68,6 @@ public struct SpiceFrame: Sendable, Equatable {
         self.bytesPerRow = bytesPerRow
         pixelStorage = FramePixelStorage(pixels: pixels, ioSurfaceFrame: nil)
         self.ioSurface = nil
-        diagnosticsMailboxSentAt = nil
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -389,13 +382,9 @@ public enum SpiceAgentEvent: Sendable, Equatable {
 }
 
 public enum SpiceSessionEvent: Sendable, Equatable {
-    case frame(SpiceFrame)
-    case surfaceDestroyed(UInt32)
     case displayConfiguration(SpiceGuestDisplayConfiguration)
-    case cursor(SpiceCursorState)
     case keyboardModifiers(UInt16)
     case mouseMotionAcknowledged
-    case mouseMode(supported: UInt32, current: UInt32)
     case migration(SpiceMigrationEvent)
     case failed(SpiceError)
     case disconnected

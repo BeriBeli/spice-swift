@@ -67,3 +67,36 @@ kernel void spice_nv12_to_bgra(
 
     destination.write(float4(rgb, 1.0f), destinationPosition);
 }
+
+kernel void spice_bgra_to_bgra(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(2)]],
+    constant SpiceVideoCompositorUniforms &uniforms [[buffer(0)]],
+    uint2 positionInClip [[thread_position_in_grid]]
+) {
+    const uint2 clipSize = uniforms.clipRect.zw;
+    if (any(positionInClip >= clipSize)) {
+        return;
+    }
+
+    const uint2 destinationPosition = uniforms.clipRect.xy + positionInClip;
+    const uint2 destinationOrigin = uniforms.destinationRect.xy;
+    const uint2 destinationSize = uniforms.destinationRect.zw;
+    if (any(destinationPosition < destinationOrigin)
+        || any(destinationPosition >= destinationOrigin + destinationSize)) {
+        return;
+    }
+
+    const uint2 relativePosition = destinationPosition - destinationOrigin;
+    const uint2 sourceSize = uniforms.sourceAndFlags.xy;
+    uint2 sourcePosition = uniforms.sourceRect.xy + uint2(
+        relativePosition.x * uniforms.sourceRect.z / destinationSize.x,
+        relativePosition.y * uniforms.sourceRect.w / destinationSize.y
+    );
+    sourcePosition = min(sourcePosition, sourceSize - 1u);
+    if (uniforms.sourceAndFlags.z != 0u) {
+        sourcePosition.y = sourceSize.y - 1u - sourcePosition.y;
+    }
+
+    destination.write(source.read(sourcePosition), destinationPosition);
+}

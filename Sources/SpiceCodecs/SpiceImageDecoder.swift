@@ -85,6 +85,8 @@ package enum SpiceCodecError: Error, Sendable, Equatable, CustomStringConvertibl
     case backendFailure(String)
     case invalidHeader(String)
     case unsupportedFormat(Int)
+    case videoHardwareUnavailable(codec: SpiceAdvancedVideoCodec, status: Int32?)
+    case unsupportedVideoFormat(codec: SpiceAdvancedVideoCodec, status: Int32)
     case malformedPayload(String)
     case integerOverflow
     case cancelled
@@ -113,6 +115,14 @@ package enum SpiceCodecError: Error, Sendable, Equatable, CustomStringConvertibl
             "invalid codec header: \(reason)"
         case let .unsupportedFormat(format):
             "unsupported codec format \(format)"
+        case let .videoHardwareUnavailable(codec, status):
+            if let status {
+                "hardware \(codec) decoder is unavailable (status \(status))"
+            } else {
+                "hardware \(codec) decoder is unavailable"
+            }
+        case let .unsupportedVideoFormat(codec, status):
+            "hardware decoder does not support the \(codec) format (status \(status))"
         case let .malformedPayload(reason):
             "malformed codec payload: \(reason)"
         case .integerOverflow:

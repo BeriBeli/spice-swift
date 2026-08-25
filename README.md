@@ -15,9 +15,9 @@ advertised on the wire after their interoperability requirements are met.
 | --- | --- |
 | TCP/TLS, ticket authentication, Main Channel | Implemented and exercised against live QEMU/SPICE |
 | Display, Cursor, physical keyboard and pointer input | Implemented and exercised against live QEMU/SPICE |
-| RAW, JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, and MJPEG display data | Covered by bounded decoders and offline golden fixtures |
+| RAW, JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, and MJPEG display data | Covered by bounded decoders and offline golden fixtures; MJPEG streams reuse TurboJPEG and IOSurface-backed buffers |
 | H.264 and H.265 | VideoToolbox decode and deterministic Rocky yuv420p interoperability are closed behind explicit opt-in; `.mjpegOnly` remains the default |
-| Apple Silicon display path | Revisioned IOSurface backing and native NV12-to-Metal composition are implemented; the M4 Metal/VideoToolbox and live Rocky H.264/H.265 native paths pass with zero BGRA materialization or GPU errors, while CPU/frame performance plus M1 and real 1080p/4K window gates remain pending |
+| Apple Silicon display path | Demand-driven revisioned IOSurface publication, display-link scheduling, native video composition, and direct Metal presentation are implemented; CPU/frame performance plus M1 and real 1080p/4K window gates remain pending |
 | UTF-8 clipboard, file transfer, and monitor configuration | Implemented and exercised with the richer Agent guest |
 | Playback and Record | Implemented locally; audible playback and microphone capture remain external hardware gates |
 | Smartcard and USB redirection | Implemented locally; real devices remain external gates |
@@ -121,7 +121,7 @@ them on every build and also checks a release tag:
 
 ```sh
 ./Scripts/check-version.sh
-./Scripts/check-version.sh v0.1.10
+./Scripts/check-version.sh v0.2.0
 ```
 
 To publish a release from a clean, synchronized `main`, run the full local
@@ -131,15 +131,15 @@ version, commits the two version files, pushes `main`, and pushes the tag that
 starts the repository's GitHub Release workflow:
 
 ```sh
-./Scripts/release.sh 0.1.11
+./Scripts/release.sh 0.2.1
 ```
 
 ## Use the library
 
-Add the package and import `SwiftSpice`. A session owns the Main Channel,
-attaches advertised child channels, and publishes a bounded asynchronous event
-stream. Control events preserve order and are not evicted by frame pressure;
-pending frames are bounded and coalesced by Display channel and surface.
+Add the package and import `SwiftSpice`. A session owns the Main Channel and
+attaches advertised child channels. `events` contains only ordered control
+events. Desktop frames, cursor state, and pointer mode use a separate,
+demand-driven latest-only source.
 
 ```swift
 import SwiftSpice
@@ -151,13 +151,17 @@ let info = try await session.connect(
     credentials: SpiceCredentials(password: "ticket-password")
 )
 
-for await event in session.events {
-    switch event {
-    case .frame(let frame):
-        // Present the immutable packed-BGRA frame.
-        print("surface \(frame.surfaceID): \(frame.width)x\(frame.height)")
-    default:
-        break
+let desktop = session.desktop.subscribe()
+desktop.setDemand(.visible)
+defer { desktop.cancel() }
+
+for await snapshot in desktop.updates {
+    if let update = snapshot.frame {
+        print(
+            "surface \(update.revision.surface.surfaceID) "
+                + "revision \(update.revision.value): "
+                + "\(update.frame.width)x\(update.frame.height)"
+        )
     }
 }
 
@@ -169,15 +173,18 @@ frames, `pixels` performs one lazy CPU readback and caches it; Metal presentatio
 does not trigger that materialization. Public IOSurface frames expose metadata,
 not a mutable IOSurface or CoreVideo handle.
 
+`SpiceFrameUpdate.damage` describes changes since that subscriber's preceding
+delivered revision. Lifecycle changes, insufficient retained damage history,
+and resume after suppressed presentation produce `.full`. Setting demand to
+`.none` keeps protocol drawing and the canonical surface current while avoiding
+publication snapshots and drawable work.
+
 On macOS, `SpiceDesktopView` presents frames and cursors and returns ordered
 physical input events:
 
 ```swift
 SpiceDesktopView(
-    frame: frame,
-    cursor: cursor,
-    pointerMode: pointerMode,
-    presentationDiagnostics: session.presentationDiagnostics
+    desktop: session.desktop
 ) { input in
     Task { try? await session.send(input) }
 }
@@ -200,14 +207,14 @@ failures with fixed content-free categories. Counters cover the current Agent
 manager lifetime, while capability and last-failure fields are its latest
 observation.
 
-When `SpiceDesktopView` receives `session.presentationDiagnostics`, the session
-snapshot also separates publisher-emitted IOSurface/CPU-only frames and records
-Metal presentation versus AppKit CPU fallback. Fixed fallback categories
-distinguish unavailable Metal, missing IOSurface backing, dimension or pixel
-format mismatch, and Metal texture creation failure. Content-free timing
-summaries expose sample count, approximate p95, and maximum latency for
-publisher scheduling/snapshot/emission, mailbox delivery, view-to-Metal commit,
-and Metal command completion.
+`SpiceDesktopView` records presentation telemetry directly into its desktop
+source, so the session snapshot separates publisher-emitted IOSurface/CPU-only
+frames and Metal presentation versus AppKit CPU fallback. Fixed fallback
+categories distinguish unavailable Metal, missing IOSurface backing, dimension
+or pixel-format mismatch, and Metal texture creation failure. Content-free
+timing summaries expose sample count, approximate p95, and maximum latency for
+publisher scheduling/snapshot/emission, desktop-source coalescing,
+view-to-Metal commit, Metal completion, and confirmed drawable presentation.
 
 ## Command-line probe
 

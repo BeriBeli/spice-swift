@@ -21,9 +21,7 @@ struct RemoteViewerView: View {
             connectionStatusBar
             ZStack {
                 SpiceDesktopView(
-                    frame: store.frame,
-                    cursor: store.cursor,
-                    pointerMode: store.pointerMode,
+                    desktop: store.desktop,
                     onInput: store.submit
                 )
                 .background(.black)

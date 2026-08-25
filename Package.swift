@@ -119,7 +119,9 @@ let package = Package(
                 "SpiceTransportNetwork",
                 "SpiceWire",
                 "CUSBRedirShim",
-            ]
+            ],
+            exclude: ["Shaders"],
+            plugins: ["CompileMetalShaders"]
         ),
         .executableTarget(
             name: "SpiceProbe",

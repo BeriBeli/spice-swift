@@ -17,6 +17,7 @@ fi
 printf '[coverage] running the complete instrumented test suite\n'
 swift test --disable-sandbox \
     --scratch-path "$SCRATCH_PATH" \
+    --no-parallel \
     --enable-code-coverage \
     -Xswiftc -warnings-as-errors \
     -q

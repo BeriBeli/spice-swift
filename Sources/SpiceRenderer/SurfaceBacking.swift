@@ -324,6 +324,10 @@ package struct SurfaceStorage: @unchecked Sendable {
     package var dataBacking: DataSurfaceBacking
     package var unifiedBacking: UnifiedIOSurfaceBacking?
     package var dataRevision: UInt64
+    /// Damage not yet attached to a desktop publication. Unlike the
+    /// IOSurface catch-up journal this exists for every backing kind and is
+    /// cleared only by `SurfaceStore.publicationSnapshot`.
+    package var publicationDamageJournal: SurfaceDamageJournal
 
     package init(
         pixels: consuming Data,
@@ -342,6 +346,11 @@ package struct SurfaceStorage: @unchecked Sendable {
             )
         }
         dataRevision = 0
+        publicationDamageJournal = SurfaceDamageJournal(
+            width: width,
+            height: height,
+            initiallyFull: true
+        )
     }
 
     package var kind: SurfaceBackingKind {
@@ -360,11 +369,19 @@ package struct SurfaceStorage: @unchecked Sendable {
     package mutating func recordDamage(_ rectangle: PixelRect, revision: UInt64) {
         dataRevision = revision
         unifiedBacking?.damageJournal.append(rectangle)
+        publicationDamageJournal.append(rectangle)
     }
 
     package mutating func recordFullDamage(revision: UInt64) {
         dataRevision = revision
         unifiedBacking?.damageJournal.markFull()
+        publicationDamageJournal.markFull()
+    }
+
+    /// Native video composition commits the IOSurface directly, so only the
+    /// publication journal needs the clipped destination damage.
+    package mutating func recordPublicationDamage(_ rectangle: PixelRect) {
+        publicationDamageJournal.append(rectangle)
     }
 
     package mutating func disableUnifiedBacking(surfaceID: UInt32) {
