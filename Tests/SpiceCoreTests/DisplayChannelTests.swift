@@ -241,6 +241,7 @@ struct DisplayChannelTests {
         }
 
         #expect(sawSentinelSurface)
+        await decoder.waitUntilCancelled()
         #expect(await decoder.wasCancelled)
         runTask.cancel()
         _ = try? await runTask.value
@@ -2622,6 +2623,7 @@ private actor CancellationAwareJPEGDecoder: SpiceImageDecoder {
     private var started = false
     private var startedWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var wasCancelled = false
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
 
     func decode(
         descriptor: SpiceCodecImageDescriptor,
@@ -2636,6 +2638,8 @@ private actor CancellationAwareJPEGDecoder: SpiceImageDecoder {
             try await Task.sleep(for: .seconds(60))
         } catch {
             wasCancelled = true
+            for continuation in cancellationWaiters { continuation.resume() }
+            cancellationWaiters.removeAll()
             throw .cancelled
         }
         throw .decodeFailed
@@ -2644,6 +2648,11 @@ private actor CancellationAwareJPEGDecoder: SpiceImageDecoder {
     func waitUntilDecodeStarts() async {
         guard !started else { return }
         await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func waitUntilCancelled() async {
+        guard !wasCancelled else { return }
+        await withCheckedContinuation { cancellationWaiters.append($0) }
     }
 }
 
