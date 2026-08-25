@@ -183,6 +183,84 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
+    @Test func retiredRunDecodeFailureDoesNotCloseMigrationTarget() async throws {
+        let oldTransport = RetirableDisplayTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 2, height: 2, format: 32, flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7,
+                multimediaTime: 1,
+                data: Data([1])
+            )),
+        ])
+        try await oldTransport.connect()
+        let decoder = ReleaseFailingJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: oldTransport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let oldRun = Task { try await channel.run { _ in } }
+        await decoder.waitUntilDecodeStarts()
+        await oldTransport.waitUntilReadIsBlocked()
+        oldRun.cancel()
+
+        let targetTransport = GatedDisplayTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2, width: 1, height: 1, format: 32, flags: 1
+            )),
+        ], gateAfterReads: 0)
+        try await targetTransport.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: targetTransport,
+            headerMode: .mini
+        ))
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let targetRun = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+        await targetTransport.waitUntilGateIsBlocking()
+
+        await oldTransport.releaseBlockedRead()
+        _ = try? await oldRun.value
+        await decoder.releaseWithFailure()
+        try await Task.sleep(for: .milliseconds(10))
+        await targetTransport.releaseRemainingReads()
+
+        var eventIterator = events.stream.makeAsyncIterator()
+        var targetStayedConnected = false
+        while let event = await eventIterator.next() {
+            guard event == .surfaceCreated(2) else { continue }
+            targetStayedConnected = true
+            break
+        }
+        #expect(targetStayedConnected)
+        targetRun.cancel()
+        _ = try? await targetRun.value
+        await channel.close()
+    }
+
     @Test func staleMJPEGDecodeCannotOverwriteLaterDrawCommand() async throws {
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
@@ -324,6 +402,69 @@ struct DisplayChannelTests {
         await decoder.waitUntilDecodeStarts()
         await transport.releaseRemainingReads()
 
+        var eventIterator = events.stream.makeAsyncIterator()
+        var sawSentinelSurface = false
+        while let event = await eventIterator.next() {
+            guard event == .surfaceCreated(2) else { continue }
+            sawSentinelSurface = true
+            break
+        }
+
+        #expect(sawSentinelSurface)
+        await decoder.waitUntilCancelled()
+        #expect(await decoder.wasCancelled)
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+    }
+
+    @Test func surfaceDestroyCancelsInFlightMJPEGBeforeContinuing() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 2, height: 2, format: 32, flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 1, data: Data([1])
+            )),
+            encodeMini(SpiceMsgDisplaySurfaceDestroy(surfaceID: 1)),
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 2, width: 1, height: 1, format: 32, flags: 1
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 3)
+        try await transport.connect()
+        let decoder = CancellationAwareJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(
+            of: SpiceChannelEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                _ = events.continuation.yield(event)
+            }
+        }
+
+        await decoder.waitUntilDecodeStarts()
+        await transport.releaseRemainingReads()
         var eventIterator = events.stream.makeAsyncIterator()
         var sawSentinelSurface = false
         while let event = await eventIterator.next() {
@@ -2766,6 +2907,8 @@ private actor GatedDisplayTransport: SpiceTransport {
     private var readCount = 0
     private var remainingReadsReleased = false
     private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var gateIsBlocking = false
+    private var gateBlockingWaiters: [CheckedContinuation<Void, Never>] = []
     private var readCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var connected = false
     private var closed = false
@@ -2782,7 +2925,11 @@ private actor GatedDisplayTransport: SpiceTransport {
     func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
         guard connected, !closed else { throw .connectionClosed }
         if readCount >= gateAfterReads, !remainingReadsReleased {
+            gateIsBlocking = true
+            for continuation in gateBlockingWaiters { continuation.resume() }
+            gateBlockingWaiters.removeAll()
             await withCheckedContinuation { gateWaiters.append($0) }
+            guard connected, !closed else { throw .connectionClosed }
         }
         guard !inbound.isEmpty else {
             do {
@@ -2817,6 +2964,7 @@ private actor GatedDisplayTransport: SpiceTransport {
 
     func releaseRemainingReads() {
         remainingReadsReleased = true
+        gateIsBlocking = false
         for continuation in gateWaiters { continuation.resume() }
         gateWaiters.removeAll()
     }
@@ -2828,6 +2976,11 @@ private actor GatedDisplayTransport: SpiceTransport {
 
     func readCountSnapshot() -> Int {
         readCount
+    }
+
+    func waitUntilGateIsBlocking() async {
+        guard !gateIsBlocking else { return }
+        await withCheckedContinuation { gateBlockingWaiters.append($0) }
     }
 }
 
@@ -2959,6 +3112,36 @@ private actor CancellationAwareJPEGDecoder: SpiceImageDecoder {
     func waitUntilCancelled() async {
         guard !wasCancelled else { return }
         await withCheckedContinuation { cancellationWaiters.append($0) }
+    }
+}
+
+private actor ReleaseFailingJPEGDecoder: SpiceImageDecoder {
+    nonisolated let format = SpiceImageFormat.jpeg
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var release: CheckedContinuation<Void, Never>?
+
+    func decode(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data
+    ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        _ = descriptor
+        _ = payload
+        started = true
+        for continuation in startedWaiters { continuation.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { release = $0 }
+        throw .decodeFailed
+    }
+
+    func waitUntilDecodeStarts() async {
+        guard !started else { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func releaseWithFailure() {
+        release?.resume()
+        release = nil
     }
 }
 

@@ -92,6 +92,8 @@ package actor DisplayChannel: SpiceManagedChannel {
     private struct PendingMJPEGFrame: Sendable {
         let streamID: UInt32
         let streamGeneration: UInt64
+        let runGeneration: UInt64
+        let originConnection: ChannelConnection
         let expectedMutationBarrier: SurfaceMutationBarrier
         let videoSequence: SurfaceVideoSequence
         let clip: SpiceClip
@@ -125,6 +127,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var streams: [UInt32: VideoStream] = [:]
     private var asynchronousMJPEGRunGeneration: UInt64?
     private var nextRunGeneration: UInt64 = 0
+    private var asynchronousMJPEGRunConnections: [UInt64: ChannelConnection] = [:]
     private var pendingMJPEGFrames: [UInt32: PendingMJPEGFrame] = [:]
     private var mjpegFrameTasks: [UInt32: Task<Void, Never>] = [:]
     private var nextSurfaceVideoSequences: [UInt32: UInt64] = [:]
@@ -235,7 +238,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
         do {
             while !Task.isCancelled {
-                let event = try await processNext()
+                let event = try await processNext(runGeneration: runGeneration)
                 switch event {
                 case let .surfaceCreated(surfaceID):
                     await emit(.surfaceCreated(surfaceID))
@@ -264,6 +267,12 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
+        try await processNext(runGeneration: nil)
+    }
+
+    private func processNext(
+        runGeneration: UInt64?
+    ) async throws(ChannelError) -> DisplayEvent {
         if let asynchronousFailure {
             throw asynchronousFailure
         }
@@ -296,17 +305,17 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .surfaceCreated(create.surfaceID)
         case let .displaySurfaceDestroy(destroy):
-            do {
-                try await surfaces.destroy(id: destroy.surfaceID)
-            } catch {
-                throw .protocolViolation(String(describing: error))
-            }
             let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
                 cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
+            }
+            do {
+                try await surfaces.destroy(id: destroy.surfaceID)
+            } catch {
+                throw .protocolViolation(String(describing: error))
             }
             try await acknowledgeIfNeeded()
             return .surfaceDestroyed(destroy.surfaceID)
@@ -351,10 +360,11 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamData(data):
-            if asynchronousMJPEGRunGeneration != nil,
+            if let runGeneration,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
                     streamID: data.streamID,
+                    runGeneration: runGeneration,
                     multimediaTime: data.multimediaTime,
                     sizing: nil,
                     data: data.data,
@@ -374,10 +384,11 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamDataSized(data):
-            if asynchronousMJPEGRunGeneration != nil,
+            if let runGeneration,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
                     streamID: data.streamID,
+                    runGeneration: runGeneration,
                     multimediaTime: data.multimediaTime,
                     sizing: (data.width, data.height, data.destination),
                     data: data.data,
@@ -497,6 +508,7 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     private func enqueueMJPEGFrame(
         streamID: UInt32,
+        runGeneration: UInt64,
         multimediaTime: UInt32,
         sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
         data: Data,
@@ -517,12 +529,17 @@ package actor DisplayChannel: SpiceManagedChannel {
             return
         }
         let videoSequence = try reserveVideoSequence(for: stream)
+        guard let originConnection = asynchronousMJPEGRunConnections[runGeneration] else {
+            return
+        }
         if pendingMJPEGFrames[streamID] != nil {
             mjpegFramesSupersededBeforeDecode &+= 1
         }
         pendingMJPEGFrames[streamID] = PendingMJPEGFrame(
             streamID: streamID,
             streamGeneration: stream.generation,
+            runGeneration: runGeneration,
+            originConnection: originConnection,
             expectedMutationBarrier: expectedMutationBarrier,
             videoSequence: videoSequence,
             clip: stream.clip,
@@ -577,6 +594,11 @@ package actor DisplayChannel: SpiceManagedChannel {
                 else {
                     break
                 }
+                guard asynchronousMJPEGRunGeneration == pending.runGeneration,
+                      connection === pending.originConnection
+                else {
+                    continue
+                }
                 asynchronousFailure = error
                 await connection.close()
                 break
@@ -623,13 +645,18 @@ package actor DisplayChannel: SpiceManagedChannel {
             nextRunGeneration = 1
         }
         asynchronousMJPEGRunGeneration = nextRunGeneration
+        asynchronousMJPEGRunConnections[nextRunGeneration] = connection
         return nextRunGeneration
     }
 
     private func stopAsynchronousMJPEGScheduling(runGeneration: UInt64? = nil) {
-        if let runGeneration,
-           asynchronousMJPEGRunGeneration != runGeneration {
-            return
+        if let runGeneration {
+            asynchronousMJPEGRunConnections.removeValue(forKey: runGeneration)
+            if asynchronousMJPEGRunGeneration != runGeneration {
+                return
+            }
+        } else {
+            asynchronousMJPEGRunConnections.removeAll(keepingCapacity: false)
         }
         asynchronousMJPEGRunGeneration = nil
         pendingMJPEGFrames.removeAll(keepingCapacity: false)
