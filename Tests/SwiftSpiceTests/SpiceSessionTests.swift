@@ -3097,15 +3097,23 @@ private actor BlockingTransport: SpiceTransport {
 }
 
 private actor StreamingSessionTransport: SpiceTransport {
-    private var inbound: [Data]
-    private var nextReadWaiterID: UInt64 = 1
-    private var readWaiters: [UInt64: CheckedContinuation<Data?, Never>] = [:]
-    private var outboundWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private let inbound: AsyncStream<Data>
+    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private let writes: AsyncStream<Void>
+    private let writeContinuation: AsyncStream<Void>.Continuation
     private(set) var outbound: [Data] = []
     private(set) var isConnected = false
 
     init(initial: [Data]) {
-        inbound = initial
+        let inboundPipe = AsyncStream.makeStream(of: Data.self)
+        inbound = inboundPipe.stream
+        inboundContinuation = inboundPipe.continuation
+        for packet in initial {
+            inboundPipe.continuation.yield(packet)
+        }
+        let writePipe = AsyncStream.makeStream(of: Void.self)
+        writes = writePipe.stream
+        writeContinuation = writePipe.continuation
     }
 
     func connect() async throws(TransportError) {
@@ -3116,27 +3124,13 @@ private actor StreamingSessionTransport: SpiceTransport {
         guard isConnected else {
             throw .connectionClosed
         }
-        let packet: Data?
-        if inbound.isEmpty {
-            let waiterID = nextReadWaiterID
-            nextReadWaiterID &+= 1
-            packet = await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    readWaiters[waiterID] = continuation
-                }
-            } onCancel: {
-                Task { await self.cancelRead(waiterID: waiterID) }
+        for await packet in inbound {
+            guard packet.count <= maximum else {
+                throw .connectionFailed("fixture exceeds requested maximum")
             }
-        } else {
-            packet = inbound.removeFirst()
+            return packet
         }
-        guard let packet else {
-            throw Task.isCancelled ? .cancelled : .connectionClosed
-        }
-        guard packet.count >= minimum, packet.count <= maximum else {
-            throw .connectionFailed("fixture is outside requested read bounds")
-        }
-        return packet
+        throw Task.isCancelled ? .cancelled : .connectionClosed
     }
 
     func write(_ data: sending Data) async throws(TransportError) {
@@ -3144,42 +3138,28 @@ private actor StreamingSessionTransport: SpiceTransport {
             throw .connectionClosed
         }
         outbound.append(data)
-        let ready = outboundWaiters.filter { outbound.count >= $0.0 }
-        outboundWaiters.removeAll { outbound.count >= $0.0 }
-        for (_, continuation) in ready { continuation.resume() }
+        writeContinuation.yield(())
     }
 
     func enqueue(_ data: Data) {
-        if let waiterID = readWaiters.keys.first,
-           let continuation = readWaiters.removeValue(forKey: waiterID)
-        {
-            continuation.resume(returning: data)
-        } else {
-            inbound.append(data)
-        }
+        inboundContinuation.yield(data)
     }
 
     func waitForOutboundCount(_ count: Int) async {
         guard outbound.count < count else {
             return
         }
-        await withCheckedContinuation { continuation in
-            outboundWaiters.append((count, continuation))
+        for await _ in writes {
+            if outbound.count >= count {
+                return
+            }
         }
     }
 
     func close() async {
         isConnected = false
-        let blockedReads = readWaiters.values
-        readWaiters.removeAll(keepingCapacity: false)
-        for continuation in blockedReads { continuation.resume(returning: nil) }
-        let blockedWrites = outboundWaiters.map(\.1)
-        outboundWaiters.removeAll(keepingCapacity: false)
-        for continuation in blockedWrites { continuation.resume() }
-    }
-
-    private func cancelRead(waiterID: UInt64) {
-        readWaiters.removeValue(forKey: waiterID)?.resume(returning: nil)
+        inboundContinuation.finish()
+        writeContinuation.finish()
     }
 }
 
