@@ -326,11 +326,17 @@ private struct SpiceDesktopFrameGeometry: Sendable, Equatable {
 package final class SpiceDesktopReadyLatch: Sendable {
     private struct State: Sendable {
         var pending: SpiceDesktopSnapshot?
+        var pendingSince: ContinuousClock.Instant?
         var newestGeneration: UInt64?
         var newestDeliverySequence: UInt64 = 0
     }
 
     private let state = Mutex(State())
+
+    package struct Ready: Sendable {
+        package let snapshot: SpiceDesktopSnapshot
+        package let waitingDuration: Duration
+    }
 
     /// Returns true only for the empty-to-ready transition.
     package func offer(_ snapshot: SpiceDesktopSnapshot) -> Bool {
@@ -343,6 +349,9 @@ package final class SpiceDesktopReadyLatch: Sendable {
                 return false
             }
             let wasEmpty = state.pending == nil
+            if wasEmpty {
+                state.pendingSince = ContinuousClock().now
+            }
             state.pending = state.pending.map {
                 SpiceDesktopSource.merging($0, snapshot)
             } ?? snapshot
@@ -354,8 +363,24 @@ package final class SpiceDesktopReadyLatch: Sendable {
 
     package func take() -> SpiceDesktopSnapshot? {
         state.withLock { state in
-            defer { state.pending = nil }
+            defer {
+                state.pending = nil
+                state.pendingSince = nil
+            }
             return state.pending
+        }
+    }
+
+    package func takeReady(at selectedAt: ContinuousClock.Instant) -> Ready? {
+        state.withLock { state in
+            guard let snapshot = state.pending else { return nil }
+            let pendingSince = state.pendingSince ?? selectedAt
+            state.pending = nil
+            state.pendingSince = nil
+            return Ready(
+                snapshot: snapshot,
+                waitingDuration: pendingSince.duration(to: selectedAt)
+            )
         }
     }
 
@@ -370,13 +395,17 @@ package final class SpiceDesktopReadyLatch: Sendable {
                   )
             else { return }
             state.pending = snapshot
+            state.pendingSince = ContinuousClock().now
             state.newestGeneration = snapshot.generation
             state.newestDeliverySequence = snapshot.deliverySequence
         }
     }
 
     package func discard() {
-        state.withLock { $0.pending = nil }
+        state.withLock {
+            $0.pending = nil
+            $0.pendingSince = nil
+        }
     }
 
     package var isEmpty: Bool {
@@ -703,10 +732,14 @@ package final class SpiceFramebufferView: NSView {
             pauseDisplayLinkIfIdle()
             return
         }
-        guard let snapshot = readyLatch.take() else {
+        guard let ready = readyLatch.takeReady(at: clock.now) else {
             pauseDisplayLinkIfIdle()
             return
         }
+        presentationDiagnostics?.recordDesktopReadyToDisplayLink(
+            ready.waitingDuration
+        )
+        let snapshot = ready.snapshot
 
         switch apply(snapshot, requestedAt: clock.now) {
         case .consumed:

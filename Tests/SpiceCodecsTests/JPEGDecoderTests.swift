@@ -164,7 +164,7 @@ struct JPEGDecoderTests {
         await decoder.close()
     }
 
-    @Test func mjpegFastPathHasExplicitBoundedColorDifference() async throws {
+    @Test func mjpegStreamPreservesExactJPEGColor() async throws {
         let fixture = try loadFixture(named: "jpeg-420-9x7")
         let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
         let expectedRGB = try #require(Data(base64Encoded: fixture.expectedRGBBase64))
@@ -182,17 +182,7 @@ struct JPEGDecoderTests {
             payload: jpeg
         )
         let actual = try frame.copyBGRA().pixelsBGRA
-        #expect(actual.count == expectedBGRA.count)
-        var largestColorDelta = 0
-        for offset in actual.indices where offset % 4 != 3 {
-            largestColorDelta = max(
-                largestColorDelta,
-                abs(Int(actual[offset]) - Int(expectedBGRA[offset]))
-            )
-        }
-        // FAST_DCT plus FAST_UPSAMPLE is intentionally not bit-exact. Keep the
-        // stream profile bounded so a backend/flag regression remains visible.
-        #expect(largestColorDelta <= 144, "largest RGB delta was \(largestColorDelta)")
+        #expect(actual == expectedBGRA)
         await decoder.close()
     }
 

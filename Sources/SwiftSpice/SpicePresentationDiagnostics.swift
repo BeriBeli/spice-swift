@@ -35,12 +35,19 @@ public struct SpicePresentationMetrics: Sendable, Equatable {
     public internal(set) var desktopDisplayLinkWakeups: UInt64 = 0
     public internal(set) var desktopDisplayLinkTicks: UInt64 = 0
     public internal(set) var desktopDisplayLinkIdlePauses: UInt64 = 0
+    package var desktopReadyToDisplayLinkHistogram = SpiceTimingHistogram()
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
     package var metalRequestToPresentedHistogram = SpiceTimingHistogram()
 
     public var viewUpdateToMetalCommit: SpiceTimingSummary {
         viewUpdateToMetalCommitHistogram.summary
+    }
+
+    /// Time from the first coalesced desktop update becoming ready until the
+    /// AppKit display link selects the latest revision for presentation.
+    public var desktopReadyToDisplayLink: SpiceTimingSummary {
+        desktopReadyToDisplayLinkHistogram.summary
     }
 
     public var metalCommitToCompletion: SpiceTimingSummary {
@@ -142,6 +149,10 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func recordDesktopDisplayLinkIdlePause() {
         update { $0.desktopDisplayLinkIdlePauses &+= 1 }
+    }
+
+    package func recordDesktopReadyToDisplayLink(_ duration: Duration) {
+        update { $0.desktopReadyToDisplayLinkHistogram.record(duration) }
     }
 
     package func recordViewUpdateToMetalCommit(_ duration: Duration) {

@@ -65,6 +65,29 @@ package struct SurfaceRevision: Sendable, Hashable {
     }
 }
 
+/// Identifies the latest non-video mutation applied to a surface. Stream frames
+/// may advance the public revision without invalidating later frames from the
+/// same wire-ordered stream, while any subsequent draw/copy command changes
+/// this barrier and makes an older asynchronous decode stale.
+package struct SurfaceMutationBarrier: Sendable, Hashable {
+    package let surfaceID: UInt32
+    package let lifecycleGeneration: UInt64
+    package let generation: UInt64
+}
+
+/// Surface-wide wire order shared by every video stream targeting the surface.
+package struct SurfaceVideoSequence: Sendable, Hashable {
+    package let surfaceID: UInt32
+    package let lifecycleGeneration: UInt64
+    package let value: UInt64
+
+    package init(surfaceID: UInt32, lifecycleGeneration: UInt64, value: UInt64) {
+        self.surfaceID = surfaceID
+        self.lifecycleGeneration = lifecycleGeneration
+        self.value = value
+    }
+}
+
 /// Surface geometry and identity without materializing a frame snapshot.
 package struct SurfaceDescriptor: Sendable, Equatable {
     package let surfaceID: UInt32
@@ -74,12 +97,21 @@ package struct SurfaceDescriptor: Sendable, Equatable {
     package let format: SurfacePixelFormat
     package let lifecycleGeneration: UInt64
     package let revision: UInt64
+    package let mutationGeneration: UInt64
 
     package var surfaceRevision: SurfaceRevision {
         SurfaceRevision(
             surfaceID: surfaceID,
             lifecycleGeneration: lifecycleGeneration,
             revision: revision
+        )
+    }
+
+    package var mutationBarrier: SurfaceMutationBarrier {
+        SurfaceMutationBarrier(
+            surfaceID: surfaceID,
+            lifecycleGeneration: lifecycleGeneration,
+            generation: mutationGeneration
         )
     }
 }
@@ -90,6 +122,7 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let snapshots: UInt64
     package let fullFrameCopyBytes: UInt64
     package let partialFrameCopyBytes: UInt64
+    package let directIOSurfaceWriteBytes: UInt64
     package let cpuMaterializations: UInt64
     package let cpuMaterializationBytes: UInt64
     package let poolExhaustions: UInt64
@@ -364,6 +397,8 @@ package actor SurfaceStore {
         let lifecycleGeneration: UInt64
         let memoryLease: SurfaceMemoryLease
         var revision: UInt64
+        var mutationGeneration: UInt64
+        var latestVideoSequence: UInt64
         var latestAdvancedVideoRevision: UInt64?
         var storage: SurfaceStorage
 
@@ -403,6 +438,7 @@ package actor SurfaceStore {
     private var snapshots: UInt64 = 0
     private var fullFrameCopyBytes: UInt64 = 0
     private var partialFrameCopyBytes: UInt64 = 0
+    private var directIOSurfaceWriteBytes: UInt64 = 0
     private var poolExhaustions: UInt64 = 0
     private var nativeVideoFrames: UInt64 = 0
     private var nativeVideoFallbacks: UInt64 = 0
@@ -493,6 +529,8 @@ package actor SurfaceStore {
             lifecycleGeneration: lifecycleGeneration,
             memoryLease: memoryLease,
             revision: 0,
+            mutationGeneration: 0,
+            latestVideoSequence: 0,
             latestAdvancedVideoRevision: nil,
             storage: SurfaceStorage(
                 pixels: Data(repeating: 0, count: byteCount),
@@ -575,6 +613,7 @@ package actor SurfaceStore {
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         let destinationBytesPerRow = surface.bytesPerRow
         surface.pixels.withUnsafeMutableBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
@@ -637,6 +676,7 @@ package actor SurfaceStore {
             copied.append(surface.pixels[start..<(start + rowBytes)])
         }
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         for row in 0..<destination.height {
             let sourceStart = row * rowBytes
             let destinationStart = (destination.y + row) * surface.bytesPerRow + destination.x * 4
@@ -694,52 +734,62 @@ package actor SurfaceStore {
         }
 
         let nextRevision = try advancedRevision(surface.revision)
-        try prepareForMutation(&surface)
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
+        let fullSurface = PixelRect(
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height
+        )
+        if destination == fullSurface,
+           var unified = surface.storage.unifiedBacking,
+           let writable = unified.pool.checkoutWritable(
+               namespace: unified.namespace,
+               surfaceID: surfaceID,
+               width: surface.width,
+               height: surface.height,
+               source: unified.current,
+               allowsInPlaceSource: true
+           ),
+           writable.withLockedMutableBytes({ destinationBase, bytesPerRow in
+               copyRawBitmap(
+                   bitmap,
+                   source: source,
+                   to: destinationBase,
+                   destinationBytesPerRow: bytesPerRow,
+                   preservesAlpha: preservesAlpha
+               )
+           }) != nil,
+           let committed = writable.finish(revision: nextRevision)
+        {
+            surface.revision = nextRevision
+            surface.mutationGeneration &+= 1
+            unified.current = committed
+            unified.damageJournal.clear()
+            unified.damageHistory.reset(at: nextRevision)
+            surface.storage.unifiedBacking = unified
+            surface.storage.recordPublicationDamage(fullSurface)
+            currentFramePixelStorage[surfaceID] = nil
+            surfaces[surfaceID] = surface
+            directIOSurfaceWriteBytes &+= UInt64(surface.width * surface.height * 4)
+            recordDamage(fullSurface)
+            return surfaceRevision(of: surface)
+        }
+
+        try prepareForMutation(&surface)
         surface.revision = nextRevision
+        surface.mutationGeneration &+= 1
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
-            bitmap.pixels.withUnsafeBytes { sourceBytes in
-                guard let destinationBase = destinationBytes.baseAddress,
-                      let sourceBase = sourceBytes.baseAddress
-                else {
-                    return
-                }
-                for destinationRow in 0..<source.height {
-                    let logicalSourceRow = source.y + destinationRow
-                    let sourceRow = bitmap.topDown
-                        ? logicalSourceRow
-                        : bitmap.height - 1 - logicalSourceRow
-                    let sourceStart = sourceRow * bitmap.stride + source.x * 4
-                    let destinationStart = (destination.y + destinationRow)
-                        * destinationBytesPerRow + destination.x * 4
-                    let sourceRowBase = sourceBase.advanced(by: sourceStart)
-                    let destinationRowBase = destinationBase.advanced(by: destinationStart)
-                    if preservesAlpha {
-                        memmove(destinationRowBase, sourceRowBase, source.width * 4)
-                    } else if Int(bitPattern: sourceRowBase) & 3 == 0,
-                              Int(bitPattern: destinationRowBase) & 3 == 0
-                    {
-                        let sourcePixels = sourceRowBase.assumingMemoryBound(to: UInt32.self)
-                        let destinationPixels = destinationRowBase.assumingMemoryBound(
-                            to: UInt32.self
-                        )
-                        for column in 0..<source.width {
-                            destinationPixels[column] = sourcePixels[column] | 0xff00_0000
-                        }
-                    } else {
-                        for column in 0..<source.width {
-                            let sourcePixel = sourceRowBase.advanced(by: column * 4)
-                            let destinationPixel = destinationRowBase.advanced(by: column * 4)
-                            let sourceBGRA = sourcePixel.loadUnaligned(as: UInt32.self)
-                            destinationPixel.storeBytes(
-                                of: sourceBGRA | 0xff00_0000,
-                                as: UInt32.self
-                            )
-                        }
-                    }
-                }
-            }
+            guard let destinationBase = destinationBytes.baseAddress else { return }
+            copyRawBitmap(
+                bitmap,
+                source: source,
+                to: destinationBase.advanced(by: destination.y * destinationBytesPerRow
+                    + destination.x * 4),
+                destinationBytesPerRow: destinationBytesPerRow,
+                preservesAlpha: preservesAlpha
+            )
         }
         surface.storage.recordDamage(destination, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
@@ -810,6 +860,7 @@ package actor SurfaceStore {
             copied.append(sourceSurface.pixels[start..<(start + rowBytes)])
         }
         destinationSurface.revision = nextRevision
+        destinationSurface.mutationGeneration &+= 1
         for row in 0..<destination.height {
             let sourceStart = row * rowBytes
             let destinationStart = (destination.y + row) * destinationSurface.bytesPerRow
@@ -835,11 +886,21 @@ package actor SurfaceStore {
         destination: PixelRect,
         bitmap: RawBitmap,
         source: PixelRect,
-        clippedDestinations: [PixelRect]
+        clippedDestinations: [PixelRect],
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil
     ) async throws(RenderError) -> SurfaceRevision? {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
+        if let expectedMutationBarrier,
+           mutationBarrier(of: surface) != expectedMutationBarrier
+        {
+            return nil
+        }
+        if let videoSequence, !canCommit(videoSequence, to: surface) {
+            return nil
+        }
         try validate(destination, in: surface)
         guard source.x >= 0, source.y >= 0,
               source.width > 0, source.height > 0,
@@ -887,6 +948,9 @@ package actor SurfaceStore {
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
+        if let videoSequence {
+            surface.latestVideoSequence = videoSequence.value
+        }
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
@@ -942,7 +1006,9 @@ package actor SurfaceStore {
         source: PixelRect,
         topDown: Bool,
         clippedDestinations: [PixelRect],
-        isAdvancedVideo: Bool = false
+        isAdvancedVideo: Bool = false,
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil
     ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
         guard let compositor = metalCompositor else {
             throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
@@ -954,6 +1020,14 @@ package actor SurfaceStore {
         }
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         guard let surface = surfaces[surfaceID] else {
+            throw .staleSurface
+        }
+        if let expectedMutationBarrier,
+           mutationBarrier(of: surface) != expectedMutationBarrier
+        {
+            throw .staleSurface
+        }
+        if let videoSequence, !canCommit(videoSequence, to: surface) {
             throw .staleSurface
         }
         do {
@@ -1112,6 +1186,9 @@ package actor SurfaceStore {
         }
 
         liveSurface.revision = nextRevision
+        if let videoSequence {
+            liveSurface.latestVideoSequence = videoSequence.value
+        }
         if isAdvancedVideo {
             liveSurface.latestAdvancedVideoRevision = nextRevision
         }
@@ -1255,7 +1332,8 @@ package actor SurfaceStore {
             bytesPerRow: surface.bytesPerRow,
             format: surface.format,
             lifecycleGeneration: surface.lifecycleGeneration,
-            revision: surface.revision
+            revision: surface.revision,
+            mutationGeneration: surface.mutationGeneration
         )
     }
 
@@ -1269,6 +1347,7 @@ package actor SurfaceStore {
             snapshots: snapshots,
             fullFrameCopyBytes: fullFrameCopyBytes,
             partialFrameCopyBytes: partialFrameCopyBytes,
+            directIOSurfaceWriteBytes: directIOSurfaceWriteBytes,
             cpuMaterializations: materializations.count,
             cpuMaterializationBytes: materializations.bytes,
             poolExhaustions: poolExhaustions,
@@ -1515,6 +1594,20 @@ package actor SurfaceStore {
         )
     }
 
+    private func mutationBarrier(of surface: Surface) -> SurfaceMutationBarrier {
+        SurfaceMutationBarrier(
+            surfaceID: surface.id,
+            lifecycleGeneration: surface.lifecycleGeneration,
+            generation: surface.mutationGeneration
+        )
+    }
+
+    private func canCommit(_ sequence: SurfaceVideoSequence, to surface: Surface) -> Bool {
+        sequence.surfaceID == surface.id
+            && sequence.lifecycleGeneration == surface.lifecycleGeneration
+            && sequence.value > surface.latestVideoSequence
+    }
+
     private func isCurrent(_ requested: SurfaceRevision) -> Bool {
         guard let surface = surfaces[requested.surfaceID] else {
             return false
@@ -1655,6 +1748,50 @@ package actor SurfaceStore {
         surface.storage.pixels = pixels
         surface.storage.dataRevision = surface.revision
         materializationMetrics.record(bytes: pixels.count)
+    }
+
+    private func copyRawBitmap(
+        _ bitmap: RawBitmap,
+        source: PixelRect,
+        to destinationBase: UnsafeMutableRawPointer,
+        destinationBytesPerRow: Int,
+        preservesAlpha: Bool
+    ) {
+        bitmap.pixels.withUnsafeBytes { sourceBytes in
+            guard let sourceBase = sourceBytes.baseAddress else { return }
+            for destinationRow in 0..<source.height {
+                let logicalSourceRow = source.y + destinationRow
+                let sourceRow = bitmap.topDown
+                    ? logicalSourceRow
+                    : bitmap.height - 1 - logicalSourceRow
+                let sourceStart = sourceRow * bitmap.stride + source.x * 4
+                let sourceRowBase = sourceBase.advanced(by: sourceStart)
+                let destinationRowBase = destinationBase.advanced(
+                    by: destinationRow * destinationBytesPerRow
+                )
+                if preservesAlpha {
+                    memmove(destinationRowBase, sourceRowBase, source.width * 4)
+                } else if Int(bitPattern: sourceRowBase) & 3 == 0,
+                          Int(bitPattern: destinationRowBase) & 3 == 0
+                {
+                    let sourcePixels = sourceRowBase.assumingMemoryBound(to: UInt32.self)
+                    let destinationPixels = destinationRowBase.assumingMemoryBound(to: UInt32.self)
+                    for column in 0..<source.width {
+                        destinationPixels[column] = sourcePixels[column] | 0xff00_0000
+                    }
+                } else {
+                    for column in 0..<source.width {
+                        let sourcePixel = sourceRowBase.advanced(by: column * 4)
+                        let destinationPixel = destinationRowBase.advanced(by: column * 4)
+                        let sourceBGRA = sourcePixel.loadUnaligned(as: UInt32.self)
+                        destinationPixel.storeBytes(
+                            of: sourceBGRA | 0xff00_0000,
+                            as: UInt32.self
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private func validate(_ rectangle: PixelRect, in surface: Surface) throws(RenderError) {

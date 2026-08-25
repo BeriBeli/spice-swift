@@ -22,6 +22,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.snapshots
         _ = diagnostics.fullFrameCopyBytes
         _ = diagnostics.partialFrameCopyBytes
+        _ = diagnostics.directIOSurfaceWriteBytes
         _ = diagnostics.cpuMaterializations
         _ = diagnostics.cpuMaterializationBytes
         _ = diagnostics.poolExhaustions
@@ -78,6 +79,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.mjpegIOSurfaceAllocations
         _ = diagnostics.mjpegPeakBuffersInUse
         _ = diagnostics.mjpegPeakConcurrentDecodes
+        _ = diagnostics.mjpegFramesSupersededBeforeDecode
         _ = diagnostics.advancedCPUFallbackFrames
         _ = diagnostics.metalGenerationDisableCount
         _ = diagnostics.firstMetalGenerationDisableReason
@@ -105,6 +107,7 @@ struct PublicAPIConsumer {
         _ = diagnostics.desktopDisplayLinkWakeups
         _ = diagnostics.desktopDisplayLinkTicks
         _ = diagnostics.desktopDisplayLinkIdlePauses
+        _ = diagnostics.desktopReadyToDisplayLink
         let timing: SpiceTimingSummary = diagnostics.viewUpdateToMetalCommit
         requireSendable(timing)
         _ = timing.sampleCount

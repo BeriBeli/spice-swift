@@ -32,6 +32,7 @@ package struct DisplayMJPEGDiagnostics: Sendable, Equatable {
     package var ioSurfaceAllocations: UInt64 = 0
     package var peakBuffersInUse: Int = 0
     package var peakConcurrentDecodes: Int = 0
+    package var supersededBeforeDecode: UInt64 = 0
 
     package mutating func accumulate(_ diagnostics: SpiceMJPEGDecoderDiagnostics) {
         handleCreations &+= diagnostics.handleCreationCount
@@ -69,6 +70,7 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     private struct VideoStream: Sendable {
         let surfaceID: UInt32
+        let surfaceLifecycleGeneration: UInt64
         let streamID: UInt32
         let generation: UInt64
         let topDown: Bool
@@ -85,6 +87,20 @@ package actor DisplayChannel: SpiceManagedChannel {
         var lastPresentedSequence: UInt64
         var lastMultimediaTime: UInt32?
         var metalCompositorDisabled: Bool
+    }
+
+    private struct PendingMJPEGFrame: Sendable {
+        let streamID: UInt32
+        let streamGeneration: UInt64
+        let runGeneration: UInt64
+        let originConnection: ChannelConnection
+        let expectedMutationBarrier: SurfaceMutationBarrier
+        let videoSequence: SurfaceVideoSequence
+        let clip: SpiceClip
+        let multimediaTime: UInt32
+        let sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?
+        let data: Data
+        let receivedAt: ContinuousClock.Instant
     }
 
     private var connection: ChannelConnection
@@ -109,6 +125,14 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var images: [UInt64: CachedImage] = [:]
     private var cachedImageBytes = 0
     private var streams: [UInt32: VideoStream] = [:]
+    private var asynchronousMJPEGRunGeneration: UInt64?
+    private var nextRunGeneration: UInt64 = 0
+    private var asynchronousMJPEGRunConnections: [UInt64: ChannelConnection] = [:]
+    private var pendingMJPEGFrames: [UInt32: PendingMJPEGFrame] = [:]
+    private var mjpegFrameTasks: [UInt32: Task<Void, Never>] = [:]
+    private var nextSurfaceVideoSequences: [UInt32: UInt64] = [:]
+    private var asynchronousFailure: ChannelError?
+    private var mjpegFramesSupersededBeforeDecode: UInt64 = 0
     private var nextStreamGeneration: UInt64 = 1
     private var ackController = AckController()
     private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
@@ -164,6 +188,8 @@ package actor DisplayChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runGeneration = beginAsynchronousMJPEGScheduling()
+        defer { stopAsynchronousMJPEGScheduling(runGeneration: runGeneration) }
         try await connection.send(SpiceMsgcDisplayInit(
             pixmapCacheID: 1,
             pixmapCacheSize: Self.pixmapCachePixels,
@@ -212,7 +238,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
         do {
             while !Task.isCancelled {
-                let event = try await processNext()
+                let event = try await processNext(runGeneration: runGeneration)
                 switch event {
                 case let .surfaceCreated(surfaceID):
                     await emit(.surfaceCreated(surfaceID))
@@ -241,6 +267,15 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     package func processNext() async throws(ChannelError) -> DisplayEvent {
+        try await processNext(runGeneration: nil)
+    }
+
+    private func processNext(
+        runGeneration: UInt64?
+    ) async throws(ChannelError) -> DisplayEvent {
+        if let asynchronousFailure {
+            throw asynchronousFailure
+        }
         completedFrameSourceTiming = nil
         let framed = try await connection.receive()
         currentMessageReceivedAt = diagnosticsClock.now
@@ -270,16 +305,17 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .surfaceCreated(create.surfaceID)
         case let .displaySurfaceDestroy(destroy):
+            let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
+            streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
+            for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
+                await retireAdvancedDecoder(stream.advancedDecoder)
+                await retireMJPEGDecoder(stream.mjpegDecoder)
+            }
             do {
                 try await surfaces.destroy(id: destroy.surfaceID)
             } catch {
                 throw .protocolViolation(String(describing: error))
-            }
-            let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
-            streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
-            for stream in removedStreams {
-                await retireAdvancedDecoder(stream.advancedDecoder)
-                await retireMJPEGDecoder(stream.mjpegDecoder)
             }
             try await acknowledgeIfNeeded()
             return .surfaceDestroyed(destroy.surfaceID)
@@ -288,6 +324,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -323,21 +360,49 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamData(data):
+            if let runGeneration,
+               streams[data.streamID]?.codec == .mjpeg {
+                try await enqueueMJPEGFrame(
+                    streamID: data.streamID,
+                    runGeneration: runGeneration,
+                    multimediaTime: data.multimediaTime,
+                    sizing: nil,
+                    data: data.data,
+                    receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
+                )
+                try await acknowledgeIfNeeded()
+                return .ignored(framed.type)
+            }
             let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
                 sizing: nil,
-                data: data.data
+                data: data.data,
+                videoSequence: try reserveVideoSequence(streamID: data.streamID)
             )
             let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamDataSized(data):
+            if let runGeneration,
+               streams[data.streamID]?.codec == .mjpeg {
+                try await enqueueMJPEGFrame(
+                    streamID: data.streamID,
+                    runGeneration: runGeneration,
+                    multimediaTime: data.multimediaTime,
+                    sizing: (data.width, data.height, data.destination),
+                    data: data.data,
+                    receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
+                )
+                try await acknowledgeIfNeeded()
+                return .ignored(framed.type)
+            }
             let surfaceRevision = try await renderStreamFrame(
                 streamID: data.streamID,
                 multimediaTime: data.multimediaTime,
                 sizing: (data.width, data.height, data.destination),
-                data: data.data
+                data: data.data,
+                videoSequence: try reserveVideoSequence(streamID: data.streamID)
             )
             let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
@@ -350,6 +415,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard let removed = streams.removeValue(forKey: streamID) else {
                 throw .protocolViolation("destroy of unknown stream \(streamID)")
             }
+            cancelScheduledMJPEG(streamID: streamID)
             await retireAdvancedDecoder(removed.advancedDecoder)
             await retireMJPEGDecoder(removed.mjpegDecoder)
             try await acknowledgeIfNeeded()
@@ -358,6 +424,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
             for stream in removedStreams {
+                cancelScheduledMJPEG(streamID: stream.streamID)
                 await retireAdvancedDecoder(stream.advancedDecoder)
                 await retireMJPEGDecoder(stream.mjpegDecoder)
             }
@@ -439,7 +506,168 @@ package actor DisplayChannel: SpiceManagedChannel {
         return .frameChanged(surfaceRevision)
     }
 
+    private func enqueueMJPEGFrame(
+        streamID: UInt32,
+        runGeneration: UInt64,
+        multimediaTime: UInt32,
+        sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
+        data: Data,
+        receivedAt: ContinuousClock.Instant
+    ) async throws(ChannelError) {
+        guard let stream = streams[streamID], stream.codec == .mjpeg else {
+            throw .protocolViolation("data for unknown MJPEG stream \(streamID)")
+        }
+        let expectedMutationBarrier: SurfaceMutationBarrier
+        do {
+            expectedMutationBarrier = try await surfaces.descriptor(
+                surfaceID: stream.surfaceID
+            ).mutationBarrier
+        } catch {
+            throw .protocolViolation(String(describing: error))
+        }
+        guard streams[streamID]?.generation == stream.generation else {
+            return
+        }
+        let videoSequence = try reserveVideoSequence(for: stream)
+        guard let originConnection = asynchronousMJPEGRunConnections[runGeneration] else {
+            return
+        }
+        if pendingMJPEGFrames[streamID] != nil {
+            mjpegFramesSupersededBeforeDecode &+= 1
+        }
+        pendingMJPEGFrames[streamID] = PendingMJPEGFrame(
+            streamID: streamID,
+            streamGeneration: stream.generation,
+            runGeneration: runGeneration,
+            originConnection: originConnection,
+            expectedMutationBarrier: expectedMutationBarrier,
+            videoSequence: videoSequence,
+            clip: stream.clip,
+            multimediaTime: multimediaTime,
+            sizing: sizing,
+            data: data,
+            receivedAt: receivedAt
+        )
+        guard mjpegFrameTasks[streamID] == nil else { return }
+        mjpegFrameTasks[streamID] = Task { [weak self] in
+            await self?.drainScheduledMJPEG(
+                streamID: streamID,
+                streamGeneration: stream.generation
+            )
+        }
+    }
+
+    private func drainScheduledMJPEG(
+        streamID: UInt32,
+        streamGeneration: UInt64
+    ) async {
+        while !Task.isCancelled {
+            guard streams[streamID]?.generation == streamGeneration,
+                  let pending = pendingMJPEGFrames.removeValue(forKey: streamID),
+                  pending.streamGeneration == streamGeneration
+            else {
+                break
+            }
+            do {
+                guard let revision = try await renderStreamFrame(
+                    streamID: pending.streamID,
+                    multimediaTime: pending.multimediaTime,
+                    sizing: pending.sizing,
+                    data: pending.data,
+                    expectedMutationBarrier: pending.expectedMutationBarrier,
+                    videoSequence: pending.videoSequence,
+                    clipOverride: pending.clip
+                ) else {
+                    continue
+                }
+                let timing = DisplayFrameSourceTiming(
+                    messageReceivedAt: pending.receivedAt,
+                    surfaceReadyAt: diagnosticsClock.now
+                )
+                let publishers = Array(framePublishers.values)
+                for publisher in publishers {
+                    await publisher.submit(revision, sourceTiming: timing)
+                }
+            } catch {
+                guard !Task.isCancelled,
+                      streams[streamID]?.generation == streamGeneration
+                else {
+                    break
+                }
+                guard asynchronousMJPEGRunGeneration == pending.runGeneration,
+                      connection === pending.originConnection
+                else {
+                    continue
+                }
+                asynchronousFailure = error
+                await connection.close()
+                break
+            }
+        }
+        if streams[streamID]?.generation == streamGeneration {
+            mjpegFrameTasks.removeValue(forKey: streamID)
+        }
+    }
+
+    private func reserveVideoSequence(
+        for stream: VideoStream
+    ) throws(ChannelError) -> SurfaceVideoSequence {
+        let current = nextSurfaceVideoSequences[stream.surfaceID, default: 0]
+        let (next, overflow) = current.addingReportingOverflow(1)
+        guard !overflow else {
+            throw .protocolViolation("surface video sequence overflow")
+        }
+        nextSurfaceVideoSequences[stream.surfaceID] = next
+        return SurfaceVideoSequence(
+            surfaceID: stream.surfaceID,
+            lifecycleGeneration: stream.surfaceLifecycleGeneration,
+            value: next
+        )
+    }
+
+    private func reserveVideoSequence(
+        streamID: UInt32
+    ) throws(ChannelError) -> SurfaceVideoSequence {
+        guard let stream = streams[streamID] else {
+            throw .protocolViolation("data for unknown stream \(streamID)")
+        }
+        return try reserveVideoSequence(for: stream)
+    }
+
+    private func cancelScheduledMJPEG(streamID: UInt32) {
+        pendingMJPEGFrames.removeValue(forKey: streamID)
+        mjpegFrameTasks.removeValue(forKey: streamID)?.cancel()
+    }
+
+    private func beginAsynchronousMJPEGScheduling() -> UInt64 {
+        nextRunGeneration &+= 1
+        if nextRunGeneration == 0 {
+            nextRunGeneration = 1
+        }
+        asynchronousMJPEGRunGeneration = nextRunGeneration
+        asynchronousMJPEGRunConnections[nextRunGeneration] = connection
+        return nextRunGeneration
+    }
+
+    private func stopAsynchronousMJPEGScheduling(runGeneration: UInt64? = nil) {
+        if let runGeneration {
+            asynchronousMJPEGRunConnections.removeValue(forKey: runGeneration)
+            if asynchronousMJPEGRunGeneration != runGeneration {
+                return
+            }
+        } else {
+            asynchronousMJPEGRunConnections.removeAll(keepingCapacity: false)
+        }
+        asynchronousMJPEGRunGeneration = nil
+        pendingMJPEGFrames.removeAll(keepingCapacity: false)
+        for task in mjpegFrameTasks.values {
+            task.cancel()
+        }
+        mjpegFrameTasks.removeAll(keepingCapacity: false)
+    }
+
     package func close() async {
+        stopAsynchronousMJPEGScheduling()
         await connection.close()
         let publishers = Array(framePublishers.values)
         for publisher in publishers {
@@ -448,6 +676,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         let removedStreams = Array(streams.values)
         streams.removeAll(keepingCapacity: false)
         for stream in removedStreams {
+            cancelScheduledMJPEG(streamID: stream.streamID)
             await retireAdvancedDecoder(stream.advancedDecoder)
             await retireMJPEGDecoder(stream.mjpegDecoder)
         }
@@ -470,6 +699,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         for decoder in activeMJPEGDecoders {
             mjpeg.accumulate(await decoder.diagnosticsSnapshot())
         }
+        mjpeg.supersededBeforeDecode = mjpegFramesSupersededBeforeDecode
         return DisplayChannelDiagnostics(
             surfaces: await surfaces.metrics(),
             publisher: publisherMetrics,
@@ -557,6 +787,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         nextStreamGeneration = followingGeneration
         streams[create.streamID] = VideoStream(
             surfaceID: create.surfaceID,
+            surfaceLifecycleGeneration: descriptor.lifecycleGeneration,
             streamID: create.streamID,
             generation: generation,
             topDown: create.topDown,
@@ -589,7 +820,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         streamID: UInt32,
         multimediaTime: UInt32,
         sizing: (width: UInt32, height: UInt32, destination: SpiceRect)?,
-        data: Data
+        data: Data,
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil,
+        clipOverride: SpiceClip? = nil
     ) async throws(ChannelError) -> SurfaceRevision? {
         guard var stream = streams[streamID] else {
             throw .protocolViolation("data for unknown stream \(streamID)")
@@ -706,7 +940,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
 
         let destination = try pixelRect(destinationRect)
-        let clipped = try clippedRectangles(destination: destinationRect, clip: stream.clip)
+        let clipped = try clippedRectangles(
+            destination: destinationRect,
+            clip: clipOverride ?? stream.clip
+        )
         if clipped.isEmpty {
             guard var committed = streams[streamID],
                   committed.generation == stream.generation
@@ -737,7 +974,9 @@ package actor DisplayChannel: SpiceManagedChannel {
                     source: source,
                     topDown: stream.topDown,
                     clippedDestinations: clipped,
-                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265
+                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265,
+                    expectedMutationBarrier: expectedMutationBarrier,
+                    videoSequence: videoSequence
                 )
                 usedNativeVideoPath = surfaceRevision != nil
             } catch {
@@ -788,7 +1027,9 @@ package actor DisplayChannel: SpiceManagedChannel {
                     destination: destination,
                     bitmap: bitmap,
                     source: source,
-                    clippedDestinations: clipped
+                    clippedDestinations: clipped,
+                    expectedMutationBarrier: expectedMutationBarrier,
+                    videoSequence: videoSequence
                 )
             } catch {
                 throw .protocolViolation(String(describing: error))
