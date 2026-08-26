@@ -1575,8 +1575,9 @@ struct DisplayChannelTests {
         ]))
     }
 
-    @Test func losslessReferenceRejectsJPEGUntilLosslessReplacement() async throws {
+    @Test func losslessReferenceWaitsForLosslessReplacement() async throws {
         let imageID: UInt64 = 0x7788
+        let imageCache = DisplayImageCache()
         let transport = FakeTransport(inbound: try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
                 surfaceID: 1,
@@ -1603,16 +1604,39 @@ struct DisplayChannelTests {
                 transport: transport,
                 headerMode: .mini
             ),
+            imageCache: imageCache,
             jpegDecoder: StubJPEGDecoder(result: .success(decodedPixels([9, 8, 7, 6, 5, 4])))
         )
 
         _ = try await channel.processNext()
         _ = try await channel.processNext()
-        let before = try await channel.snapshot(surfaceID: 1)
-        await #expect(throws: ChannelError.self) {
+        let pendingLosslessDraw = Task {
             try await channel.processNext()
         }
-        #expect(try await channel.snapshot(surfaceID: 1) == before)
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+
+        let replacement = try await imageCache.reserve(
+            id: imageID,
+            bitmap: RawBitmap(
+                format: .xRGB8888,
+                width: 2,
+                height: 1,
+                stride: 8,
+                topDown: true,
+                pixels: Data([1, 2, 3, 0, 4, 5, 6, 0])
+            ),
+            lossy: false,
+            mode: .replace
+        )
+        await imageCache.commit(replacement)
+        _ = try await pendingLosslessDraw.value
+        #expect(try await channel.snapshot(surfaceID: 1).pixels == Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+        ]))
     }
 
     @Test func replacesLossyCacheWithLosslessImage() async throws {
@@ -1667,6 +1691,7 @@ struct DisplayChannelTests {
             (105, invalidateImagesBody([0x1234])),
             (106, invalidateAllImagesBody()),
         ] {
+            let imageCache = DisplayImageCache()
             let transport = FakeTransport(inbound: try [
                 encodeMini(SpiceMsgDisplaySurfaceCreate(
                     surfaceID: 1,
@@ -1694,6 +1719,7 @@ struct DisplayChannelTests {
                     transport: transport,
                     headerMode: .mini
                 ),
+                imageCache: imageCache,
                 lzDecoder: StubLZDecoder(
                     result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
                 )
@@ -1703,8 +1729,18 @@ struct DisplayChannelTests {
             _ = try await channel.processNext()
             _ = try await channel.processNext()
             let before = try await channel.snapshot(surfaceID: 1)
-            await #expect(throws: ChannelError.self) {
+            let missingReference = Task {
                 try await channel.processNext()
+            }
+            for _ in 0..<1_000 {
+                if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+                await Task.yield()
+            }
+            #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
+            #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+            await imageCache.clear()
+            await #expect(throws: ChannelError.protocolViolation("image cache cleared")) {
+                try await missingReference.value
             }
             #expect(try await channel.snapshot(surfaceID: 1) == before)
         }
@@ -1750,8 +1786,505 @@ struct DisplayChannelTests {
         ]))
     }
 
+    @Test func closingDisplayClosesOwnedImageCachePendingResolve() async throws {
+        let transport = GatedDisplayTransport(
+            inbound: [encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: 0xa100
+            ))],
+            gateAfterReads: 1
+        )
+        try await transport.connect()
+        let channel = DisplayChannel(connection: ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: transport,
+            headerMode: .mini
+        ))
+        let probe = DisplayProcessProbe()
+        let processing = Task { await probe.process(on: channel) }
+        await transport.waitUntilReadCount(1)
+        await expectDisplayProcessWaiting(probe)
+
+        await channel.close()
+        await processing.value
+
+        #expect(await probe.state == .failed(.transport(.connectionClosed)))
+    }
+
+    @Test func closingDisplayKeepsInjectedSessionImageCacheOpen() async throws {
+        let imageID: UInt64 = 0xa101
+        let imageCache = DisplayImageCache(maximumEntries: 2, maximumBytes: 16)
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+        _ = try await channel.processNext()
+        _ = try await channel.processNext()
+        var diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.imageCacheCommittedMutations == 1)
+        #expect(diagnostics.imageCacheInvalidatedMutations == 0)
+        #expect(diagnostics.imageCacheDiscardedMutations == 0)
+
+        await channel.close()
+
+        #expect(try await imageCache.resolve(id: imageID, requirement: .any).pixels == Data([
+            1, 2, 3, 0, 4, 5, 6, 0,
+        ]))
+        let next = try await imageCache.reserve(
+            id: imageID + 1,
+            bitmap: RawBitmap(
+                format: .xRGB8888,
+                width: 1,
+                height: 1,
+                stride: 4,
+                topDown: true,
+                pixels: Data([7, 8, 9, 0])
+            ),
+            lossy: false,
+            mode: .cache
+        )
+        #expect(await imageCache.commit(next) == .committed)
+        diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.imageCacheCommittedMutations == 1)
+    }
+
+    @Test func twoDisplaysResolveOneSessionImageCache() async throws {
+        let imageCache = DisplayImageCache()
+        let producerTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1]),
+                descriptorID: 0xa001,
+                descriptorFlags: 0x01
+            )),
+        ].map(Result.success))
+        let consumerTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: 0xa001
+            )),
+        ].map(Result.success))
+        try await producerTransport.connect()
+        try await consumerTransport.connect()
+        let producer = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: producerTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+        let consumer = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: consumerTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache
+        )
+
+        _ = try await producer.processNext()
+        _ = try await producer.processNext()
+        _ = try await consumer.processNext()
+        _ = try await consumer.processNext()
+
+        #expect(try await consumer.snapshot(surfaceID: 1).pixels == Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+        ]))
+        #expect(await imageCache.diagnosticsSnapshot().entryCount == 1)
+    }
+
+    @Test func secondDisplayWaitsForPendingSessionCacheCommit() async throws {
+        let imageCache = DisplayImageCache(maximumEntries: 2, maximumBytes: 1_024)
+        let bitmap = RawBitmap(
+            format: .xRGB8888,
+            width: 2,
+            height: 1,
+            stride: 8,
+            topDown: true,
+            pixels: Data([1, 2, 3, 0, 4, 5, 6, 0])
+        )
+        let reservation = try await imageCache.reserve(
+            id: 0xa002,
+            bitmap: bitmap,
+            lossy: false,
+            mode: .cache
+        )
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: 0xa002
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let consumer = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: transport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache
+        )
+        _ = try await consumer.processNext()
+        let pendingDraw = Task {
+            try await consumer.processNext()
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+
+        await imageCache.commit(reservation)
+
+        _ = try await pendingDraw.value
+        #expect(try await consumer.snapshot(surfaceID: 1).pixels == Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+        ]))
+    }
+
+    @Test func losslessReplacementCrossesDisplayChannels() async throws {
+        let imageID: UInt64 = 0xa003
+        let imageCache = DisplayImageCache()
+        let lossyTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 105,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 106,
+                descriptorID: imageID
+            )),
+        ].map(Result.success))
+        let replacementTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([2]),
+                descriptorID: imageID,
+                descriptorFlags: 0x04
+            )),
+        ].map(Result.success))
+        try await lossyTransport.connect()
+        try await replacementTransport.connect()
+        let lossyDisplay = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: lossyTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            jpegDecoder: StubJPEGDecoder(
+                result: .success(decodedPixels([9, 8, 7, 6, 5, 4]))
+            )
+        )
+        let replacementDisplay = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: replacementTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+
+        _ = try await lossyDisplay.processNext()
+        _ = try await lossyDisplay.processNext()
+        _ = try await replacementDisplay.processNext()
+        _ = try await replacementDisplay.processNext()
+        _ = try await lossyDisplay.processNext()
+
+        #expect(try await lossyDisplay.snapshot(surfaceID: 1).pixels == Data([
+            1, 2, 3, 255, 4, 5, 6, 255,
+        ]))
+    }
+
+    @Test func invalidationListFromOneDisplayRemovesAnotherDisplaysImage() async throws {
+        let imageID: UInt64 = 0xa004
+        let imageCache = DisplayImageCache()
+        let producerTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: imageID
+            )),
+        ].map(Result.success))
+        let invalidatorTransport = FakeTransport(inbound: [
+            .success(encodeMini(id: 105, body: invalidateImagesBody([imageID]))),
+        ])
+        try await producerTransport.connect()
+        try await invalidatorTransport.connect()
+        let producer = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: producerTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+        let invalidator = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: invalidatorTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache
+        )
+
+        _ = try await producer.processNext()
+        _ = try await producer.processNext()
+        _ = try await invalidator.processNext()
+        let missingReference = Task {
+            try await producer.processNext()
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+        await imageCache.clear()
+        await #expect(throws: ChannelError.protocolViolation("image cache cleared")) {
+            try await missingReference.value
+        }
+    }
+
+    @Test func invalidationAllWaitsForOtherDisplayProcessedSerialBeforeClearing() async throws {
+        let imageID: UInt64 = 0xa005
+        let imageCache = DisplayImageCache()
+        let serialBarrier = ChannelSerialBarrier()
+        let decoder = GatedPatternJPEGDecoder()
+        let producerTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 105,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+            encodeMini(id: 304, body: drawCachedCopyBody(
+                imageType: 103,
+                descriptorID: imageID
+            )),
+        ].map(Result.success))
+        let invalidatorTransport = FakeTransport(inbound: [
+            .success(encodeMini(id: 106, body: invalidateAllImagesBody(waits: [
+                (channelType: 2, channelID: 0, serial: 2),
+            ]))),
+        ])
+        try await producerTransport.connect()
+        try await invalidatorTransport.connect()
+        let producerConnection = ChannelConnection(
+            key: ChannelKey(type: 2, id: 0),
+            transport: producerTransport,
+            headerMode: .mini,
+            serialBarrier: serialBarrier
+        )
+        let invalidatorConnection = ChannelConnection(
+            key: ChannelKey(type: 2, id: 1),
+            transport: invalidatorTransport,
+            headerMode: .mini,
+            serialBarrier: serialBarrier
+        )
+        let producer = DisplayChannel(
+            connection: producerConnection,
+            imageCache: imageCache,
+            jpegDecoder: decoder
+        )
+        let invalidator = DisplayChannel(
+            connection: invalidatorConnection,
+            imageCache: imageCache
+        )
+
+        _ = try await producer.processNext()
+        let cacheDraw = Task {
+            try await producer.processNext()
+        }
+        await decoder.waitUntilFirstDecodeStarts()
+        let invalidationProbe = DisplayProcessProbe()
+        let invalidation = Task {
+            await invalidationProbe.process(on: invalidator)
+        }
+        await expectDisplayProcessWaiting(invalidationProbe)
+        #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
+
+        await decoder.releaseFirstDecode()
+        _ = try await cacheDraw.value
+        await invalidation.value
+        #expect(await invalidationProbe.state == .succeeded)
+        try await invalidatorConnection.waitUntilProcessed([
+            .init(key: ChannelKey(type: 2, id: 1), serial: 1),
+        ])
+        #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
+        let missingReference = Task {
+            try await producer.processNext()
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+        await imageCache.clear()
+        await #expect(throws: ChannelError.protocolViolation("image cache cleared")) {
+            try await missingReference.value
+        }
+    }
+
+    @Test func failedSurfaceMutationAbortsSharedCacheReservationAtomically() async throws {
+        let imageCache = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+        let failingTransport = FakeTransport(inbound: [
+            .success(encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1]),
+                descriptorID: 0xa006,
+                descriptorFlags: 0x01
+            ))),
+        ])
+        try await failingTransport.connect()
+        let failingDisplay = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: failingTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+
+        await #expect(throws: ChannelError.self) {
+            try await failingDisplay.processNext()
+        }
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.committedBytes == 0)
+        #expect(diagnostics.pendingReservationCount == 0)
+
+        let healthyTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([2]),
+                descriptorID: 0xa007,
+                descriptorFlags: 0x01
+            )),
+        ].map(Result.success))
+        try await healthyTransport.connect()
+        let healthyDisplay = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: healthyTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            lzDecoder: StubLZDecoder(
+                result: .success(decodedPixels([6, 5, 4, 3, 2, 1]))
+            )
+        )
+        _ = try await healthyDisplay.processNext()
+        _ = try await healthyDisplay.processNext()
+
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 1)
+        #expect(diagnostics.committedBytes == 8)
+        #expect(diagnostics.referenceCounts == [0xa007: 1])
+    }
+
     @Test func repeatedCacheMeUsesReferenceCountedInvalidation() async throws {
         let imageID: UInt64 = 0x5678
+        let imageCache = DisplayImageCache()
         let invalidation = invalidateImagesBody([imageID])
         let transport = FakeTransport(inbound: try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
@@ -1791,6 +2324,7 @@ struct DisplayChannelTests {
                 transport: transport,
                 headerMode: .mini
             ),
+            imageCache: imageCache,
             jpegDecoder: StubJPEGDecoder(result: .success(decodedPixels([9, 8, 7, 6, 5, 4]))),
             lzDecoder: StubLZDecoder(result: .success(decodedPixels([1, 2, 3, 4, 5, 6])))
         )
@@ -1801,8 +2335,17 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1).pixels == Data([
             9, 8, 7, 255, 6, 5, 4, 255,
         ]))
-        await #expect(throws: ChannelError.self) {
+        let missingReference = Task {
             try await channel.processNext()
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+        await imageCache.clear()
+        await #expect(throws: ChannelError.protocolViolation("image cache cleared")) {
+            try await missingReference.value
         }
     }
 
@@ -2865,9 +3408,16 @@ struct DisplayChannelTests {
         return writer.data
     }
 
-    private func invalidateAllImagesBody() -> Data {
+    private func invalidateAllImagesBody(
+        waits: [(channelType: UInt8, channelID: UInt8, serial: UInt64)] = []
+    ) -> Data {
         var writer = ByteWriter()
-        writer.writeUInt8(0)
+        writer.writeUInt8(UInt8(waits.count))
+        for wait in waits {
+            writer.writeUInt8(wait.channelType)
+            writer.writeUInt8(wait.channelID)
+            writer.writeUInt64LE(wait.serial)
+        }
         return writer.data
     }
 
@@ -2979,6 +3529,35 @@ struct DisplayChannelTests {
             revision: revision
         ))
     }
+}
+
+private actor DisplayProcessProbe {
+    enum State: Sendable, Equatable {
+        case starting
+        case waiting
+        case succeeded
+        case failed(ChannelError)
+    }
+
+    private(set) var state: State = .starting
+
+    func process(on channel: DisplayChannel) async {
+        state = .waiting
+        do {
+            _ = try await channel.processNext()
+            state = .succeeded
+        } catch let error {
+            state = .failed(error)
+        }
+    }
+}
+
+private func expectDisplayProcessWaiting(_ probe: DisplayProcessProbe) async {
+    for _ in 0..<1_000 where await probe.state == .starting {
+        await Task.yield()
+    }
+    for _ in 0..<20 { await Task.yield() }
+    #expect(await probe.state == .waiting)
 }
 
 private actor GatedDisplayTransport: SpiceTransport {
