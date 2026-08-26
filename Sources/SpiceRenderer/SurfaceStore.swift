@@ -1,3 +1,4 @@
+import CSpicePixelOps
 import Foundation
 import SpiceCodecs
 import SpiceIOSurface
@@ -1771,24 +1772,12 @@ package actor SurfaceStore {
                 )
                 if preservesAlpha {
                     memmove(destinationRowBase, sourceRowBase, source.width * 4)
-                } else if Int(bitPattern: sourceRowBase) & 3 == 0,
-                          Int(bitPattern: destinationRowBase) & 3 == 0
-                {
-                    let sourcePixels = sourceRowBase.assumingMemoryBound(to: UInt32.self)
-                    let destinationPixels = destinationRowBase.assumingMemoryBound(to: UInt32.self)
-                    for column in 0..<source.width {
-                        destinationPixels[column] = sourcePixels[column] | 0xff00_0000
-                    }
                 } else {
-                    for column in 0..<source.width {
-                        let sourcePixel = sourceRowBase.advanced(by: column * 4)
-                        let destinationPixel = destinationRowBase.advanced(by: column * 4)
-                        let sourceBGRA = sourcePixel.loadUnaligned(as: UInt32.self)
-                        destinationPixel.storeBytes(
-                            of: sourceBGRA | 0xff00_0000,
-                            as: UInt32.self
-                        )
-                    }
+                    spice_copy_bgra_opaque(
+                        sourceRowBase.assumingMemoryBound(to: UInt8.self),
+                        destinationRowBase.assumingMemoryBound(to: UInt8.self),
+                        source.width
+                    )
                 }
             }
         }
