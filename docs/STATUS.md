@@ -44,11 +44,14 @@ Agent behavior, including system-trusted TLS.
 - Handler or transport failure, run-task cancellation, and connection close
   terminate unsatisfied waiters for that channel. Waiter cancellation and an
   unrelated channel failure remain isolated. A recoverable migration request
-  completes its physical serial without poisoning the source connection.
+  completes its physical serial without poisoning the source connection. If
+  that MIGRATE message reaches the ACK window, its protocol ACK is still sent
+  after migration state begins while ordinary client sends remain blocked.
 - Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (16 tests), the
   combined serial-barrier selection (19 tests), the AIP-10 batch regression
-  (12 tests), `SpiceSessionTests` (61 tests), `DisplayChannelTests` (50 tests),
-  and the full warnings-as-errors test gate. Replacement connections retain
+  (12 tests), `ChannelMigrationTests` (5 tests), `SpiceSessionTests` (61 tests),
+  `DisplayChannelTests` (50 tests), and the full warnings-as-errors test gate.
+  Replacement connections retain
   their processed-serial barrier when superseded receive tasks unwind, while
   already-started Agent byte streams drain on their captured retiring connection
   before its transport closes; later target sends do not extend that retirement

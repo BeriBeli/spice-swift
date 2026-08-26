@@ -57,6 +57,40 @@ struct ChannelMigrationTests {
         #expect(try miniID((await transport.outbound).last ?? Data()) == 101)
     }
 
+    @Test func migrationCompletesTriggeredAckWithoutTerminatingConnection() async throws {
+        let key = ChannelKey(type: 4, id: 1)
+        let barrier = ChannelSerialBarrier()
+        let transport = FakeTransport(inbound: [
+            .success(mini(id: 1, body: uint32(0))),
+        ])
+        try await transport.connect()
+        let connection = ChannelConnection(
+            key: key,
+            transport: transport,
+            headerMode: .mini,
+            serialBarrier: barrier
+        )
+        await connection.configureAcknowledgments(generation: 7, window: 1)
+
+        await #expect(throws: ChannelError.migrationRequested(key: key, data: nil)) {
+            try await connection.receive()
+        }
+        try await connection.waitUntilProcessed([.init(key: key, serial: 1)])
+
+        var outbound = await transport.outbound
+        #expect(outbound.count == 1)
+        #expect(try miniID(outbound[0]) == 2)
+        #expect(try miniBody(outbound[0]).isEmpty)
+        await #expect(throws: ChannelError.invalidState) {
+            try await connection.send(messageType: 101, body: Data())
+        }
+
+        await connection.resumeAfterMigrationCancellation()
+        try await connection.send(messageType: 101, body: Data())
+        outbound = await transport.outbound
+        #expect(try outbound.map(miniID) == [2, 101])
+    }
+
     @Test func rejectsUnknownFlagsAndMissingMigrationData() async throws {
         let key = ChannelKey(type: 2, id: 0)
         let unknownFlags = FakeTransport(inbound: [

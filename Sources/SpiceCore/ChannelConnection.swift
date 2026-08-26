@@ -324,15 +324,28 @@ package actor ChannelConnection {
             throw .protocolViolation("negative physical message ACK count")
         }
         for _ in 0..<count where ackController.didProcessMessage() {
-            try await send(SpiceMsgcAck())
+            try await sendGenerated(
+                SpiceMsgcAck(),
+                allowDuringMigrationCompletion: true
+            )
         }
     }
 
     package func send<Message: SpiceGeneratedMessage>(
         _ message: Message
     ) async throws(ChannelError) {
+        try await sendGenerated(message, allowDuringMigrationCompletion: false)
+    }
+
+    private func sendGenerated<Message: SpiceGeneratedMessage>(
+        _ message: Message,
+        allowDuringMigrationCompletion: Bool
+    ) async throws(ChannelError) {
         guard let messageID = Message.messageID else {
             throw .protocolViolation("message \(String(describing: Message.self)) has no wire ID")
+        }
+        guard !allowDuringMigrationCompletion || messageID == SpiceMsgcAck.messageID else {
+            throw .protocolViolation("only protocol ACK may complete during migration")
         }
 
         var bodyWriter = ByteWriter(capacity: Message.minimumWireSize)
@@ -341,7 +354,12 @@ package actor ChannelConnection {
         } catch let error {
             throw .wire(error)
         }
-        try await send(messageType: messageID, body: bodyWriter.data)
+        try await sendFramed(
+            messageType: messageID,
+            body: bodyWriter.data,
+            allowRetiringSend: false,
+            allowDuringMigrationCompletion: allowDuringMigrationCompletion
+        )
     }
 
     package func send(
@@ -349,12 +367,27 @@ package actor ChannelConnection {
         body: Data,
         allowRetiringSend: Bool = false
     ) async throws(ChannelError) {
+        try await sendFramed(
+            messageType: messageType,
+            body: body,
+            allowRetiringSend: allowRetiringSend,
+            allowDuringMigrationCompletion: false
+        )
+    }
+
+    private func sendFramed(
+        messageType: UInt16,
+        body: Data,
+        allowRetiringSend: Bool,
+        allowDuringMigrationCompletion: Bool
+    ) async throws(ChannelError) {
         if let terminalError {
             throw terminalError
         }
         guard (!isSuperseded || allowRetiringSend),
               !isMigrating
                 || allowRetiringSend
+                || allowDuringMigrationCompletion
                 || messageType == SpiceChannelMigrationWire.clientFlushMark
                 || messageType == SpiceChannelMigrationWire.clientMigrateData else {
             throw .invalidState
