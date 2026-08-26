@@ -50,7 +50,7 @@ Use exactly one of these values in the work table:
 | AIP-00 | pending | Establish fresh `v0.2.7` metrics and a Release `spice-bench` JSON harness | — | Microbench and live artifacts identify commit, toolchain, hardware, thermal state, workload, and date |
 | AIP-10 | done | Add an owned physical-message model and strict full-header submessage lists | — | List-only and main-plus-list ordering, bounds, ACK, fragmentation, and mutation tests pass |
 | AIP-11 | done | Advance the serial barrier after processing and propagate channel failure | AIP-10 | Waiters remain blocked through handler work and terminate on success, failure, cancellation, or close |
-| AIP-12 | pending | Move the image cache to Session scope with reservations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, cancellation, and capacity tests pass |
+| AIP-12 | in-progress | Move the image cache to Session scope with reservations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, cancellation, and capacity tests pass |
 | AIP-20 | pending | Introduce a bounded canonical `PixelRegion` | AIP-12 | Random-mask differential tests and pathological 4,096-clip inputs pass |
 | AIP-21 | pending | Apply each wire draw command as one Surface transaction and revision | AIP-20 | Failure is atomic and `mutationTransactions == 1` |
 | AIP-22 | pending | Replace staged COPY_BITS with direction-aware O(1)-space copying and add bulk/fill kernels | AIP-21 | Eight-direction differential tests pass and `temporaryCopyBytes == 0` |
