@@ -1,5 +1,11 @@
 # SwiftSpice and spice-client-glib2 remote performance results
 
+> **Historical result:** this report predates `v0.2.7` and several substantial
+> Display, IOSurface, publication, and NEON changes. It is retained as an
+> engineering record and must not be cited as current SwiftSpice performance.
+> Establish a fresh baseline through
+> [the algorithm improvement plan](../docs/ALGORITHM_IMPROVEMENT_PLAN.md).
+
 Test date: 2026-08-01 (Asia/Singapore)
 
 This report keeps the latest measurements first. The later sections preserve

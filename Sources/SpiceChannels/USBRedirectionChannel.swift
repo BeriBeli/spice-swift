@@ -11,7 +11,6 @@ package enum USBRedirectionEvent: Sendable, Equatable {
 package actor USBRedirectionChannel: SpiceManagedChannel {
     private var connection: ChannelConnection
     private let codec: SpiceVMCWireCodec
-    private var ackController = AckController()
 
     package init(
         connection: ChannelConnection,
@@ -52,7 +51,10 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
             } catch let error {
                 throw .wire(error)
             }
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case 4:
@@ -99,8 +101,6 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

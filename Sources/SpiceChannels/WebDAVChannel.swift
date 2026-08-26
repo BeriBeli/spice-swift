@@ -17,7 +17,6 @@ package actor WebDAVChannel: SpiceManagedChannel {
     private let portCodec: SpicePortWireCodec
     private var muxDecoder: SpiceWebDAVMuxDecoder
     private let muxEncoder: SpiceWebDAVMuxEncoder
-    private var ackController = AckController()
     private var initialization: SpicePortInitialization?
     private var isOpen = false
     private var pendingEvents: [WebDAVEvent] = []
@@ -112,7 +111,10 @@ package actor WebDAVChannel: SpiceManagedChannel {
                 } catch let error {
                     throw .wire(error)
                 }
-                ackController.configure(generation: setAck.generation, window: setAck.window)
+                await connection.configureAcknowledgments(
+                    generation: setAck.generation,
+                    window: setAck.window
+                )
                 try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
                 return .ignored(framed.type)
             case 4:
@@ -166,8 +168,6 @@ package actor WebDAVChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

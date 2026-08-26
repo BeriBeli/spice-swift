@@ -2,13 +2,18 @@
 
 This document lists unfinished work and the checks required before a feature or
 release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
-[ARCHITECTURE.md](ARCHITECTURE.md) for design rules.
+[ARCHITECTURE.md](ARCHITECTURE.md) for design rules. The active protocol,
+rendering, and ownership work is tracked in the
+[algorithm improvement plan](ALGORITHM_IMPROVEMENT_PLAN.md).
 
 ## Closed locally
 
 - Wire framing, Link handshake, ticket authentication, and channel attachment
+- Strict full-header message lists with owned physical batches, ordered logical
+  dispatch, and one ACK unit per physical message
 - Basic desktop Display, Cursor, and Inputs paths
-- JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG, and shared image caches
+- JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG, and bounded per-Display image-cache
+  behavior; cross-Display Session sharing remains open in AIP-12
 - IOSurface and Metal presentation with a CPU frame fallback
 - Playback, Record, Agent clipboard, file transfer, and monitor configuration
 - Smartcard, USB redirection, WebDAV, and migration state machines
@@ -26,10 +31,10 @@ release claim is complete. See [STATUS.md](STATUS.md) for current evidence and
 - Close audible Playback and physical microphone Record behavior.
 - Validate real Smartcard and redirected USB devices.
 - Exercise live semi-seamless and seamless migration.
-- Reduce the corrected five-second CPU-per-frame ratio from the current
-  1.203073 to at most 1.10 while preserving the passing fps, ready-frame, p95,
-  RSS, and zero-stale Publisher results. Only then run ten paired 30-second
-  bootstrap measurements.
+- Establish a fresh `v0.2.7` CPU-per-frame baseline before setting a current
+  optimization target. The retained 2026-08-01 Rocky result is historical and
+  must not be used as current evidence. Preserve the existing fps, ready-frame,
+  p95, RSS, and zero-stale gates, then run ten paired 30-second measurements.
 - Complete Developer ID signing, notarization, Gatekeeper acceptance, and launch
   on a clean Apple Silicon macOS 26 host.
 - Restore the custom KVM kernel and local QEMU image before rerunning the current

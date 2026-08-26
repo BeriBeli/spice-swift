@@ -134,7 +134,6 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var asynchronousFailure: ChannelError?
     private var mjpegFramesSupersededBeforeDecode: UInt64 = 0
     private var nextStreamGeneration: UInt64 = 1
-    private var ackController = AckController()
     private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
     private var completedPublisherMetrics = DisplayFramePublisherMetrics()
     private let diagnosticsClock = ContinuousClock()
@@ -452,7 +451,10 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -1540,8 +1542,6 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

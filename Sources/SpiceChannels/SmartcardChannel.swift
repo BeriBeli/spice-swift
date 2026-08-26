@@ -19,7 +19,6 @@ package actor SmartcardChannel: SpiceManagedChannel {
     private var connection: ChannelConnection
     private let codec: SpiceSmartcardWireCodec
     private let maximumQueuedControlMessages: Int
-    private var ackController = AckController()
     private var pendingControlMessages: [SpiceSmartcardMessage] = []
     private var inFlightControlType: SpiceSmartcardMessageType?
 
@@ -62,7 +61,10 @@ package actor SmartcardChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -225,8 +227,6 @@ package actor SmartcardChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

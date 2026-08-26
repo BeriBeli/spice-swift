@@ -18,7 +18,6 @@ package actor RecordChannel: SpiceManagedChannel {
     private let codec: SpiceRecordWireCodec
     private var configuration: SpiceRecordStart?
     private var streamMarked = false
-    private var ackController = AckController()
 
     package init(
         connection: ChannelConnection,
@@ -58,7 +57,10 @@ package actor RecordChannel: SpiceManagedChannel {
         case let .record(command):
             event = try handle(command)
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -168,8 +170,6 @@ package actor RecordChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }
