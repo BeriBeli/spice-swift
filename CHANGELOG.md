@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-08-26
+
+### Performance
+
+- Apple Silicon BGRA alpha copies now use contiguous NEON loads and an alpha
+  byte mask instead of channel deinterleave/reinterleave operations. Opaque raw
+  bitmap uploads also use a dedicated NEON kernel instead of a Swift per-pixel
+  loop.
+
 ## [0.2.6] — 2026-08-26
 
 ### Performance
@@ -206,7 +215,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/BeriBeli/spice-swift/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/BeriBeli/spice-swift/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/BeriBeli/spice-swift/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/BeriBeli/spice-swift/compare/v0.2.3...v0.2.4
