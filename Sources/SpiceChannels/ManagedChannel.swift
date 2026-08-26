@@ -40,7 +40,9 @@ package actor PassiveChannel: SpiceManagedChannel {
         _ = emit
         while !Task.isCancelled {
             _ = try await connection.receive()
+            try await connection.completeLastDelivered()
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func close() async {

@@ -40,9 +40,19 @@ package actor WebDAVChannel: SpiceManagedChannel {
             if case .ignored = event { continue }
             await emit(.webDAV(channelID: channelID, event))
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func processNext() async throws(ChannelError) -> WebDAVEvent {
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> WebDAVEvent {
         if !pendingEvents.isEmpty {
             return pendingEvents.removeFirst()
         }
@@ -116,6 +126,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
                     window: setAck.window
                 )
                 try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+                try await acknowledgeIfNeeded()
                 return .ignored(framed.type)
             case 4:
                 let ping: SpiceMsgPing

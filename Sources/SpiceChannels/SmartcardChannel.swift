@@ -40,9 +40,19 @@ package actor SmartcardChannel: SpiceManagedChannel {
             if case .ignored = event { continue }
             await emit(.smartcard(event))
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func processNext() async throws(ChannelError) -> SmartcardEvent {
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> SmartcardEvent {
         let framed = try await connection.receive()
         let decoded: SpiceServerMessage
         do {
@@ -66,6 +76,7 @@ package actor SmartcardChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .ping(ping):
             try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))

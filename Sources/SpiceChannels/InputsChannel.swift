@@ -50,6 +50,7 @@ package actor InputsChannel: SpiceManagedChannel {
             }
             await emit(.inputs(event))
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func send(_ event: SpiceInputEvent) async throws(ChannelError) {
@@ -93,6 +94,15 @@ package actor InputsChannel: SpiceManagedChannel {
     }
 
     package func processNext() async throws(ChannelError) -> InputsServerEvent {
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> InputsServerEvent {
         let framed = try await connection.receive()
         let message: SpiceServerMessage
         do {
@@ -123,6 +133,7 @@ package actor InputsChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .ping(ping):
             try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))

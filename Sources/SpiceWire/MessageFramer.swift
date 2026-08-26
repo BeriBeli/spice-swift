@@ -80,6 +80,7 @@ package struct FramedMessageBatch: Sendable, Equatable {
     package let physicalType: UInt16
     package let storage: Data
     package let messages: [FramedMessageSlice]
+    package let mainMessageIndex: Int?
 
     package var physicalBodySize: Int { storage.count }
     package var logicalMessages: [FramedMessageSlice] { messages }
@@ -132,6 +133,7 @@ package struct FramedMessageBatch: Sendable, Equatable {
                     bodyRange: 0..<framedMessage.body.count
                 )
             ]
+            mainMessageIndex = 0
             return
         }
 
@@ -143,6 +145,7 @@ package struct FramedMessageBatch: Sendable, Equatable {
                     bodyRange: 0..<framedMessage.body.count
                 )
             ]
+            mainMessageIndex = 0
             return
         }
 
@@ -225,6 +228,7 @@ package struct FramedMessageBatch: Sendable, Equatable {
         if physicalType != Self.messageListType {
             ordered.append((physicalType, 0..<listOffset))
         }
+        mainMessageIndex = physicalType == Self.messageListType ? nil : ordered.count - 1
         messages = ordered.enumerated().map { index, message in
             FramedMessageSlice(
                 type: message.0,

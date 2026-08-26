@@ -78,6 +78,15 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     package func bootstrap() async throws(ChannelError) -> MainBootstrap {
+        do {
+            return try await bootstrapImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func bootstrapImpl() async throws(ChannelError) -> MainBootstrap {
         let first = try await receiveDecoded()
         guard case let .mainInit(mainInit) = first else {
             throw .protocolViolation("Main Init must be the first Main Channel message")
@@ -96,6 +105,7 @@ package actor MainChannel: SpiceManagedChannel {
             try await startAgent(clientTokens: mainInit.agentTokens)
         }
         try await connection.send(SpiceMsgcMainAttachChannels())
+        try await acknowledgeIfNeeded()
 
         while true {
             let message = try await receiveDecoded()
@@ -129,6 +139,7 @@ package actor MainChannel: SpiceManagedChannel {
                     window: setAck.window
                 )
                 try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+                try await acknowledgeIfNeeded()
             case let .ping(ping):
                 try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))
                 try await acknowledgeIfNeeded()
@@ -156,6 +167,7 @@ package actor MainChannel: SpiceManagedChannel {
                 await emit(.main(event))
             }
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func close() async {
@@ -304,12 +316,25 @@ package actor MainChannel: SpiceManagedChannel {
     package func negotiateDestinationSeamless(
         sourceVersion: UInt32
     ) async throws(ChannelError) -> Bool {
+        do {
+            return try await negotiateDestinationSeamlessImpl(sourceVersion: sourceVersion)
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func negotiateDestinationSeamlessImpl(
+        sourceVersion: UInt32
+    ) async throws(ChannelError) -> Bool {
         try await sendMigrationReply(.destinationDoSeamless(sourceVersion: sourceVersion))
         let reply = try await receiveDecoded()
         switch reply {
         case .mainMigration(.destinationSeamlessAccepted):
+            try await acknowledgeIfNeeded()
             return true
         case .mainMigration(.destinationSeamlessRejected):
+            try await acknowledgeIfNeeded()
             return false
         default:
             throw .protocolViolation(
@@ -319,6 +344,15 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func processNext() async throws(ChannelError) -> MainEvent? {
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> MainEvent? {
         if !pendingEvents.isEmpty {
             return removeFirstPendingEvent()
         }
@@ -351,6 +385,7 @@ package actor MainChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return nil
         case let .ping(ping):
             try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))

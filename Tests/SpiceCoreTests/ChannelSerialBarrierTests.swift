@@ -35,7 +35,7 @@ struct ChannelSerialBarrierTests {
         }
     }
 
-    @Test func channelConnectionPublishesFullAndImplicitMiniSerials() async throws {
+    @Test func channelConnectionPublishesFullAndImplicitMiniSerialsAfterCompletion() async throws {
         let barrier = ChannelSerialBarrier()
         let fullKey = ChannelKey(type: 2, id: 0)
         var fullWriter = ByteWriter()
@@ -52,6 +52,7 @@ struct ChannelSerialBarrierTests {
             serialBarrier: barrier
         )
         _ = try await fullConnection.receive()
+        try await fullConnection.completeLastDelivered()
         try await barrier.wait(for: [.init(key: fullKey, serial: 42)])
 
         let miniKey = ChannelKey(type: 2, id: 1)
@@ -69,7 +70,9 @@ struct ChannelSerialBarrierTests {
             serialBarrier: barrier
         )
         _ = try await miniConnection.receive()
+        try await miniConnection.completeLastDelivered()
         _ = try await miniConnection.receive()
+        try await miniConnection.completeLastDelivered()
         try await barrier.wait(for: [.init(key: miniKey, serial: 2)])
     }
 }

@@ -28,9 +28,19 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
             if case .ignored = event { continue }
             await emit(.usbRedirection(event))
         }
+        await connection.fail(.transport(.cancelled))
     }
 
     package func processNext() async throws(ChannelError) -> USBRedirectionEvent {
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            await connection.fail(error)
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> USBRedirectionEvent {
         let framed = try await connection.receive()
         switch framed.type {
         case SpiceVMCWire.serverData, SpiceVMCWire.serverCompressedData:
@@ -56,6 +66,7 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case 4:
             let ping: SpiceMsgPing

@@ -35,14 +35,20 @@ Agent behavior, including system-trusted TLS.
 - ACK flow control now counts one unit per physical message across all active
   channels. An empty list dispatches no fake logical message but still completes
   its physical ACK unit.
-- Focused evidence is `InboundMessageBatchTests` (9 tests, including 14
+- Focused AIP-10 evidence is `InboundMessageBatchTests` (9 tests, including 14
   malformed-list argument cases) and `ChannelConnectionBatchTests` (3 tests),
-  plus a warnings-as-errors build. A full test run built and showed no failure
-  before a long-running phase stopped producing output; it was
-  terminated without a final summary and is not claimed as a full-suite pass.
-- AIP-11 remains open: the cross-channel serial barrier still records receive
-  time and must move to successful physical-batch processing completion with
-  explicit failure, cancellation, and close propagation.
+  plus the successful Apple Silicon SwiftPM CI on PR #20.
+- AIP-11 is locally complete. Full and implicit-mini serials advance once per
+  physical message only after every logical handler and required ACK succeed.
+  Empty lists complete immediately without a fake logical message.
+- Handler or transport failure, run-task cancellation, and connection close
+  terminate unsatisfied waiters for that channel. Waiter cancellation and an
+  unrelated channel failure remain isolated. A recoverable migration request
+  completes its physical serial without poisoning the source connection.
+- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (13 tests), the
+  combined serial-barrier selection (16 tests), the AIP-10 batch regression
+  (12 tests), and a warnings-as-errors build. Live peer closure remains part of
+  AIP-90.
 
 ## Stage B local closure
 
@@ -340,12 +346,11 @@ The LZ RGB family is locally closed.
   decode, actor reentrancy, ordered commit, and repeated dictionary eviction.
   Every dependent resolves to the source pixels, the retained window edge stays
   readable, and the immediately evicted history fails without another wait.
-- Full and Mini header receive paths publish explicit or implicit server
-  serials to a session-wide cancellation-safe barrier. The current barrier is
-  updated when a message is received rather than after its handler completes;
-  AIP-11 tracks the processed-serial correction. `INVAL_ALL_PIXMAPS` therefore
-  does not yet provide the cross-Display completion guarantee required by the
-  Session cache planned in AIP-12.
+- Full and Mini header paths publish explicit or implicit server serials to a
+  session-wide cancellation-safe barrier only after the complete physical
+  message has been processed. `INVAL_ALL_PIXMAPS` can therefore wait through
+  related handler work; the Session-scoped image cache itself remains planned
+  in AIP-12.
 
 ### ZLIB GLZ slice
 

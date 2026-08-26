@@ -11,6 +11,8 @@ rendering, and ownership work is tracked in the
 - Wire framing, Link handshake, ticket authentication, and channel attachment
 - Strict full-header message lists with owned physical batches, ordered logical
   dispatch, and one ACK unit per physical message
+- Cross-channel serial barriers that advance after physical-message processing
+  and terminate dependent waiters on failure, cancellation, or close
 - Basic desktop Display, Cursor, and Inputs paths
 - JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG, and bounded per-Display image-cache
   behavior; cross-Display Session sharing remains open in AIP-12

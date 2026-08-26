@@ -4,6 +4,13 @@ import SpiceTransport
 import SpiceWire
 
 package actor ChannelConnection {
+    private struct InFlightDelivery {
+        let effectiveSerial: UInt64
+        let completesPhysicalMessage: Bool
+        let isPhysicalMainMessage: Bool
+        var acknowledgmentCount: Int
+    }
+
     package nonisolated let key: ChannelKey
 
     private let transport: any SpiceTransport
@@ -11,11 +18,13 @@ package actor ChannelConnection {
     private var framer: MessageFramer
     private var pendingBatch: FramedMessageBatch?
     private var pendingMessageIndex = 0
+    private var pendingEffectiveSerial: UInt64?
+    private var inFlightDelivery: InFlightDelivery?
     private var ackController = AckController()
-    private var unclaimedAcknowledgmentCount = 0
     private var nextClientSerial: UInt64 = 1
     private var nextImplicitServerSerial: UInt64 = 1
     private var isMigrating = false
+    private var terminalError: ChannelError?
 
     package init(
         key: ChannelKey,
@@ -34,7 +43,9 @@ package actor ChannelConnection {
         let framed = try await receiveFramed()
         guard framed.type == SpiceChannelMigrationWire.serverMigrate else {
             guard framed.type != SpiceChannelMigrationWire.serverMigrateData else {
-                throw .protocolViolation("unexpected channel migration data")
+                let error = ChannelError.protocolViolation("unexpected channel migration data")
+                await fail(error)
+                throw error
             }
             return framed
         }
@@ -43,24 +54,43 @@ package actor ChannelConnection {
         do {
             flags = try SpiceChannelMigrationCodec.decodeFlags(framed.body)
         } catch let error {
-            throw .wire(error)
+            let channelError = ChannelError.wire(error)
+            await fail(channelError)
+            throw channelError
         }
         isMigrating = true
-        if flags.contains(.needFlush) {
-            try await send(
-                messageType: SpiceChannelMigrationWire.clientFlushMark,
-                body: Data()
-            )
+        do {
+            if flags.contains(.needFlush) {
+                try await send(
+                    messageType: SpiceChannelMigrationWire.clientFlushMark,
+                    body: Data()
+                )
+            }
+            // MIGRATE is processed before a following MIGRATE_DATA physical
+            // message is admitted. This also satisfies the outstanding
+            // logical-delivery invariant.
+            try await completeLastDelivered()
+        } catch let error {
+            await fail(error)
+            throw error
         }
         let migrationData: Data?
         if flags.contains(.needDataTransfer) {
             let dataMessage = try await receiveFramed()
             guard dataMessage.type == SpiceChannelMigrationWire.serverMigrateData else {
-                throw .protocolViolation(
+                let error = ChannelError.protocolViolation(
                     "channel migration expected MIGRATE_DATA after MIGRATE"
                 )
+                await fail(error)
+                throw error
             }
             migrationData = dataMessage.body
+            do {
+                try await completeLastDelivered()
+            } catch let error {
+                await fail(error)
+                throw error
+            }
         } else {
             migrationData = nil
         }
@@ -79,22 +109,34 @@ package actor ChannelConnection {
     }
 
     private func receiveFramed() async throws(ChannelError) -> FramedMessage {
+        if let terminalError {
+            throw terminalError
+        }
+        guard inFlightDelivery == nil else {
+            let error = ChannelError.invalidState
+            await fail(error)
+            throw error
+        }
         while true {
             if let pendingBatch, pendingMessageIndex < pendingBatch.messages.count {
-                let message = pendingBatch.framedMessage(at: pendingMessageIndex)
+                guard let effectiveSerial = pendingEffectiveSerial else {
+                    let error = ChannelError.invalidState
+                    await fail(error)
+                    throw error
+                }
+                let index = pendingMessageIndex
+                let message = pendingBatch.framedMessage(at: index)
+                inFlightDelivery = InFlightDelivery(
+                    effectiveSerial: effectiveSerial,
+                    completesPhysicalMessage: message.acknowledgmentCount > 0,
+                    isPhysicalMainMessage: pendingBatch.mainMessageIndex == index,
+                    acknowledgmentCount: message.acknowledgmentCount
+                )
                 pendingMessageIndex += 1
                 if pendingMessageIndex == pendingBatch.messages.count {
                     self.pendingBatch = nil
                     pendingMessageIndex = 0
-                }
-                if message.acknowledgmentCount > 0 {
-                    let (newCount, overflow) = unclaimedAcknowledgmentCount.addingReportingOverflow(
-                        message.acknowledgmentCount
-                    )
-                    guard !overflow else {
-                        throw .protocolViolation("physical message ACK count overflow")
-                    }
-                    unclaimedAcknowledgmentCount = newCount
+                    pendingEffectiveSerial = nil
                 }
                 return message
             }
@@ -103,7 +145,9 @@ package actor ChannelConnection {
             do {
                 framedBatch = try framer.nextBatch()
             } catch let error {
-                throw .wire(error)
+                let channelError = ChannelError.wire(error)
+                await fail(channelError)
+                throw channelError
             }
             if let batch = framedBatch {
                 let serial: UInt64
@@ -113,21 +157,32 @@ package actor ChannelConnection {
                     serial = nextImplicitServerSerial
                     let (next, overflow) = serial.addingReportingOverflow(1)
                     guard !overflow else {
-                        throw .protocolViolation("server message serial overflow")
+                        let error = ChannelError.protocolViolation(
+                            "server message serial overflow"
+                        )
+                        await fail(error)
+                        throw error
                     }
                     nextImplicitServerSerial = next
                 }
-                await serialBarrier.record(key: key, serial: serial)
-
                 if batch.messages.isEmpty {
                     // An empty SPICE_MSG_LIST still represents one complete
                     // physical ACK unit. It has no logical protocol message to
                     // dispatch, so completion is immediate.
-                    try await acknowledgePhysicalMessages(batch.acknowledgmentCount)
+                    do {
+                        try await completePhysicalMessage(
+                            effectiveSerial: serial,
+                            acknowledgmentCount: batch.acknowledgmentCount
+                        )
+                    } catch let error {
+                        await fail(error)
+                        throw error
+                    }
                     continue
                 }
                 pendingBatch = batch
                 pendingMessageIndex = 0
+                pendingEffectiveSerial = serial
                 continue
             }
 
@@ -135,33 +190,88 @@ package actor ChannelConnection {
             do {
                 bytes = try await transport.read(minimum: 1, maximum: 64 * 1024)
             } catch let error {
-                throw .transport(error)
+                let channelError = ChannelError.transport(error)
+                await fail(channelError)
+                throw channelError
             }
             guard !bytes.isEmpty else {
-                throw .transport(.connectionClosed)
+                let error = ChannelError.transport(.connectionClosed)
+                await fail(error)
+                throw error
             }
             do {
                 try framer.append(bytes)
             } catch let error {
-                throw .wire(error)
+                let channelError = ChannelError.wire(error)
+                await fail(channelError)
+                throw channelError
             }
         }
     }
 
-    /// Configures ACK accounting at the physical-message boundary. Resetting
-    /// unclaimed state preserves the existing rule that the SET_ACK message
-    /// establishing a window is not counted against that new window.
+    /// Configures ACK accounting at the physical-message boundary. A SET_ACK
+    /// physical main message is not counted against the window it establishes.
     package func configureAcknowledgments(generation: UInt32, window: UInt32) {
         ackController.configure(generation: generation, window: window)
-        unclaimedAcknowledgmentCount = 0
+        // A SET_ACK carried as the physical main message establishes the new
+        // window after that physical ACK boundary. A SET_ACK submessage, in
+        // contrast, precedes the batch ACK and must not suppress it.
+        if inFlightDelivery?.isPhysicalMainMessage == true {
+            inFlightDelivery?.acknowledgmentCount = 0
+        }
     }
 
-    /// Completes ACK accounting for the latest fully dispatched physical
-    /// message. Intermediate logical submessages contribute zero here.
+    /// Completes the latest logical handler. Only the final logical message in
+    /// a physical batch advances its effective serial and ACK state.
+    package func completeLastDelivered() async throws(ChannelError) {
+        guard terminalError == nil, let delivery = inFlightDelivery else {
+            throw terminalError ?? .invalidState
+        }
+        if delivery.completesPhysicalMessage {
+            do {
+                try await completePhysicalMessage(
+                    effectiveSerial: delivery.effectiveSerial,
+                    acknowledgmentCount: delivery.acknowledgmentCount
+                )
+            } catch let error {
+                await fail(error)
+                throw error
+            }
+        }
+        guard terminalError == nil else {
+            throw terminalError ?? .invalidState
+        }
+        inFlightDelivery = nil
+    }
+
+    /// Compatibility spelling retained for AIP-10 callers.
     package func acknowledgeLastDelivered() async throws(ChannelError) {
-        let count = unclaimedAcknowledgmentCount
-        unclaimedAcknowledgmentCount = 0
-        try await acknowledgePhysicalMessages(count)
+        try await completeLastDelivered()
+    }
+
+    package func fail(_ error: ChannelError) async {
+        if case .migrationRequested = error { return }
+        guard terminalError == nil else { return }
+        terminalError = error
+        pendingBatch = nil
+        pendingMessageIndex = 0
+        pendingEffectiveSerial = nil
+        inFlightDelivery = nil
+        await serialBarrier.terminate(key: key)
+    }
+
+    private func completePhysicalMessage(
+        effectiveSerial: UInt64,
+        acknowledgmentCount: Int
+    ) async throws(ChannelError) {
+        try await acknowledgePhysicalMessages(acknowledgmentCount)
+        guard terminalError == nil else {
+            throw terminalError ?? .invalidState
+        }
+        await serialBarrier.record(key: key, serial: effectiveSerial)
+        guard terminalError == nil else {
+            throw terminalError ?? .invalidState
+        }
     }
 
     private func acknowledgePhysicalMessages(_ count: Int) async throws(ChannelError) {
@@ -220,15 +330,18 @@ package actor ChannelConnection {
         do {
             try await transport.write(writer.data)
         } catch let error {
-            throw .transport(error)
+            let channelError = ChannelError.transport(error)
+            await fail(channelError)
+            throw channelError
         }
     }
 
     package func close() async {
+        await fail(.transport(.connectionClosed))
         await transport.close()
     }
 
-    package func waitUntilReceived(
+    package func waitUntilProcessed(
         _ requirements: [ChannelSerialBarrier.Requirement]
     ) async throws(ChannelError) {
         do {
@@ -238,6 +351,12 @@ package actor ChannelConnection {
         } catch {
             throw .protocolViolation(String(describing: error))
         }
+    }
+
+    package func waitUntilReceived(
+        _ requirements: [ChannelSerialBarrier.Requirement]
+    ) async throws(ChannelError) {
+        try await waitUntilProcessed(requirements)
     }
 }
 
