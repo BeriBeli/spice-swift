@@ -311,22 +311,33 @@ The LZ RGB family is locally closed.
 - Corrected the source-backed image type values to `SURFACE` 104 and `JPEG`
   105; `FROM_CACHE` 103 and `FROM_CACHE_LOSSLESS` 106 are now descriptor-only
   image references.
-- Each DisplayChannel currently owns a bounded image cache with both entry-count
-  and decoded-byte limits. RAW, JPEG, LZ palette/RGB, and QUIC sources are
-  decoded once per command, even when several clip rectangles are present.
-  Session-wide sharing and cross-Display wait semantics are not yet implemented
-  and are tracked by AIP-12.
-- `CACHE_ME` inserts only after every clipped Surface write succeeds.
-  `CACHE_REPLACE_ME` accepts only a lossless source replacing an existing lossy
-  representation, and `FROM_CACHE_LOSSLESS` rejects JPEG-derived entries until
-  that replacement completes within one Display channel. Repeated `CACHE_ME`
-  and targeted invalidation use compatible reference-count semantics locally.
-- Missing references, dimension disagreement, invalid
-  flags, decode failure, and capacity overflow fail before publishing cache
-  state. Cache byte accounting is updated on replacement and invalidation.
-- Display `INVAL_LIST` 105 and `INVAL_ALL_PIXMAPS` 106 remove the corresponding
-  channel-local images. RESET 103 preserves that image cache while clearing the
-  Display palette cache. Cross-Display invalidation remains part of AIP-12.
+- One Session-owned `DisplayImageCache` actor now serves every Display channel;
+  palette caches remain Display-local. RAW, JPEG, LZ palette/RGB, and QUIC
+  sources are decoded once per command, even when several clip rectangles are
+  present. Standalone package-level Display channels own and close their private
+  fallback cache, while one channel cannot close an injected Session cache.
+- `CACHE_ME` and `CACHE_REPLACE_ME` acquire a noncopyable reservation only after
+  decode and before Surface mutation. Entry, committed-byte, and actual pending
+  bitmap-byte capacity are admitted up front; consuming commit cannot throw
+  after Surface success, and failure consumes an abort without publishing cache
+  state. Outcome counters distinguish committed, concurrently invalidated, and
+  teardown-discarded reservations.
+- `CACHE_REPLACE_ME` accepts only a lossless source replacing a committed lossy
+  representation. `FROM_CACHE_LOSSLESS` suspends across Display channels until
+  that replacement commits. Missing references likewise resolve asynchronously;
+  waits are cancellation-safe, limited to 64, and may retain no more than one
+  cache byte budget in aggregate. Clear and Session close resume every waiter
+  exactly once.
+- Repeated `CACHE_ME` and targeted invalidation retain compatible reference-count
+  semantics. Per-image and global invalidation generations prevent a reservation
+  admitted earlier from resurrecting invalidated state. Dimension disagreement,
+  invalid flags, decode failure, and capacity overflow fail without publishing
+  cache state.
+- Display `INVAL_LIST` 105 invalidates the Session entry for every Display.
+  `INVAL_ALL_PIXMAPS` 106 first observes the AIP-11 processed-serial requirements,
+  then clears the Session cache. RESET 103 preserves that image cache while
+  clearing the Display-local palette cache. Seamless and semi-seamless rebinding
+  retain the source cache; full replacement and disconnect close it.
 
 ### GLZ RGB and dictionary slice
 
@@ -358,9 +369,8 @@ The LZ RGB family is locally closed.
   readable, and the immediately evicted history fails without another wait.
 - Full and Mini header paths publish explicit or implicit server serials to a
   session-wide cancellation-safe barrier only after the complete physical
-  message has been processed. `INVAL_ALL_PIXMAPS` can therefore wait through
-  related handler work; the Session-scoped image cache itself remains planned
-  in AIP-12.
+  message has been processed. `INVAL_ALL_PIXMAPS` therefore waits through
+  related handler work before invalidating the Session-scoped image cache.
 
 ### ZLIB GLZ slice
 
@@ -428,10 +438,11 @@ rejects Homebrew, local build-tree, and other non-relocatable load paths.
 
 ## Stage D local closure
 
-JPEG, LZ, QUIC, the per-Display image cache, GLZ/dictionary, ZLIB GLZ, and
-MJPEG stream scheduling satisfy their single-channel local Stage D gates:
-exact reference output, bounded malformed-input handling, and transactional
-Surface mutation. Cross-Display cache semantics remain open in AIP-12.
+JPEG, LZ, QUIC, the Session image cache, GLZ/dictionary, ZLIB GLZ, and MJPEG
+stream scheduling satisfy their local Stage D gates: exact reference output,
+bounded malformed-input handling, transactional cache publication, and bounded
+cross-Display resolve/invalidation semantics. Multi-Display cache lifecycle is
+covered across seamless, semi-seamless, switch-host, and disconnect paths.
 
 Live multi-Display/video interoperability remains part of the deferred QEMU
 acceptance gate rather than evidence supplied by the local corpus.
@@ -925,8 +936,10 @@ such by an embedding application.
   Inputs, Playback, Record, and passive actors. Source connections are then
   closed, preserving Display surfaces/image cache, Cursor cache/snapshot, Inputs
   button state, Main Agent token/decoder state, active audio state, and the shared
-  multimedia clock. `SWITCH_HOST` intentionally retains full-session replacement.
-  The warnings-as-errors gate passes 242 tests in 55 suites.
+  multimedia clock. The Session image cache follows the same ownership boundary:
+  seamless and semi-seamless rebinding retain it, while `SWITCH_HOST` performs
+  full-session replacement and closes the source cache. The current
+  warnings-as-errors gate passes, including `SpiceSessionTests` 62/62.
 
 ## Stage F peripheral-channel local closure
 
