@@ -424,6 +424,60 @@ struct ProcessedSerialBarrierTests {
         #expect(try outbound.map(aip11MiniType) == [1, 2])
     }
 
+    @Test func submessageSetAckDoesNotCountItsPhysicalBatchAgainstTheNewWindow() async throws {
+        let barrier = ChannelSerialBarrier()
+        let key = ChannelKey(type: 5, id: 9)
+        let main = Data([0xee])
+        let setAckBody = aip11LE(UInt32(8)) + aip11LE(UInt32(1))
+        let firstPhysicalBody = aip11ListBody(
+            main: main,
+            submessages: [(type: 3, body: setAckBody)],
+            listOrder: [0]
+        )
+        let transport = FakeTransport(inbound: [
+            .success(
+                aip11FullMessage(
+                    serial: 100,
+                    type: 999,
+                    body: firstPhysicalBody,
+                    subListOffset: UInt32(main.count)
+                )
+                    + aip11FullMessage(serial: 101, type: 998, body: Data())
+            ),
+        ])
+        try await transport.connect()
+        let connection = ChannelConnection(
+            key: key,
+            transport: transport,
+            headerMode: .full,
+            serialBarrier: barrier
+        )
+        let channel = PlaybackChannel(
+            connection: connection,
+            multimediaClock: MultimediaClock()
+        )
+
+        #expect(try await channel.processNext() == .ignored(3))
+        var outbound = await transport.outbound
+        #expect(try outbound.map(aip11FullType) == [1])
+        let (probe, waiter) = aip11StartWait(
+            on: connection,
+            requirements: [.init(key: key, serial: 100)]
+        )
+        await aip11ExpectWaiting(probe)
+
+        #expect(try await channel.processNext() == .ignored(999))
+        await waiter.value
+        #expect(await probe.state == .succeeded)
+        outbound = await transport.outbound
+        #expect(try outbound.map(aip11FullType) == [1])
+
+        #expect(try await channel.processNext() == .ignored(998))
+        try await connection.waitUntilProcessed([.init(key: key, serial: 101)])
+        outbound = await transport.outbound
+        #expect(try outbound.map(aip11FullType) == [1, 2])
+    }
+
     @Test func migrationRequestCompletesSerialWithoutTerminatingTheSourceBarrier() async throws {
         let barrier = ChannelSerialBarrier()
         let key = ChannelKey(type: 2, id: 9)
@@ -609,6 +663,12 @@ private func aip11MiniMessage(type: UInt16, body: Data) -> Data {
 
 private func aip11MiniType(_ data: Data) throws -> UInt16 {
     var reader = try ByteReader(data)
+    return try reader.readUInt16LE()
+}
+
+private func aip11FullType(_ data: Data) throws -> UInt16 {
+    var reader = try ByteReader(data)
+    _ = try reader.readUInt64LE()
     return try reader.readUInt16LE()
 }
 

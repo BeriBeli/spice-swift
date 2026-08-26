@@ -7,7 +7,6 @@ package actor ChannelConnection {
     private struct InFlightDelivery {
         let effectiveSerial: UInt64
         let completesPhysicalMessage: Bool
-        let isPhysicalMainMessage: Bool
         var acknowledgmentCount: Int
     }
 
@@ -20,6 +19,7 @@ package actor ChannelConnection {
     private var pendingMessageIndex = 0
     private var pendingEffectiveSerial: UInt64?
     private var inFlightDelivery: InFlightDelivery?
+    private var acknowledgmentSuppressedEffectiveSerial: UInt64?
     private var ackController = AckController()
     private var nextClientSerial: UInt64 = 1
     private var nextImplicitServerSerial: UInt64 = 1
@@ -131,11 +131,14 @@ package actor ChannelConnection {
                 }
                 let index = pendingMessageIndex
                 let message = pendingBatch.framedMessage(at: index)
+                let completesPhysicalMessage = message.acknowledgmentCount > 0
                 inFlightDelivery = InFlightDelivery(
                     effectiveSerial: effectiveSerial,
-                    completesPhysicalMessage: message.acknowledgmentCount > 0,
-                    isPhysicalMainMessage: pendingBatch.mainMessageIndex == index,
-                    acknowledgmentCount: message.acknowledgmentCount
+                    completesPhysicalMessage: completesPhysicalMessage,
+                    acknowledgmentCount:
+                        acknowledgmentSuppressedEffectiveSerial == effectiveSerial
+                            ? 0
+                            : message.acknowledgmentCount
                 )
                 pendingMessageIndex += 1
                 if pendingMessageIndex == pendingBatch.messages.count {
@@ -217,14 +220,15 @@ package actor ChannelConnection {
         }
     }
 
-    /// Configures ACK accounting at the physical-message boundary. A SET_ACK
-    /// physical main message is not counted against the window it establishes.
+    /// Configures ACK accounting at the physical-message boundary. The entire
+    /// physical message carrying SET_ACK is excluded from the new window,
+    /// whether SET_ACK is the main message or any logical submessage.
     package func configureAcknowledgments(generation: UInt32, window: UInt32) {
         ackController.configure(generation: generation, window: window)
-        // A SET_ACK carried as the physical main message establishes the new
-        // window after that physical ACK boundary. A SET_ACK submessage, in
-        // contrast, precedes the batch ACK and must not suppress it.
-        if inFlightDelivery?.isPhysicalMainMessage == true {
+        if let delivery = inFlightDelivery {
+            acknowledgmentSuppressedEffectiveSerial = delivery.effectiveSerial
+        }
+        if inFlightDelivery?.completesPhysicalMessage == true {
             inFlightDelivery?.acknowledgmentCount = 0
         }
     }
@@ -241,6 +245,9 @@ package actor ChannelConnection {
                     effectiveSerial: delivery.effectiveSerial,
                     acknowledgmentCount: delivery.acknowledgmentCount
                 )
+                if acknowledgmentSuppressedEffectiveSerial == delivery.effectiveSerial {
+                    acknowledgmentSuppressedEffectiveSerial = nil
+                }
             } catch let error {
                 await fail(error)
                 throw error
@@ -268,6 +275,7 @@ package actor ChannelConnection {
         pendingMessageIndex = 0
         pendingEffectiveSerial = nil
         inFlightDelivery = nil
+        acknowledgmentSuppressedEffectiveSerial = nil
         await serialBarrier.terminate(key: key)
     }
 
@@ -280,6 +288,7 @@ package actor ChannelConnection {
         pendingMessageIndex = 0
         pendingEffectiveSerial = nil
         inFlightDelivery = nil
+        acknowledgmentSuppressedEffectiveSerial = nil
     }
 
     /// Makes a previously superseded connection current again during a

@@ -45,8 +45,8 @@ Agent behavior, including system-trusted TLS.
   terminate unsatisfied waiters for that channel. Waiter cancellation and an
   unrelated channel failure remain isolated. A recoverable migration request
   completes its physical serial without poisoning the source connection.
-- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (14 tests), the
-  combined serial-barrier selection (17 tests), the AIP-10 batch regression
+- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (15 tests), the
+  combined serial-barrier selection (18 tests), the AIP-10 batch regression
   (12 tests), `SpiceSessionTests` (59 tests), `DisplayChannelTests` (50 tests),
   and the full warnings-as-errors test gate. Replacement connections retain
   their processed-serial barrier when superseded receive tasks unwind, while
