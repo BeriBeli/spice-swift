@@ -17,4 +17,10 @@ void spice_copy_bgra_alpha_overlap(
     size_t pixel_count
 );
 
+void spice_copy_bgra_opaque(
+    const uint8_t *source,
+    uint8_t *destination,
+    size_t pixel_count
+);
+
 #endif

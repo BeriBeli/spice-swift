@@ -6,23 +6,98 @@
 
 #include <arm_neon.h>
 
+static inline uint8x16_t spice_bgra_alpha_mask(void)
+{
+    return vreinterpretq_u8_u32(vdupq_n_u32(UINT32_C(0xff000000)));
+}
+
 static void spice_copy_bgra_alpha_nonoverlapping(
     const uint8_t *source,
     uint8_t *destination,
     size_t pixel_count
 )
 {
+    const uint8x16_t alpha_mask = spice_bgra_alpha_mask();
     while (pixel_count >= 16) {
-        const uint8x16x4_t source_pixels = vld4q_u8(source);
-        uint8x16x4_t destination_pixels = vld4q_u8(destination);
-        destination_pixels.val[3] = source_pixels.val[3];
-        vst4q_u8(destination, destination_pixels);
+        const uint8x16x4_t source_pixels = vld1q_u8_x4(source);
+        uint8x16x4_t destination_pixels = vld1q_u8_x4(destination);
+        destination_pixels.val[0] = vbslq_u8(
+            alpha_mask,
+            source_pixels.val[0],
+            destination_pixels.val[0]
+        );
+        destination_pixels.val[1] = vbslq_u8(
+            alpha_mask,
+            source_pixels.val[1],
+            destination_pixels.val[1]
+        );
+        destination_pixels.val[2] = vbslq_u8(
+            alpha_mask,
+            source_pixels.val[2],
+            destination_pixels.val[2]
+        );
+        destination_pixels.val[3] = vbslq_u8(
+            alpha_mask,
+            source_pixels.val[3],
+            destination_pixels.val[3]
+        );
+        vst1q_u8_x4(destination, destination_pixels);
         source += 16 * 4;
         destination += 16 * 4;
         pixel_count -= 16;
     }
+    while (pixel_count >= 4) {
+        const uint8x16_t source_pixels = vld1q_u8(source);
+        const uint8x16_t destination_pixels = vld1q_u8(destination);
+        vst1q_u8(
+            destination,
+            vbslq_u8(alpha_mask, source_pixels, destination_pixels)
+        );
+        source += 4 * 4;
+        destination += 4 * 4;
+        pixel_count -= 4;
+    }
     while (pixel_count != 0) {
         destination[3] = source[3];
+        source += 4;
+        destination += 4;
+        pixel_count -= 1;
+    }
+}
+
+void spice_copy_bgra_opaque(
+    const uint8_t *source,
+    uint8_t *destination,
+    size_t pixel_count
+)
+{
+    if (source == NULL || destination == NULL) {
+        return;
+    }
+
+    const uint8x16_t alpha_mask = spice_bgra_alpha_mask();
+    while (pixel_count >= 16) {
+        uint8x16x4_t pixels = vld1q_u8_x4(source);
+        pixels.val[0] = vorrq_u8(pixels.val[0], alpha_mask);
+        pixels.val[1] = vorrq_u8(pixels.val[1], alpha_mask);
+        pixels.val[2] = vorrq_u8(pixels.val[2], alpha_mask);
+        pixels.val[3] = vorrq_u8(pixels.val[3], alpha_mask);
+        vst1q_u8_x4(destination, pixels);
+        source += 16 * 4;
+        destination += 16 * 4;
+        pixel_count -= 16;
+    }
+    while (pixel_count >= 4) {
+        vst1q_u8(destination, vorrq_u8(vld1q_u8(source), alpha_mask));
+        source += 4 * 4;
+        destination += 4 * 4;
+        pixel_count -= 4;
+    }
+    while (pixel_count != 0) {
+        destination[0] = source[0];
+        destination[1] = source[1];
+        destination[2] = source[2];
+        destination[3] = UINT8_C(0xff);
         source += 4;
         destination += 4;
         pixel_count -= 1;

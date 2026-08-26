@@ -97,6 +97,7 @@ let package = Package(
         .target(
             name: "SpiceRenderer",
             dependencies: [
+                "CSpicePixelOps",
                 "SpiceCodecs",
                 "SpiceIOSurface",
                 "SpiceMetalCompositor",
@@ -203,6 +204,7 @@ let package = Package(
         .testTarget(
             name: "SpiceRendererTests",
             dependencies: [
+                "CSpicePixelOps",
                 "SpiceCodecs",
                 "SpiceIOSurface",
                 "SpiceRenderer",
