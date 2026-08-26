@@ -152,6 +152,7 @@ public actor SpiceSession {
     private let transportFactory: TransportFactory
     private let ticketEncryptor: any TicketEncrypting
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
+    private let displayImageCacheFactory: @Sendable () -> DisplayImageCache
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
     private let mjpegDecodeLimiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
     package nonisolated let presentationDiagnostics: SpicePresentationDiagnostics
@@ -179,6 +180,7 @@ public actor SpiceSession {
     public nonisolated let webDAVEvents: AsyncStream<SpiceWebDAVEvent>
     private let webDAVEventContinuation: AsyncStream<SpiceWebDAVEvent>.Continuation
     private var mainChannel: MainChannel?
+    private var displayImageCache: DisplayImageCache?
     private var channels: [ChannelKey: any SpiceManagedChannel] = [:]
     private var connections: [ChannelKey: ChannelConnection] = [:]
     private var retiredDisplayDiagnostics = SpiceSessionDiagnostics()
@@ -220,6 +222,7 @@ public actor SpiceSession {
     private struct PreparedSession: Sendable {
         let endpoint: SpiceEndpoint
         let mainChannel: MainChannel
+        let imageCache: DisplayImageCache
         let channels: [ChannelKey: any SpiceManagedChannel]
         let connections: [ChannelKey: ChannelConnection]
         let bootstrap: MainBootstrap
@@ -285,12 +288,16 @@ public actor SpiceSession {
         transportFactory = Self.makeNetworkTransport
         ticketEncryptor = SecurityTicketEncryptor()
         injectedMigrationExecutor = nil
+        displayImageCacheFactory = { DisplayImageCache() }
     }
 
     package init(
         transportFactory: @escaping TransportFactory,
         ticketEncryptor: any TicketEncrypting,
-        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil
+        migrationExecutor: (any SpiceMigrationHandoffExecuting)? = nil,
+        imageCacheFactory: @escaping @Sendable () -> DisplayImageCache = {
+            DisplayImageCache()
+        }
     ) {
         let presentationDiagnostics = SpicePresentationDiagnostics()
         self.presentationDiagnostics = presentationDiagnostics
@@ -333,6 +340,7 @@ public actor SpiceSession {
         self.transportFactory = transportFactory
         self.ticketEncryptor = ticketEncryptor
         injectedMigrationExecutor = migrationExecutor
+        displayImageCacheFactory = imageCacheFactory
     }
 
     deinit {
@@ -405,6 +413,7 @@ public actor SpiceSession {
         credentials: SpiceCredentialStorage
     ) async throws(SpiceError) -> PreparedSession {
         let transport = transportFactory(endpoint)
+        let imageCache = displayImageCacheFactory()
         var preparedMain: MainChannel?
         var preparedChannels: [ChannelKey: any SpiceManagedChannel] = [:]
         var preparedConnections: [ChannelKey: ChannelConnection] = [:]
@@ -456,6 +465,7 @@ public actor SpiceSession {
                     key: key,
                     connection: connected,
                     glzDecoder: glzDecoder,
+                    imageCache: imageCache,
                     multimediaClock: multimediaClock,
                     surfaceMemoryBudget: surfaceMemoryBudget,
                     frameDemandCoordinator: desktop.frameDemandCoordinator,
@@ -466,24 +476,50 @@ public actor SpiceSession {
             return PreparedSession(
                 endpoint: endpoint,
                 mainChannel: main,
+                imageCache: imageCache,
                 channels: preparedChannels,
                 connections: preparedConnections,
                 bootstrap: bootstrap
             )
         } catch is CancellationError {
-            await Self.closePrepared(main: preparedMain, transport: transport, channels: preparedChannels)
+            await Self.closePrepared(
+                main: preparedMain,
+                transport: transport,
+                channels: preparedChannels,
+                imageCache: imageCache
+            )
             throw .cancelled
         } catch let error as ChannelError {
-            await Self.closePrepared(main: preparedMain, transport: transport, channels: preparedChannels)
+            await Self.closePrepared(
+                main: preparedMain,
+                transport: transport,
+                channels: preparedChannels,
+                imageCache: imageCache
+            )
             throw Self.map(channelError: error)
         } catch let error as TransportError {
-            await Self.closePrepared(main: preparedMain, transport: transport, channels: preparedChannels)
+            await Self.closePrepared(
+                main: preparedMain,
+                transport: transport,
+                channels: preparedChannels,
+                imageCache: imageCache
+            )
             throw Self.map(transportError: error)
         } catch let error as SpiceError {
-            await Self.closePrepared(main: preparedMain, transport: transport, channels: preparedChannels)
+            await Self.closePrepared(
+                main: preparedMain,
+                transport: transport,
+                channels: preparedChannels,
+                imageCache: imageCache
+            )
             throw error
         } catch {
-            await Self.closePrepared(main: preparedMain, transport: transport, channels: preparedChannels)
+            await Self.closePrepared(
+                main: preparedMain,
+                transport: transport,
+                channels: preparedChannels,
+                imageCache: imageCache
+            )
             throw .protocolError(String(describing: error))
         }
     }
@@ -494,6 +530,7 @@ public actor SpiceSession {
     ) {
         agentConnectionGeneration &+= 1
         mainChannel = prepared.mainChannel
+        displayImageCache = prepared.imageCache
         channels = prepared.channels
         connections = prepared.connections
         currentEndpoint = prepared.endpoint
@@ -546,8 +583,11 @@ public actor SpiceSession {
         let wasAgentConnected = isAgentConnected
         let hadPlaybackChannel = channels[ChannelKey(type: 5, id: 0)] != nil
         let connectedMainChannel = mainChannel
+        let connectedImageCache = displayImageCache
         self.mainChannel = nil
+        displayImageCache = nil
         isAgentConnected = false
+        await connectedImageCache?.close()
         if let connectedMainChannel {
             await connectedMainChannel.close()
         }
@@ -567,6 +607,11 @@ public actor SpiceSession {
 
     package func currentAgentConnectionState() -> Bool {
         isAgentConnected
+    }
+
+    package func displayImageCacheDiagnosticsSnapshot() async -> DisplayImageCacheDiagnostics? {
+        guard let displayImageCache else { return nil }
+        return await displayImageCache.diagnosticsSnapshot()
     }
 
     package func currentAgentConnectionSnapshot() -> (
@@ -1141,8 +1186,10 @@ public actor SpiceSession {
     private nonisolated static func closePrepared(
         main: MainChannel?,
         transport: any SpiceTransport,
-        channels: [ChannelKey: any SpiceManagedChannel]
+        channels: [ChannelKey: any SpiceManagedChannel],
+        imageCache: DisplayImageCache? = nil
     ) async {
+        await imageCache?.close()
         if let main {
             await main.close()
         } else {
@@ -1154,6 +1201,7 @@ public actor SpiceSession {
     }
 
     private nonisolated static func closePrepared(_ prepared: PreparedSession) async {
+        await prepared.imageCache.close()
         await prepared.mainChannel.close()
         for channel in prepared.channels.values {
             await channel.close()
@@ -1655,6 +1703,15 @@ public actor SpiceSession {
                 await cancelMigrationOffer(offer, resumeSource: false)
             }
         }
+        // Coordinator actions normally own the active offer. Drain any
+        // prepared target left outside that state as a teardown backstop so a
+        // failed or superseded preparation cannot retain its Session cache.
+        let orphanedPreparedTargets = Array(preparedMigrations.values)
+        preparedMigrations.removeAll(keepingCapacity: false)
+        seamlessMigrationPayloads.removeAll(keepingCapacity: false)
+        for prepared in orphanedPreparedTargets {
+            await Self.closePrepared(prepared)
+        }
     }
 
     private func cancelAndCloseRetiringMainDrain() async {
@@ -1694,6 +1751,7 @@ public actor SpiceSession {
         sourceBootstrap: MainBootstrap
     ) async throws(SpiceError) -> (PreparedSession, Bool) {
         let transport = transportFactory(endpoint)
+        let imageCache = displayImageCacheFactory()
         var preparedMain: MainChannel?
         var preparedChannels: [ChannelKey: any SpiceManagedChannel] = [:]
         var preparedConnections: [ChannelKey: ChannelConnection] = [:]
@@ -1766,6 +1824,7 @@ public actor SpiceSession {
                     key: key,
                     connection: connected,
                     glzDecoder: glzDecoder,
+                    imageCache: imageCache,
                     multimediaClock: multimediaClock,
                     surfaceMemoryBudget: surfaceMemoryBudget,
                     frameDemandCoordinator: desktop.frameDemandCoordinator,
@@ -1776,6 +1835,7 @@ public actor SpiceSession {
             return (PreparedSession(
                 endpoint: endpoint,
                 mainChannel: main,
+                imageCache: imageCache,
                 channels: preparedChannels,
                 connections: preparedConnections,
                 bootstrap: sourceBootstrap
@@ -1784,28 +1844,32 @@ public actor SpiceSession {
             await Self.closePrepared(
                 main: preparedMain,
                 transport: transport,
-                channels: preparedChannels
+                channels: preparedChannels,
+                imageCache: imageCache
             )
             throw .cancelled
         } catch let error as ChannelError {
             await Self.closePrepared(
                 main: preparedMain,
                 transport: transport,
-                channels: preparedChannels
+                channels: preparedChannels,
+                imageCache: imageCache
             )
             throw Self.map(channelError: error)
         } catch let error as TransportError {
             await Self.closePrepared(
                 main: preparedMain,
                 transport: transport,
-                channels: preparedChannels
+                channels: preparedChannels,
+                imageCache: imageCache
             )
             throw Self.map(transportError: error)
         } catch {
             await Self.closePrepared(
                 main: preparedMain,
                 transport: transport,
-                channels: preparedChannels
+                channels: preparedChannels,
+                imageCache: imageCache
             )
             throw .protocolError(String(describing: error))
         }
@@ -1922,6 +1986,7 @@ public actor SpiceSession {
         currentEndpoint = prepared.endpoint
         currentBootstrap = prepared.bootstrap
         credentialStorage = credentials
+        await prepared.imageCache.close()
         desktop.beginSeamlessMigration(
             pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
         )
@@ -1979,11 +2044,13 @@ public actor SpiceSession {
         for task in oldTasks { task.cancel() }
 
         let oldMain = mainChannel
+        let oldImageCache = displayImageCache
         let oldChannels = channels
         let oldAgentConnected = isAgentConnected
         let oldHadPlaybackChannel = oldChannels[ChannelKey(type: 5, id: 0)] != nil
 
         mainChannel = prepared.mainChannel
+        displayImageCache = prepared.imageCache
         channels = prepared.channels
         connections = prepared.connections
         currentEndpoint = prepared.endpoint
@@ -2001,6 +2068,7 @@ public actor SpiceSession {
             sendAgentLifecycle(.connected)
         }
         startSupervision(mainChannel: prepared.mainChannel)
+        await oldImageCache?.close()
         if let oldMain { await oldMain.close() }
         for key in oldChannels.keys.sorted(by: Self.channelKeySort) {
             if let channel = oldChannels[key] {
@@ -2103,8 +2171,11 @@ public actor SpiceSession {
         let wasAgentConnected = isAgentConnected
         let hadPlaybackChannel = channels[ChannelKey(type: 5, id: 0)] != nil
         let connectedMainChannel = mainChannel
+        let connectedImageCache = displayImageCache
         mainChannel = nil
+        displayImageCache = nil
         isAgentConnected = false
+        await connectedImageCache?.close()
         if let connectedMainChannel {
             await connectedMainChannel.close()
         }
@@ -2315,6 +2386,7 @@ public actor SpiceSession {
         key: ChannelKey,
         connection: ChannelConnection,
         glzDecoder: SpiceGLZDecoder,
+        imageCache: DisplayImageCache,
         multimediaClock: any MultimediaClockScheduling,
         surfaceMemoryBudget: SurfaceMemoryBudget,
         frameDemandCoordinator: DisplayFrameDemandCoordinator,
@@ -2325,6 +2397,7 @@ public actor SpiceSession {
             DisplayChannel(
                 connection: connection,
                 surfaces: SurfaceStore(memoryBudget: surfaceMemoryBudget),
+                imageCache: imageCache,
                 glzDecoder: glzDecoder,
                 multimediaClock: multimediaClock,
                 frameDemandCoordinator: frameDemandCoordinator,

@@ -22,6 +22,9 @@ package struct DisplayChannelDiagnostics: Sendable, Equatable {
     package let advancedCPUFallbackFrames: UInt64
     package let metalGenerationDisableCount: UInt64
     package let firstMetalGenerationDisableReason: String?
+    package let imageCacheCommittedMutations: UInt64
+    package let imageCacheInvalidatedMutations: UInt64
+    package let imageCacheDiscardedMutations: UInt64
 }
 
 package struct DisplayMJPEGDiagnostics: Sendable, Equatable {
@@ -52,20 +55,16 @@ package actor DisplayChannel: SpiceManagedChannel {
     private static let pixmapCachePixels: UInt64 = 16 * 1_024 * 1_024
     private static let glzDictionaryWindowPixels: Int32 = 8 * 1_024 * 1_024
 
-    private struct CachedImage: Sendable {
-        let bitmap: RawBitmap
-        let lossy: Bool
-        let referenceCount: UInt32
-    }
-
     private enum ResolvedSource: Sendable {
         case bitmap(RawBitmap)
         case surface(UInt32)
     }
 
-    private enum PendingImageCacheMutation: Sendable {
-        case insert(UInt64, CachedImage)
-        case replace(UInt64, CachedImage)
+    private struct ImageCacheMutationPlan: Sendable {
+        let id: UInt64
+        let bitmap: RawBitmap
+        let lossy: Bool
+        let mode: DisplayImageCacheReservationMode
     }
 
     private struct VideoStream: Sendable {
@@ -105,6 +104,8 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     private var connection: ChannelConnection
     private let surfaces: SurfaceStore
+    private let imageCache: DisplayImageCache
+    private let ownsImageCache: Bool
     private let jpegDecoder: any SpiceImageDecoder
     private let lzDecoder: any SpiceImageDecoder
     private let glzDecoder: SpiceGLZDecoder
@@ -116,14 +117,10 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let usesInjectedJPEGDecoder: Bool
     private let multimediaClock: (any MultimediaClockScheduling)?
     private let maximumCachedPalettes: Int
-    private let maximumCachedImages: Int
-    private let maximumCachedImageBytes: Int
     private let maximumStreams: Int
     private let framePublicationInterval: Duration
     private let frameDemandCoordinator: DisplayFrameDemandCoordinator?
     private var palettes: [UInt64: SpiceLZPalette] = [:]
-    private var images: [UInt64: CachedImage] = [:]
-    private var cachedImageBytes = 0
     private var streams: [UInt32: VideoStream] = [:]
     private var asynchronousMJPEGRunGeneration: UInt64?
     private var nextRunGeneration: UInt64 = 0
@@ -138,16 +135,21 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var completedPublisherMetrics = DisplayFramePublisherMetrics()
     private let diagnosticsClock = ContinuousClock()
     private var currentMessageReceivedAt: ContinuousClock.Instant?
+    private var currentMessageRetainedByteCount: Int?
     private var completedFrameSourceTiming: DisplayFrameSourceTiming?
     private var retiredAdvancedVideoDiagnostics = SpiceAdvancedVideoDecoderDiagnostics()
     private var retiredMJPEGDiagnostics = DisplayMJPEGDiagnostics()
     private var advancedCPUFallbackFrames: UInt64 = 0
     private var metalGenerationDisableCount: UInt64 = 0
     private var firstMetalGenerationDisableReason: String?
+    private var imageCacheCommittedMutations: UInt64 = 0
+    private var imageCacheInvalidatedMutations: UInt64 = 0
+    private var imageCacheDiscardedMutations: UInt64 = 0
 
     package init(
         connection: ChannelConnection,
         surfaces: SurfaceStore = SurfaceStore(),
+        imageCache: DisplayImageCache? = nil,
         jpegDecoder: any SpiceImageDecoder = SpiceJPEGDecoder(),
         lzDecoder: any SpiceImageDecoder = SpiceLZDecoder(),
         glzDecoder: SpiceGLZDecoder = SpiceGLZDecoder(),
@@ -166,6 +168,16 @@ package actor DisplayChannel: SpiceManagedChannel {
     ) {
         self.connection = connection
         self.surfaces = surfaces
+        if let imageCache {
+            self.imageCache = imageCache
+            ownsImageCache = false
+        } else {
+            self.imageCache = DisplayImageCache(
+                maximumEntries: maximumCachedImages,
+                maximumBytes: maximumCachedImageBytes
+            )
+            ownsImageCache = true
+        }
         self.jpegDecoder = jpegDecoder
         self.lzDecoder = lzDecoder
         self.glzDecoder = glzDecoder
@@ -176,8 +188,6 @@ package actor DisplayChannel: SpiceManagedChannel {
         usesInjectedJPEGDecoder = !(jpegDecoder is SpiceJPEGDecoder)
         self.multimediaClock = multimediaClock
         self.maximumCachedPalettes = max(1, maximumCachedPalettes)
-        self.maximumCachedImages = max(1, maximumCachedImages)
-        self.maximumCachedImageBytes = max(1, maximumCachedImageBytes)
         self.maximumStreams = min(64, max(1, maximumStreams))
         self.framePublicationInterval = framePublicationInterval
         self.frameDemandCoordinator = frameDemandCoordinator
@@ -296,6 +306,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         completedFrameSourceTiming = nil
         let framed = try await connection.receive()
         currentMessageReceivedAt = diagnosticsClock.now
+        currentMessageRetainedByteCount = framed.body.count
         let message: SpiceServerMessage
         do {
             message = try SpiceServerMessageDecoder.decode(
@@ -348,9 +359,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayInvalidateImages(imageIDs):
-            for imageID in imageIDs {
-                removeCachedImage(id: imageID)
-            }
+            await imageCache.invalidate(ids: imageIDs)
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayInvalidateAllImages(waits):
@@ -360,8 +369,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                     serial: $0.messageSerial
                 )
             })
-            images.removeAll(keepingCapacity: true)
-            cachedImageBytes = 0
+            await imageCache.invalidateAll()
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayInvalidatePalette(paletteID):
@@ -690,6 +698,9 @@ package actor DisplayChannel: SpiceManagedChannel {
     package func close() async {
         stopAsynchronousMJPEGScheduling()
         await connection.close()
+        if ownsImageCache {
+            await imageCache.close()
+        }
         let publishers = Array(framePublishers.values)
         for publisher in publishers {
             await retireFramePublisher(publisher)
@@ -728,7 +739,10 @@ package actor DisplayChannel: SpiceManagedChannel {
             mjpeg: mjpeg,
             advancedCPUFallbackFrames: advancedCPUFallbackFrames,
             metalGenerationDisableCount: metalGenerationDisableCount,
-            firstMetalGenerationDisableReason: firstMetalGenerationDisableReason
+            firstMetalGenerationDisableReason: firstMetalGenerationDisableReason,
+            imageCacheCommittedMutations: imageCacheCommittedMutations,
+            imageCacheInvalidatedMutations: imageCacheInvalidatedMutations,
+            imageCacheDiscardedMutations: imageCacheDiscardedMutations
         )
     }
 
@@ -1176,7 +1190,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
 
         let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
-        let cacheMutation = try preflightCacheMutation(
+        let cacheMutation = try cacheMutationPlan(
             image: command.sourceImage,
             resolvedSource: resolvedSource
         )
@@ -1190,6 +1204,62 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
         }
 
+        if let cacheMutation {
+            let reservation = try await imageCache.reserve(
+                id: cacheMutation.id,
+                bitmap: cacheMutation.bitmap,
+                lossy: cacheMutation.lossy,
+                mode: cacheMutation.mode
+            )
+            do {
+                let surfaceRevision = try await drawResolvedSource(
+                    resolvedSource,
+                    command: command,
+                    base: base,
+                    sourceArea: sourceArea
+                )
+                if let paletteToCache {
+                    palettes[paletteToCache.uniqueID] = paletteToCache
+                }
+                recordImageCacheCommit(
+                    await imageCache.commit(consume reservation)
+                )
+                return surfaceRevision
+            } catch {
+                await imageCache.abort(consume reservation)
+                throw error
+            }
+        }
+
+        let surfaceRevision = try await drawResolvedSource(
+            resolvedSource,
+            command: command,
+            base: base,
+            sourceArea: sourceArea
+        )
+        if let paletteToCache {
+            palettes[paletteToCache.uniqueID] = paletteToCache
+        }
+        return surfaceRevision
+    }
+
+    private func recordImageCacheCommit(_ outcome: DisplayImageCacheCommitOutcome) {
+        switch outcome {
+        case .committed:
+            imageCacheCommittedMutations &+= 1
+        case .invalidated:
+            imageCacheInvalidatedMutations &+= 1
+        case .discarded:
+            imageCacheDiscardedMutations &+= 1
+        }
+    }
+
+    private func drawResolvedSource(
+        _ resolvedSource: ResolvedSource,
+        command: SpiceDisplayDrawCopy,
+        base: PixelRect,
+        sourceArea: PixelRect
+    ) async throws(ChannelError) -> SurfaceRevision? {
         var surfaceRevision: SurfaceRevision?
         for destination in try clippedRectangles(command.base) {
             let source = PixelRect(
@@ -1219,10 +1289,6 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation(String(describing: error))
             }
         }
-        if let paletteToCache {
-            palettes[paletteToCache.uniqueID] = paletteToCache
-        }
-        commit(cacheMutation)
         return surfaceRevision
     }
 
@@ -1239,18 +1305,23 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard descriptor.flags & 0x05 == 0 else {
                 throw .protocolViolation("cache reference cannot mutate shared image cache")
             }
-            guard let cached = images[descriptor.id] else {
-                throw .protocolViolation("missing cached image \(descriptor.id)")
+            let retainedByteCount: Int
+            if let currentMessageRetainedByteCount {
+                retainedByteCount = currentMessageRetainedByteCount
+            } else {
+                retainedByteCount = try imageRetainedByteCount(descriptor: descriptor)
             }
-            guard cached.bitmap.width == Int(descriptor.width),
-                  cached.bitmap.height == Int(descriptor.height)
+            let bitmap = try await imageCache.resolve(
+                id: descriptor.id,
+                requirement: requirement,
+                retainedByteCount: retainedByteCount
+            )
+            guard bitmap.width == Int(descriptor.width),
+                  bitmap.height == Int(descriptor.height)
             else {
                 throw .protocolViolation("cached image dimensions do not match descriptor")
             }
-            if requirement == .lossless, cached.lossy {
-                throw .protocolViolation("cached image \(descriptor.id) is lossy")
-            }
-            return (.bitmap(cached.bitmap), nil)
+            return (.bitmap(bitmap), nil)
         case let .bitmap(_, bitmap):
             guard let format = RawBitmapFormat(rawValue: bitmap.format),
                   let width = Int(exactly: bitmap.width),
@@ -1374,10 +1445,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         )
     }
 
-    private func preflightCacheMutation(
+    private func cacheMutationPlan(
         image: SpiceImage,
         resolvedSource: ResolvedSource
-    ) throws(ChannelError) -> PendingImageCacheMutation? {
+    ) throws(ChannelError) -> ImageCacheMutationPlan? {
         let (descriptor, lossy): (SpiceImageDescriptor, Bool)
         switch image {
         case let .bitmap(value, _), let .quic(value, _), let .lzRGB(value, _),
@@ -1403,78 +1474,39 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard case let .bitmap(bitmap) = resolvedSource else {
             throw .protocolViolation("only decoded bitmaps can enter shared image cache")
         }
-        let existing = images[descriptor.id]
-        if cacheMe {
-            guard existing != nil || images.count < maximumCachedImages else {
-                throw .protocolViolation("image cache entry limit exceeded")
-            }
-            let referenceCount: UInt32
-            if let existing {
-                let (incremented, overflow) = existing.referenceCount.addingReportingOverflow(1)
-                guard !overflow else {
-                    throw .protocolViolation("image cache reference count overflow")
-                }
-                referenceCount = incremented
-            } else {
-                referenceCount = 1
-            }
-            let remainingBytes = cachedImageBytes - (existing?.bitmap.pixels.count ?? 0)
-            guard bitmap.pixels.count <= maximumCachedImageBytes - remainingBytes else {
-                throw .protocolViolation("image cache byte limit exceeded")
-            }
-            let cached = CachedImage(
-                bitmap: bitmap,
-                lossy: lossy,
-                referenceCount: referenceCount
-            )
-            return .insert(descriptor.id, cached)
-        }
         guard !lossy else {
-            throw .protocolViolation("CACHE_REPLACE_ME source must be lossless")
+            guard cacheMe else {
+                throw .protocolViolation("CACHE_REPLACE_ME source must be lossless")
+            }
+            return ImageCacheMutationPlan(
+                id: descriptor.id,
+                bitmap: bitmap,
+                lossy: true,
+                mode: .cache
+            )
         }
-        let remainingBytes = cachedImageBytes - (existing?.bitmap.pixels.count ?? 0)
-        guard bitmap.pixels.count <= maximumCachedImageBytes - remainingBytes else {
-            throw .protocolViolation("image cache byte limit exceeded")
-        }
-        guard existing != nil || images.count < maximumCachedImages else {
-            throw .protocolViolation("image cache entry limit exceeded")
-        }
-        let cached = CachedImage(
+        return ImageCacheMutationPlan(
+            id: descriptor.id,
             bitmap: bitmap,
             lossy: false,
-            referenceCount: existing?.referenceCount ?? 1
+            mode: cacheMe ? .cache : .replace
         )
-        return .replace(descriptor.id, cached)
     }
 
-    private func commit(_ mutation: PendingImageCacheMutation?) {
-        guard let mutation else { return }
-        switch mutation {
-        case let .insert(id, cached):
-            if let previous = images.updateValue(cached, forKey: id) {
-                cachedImageBytes -= previous.bitmap.pixels.count
-            }
-            cachedImageBytes += cached.bitmap.pixels.count
-        case let .replace(id, cached):
-            if let previous = images.updateValue(cached, forKey: id) {
-                cachedImageBytes -= previous.bitmap.pixels.count
-            }
-            cachedImageBytes += cached.bitmap.pixels.count
+    private func imageRetainedByteCount(
+        descriptor: SpiceImageDescriptor
+    ) throws(ChannelError) -> Int {
+        guard let width = Int(exactly: descriptor.width),
+              let height = Int(exactly: descriptor.height)
+        else {
+            throw .protocolViolation("invalid cached image dimensions")
         }
-    }
-
-    private func removeCachedImage(id: UInt64) {
-        guard let cached = images[id] else { return }
-        if cached.referenceCount > 1 {
-            images[id] = CachedImage(
-                bitmap: cached.bitmap,
-                lossy: cached.lossy,
-                referenceCount: cached.referenceCount - 1
-            )
-        } else {
-            images.removeValue(forKey: id)
-            cachedImageBytes -= cached.bitmap.pixels.count
+        let (pixels, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        guard !pixelOverflow, !byteOverflow else {
+            throw .protocolViolation("cached image retained byte count overflow")
         }
+        return bytes
     }
 
     private func resolvePalette(
