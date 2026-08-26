@@ -4,6 +4,7 @@ import SpiceTransport
 import Testing
 @testable import SpiceChannels
 @testable import SpiceCore
+@testable import SpiceProtocol
 @testable import SpiceWire
 
 @Suite("Processed serial barriers")
@@ -183,6 +184,29 @@ struct ProcessedSerialBarrierTests {
         await #expect(throws: ChannelError.self) {
             try await connection.waitUntilProcessed([.init(key: key, serial: 1)])
         }
+    }
+
+    @Test func terminalConnectionRejectsRawAndTypedSendsWithoutWriting() async throws {
+        let transport = FakeTransport()
+        try await transport.connect()
+        let connection = ChannelConnection(
+            key: ChannelKey(type: 2, id: 12),
+            transport: transport,
+            headerMode: .mini
+        )
+        let terminalError = ChannelError.protocolViolation("terminal send sentinel")
+        await connection.fail(terminalError)
+        let outboundBaseline = await transport.outbound.count
+
+        await #expect(throws: terminalError) {
+            try await connection.send(messageType: 777, body: Data([1, 2, 3]))
+        }
+        #expect(await transport.outbound.count == outboundBaseline)
+
+        await #expect(throws: terminalError) {
+            try await connection.send(SpiceMsgcAck())
+        }
+        #expect(await transport.outbound.count == outboundBaseline)
     }
 
     @Test func closeTerminatesWaiterAndIsIdempotent() async throws {

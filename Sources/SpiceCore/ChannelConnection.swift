@@ -349,6 +349,9 @@ package actor ChannelConnection {
         body: Data,
         allowSupersededSend: Bool = false
     ) async throws(ChannelError) {
+        if let terminalError {
+            throw terminalError
+        }
         guard (!isSuperseded || allowSupersededSend),
               !isMigrating
                 || messageType == SpiceChannelMigrationWire.clientFlushMark

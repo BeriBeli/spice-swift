@@ -551,6 +551,14 @@ struct MainChannelTests {
         }
 
         #expect(try (await source.outbound).map(decodeMiniMessageID) == [106, 104, 107, 106])
+        let replacement = FakeTransport()
+        try await replacement.connect()
+        _ = try await channel.replaceConnection(with: ChannelConnection(
+            key: ChannelKey(type: 1, id: 0),
+            transport: replacement,
+            headerMode: .mini
+        ))
+
         #expect(try await channel.sendAgentMessageIfTokensAvailable(
             VDAgentMessage(type: 3, data: Data([1]))
         ))
@@ -560,6 +568,8 @@ struct MainChannelTests {
         #expect(try await !channel.sendAgentMessageIfTokensAvailable(
             VDAgentMessage(type: 3, data: Data([3]))
         ))
+        #expect(try (await source.outbound).map(decodeMiniMessageID) == [106, 104, 107, 106])
+        #expect(try (await replacement.outbound).map(decodeMiniMessageID) == [107, 107])
     }
 
     @Test func reassemblesRuntimeAgentStreamAndReplenishesEveryPacket() async throws {
