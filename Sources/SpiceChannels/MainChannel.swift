@@ -53,9 +53,15 @@ package actor MainChannel: SpiceManagedChannel {
         let connection: ChannelConnection
     }
 
+    private enum AgentSendRetirementResult: Sendable {
+        case drained
+        case cancelled
+    }
+
     private struct AgentSendRetirementWaiter {
+        let id: UInt64
         let connection: ChannelConnection
-        let continuation: CheckedContinuation<Void, Never>
+        let continuation: CheckedContinuation<AgentSendRetirementResult, Never>
     }
 
     private var connection: ChannelConnection
@@ -71,6 +77,7 @@ package actor MainChannel: SpiceManagedChannel {
     private var activeAgentSendTicket: AgentSendTicket?
     private var pendingAgentSendWaiters: [AgentSendWaiter] = []
     private var activeAgentSends: [ActiveAgentSend] = []
+    private var nextAgentSendRetirementWaiterID: UInt64 = 0
     private var agentSendRetirementWaiters: [AgentSendRetirementWaiter] = []
     private var pendingEvents: [MainEvent] = []
     private var pendingAgentBytes = 0
@@ -209,18 +216,46 @@ package actor MainChannel: SpiceManagedChannel {
         return previous
     }
 
-    package func waitForActiveAgentSends(on retiredConnection: ChannelConnection) async {
-        await withCheckedContinuation { continuation in
-            guard activeAgentSends.contains(where: {
-                $0.connection === retiredConnection
-            }) else {
-                continuation.resume()
-                return
+    package func waitForActiveAgentSends(
+        on retiredConnection: ChannelConnection
+    ) async throws(ChannelError) {
+        guard !Task.isCancelled else {
+            throw .transport(.cancelled)
+        }
+        let waiterID = nextAgentSendRetirementWaiterID
+        let (nextWaiterID, overflow) = waiterID.addingReportingOverflow(1)
+        guard !overflow else {
+            throw .protocolViolation("Agent send retirement waiter ID overflow")
+        }
+        nextAgentSendRetirementWaiterID = nextWaiterID
+
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                (continuation: CheckedContinuation<AgentSendRetirementResult, Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                guard activeAgentSends.contains(where: {
+                    $0.connection === retiredConnection
+                }) else {
+                    continuation.resume(returning: .drained)
+                    return
+                }
+                agentSendRetirementWaiters.append(AgentSendRetirementWaiter(
+                    id: waiterID,
+                    connection: retiredConnection,
+                    continuation: continuation
+                ))
             }
-            agentSendRetirementWaiters.append(AgentSendRetirementWaiter(
-                connection: retiredConnection,
-                continuation: continuation
-            ))
+        } onCancel: {
+            Task { await self.cancelAgentSendRetirementWait(id: waiterID) }
+        }
+        switch result {
+        case .drained:
+            return
+        case .cancelled:
+            throw .transport(.cancelled)
         }
     }
 
@@ -614,6 +649,17 @@ package actor MainChannel: SpiceManagedChannel {
         activeAgentSends.append(ActiveAgentSend(ticket: ticket, connection: connection))
     }
 
+    private func cancelAgentSendRetirementWait(id: UInt64) {
+        guard let waiterIndex = agentSendRetirementWaiters.firstIndex(where: {
+            $0.id == id
+        }) else {
+            return
+        }
+        agentSendRetirementWaiters.remove(at: waiterIndex).continuation.resume(
+            returning: .cancelled
+        )
+    }
+
     private func finishActiveAgentSend(
         ticket: AgentSendTicket,
         on connection: ChannelConnection
@@ -632,7 +678,7 @@ package actor MainChannel: SpiceManagedChannel {
         agentSendRetirementWaiters.removeAll(keepingCapacity: true)
         for waiter in waiters {
             if waiter.connection === connection {
-                waiter.continuation.resume()
+                waiter.continuation.resume(returning: .drained)
             } else {
                 agentSendRetirementWaiters.append(waiter)
             }

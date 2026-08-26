@@ -2756,6 +2756,110 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func disconnectCancelsSeamlessAdoptionWaitingForRetiredAgentSend() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 16
+        ))
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let transports = TransportPool([source, target])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
+        var events = session.events.makeAsyncIterator()
+        let sourceAgentMessage = SpiceAgentMessage(
+            protocolID: VDAgentMessage.protocolVersion,
+            type: VDAgentMessageType.clipboard.rawValue,
+            opaque: 0x99,
+            data: Data(repeating: 0x5a, count: 6_000)
+        )
+
+        await source.blockNextWrite()
+        let sourceSend = Task {
+            try await session.sendAgentMessage(sourceAgentMessage)
+        }
+        await source.waitUntilWriteIsBlocked()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+        await source.enqueue(encodeMini(id: 1, body: uint32(3)))
+        await source.enqueue(encodeMini(id: 2, body: Data("main-state".utf8)))
+        #expect(await events.next() == .migration(.committing(offer)))
+
+        await target.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
+        ))
+        var targetPointerMode: SpicePointerMode?
+        for _ in 0..<4 {
+            guard let snapshot = await desktopUpdates.next() else { break }
+            targetPointerMode = snapshot.pointerMode
+            if targetPointerMode == .relative { break }
+        }
+        #expect(targetPointerMode == .relative)
+        #expect(await source.isConnected)
+        #expect(await target.isConnected)
+
+        let disconnectFinished = Mutex(false)
+        let disconnectTask = Task {
+            await session.disconnect()
+            disconnectFinished.withLock { $0 = true }
+        }
+        for _ in 0..<100 {
+            if disconnectFinished.withLock({ $0 }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let completedWithoutManualGateRelease = disconnectFinished.withLock { $0 }
+        #expect(completedWithoutManualGateRelease)
+        var manuallyReleasedGate = false
+        if !completedWithoutManualGateRelease {
+            // Keep failure-first runs finite: old adoption leaves the retired
+            // continuation unreachable, so release it only after recording
+            // the timeout that distinguishes the bug.
+            await source.releaseBlockedWrite()
+            manuallyReleasedGate = true
+        }
+        await disconnectTask.value
+
+        for _ in 0..<100 where await source.isConnected {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let sourceClosedWithoutManualGateRelease = !(await source.isConnected)
+        #expect(sourceClosedWithoutManualGateRelease)
+        if !sourceClosedWithoutManualGateRelease && !manuallyReleasedGate {
+            // A second old failure mode lets disconnect return after losing
+            // ownership of the retired Main. Unblock its caller so this
+            // failure-first regression can still finish deterministically.
+            await source.releaseBlockedWrite()
+            manuallyReleasedGate = true
+        }
+        await #expect(throws: SpiceError.connectionFailed("connectionClosed")) {
+            try await sourceSend.value
+        }
+        if await source.isConnected {
+            await source.close()
+        }
+        #expect(!(await source.isConnected))
+        #expect(!(await target.isConnected))
+        #expect(!(await session.currentAgentConnectionState()))
+        desktop.cancel()
+    }
+
     @Test func migrationEndpointPolicyPreservesTLSAndRejectsUnsafeTargets() throws {
         #expect(try SpiceSession.selectMigrationEndpoint(
             destination: .init(
@@ -3327,6 +3431,9 @@ private actor StreamingSessionTransport: SpiceTransport {
 
     func close() async {
         isConnected = false
+        shouldBlockNextWrite = false
+        blockedWriteRelease?.resume()
+        blockedWriteRelease = nil
         inboundContinuation.finish()
         writeContinuation.finish()
     }

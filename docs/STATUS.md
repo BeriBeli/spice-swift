@@ -47,13 +47,15 @@ Agent behavior, including system-trusted TLS.
   completes its physical serial without poisoning the source connection.
 - Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (16 tests), the
   combined serial-barrier selection (19 tests), the AIP-10 batch regression
-  (12 tests), `SpiceSessionTests` (60 tests), `DisplayChannelTests` (50 tests),
+  (12 tests), `SpiceSessionTests` (61 tests), `DisplayChannelTests` (50 tests),
   and the full warnings-as-errors test gate. Replacement connections retain
   their processed-serial barrier when superseded receive tasks unwind, while
   already-started Agent byte streams drain on their captured retiring connection
   before its transport closes; later target sends do not extend that retirement
-  fence. Terminal connections reject raw and typed client sends without writing.
-  Live peer closure remains part of AIP-90.
+  fence. Disconnect cancels the retirement waiter, closes its retained source,
+  and suppresses a late migration-completed event. Terminal connections reject
+  raw and typed client sends without writing. Live peer closure remains part of
+  AIP-90.
 
 ## Stage B local closure
 
