@@ -347,13 +347,14 @@ package actor ChannelConnection {
     package func send(
         messageType: UInt16,
         body: Data,
-        allowSupersededSend: Bool = false
+        allowRetiringSend: Bool = false
     ) async throws(ChannelError) {
         if let terminalError {
             throw terminalError
         }
-        guard (!isSuperseded || allowSupersededSend),
+        guard (!isSuperseded || allowRetiringSend),
               !isMigrating
+                || allowRetiringSend
                 || messageType == SpiceChannelMigrationWire.clientFlushMark
                 || messageType == SpiceChannelMigrationWire.clientMigrateData else {
             throw .invalidState

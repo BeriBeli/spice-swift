@@ -1893,10 +1893,15 @@ public actor SpiceSession {
         desktop.beginSeamlessMigration(
             pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
         )
-        for connection in previousConnections.values {
-            await connection.close()
+        for key in previousConnections.keys.sorted(by: Self.channelKeySort)
+        where key != mainKey {
+            await previousConnections[key]?.close()
         }
         startSupervision(mainChannel: mainChannel)
+        if let previousMainConnection = previousConnections[mainKey] {
+            await mainChannel.waitForActiveAgentSends(on: previousMainConnection)
+            await previousMainConnection.close()
+        }
     }
 
     private func replaceSessionWithTarget(
