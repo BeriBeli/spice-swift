@@ -187,6 +187,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         let runGeneration = beginAsynchronousMJPEGScheduling()
         defer { stopAsynchronousMJPEGScheduling(runGeneration: runGeneration) }
         try await connection.send(SpiceMsgcDisplayInit(
@@ -262,7 +263,9 @@ package actor DisplayChannel: SpiceManagedChannel {
             await retireFramePublisher(framePublisher)
             throw error
         }
-        await connection.fail(.transport(.cancelled))
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
+        }
         await retireFramePublisher(framePublisher)
     }
 
@@ -273,10 +276,13 @@ package actor DisplayChannel: SpiceManagedChannel {
     private func processNext(
         runGeneration: UInt64?
     ) async throws(ChannelError) -> DisplayEvent {
+        let activeConnection = connection
         do {
             return try await processNextImpl(runGeneration: runGeneration)
         } catch let error {
-            await connection.fail(error)
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
             throw error
         }
     }
@@ -728,11 +734,15 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Display Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         return previous
     }

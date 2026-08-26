@@ -78,10 +78,13 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     package func bootstrap() async throws(ChannelError) -> MainBootstrap {
+        let activeConnection = connection
         do {
             return try await bootstrapImpl()
         } catch let error {
-            await connection.fail(error)
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
             throw error
         }
     }
@@ -162,12 +165,15 @@ package actor MainChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         while !Task.isCancelled {
             if let event = try await processNext() {
                 await emit(.main(event))
             }
         }
-        await connection.fail(.transport(.cancelled))
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
+        }
     }
 
     package func close() async {
@@ -177,11 +183,15 @@ package actor MainChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Main Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         lastClientMouseModeRequest = nil
         return previous
@@ -263,7 +273,12 @@ package actor MainChannel: SpiceManagedChannel {
                 }
                 try await messageConnection.send(
                     messageType: SpiceMainAgentWire.clientData,
-                    body: fragment
+                    body: fragment,
+                    // The complete message reserved its tokens and captured
+                    // this connection before rebind. Its suffix must remain on
+                    // the same byte stream even after that connection becomes
+                    // superseded; new sends retain the default rejection.
+                    allowSupersededSend: true
                 )
                 unsentReservedTokens -= 1
                 sentFragmentCount += 1
@@ -316,10 +331,13 @@ package actor MainChannel: SpiceManagedChannel {
     package func negotiateDestinationSeamless(
         sourceVersion: UInt32
     ) async throws(ChannelError) -> Bool {
+        let activeConnection = connection
         do {
             return try await negotiateDestinationSeamlessImpl(sourceVersion: sourceVersion)
         } catch let error {
-            await connection.fail(error)
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
             throw error
         }
     }
@@ -344,10 +362,13 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func processNext() async throws(ChannelError) -> MainEvent? {
+        let activeConnection = connection
         do {
             return try await processNextImpl()
         } catch let error {
-            await connection.fail(error)
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
             throw error
         }
     }

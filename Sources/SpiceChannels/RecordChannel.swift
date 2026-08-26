@@ -34,17 +34,23 @@ package actor RecordChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         while !Task.isCancelled {
             await emit(.record(try await processNext()))
         }
-        await connection.fail(.transport(.cancelled))
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
+        }
     }
 
     package func processNext() async throws(ChannelError) -> RecordEvent {
+        let activeConnection = connection
         do {
             return try await processNextImpl()
         } catch let error {
-            await connection.fail(error)
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
             throw error
         }
     }
@@ -139,11 +145,15 @@ package actor RecordChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Record Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         return previous
     }

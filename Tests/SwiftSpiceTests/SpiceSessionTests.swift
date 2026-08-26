@@ -568,35 +568,32 @@ struct SpiceSessionTests {
             data: Data("agent".utf8)
         )
         let encoded = try #require(VDAgentWireEncoder.fragments(for: agentMessage).first)
-        var transcript = try makeServerTranscript(channels: [])
-        transcript.append(encodeMini(id: 115, body: uint32(2)))
-        transcript.append(encodeMini(id: 109, body: encoded))
-        transcript.append(encodeMini(id: 108, body: uint32(9)))
-        let transport = FakeTransport(inbound: transcript.map(Result.success))
+        let transport = StreamingSessionTransport(
+            initial: try makeServerTranscript(channels: [])
+        )
         let session = SpiceSession(
             transportFactory: { _ in transport },
             ticketEncryptor: SessionTicketEncryptor()
         )
-        let eventTask = Task {
-            var iterator = session.agentEvents.makeAsyncIterator()
-            return [await iterator.next(), await iterator.next(), await iterator.next()]
-        }
+        var iterator = session.agentEvents.makeAsyncIterator()
 
         let info = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
         #expect(!info.agentConnected)
-        #expect(await eventTask.value == [
-            .connected,
-            .message(SpiceAgentMessage(
-                protocolID: 1,
-                type: 6,
-                opaque: 11,
-                data: Data("agent".utf8)
-            )),
-            .disconnected(errorCode: 9),
-        ])
+        await transport.enqueue(encodeMini(id: 115, body: uint32(2)))
+        #expect(await iterator.next() == .connected)
+        await transport.enqueue(encodeMini(id: 109, body: encoded))
+        #expect(await iterator.next() == .message(SpiceAgentMessage(
+            protocolID: 1,
+            type: 6,
+            opaque: 11,
+            data: Data("agent".utf8)
+        )))
+        await transport.enqueue(encodeMini(id: 108, body: uint32(9)))
+        #expect(await iterator.next() == .disconnected(errorCode: 9))
+        await session.disconnect()
     }
 
     @Test func publishesAgentConnectedStateFromMainInit() async throws {

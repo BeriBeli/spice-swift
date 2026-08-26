@@ -24,6 +24,8 @@ package actor ChannelConnection {
     private var nextClientSerial: UInt64 = 1
     private var nextImplicitServerSerial: UInt64 = 1
     private var isMigrating = false
+    private var isSuperseded = false
+    private var preservesSerialBarrierAfterSupersede = false
     private var terminalError: ChannelError?
 
     package init(
@@ -109,6 +111,9 @@ package actor ChannelConnection {
     }
 
     private func receiveFramed() async throws(ChannelError) -> FramedMessage {
+        guard !isSuperseded else {
+            throw .invalidState
+        }
         if let terminalError {
             throw terminalError
         }
@@ -194,6 +199,9 @@ package actor ChannelConnection {
                 await fail(channelError)
                 throw channelError
             }
+            guard !isSuperseded else {
+                throw .invalidState
+            }
             guard !bytes.isEmpty else {
                 let error = ChannelError.transport(.connectionClosed)
                 await fail(error)
@@ -224,7 +232,7 @@ package actor ChannelConnection {
     /// Completes the latest logical handler. Only the final logical message in
     /// a physical batch advances its effective serial and ACK state.
     package func completeLastDelivered() async throws(ChannelError) {
-        guard terminalError == nil, let delivery = inFlightDelivery else {
+        guard !isSuperseded, terminalError == nil, let delivery = inFlightDelivery else {
             throw terminalError ?? .invalidState
         }
         if delivery.completesPhysicalMessage {
@@ -251,6 +259,9 @@ package actor ChannelConnection {
 
     package func fail(_ error: ChannelError) async {
         if case .migrationRequested = error { return }
+        if isSuperseded, preservesSerialBarrierAfterSupersede {
+            return
+        }
         guard terminalError == nil else { return }
         terminalError = error
         pendingBatch = nil
@@ -260,16 +271,41 @@ package actor ChannelConnection {
         await serialBarrier.terminate(key: key)
     }
 
+    /// Retires this connection without terminating the key-scoped serial
+    /// barrier. A replacement may share that barrier and ChannelKey.
+    package func supersede(preservingSerialBarrier: Bool) {
+        isSuperseded = true
+        preservesSerialBarrierAfterSupersede = preservingSerialBarrier
+        pendingBatch = nil
+        pendingMessageIndex = 0
+        pendingEffectiveSerial = nil
+        inFlightDelivery = nil
+    }
+
+    /// Makes a previously superseded connection current again during a
+    /// migration rollback. A genuinely terminal connection is not revivable.
+    package func activate() throws(ChannelError) {
+        guard terminalError == nil else {
+            throw terminalError ?? .invalidState
+        }
+        isSuperseded = false
+        preservesSerialBarrierAfterSupersede = false
+    }
+
+    package nonisolated func sharesSerialBarrier(with other: ChannelConnection) -> Bool {
+        serialBarrier === other.serialBarrier
+    }
+
     private func completePhysicalMessage(
         effectiveSerial: UInt64,
         acknowledgmentCount: Int
     ) async throws(ChannelError) {
         try await acknowledgePhysicalMessages(acknowledgmentCount)
-        guard terminalError == nil else {
+        guard !isSuperseded, terminalError == nil else {
             throw terminalError ?? .invalidState
         }
         await serialBarrier.record(key: key, serial: effectiveSerial)
-        guard terminalError == nil else {
+        guard !isSuperseded, terminalError == nil else {
             throw terminalError ?? .invalidState
         }
     }
@@ -299,8 +335,13 @@ package actor ChannelConnection {
         try await send(messageType: messageID, body: bodyWriter.data)
     }
 
-    package func send(messageType: UInt16, body: Data) async throws(ChannelError) {
-        guard !isMigrating
+    package func send(
+        messageType: UInt16,
+        body: Data,
+        allowSupersededSend: Bool = false
+    ) async throws(ChannelError) {
+        guard (!isSuperseded || allowSupersededSend),
+              !isMigrating
                 || messageType == SpiceChannelMigrationWire.clientFlushMark
                 || messageType == SpiceChannelMigrationWire.clientMigrateData else {
             throw .invalidState
@@ -337,7 +378,9 @@ package actor ChannelConnection {
     }
 
     package func close() async {
-        await fail(.transport(.connectionClosed))
+        if !isSuperseded || !preservesSerialBarrierAfterSupersede {
+            await fail(.transport(.connectionClosed))
+        }
         await transport.close()
     }
 

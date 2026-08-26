@@ -45,10 +45,13 @@ Agent behavior, including system-trusted TLS.
   terminate unsatisfied waiters for that channel. Waiter cancellation and an
   unrelated channel failure remain isolated. A recoverable migration request
   completes its physical serial without poisoning the source connection.
-- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (13 tests), the
-  combined serial-barrier selection (16 tests), the AIP-10 batch regression
-  (12 tests), and a warnings-as-errors build. Live peer closure remains part of
-  AIP-90.
+- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (14 tests), the
+  combined serial-barrier selection (17 tests), the AIP-10 batch regression
+  (12 tests), `SpiceSessionTests` (59 tests), `DisplayChannelTests` (50 tests),
+  and the full warnings-as-errors test gate. Replacement connections retain
+  their processed-serial barrier when superseded receive tasks unwind, while
+  already-started Agent byte streams finish on their captured connection. Live
+  peer closure remains part of AIP-90.
 
 ## Stage B local closure
 

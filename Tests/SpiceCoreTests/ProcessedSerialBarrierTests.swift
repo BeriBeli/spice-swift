@@ -272,6 +272,57 @@ struct ProcessedSerialBarrierTests {
         #expect(await probe.failed)
     }
 
+    @Test func cancellingSupersededRunDoesNotTerminateReplacementConnection() async throws {
+        let barrier = ChannelSerialBarrier()
+        let key = ChannelKey(type: 5, id: 10)
+        let sourceTransport = AIP11CancellationTransport()
+        try await sourceTransport.connect()
+        let sourceConnection = ChannelConnection(
+            key: key,
+            transport: sourceTransport,
+            headerMode: .mini,
+            serialBarrier: barrier
+        )
+        let channel = PlaybackChannel(
+            connection: sourceConnection,
+            multimediaClock: MultimediaClock()
+        )
+        let sourceRun = Task {
+            try await channel.run { _ in }
+        }
+        for _ in 0..<100 where !(await sourceTransport.readStarted) {
+            await Task.yield()
+        }
+        #expect(await sourceTransport.readStarted)
+
+        let modeBody = aip11LE(UInt32(123)) + aip11LE(UInt16(1))
+        let replacementTransport = FakeTransport(inbound: [
+            .success(aip11MiniMessage(type: 102, body: modeBody)),
+        ])
+        try await replacementTransport.connect()
+        let replacementConnection = ChannelConnection(
+            key: key,
+            transport: replacementTransport,
+            headerMode: .mini,
+            serialBarrier: barrier
+        )
+        _ = try await channel.replaceConnection(with: replacementConnection)
+
+        sourceRun.cancel()
+        await #expect(throws: ChannelError.transport(.cancelled)) {
+            try await sourceRun.value
+        }
+
+        #expect(try await channel.processNext() == .modeChanged(
+            multimediaTime: 123,
+            mode: .raw
+        ))
+        try await replacementConnection.waitUntilProcessed([
+            .init(key: key, serial: 1),
+        ])
+        #expect(await replacementTransport.isConnected)
+    }
+
     @Test func unrelatedChannelFailureDoesNotResolveOrFailTheWaiter() async throws {
         let barrier = ChannelSerialBarrier()
         let awaitedKey = ChannelKey(type: 2, id: 5)
