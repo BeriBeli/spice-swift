@@ -329,10 +329,10 @@ The LZ RGB family is locally closed.
   cache byte budget in aggregate. Clear and Session close resume every waiter
   exactly once.
 - Repeated `CACHE_ME` and targeted invalidation retain compatible reference-count
-  semantics. Per-image and global invalidation generations prevent a reservation
-  admitted earlier from resurrecting invalidated state. Dimension disagreement,
-  invalid flags, decode failure, and capacity overflow fail without publishing
-  cache state.
+  semantics. Invalidation marks only currently pending bounded reservations, so
+  earlier work cannot resurrect invalidated state and fresh or nonexistent IDs
+  leave no retained tombstones. Dimension disagreement, invalid flags, decode
+  failure, and capacity overflow fail without publishing cache state.
 - Display `INVAL_LIST` 105 invalidates the Session entry for every Display.
   `INVAL_ALL_PIXMAPS` 106 first observes the AIP-11 processed-serial requirements,
   then clears the Session cache. RESET 103 preserves that image cache while

@@ -306,6 +306,109 @@ struct DisplayImageCacheTests {
         #expect(diagnostics.pendingReservationCount == 0)
     }
 
+    @Test func nonexistentTargetedInvalidationsDoNotRetainTombstones() async {
+        let cache = DisplayImageCache(maximumEntries: 2, maximumBytes: 8)
+
+        for id in UInt64(10_000)..<UInt64(20_000) {
+            await cache.invalidate(id: id)
+        }
+
+        let diagnostics = await cache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.committedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+    }
+
+    @Test func invalidationTracksOnlyBoundedPendingReservations() async throws {
+        let targeted = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
+        let targetedReservation = try await targeted.reserve(
+            id: 40,
+            bitmap: cacheBitmap([1, 2, 3, 4]),
+            lossy: false,
+            mode: .cache
+        )
+        await targeted.invalidate(id: 40)
+        var diagnostics = await targeted.diagnosticsSnapshot()
+        #expect(diagnostics.pendingReservationCount == 1)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 1)
+        #expect(diagnostics.reservedBytes == 4)
+
+        #expect(await targeted.commit(targetedReservation) == .invalidated)
+        diagnostics = await targeted.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.reservedBytes == 0)
+
+        let global = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
+        let globalReservation = try await global.reserve(
+            id: 41,
+            bitmap: cacheBitmap([5, 6, 7, 8]),
+            lossy: false,
+            mode: .cache
+        )
+        await global.invalidateAll()
+        diagnostics = await global.diagnosticsSnapshot()
+        #expect(diagnostics.pendingReservationCount == 1)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 1)
+        #expect(diagnostics.reservedBytes == 4)
+
+        #expect(await global.commit(globalReservation) == .invalidated)
+        diagnostics = await global.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.reservedBytes == 0)
+    }
+
+    @Test func invalidatedReservationTrackingIsReleasedByAbortClearAndClose() async throws {
+        let aborted = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
+        let abortedReservation = try await aborted.reserve(
+            id: 50,
+            bitmap: cacheBitmap([1, 2, 3, 4]),
+            lossy: false,
+            mode: .cache
+        )
+        await aborted.invalidate(id: 50)
+        #expect(await aborted.diagnosticsSnapshot().pendingInvalidatedReservationCount == 1)
+        await aborted.abort(abortedReservation)
+        #expect(await aborted.diagnosticsSnapshot().pendingInvalidatedReservationCount == 0)
+
+        let cleared = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
+        let clearedReservation = try await cleared.reserve(
+            id: 51,
+            bitmap: cacheBitmap([5, 6, 7, 8]),
+            lossy: false,
+            mode: .cache
+        )
+        await cleared.invalidate(id: 51)
+        #expect(await cleared.diagnosticsSnapshot().pendingInvalidatedReservationCount == 1)
+        await cleared.clear()
+        var diagnostics = await cleared.diagnosticsSnapshot()
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        #expect(await cleared.commit(clearedReservation) == .discarded)
+
+        let closed = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
+        let closedReservation = try await closed.reserve(
+            id: 52,
+            bitmap: cacheBitmap([9, 10, 11, 12]),
+            lossy: false,
+            mode: .cache
+        )
+        await closed.invalidateAll()
+        #expect(await closed.diagnosticsSnapshot().pendingInvalidatedReservationCount == 1)
+        await closed.close()
+        diagnostics = await closed.diagnosticsSnapshot()
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        #expect(await closed.commit(closedReservation) == .discarded)
+    }
+
     @Test func pendingReservationsAreExclusivePerIDAndBoundedByActualBytes() async throws {
         let cache = DisplayImageCache(maximumEntries: 3, maximumBytes: 8)
         let first = try await cache.reserve(

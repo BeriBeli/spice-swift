@@ -24,6 +24,7 @@ package struct DisplayImageCacheDiagnostics: Sendable, Equatable {
     package let reservedBytes: Int
     package let retainedBytes: Int
     package let pendingReservationCount: Int
+    package let pendingInvalidatedReservationCount: Int
     package let pendingWaiterCount: Int
     package let referenceCounts: [UInt64: UInt32]
 }
@@ -40,8 +41,7 @@ package actor DisplayImageCache {
         let bitmap: RawBitmap
         let lossy: Bool
         let mode: DisplayImageCacheReservationMode
-        let globalInvalidationGeneration: UInt64
-        let imageInvalidationGeneration: UInt64
+        var invalidated: Bool
     }
 
     private struct Waiter {
@@ -64,8 +64,6 @@ package actor DisplayImageCache {
     private var nextWaiterID: UInt64 = 0
     private var waiters: [UInt64: Waiter] = [:]
     private var retainedBytes = 0
-    private var globalInvalidationGeneration: UInt64 = 0
-    private var imageInvalidationGenerations: [UInt64: UInt64] = [:]
     private var isClosed = false
 
     package init(
@@ -132,17 +130,16 @@ package actor DisplayImageCache {
             bitmap: bitmap,
             lossy: lossy,
             mode: mode,
-            globalInvalidationGeneration: globalInvalidationGeneration,
-            imageInvalidationGeneration: imageInvalidationGenerations[id, default: 0]
+            invalidated: false
         )
         return DisplayImageCacheReservation(token: token)
     }
 
     /// Finalizes a reservation after its Surface mutation has succeeded.
     ///
-    /// Invalidation linearizes when its generation advances. A reservation
-    /// admitted before that point can still finish its Surface mutation, but
-    /// returns `.invalidated` and cannot republish the invalidated cache ID.
+    /// Invalidation linearizes when it marks the currently pending reservation.
+    /// A reservation admitted before that point can still finish its Surface
+    /// mutation, but returns `.invalidated` and cannot republish the cache ID.
     /// Clear and close return `.discarded`. None of these teardown races make
     /// commit throw after the Surface has already changed.
     @discardableResult
@@ -152,10 +149,7 @@ package actor DisplayImageCache {
         guard let pending = takeReservation(token: reservation.token) else {
             return .discarded
         }
-        guard pending.globalInvalidationGeneration == globalInvalidationGeneration,
-              pending.imageInvalidationGeneration
-                == imageInvalidationGenerations[pending.id, default: 0]
-        else {
+        guard !pending.invalidated else {
             return .invalidated
         }
 
@@ -275,7 +269,9 @@ package actor DisplayImageCache {
     }
 
     private func invalidateOne(id: UInt64) {
-        imageInvalidationGenerations[id, default: 0] &+= 1
+        if let token = reservationTokensByImageID[id] {
+            reservations[token]?.invalidated = true
+        }
         if let entry = entries[id] {
             if entry.referenceCount > 1 {
                 entries[id] = Entry(
@@ -295,7 +291,10 @@ package actor DisplayImageCache {
     }
 
     package func invalidateAll() {
-        globalInvalidationGeneration &+= 1
+        let tokens = Array(reservations.keys)
+        for token in tokens {
+            reservations[token]?.invalidated = true
+        }
         removeAllState(
             waiterError: .protocolViolation("image cache invalidated"),
             closesCache: false,
@@ -327,6 +326,10 @@ package actor DisplayImageCache {
             reservedBytes: reservedBytes,
             retainedBytes: retainedBytes,
             pendingReservationCount: reservations.count,
+            pendingInvalidatedReservationCount: reservations.values.reduce(into: 0) {
+                count, reservation in
+                if reservation.invalidated { count += 1 }
+            },
             pendingWaiterCount: waiters.count,
             referenceCounts: entries.mapValues(\.referenceCount)
         )
