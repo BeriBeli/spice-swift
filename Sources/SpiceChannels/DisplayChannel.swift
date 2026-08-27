@@ -1189,7 +1189,13 @@ package actor DisplayChannel: SpiceManagedChannel {
         let base = try pixelRectAllowingEmpty(command.base.box)
         let region = try await pixelRegion(command.base)
         var surfaceRevision: SurfaceRevision?
-        for destination in region {
+        let source = PixelRect(
+            x: Int(command.sourcePosition.x),
+            y: Int(command.sourcePosition.y),
+            width: base.width,
+            height: base.height
+        )
+        for destination in region.copyTraversal(source: source, destination: base) {
             let sourceX = Int(command.sourcePosition.x) + destination.x - base.x
             let sourceY = Int(command.sourcePosition.y) + destination.y - base.y
             do {
@@ -1327,7 +1333,14 @@ package actor DisplayChannel: SpiceManagedChannel {
         region: PixelRegion
     ) async throws(ChannelError) -> SurfaceRevision? {
         var surfaceRevision: SurfaceRevision?
-        for destination in region {
+        let destinations: any Sequence<PixelRect>
+        switch resolvedSource {
+        case .surface(command.base.surfaceID):
+            destinations = region.copyTraversal(source: sourceArea, destination: base)
+        case .bitmap, .surface:
+            destinations = region
+        }
+        for destination in destinations {
             let source = PixelRect(
                 x: sourceArea.x + destination.x - base.x,
                 y: sourceArea.y + destination.y - base.y,

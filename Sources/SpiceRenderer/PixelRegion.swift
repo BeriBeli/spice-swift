@@ -217,6 +217,66 @@ package struct PixelRegion: Sendable, Equatable, Sequence {
         }
     }
 
+    /// A non-materializing traversal for translated copies within one surface.
+    ///
+    /// Moving pixels down visits lower bands first, and moving them right
+    /// visits rightmost intervals first. This prevents an earlier segment from
+    /// overwriting pixels that a later segment still needs to read.
+    package struct CopyTraversal: Sequence {
+        fileprivate let region: PixelRegion
+        fileprivate let reversesBands: Bool
+        fileprivate let reversesIntervals: Bool
+
+        package struct Iterator: IteratorProtocol {
+            fileprivate let region: PixelRegion
+            fileprivate let reversesBands: Bool
+            fileprivate let reversesIntervals: Bool
+            fileprivate var emittedInlineRectangle = false
+            fileprivate var bandOffset = 0
+            fileprivate var intervalOffset = 0
+
+            package mutating func next() -> PixelRect? {
+                switch region.storage {
+                case .empty:
+                    return nil
+                case let .rectangle(rectangle):
+                    guard !emittedInlineRectangle else { return nil }
+                    emittedInlineRectangle = true
+                    return rectangle
+                case let .bands(bands):
+                    guard bandOffset < bands.count else { return nil }
+                    let bandIndex = reversesBands
+                        ? bands.count - 1 - bandOffset
+                        : bandOffset
+                    let band = bands[bandIndex]
+                    let intervalIndex = reversesIntervals
+                        ? band.intervals.count - 1 - intervalOffset
+                        : intervalOffset
+                    let interval = band.intervals[intervalIndex]
+                    intervalOffset += 1
+                    if intervalOffset == band.intervals.count {
+                        bandOffset += 1
+                        intervalOffset = 0
+                    }
+                    return PixelRect(
+                        x: interval.lowerBound,
+                        y: band.yRange.lowerBound,
+                        width: interval.upperBound - interval.lowerBound,
+                        height: band.yRange.upperBound - band.yRange.lowerBound
+                    )
+                }
+            }
+        }
+
+        package func makeIterator() -> Iterator {
+            Iterator(
+                region: region,
+                reversesBands: reversesBands,
+                reversesIntervals: reversesIntervals
+            )
+        }
+    }
+
     private let storage: Storage
 
     package init(
@@ -340,6 +400,17 @@ package struct PixelRegion: Sendable, Equatable, Sequence {
 
     package func makeIterator() -> Iterator {
         Iterator(region: self)
+    }
+
+    package func copyTraversal(
+        source: PixelRect,
+        destination: PixelRect
+    ) -> CopyTraversal {
+        CopyTraversal(
+            region: self,
+            reversesBands: destination.y > source.y,
+            reversesIntervals: destination.x > source.x
+        )
     }
 
     private static func checkedEdges(_ rectangle: PixelRect) throws(RenderError) -> Edges {

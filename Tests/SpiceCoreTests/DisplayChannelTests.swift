@@ -3409,6 +3409,77 @@ struct DisplayChannelTests {
         #expect(try await channel.processNext() == .surfaceDestroyed(1))
     }
 
+    @Test func copyBitsPreservesOriginalSourcesAcrossDisjointRightwardSegments() async throws {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        try await store.create(id: 1, width: 5, height: 1, format: 32)
+        try await store.drawCopy(
+            surfaceID: 1,
+            destination: PixelRect(x: 0, y: 0, width: 5, height: 1),
+            bitmap: linearBitmap(width: 5, height: 1)
+        )
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 104, body: copyBitsBody(
+                box: (top: 0, left: 2, bottom: 1, right: 5),
+                sourcePosition: (x: 0, y: 0),
+                clipRectangles: [
+                    (top: 0, left: 2, bottom: 1, right: 3),
+                    (top: 0, left: 4, bottom: 1, right: 5),
+                ]
+            ))),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+
+        _ = try await channel.processNext()
+
+        #expect(try await store.snapshot(surfaceID: 1).pixels == linearPixels([1, 2, 1, 4, 3]))
+        await channel.close()
+    }
+
+    @Test func sameSurfaceDrawCopyPreservesOriginalSourcesAcrossDisjointDownwardSegments()
+        async throws
+    {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        try await store.create(id: 1, width: 1, height: 5, format: 32)
+        try await store.drawCopy(
+            surfaceID: 1,
+            destination: PixelRect(x: 0, y: 0, width: 1, height: 5),
+            bitmap: linearBitmap(width: 1, height: 5)
+        )
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 304, body: drawSurfaceCopyBody(
+                box: (top: 2, left: 0, bottom: 5, right: 1),
+                sourceArea: (top: 0, left: 0, bottom: 3, right: 1),
+                sourceSurfaceID: 1,
+                clipRectangles: [
+                    (top: 2, left: 0, bottom: 3, right: 1),
+                    (top: 4, left: 0, bottom: 5, right: 1),
+                ]
+            ))),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+
+        _ = try await channel.processNext()
+
+        #expect(try await store.snapshot(surfaceID: 1).pixels == linearPixels([1, 2, 1, 4, 3]))
+        await channel.close()
+    }
+
     @Test func fullyClippedCommandsDoNotPublishButStillCacheAndAcknowledge() async throws {
         let imageID: UInt64 = 0x4455
         let transport = FakeTransport(inbound: try [
@@ -3973,18 +4044,69 @@ struct DisplayChannelTests {
     }
 
     private func copyBitsBody(
+        box: (top: Int32, left: Int32, bottom: Int32, right: Int32) = (
+            top: 1,
+            left: 0,
+            bottom: 2,
+            right: 2
+        ),
+        sourcePosition: (x: Int32, y: Int32) = (x: 2, y: 0),
         clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)]? = nil
     ) -> Data {
         var writer = ByteWriter()
         writeBase(
             to: &writer,
             surfaceID: 1,
-            box: (top: 1, left: 0, bottom: 2, right: 2),
+            box: box,
             clipRectangles: clipRectangles
         )
-        writer.writeInt32LE(2)
-        writer.writeInt32LE(0)
+        writer.writeInt32LE(sourcePosition.x)
+        writer.writeInt32LE(sourcePosition.y)
         return writer.data
+    }
+
+    private func drawSurfaceCopyBody(
+        box: (top: Int32, left: Int32, bottom: Int32, right: Int32),
+        sourceArea: (top: Int32, left: Int32, bottom: Int32, right: Int32),
+        sourceSurfaceID: UInt32,
+        clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)]?
+    ) -> Data {
+        var writer = ByteWriter()
+        writeBase(
+            to: &writer,
+            surfaceID: 1,
+            box: box,
+            clipRectangles: clipRectangles
+        )
+        let imageOffset = UInt32(writer.data.count + 36)
+        writer.writeUInt32LE(imageOffset)
+        writeRect(to: &writer, sourceArea)
+        writer.writeUInt16LE(0x08)
+        writer.writeUInt8(0)
+        writeEmptyMask(to: &writer)
+        writeSurfaceImage(
+            to: &writer,
+            descriptorID: 0xc001,
+            surfaceID: sourceSurfaceID,
+            width: UInt32(sourceArea.right - sourceArea.left),
+            height: UInt32(sourceArea.bottom - sourceArea.top)
+        )
+        return writer.data
+    }
+
+    private func linearBitmap(width: Int, height: Int) -> RawBitmap {
+        RawBitmap(
+            format: .xRGB8888,
+            width: width,
+            height: height,
+            stride: width * 4,
+            topDown: true,
+            pixels: linearPixels(Array(1...(width * height)))
+        )
+    }
+
+    private func linearPixels(_ values: [Int]) -> Data {
+        Data(values.flatMap { [UInt8($0), 0, 0, 0xff] })
     }
 
     private func writeBase(
@@ -4026,13 +4148,15 @@ struct DisplayChannelTests {
     private func writeSurfaceImage(
         to writer: inout ByteWriter,
         descriptorID: UInt64,
-        surfaceID: UInt32
+        surfaceID: UInt32,
+        width: UInt32 = 1,
+        height: UInt32 = 1
     ) {
         writer.writeUInt64LE(descriptorID)
         writer.writeUInt8(104) // SPICE_IMAGE_TYPE_SURFACE
         writer.writeUInt8(0)
-        writer.writeUInt32LE(1)
-        writer.writeUInt32LE(1)
+        writer.writeUInt32LE(width)
+        writer.writeUInt32LE(height)
         writer.writeUInt32LE(surfaceID)
     }
 
