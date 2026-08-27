@@ -566,6 +566,7 @@ private actor AIP11WaitProbe {
     }
 
     private(set) var state: State = .starting
+    private var waitingStateObservers: [CheckedContinuation<Void, Never>] = []
 
     var failed: Bool {
         if case .failed = state { return true }
@@ -577,11 +578,23 @@ private actor AIP11WaitProbe {
         requirements: [ChannelSerialBarrier.Requirement]
     ) async {
         state = .waiting
+        let observers = waitingStateObservers
+        waitingStateObservers.removeAll(keepingCapacity: false)
+        for observer in observers {
+            observer.resume()
+        }
         do {
             try await connection.waitUntilProcessed(requirements)
             state = .succeeded
         } catch let error {
             state = .failed(error)
+        }
+    }
+
+    func waitUntilWaitingStateWasEntered() async {
+        guard state == .starting else { return }
+        await withCheckedContinuation { continuation in
+            waitingStateObservers.append(continuation)
         }
     }
 }
@@ -627,12 +640,7 @@ private func aip11StartWait(
 }
 
 private func aip11ExpectWaiting(_ probe: AIP11WaitProbe) async {
-    for _ in 0..<100 where await probe.state == .starting {
-        await Task.yield()
-    }
-    for _ in 0..<20 {
-        await Task.yield()
-    }
+    await probe.waitUntilWaitingStateWasEntered()
     #expect(await probe.state == .waiting)
 }
 
