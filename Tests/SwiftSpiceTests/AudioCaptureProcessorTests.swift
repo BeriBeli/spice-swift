@@ -17,21 +17,30 @@ struct AudioCaptureProcessorTests {
         let drain = fixture.processor.drain()
 
         let expectedPasses = Int((frameCount + 1_023) / 1_024)
+        let actualTimestamps: [UInt32] = drain.packets.map(\.timestamp)
+        var expectedTimestamps: [UInt32] = []
+        expectedTimestamps.reserveCapacity(expectedPasses)
+        for pass in 0 ..< expectedPasses {
+            expectedTimestamps.append(
+                timestamp &+ UInt32((pass * 1_024 * 1_000) / 8_000)
+            )
+        }
+        var actualBytes = Data()
+        for packet in drain.packets {
+            actualBytes.append(packet.data)
+        }
+        let expectedSplitCallbacks: UInt64 = frameCount > 1_024 ? 1 : 0
         #expect(drain.failure == nil)
         #expect(drain.droppedBytes == 0)
         #expect(drain.packets.count == expectedPasses)
-        #expect(drain.packets.map(\.timestamp) == (0 ..< expectedPasses).map {
-            timestamp &+ UInt32(($0 * 1_024 * 1_000) / 8_000)
-        })
-        #expect(drain.packets.reduce(into: Data()) { result, packet in
-            result.append(packet.data)
-        } == fixture.expectedBytes)
+        #expect(actualTimestamps == expectedTimestamps)
+        #expect(actualBytes == fixture.expectedBytes)
 
         let diagnostics = fixture.processor.diagnostics()
         #expect(diagnostics.maximumInputFrames == 1_024)
         #expect(diagnostics.inputCallbacks == 1)
         #expect(diagnostics.inputFrames == UInt64(frameCount))
-        #expect(diagnostics.splitInputCallbacks == (frameCount > 1_024 ? 1 : 0))
+        #expect(diagnostics.splitInputCallbacks == expectedSplitCallbacks)
         #expect(diagnostics.conversionPasses == UInt64(expectedPasses))
         #expect(diagnostics.conversionFailures == 0)
         #expect(diagnostics.convertedFrames == UInt64(frameCount))
@@ -56,14 +65,18 @@ struct AudioCaptureProcessorTests {
         first.processor.capture(first.input, timestamp: 1_000)
         first.processor.capture(secondInput.buffer, timestamp: 2_000)
         let drain = first.processor.drain()
+        let actualTimestamps: [UInt32] = drain.packets.map(\.timestamp)
+        let expectedTimestamps: [UInt32] = [1_000, 1_128, 1_256, 2_000, 2_128]
+        var actualBytes = Data()
+        for packet in drain.packets {
+            actualBytes.append(packet.data)
+        }
+        let expectedBytes = first.expectedBytes + secondInput.bytes
 
         #expect(drain.failure == nil)
         #expect(drain.droppedBytes == 0)
-        #expect(drain.packets.map(\.timestamp) == [1_000, 1_128, 1_256, 2_000, 2_128])
-        let expected = first.expectedBytes + secondInput.bytes
-        #expect(drain.packets.reduce(into: Data()) { result, packet in
-            result.append(packet.data)
-        } == expected)
+        #expect(actualTimestamps == expectedTimestamps)
+        #expect(actualBytes == expectedBytes)
         let diagnostics = first.processor.diagnostics()
         #expect(diagnostics.inputCallbacks == 2)
         #expect(diagnostics.inputFrames == 3_076)
@@ -107,11 +120,12 @@ struct AudioCaptureProcessorTests {
 
         fixture.processor.capture(fixture.input, timestamp: 1_000)
         let recovered = fixture.processor.drain()
-        #expect(recovered.failure == nil)
-        #expect(recovered.packets == [RecordedAudioPacket(
+        let expectedRecoveredPackets = [RecordedAudioPacket(
             timestamp: 1_000,
             data: fixture.expectedBytes
-        )])
+        )]
+        #expect(recovered.failure == nil)
+        #expect(recovered.packets == expectedRecoveredPackets)
         diagnostics = fixture.processor.diagnostics()
         #expect(diagnostics.inputCallbacks == 2)
         #expect(diagnostics.conversionPasses == 1)
@@ -158,13 +172,17 @@ struct AudioCaptureProcessorTests {
 
         processor.capture(input, timestamp: 3_000)
         let drain = processor.drain()
+        let actualTimestamps: [UInt32] = drain.packets.map(\.timestamp)
+        let expectedTimestamps: [UInt32] = [3_000, 3_128, 3_256]
+        var actualBytes = Data()
+        for packet in drain.packets {
+            actualBytes.append(packet.data)
+        }
 
         #expect(drain.failure == nil)
         #expect(drain.droppedBytes == 0)
-        #expect(drain.packets.map(\.timestamp) == [3_000, 3_128, 3_256])
-        #expect(drain.packets.reduce(into: Data()) { result, packet in
-            result.append(packet.data)
-        } == expected)
+        #expect(actualTimestamps == expectedTimestamps)
+        #expect(actualBytes == expected)
         let diagnostics = processor.diagnostics()
         #expect(diagnostics.inputCallbacks == 1)
         #expect(diagnostics.inputFrames == UInt64(frameCount))
@@ -188,11 +206,13 @@ struct AudioCaptureProcessorTests {
         fixture.processor.finish()
         fixture.processor.capture(fixture.input, timestamp: 42)
 
-        #expect(fixture.processor.drain() == RecordCaptureDrain(
+        let expectedDrain = RecordCaptureDrain(
             packets: [],
             droppedBytes: 0,
             failure: nil
-        ))
+        )
+        let actualDrain = fixture.processor.drain()
+        #expect(actualDrain == expectedDrain)
         let diagnostics = fixture.processor.diagnostics()
         #expect(diagnostics.ring.isClosed)
         #expect(diagnostics.ring.closeCount == 1)
