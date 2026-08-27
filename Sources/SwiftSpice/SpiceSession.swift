@@ -241,6 +241,20 @@ public actor SpiceSession {
         }
     }
 
+    private struct ChildChannelRequest: Sendable {
+        let descriptorIndex: Int
+        let key: ChannelKey
+    }
+
+    private struct ConnectedChildChannel: Sendable {
+        let descriptorIndex: Int
+        let key: ChannelKey
+        let connection: ChannelConnection
+    }
+
+    private typealias ChildChannelConnectOutcome =
+        Result<ConnectedChildChannel, ChannelError>
+
     private struct RetiringMainDrain: Sendable {
         let id: UInt64
         let connection: ChannelConnection
@@ -447,24 +461,19 @@ public actor SpiceSession {
                 advertisesH264: endpoint.videoCodecPolicy == .h264AndMJPEG,
                 advertisesH265: endpoint.videoCodecPolicy == .h265AndMJPEG
             )
-            for descriptor in bootstrap.channels {
-                try Task.checkCancellation()
-                let key = ChannelKey(type: descriptor.type, id: descriptor.id)
-                guard key != connection.key else { continue }
-                guard preparedChannels[key] == nil else {
-                    throw ChannelError.protocolViolation(
-                        "duplicate channel type=\(key.type) id=\(key.id)"
-                    )
-                }
-                let connected = try await channelFactory.connect(
-                    key: key,
-                    connectionID: bootstrap.sessionID,
-                    password: credentials.copyPassword()
-                )
-                preparedConnections[key] = connected
-                preparedChannels[key] = Self.makeChannel(
-                    key: key,
-                    connection: connected,
+            let connectedChildren = try await Self.connectChildChannels(
+                descriptors: bootstrap.channels,
+                mainKey: connection.key,
+                duplicateDescription: "channel",
+                channelFactory: channelFactory,
+                connectionID: bootstrap.sessionID,
+                credentials: credentials
+            )
+            for child in connectedChildren {
+                preparedConnections[child.key] = child.connection
+                preparedChannels[child.key] = Self.makeChannel(
+                    key: child.key,
+                    connection: child.connection,
                     glzDecoder: glzDecoder,
                     imageCache: imageCache,
                     multimediaClock: multimediaClock,
@@ -1202,6 +1211,173 @@ public actor SpiceSession {
         }
     }
 
+    private nonisolated static func connectChildChannels(
+        descriptors: [ChannelDescriptor],
+        mainKey: ChannelKey,
+        duplicateDescription: String,
+        channelFactory: ChannelFactory,
+        connectionID: UInt32,
+        credentials: SpiceCredentialStorage
+    ) async throws(ChannelError) -> [ConnectedChildChannel] {
+        let requests = try validatedChildChannelRequests(
+            descriptors: descriptors,
+            mainKey: mainKey,
+            duplicateDescription: duplicateDescription
+        )
+        guard !Task.isCancelled else {
+            throw .transport(.cancelled)
+        }
+        guard !requests.isEmpty else {
+            return []
+        }
+
+        let outcome = await withTaskGroup(
+            of: ChildChannelConnectOutcome.self,
+            returning: Result<[ConnectedChildChannel], ChannelError>.self
+        ) { group in
+            let maximumConcurrentConnections = 4
+            var nextRequestIndex = 0
+            var successfulConnections: [ConnectedChildChannel] = []
+            successfulConnections.reserveCapacity(requests.count)
+            var firstError: ChannelError?
+
+            while nextRequestIndex < Swift.min(maximumConcurrentConnections, requests.count) {
+                let request = requests[nextRequestIndex]
+                nextRequestIndex += 1
+                let transport = channelFactory.makeTransport(for: request.key)
+                group.addTask {
+                    await connectChildChannel(
+                        request,
+                        transport: transport,
+                        channelFactory: channelFactory,
+                        connectionID: connectionID,
+                        credentials: credentials
+                    )
+                }
+            }
+
+            while let childOutcome = await group.next() {
+                if firstError == nil, Task.isCancelled {
+                    firstError = .transport(.cancelled)
+                    group.cancelAll()
+                }
+
+                switch childOutcome {
+                case .success(let connected):
+                    if firstError == nil {
+                        successfulConnections.append(connected)
+                    } else {
+                        // The group must be fully drained after cancellation:
+                        // a transport may finish successfully after cancelAll.
+                        await connected.connection.close()
+                    }
+                case .failure(let error):
+                    if firstError == nil {
+                        firstError = Task.isCancelled ? .transport(.cancelled) : error
+                        group.cancelAll()
+                    }
+                }
+
+                if firstError == nil, nextRequestIndex < requests.count {
+                    let request = requests[nextRequestIndex]
+                    nextRequestIndex += 1
+                    let transport = channelFactory.makeTransport(for: request.key)
+                    group.addTask {
+                        await connectChildChannel(
+                            request,
+                            transport: transport,
+                            channelFactory: channelFactory,
+                            connectionID: connectionID,
+                            credentials: credentials
+                        )
+                    }
+                }
+            }
+
+            if firstError == nil, Task.isCancelled {
+                firstError = .transport(.cancelled)
+            }
+            if let firstError {
+                // These connections completed before the first observed error.
+                // They have not crossed the helper's ownership boundary yet.
+                for connected in successfulConnections {
+                    await connected.connection.close()
+                }
+                return .failure(firstError)
+            }
+            successfulConnections.sort {
+                $0.descriptorIndex < $1.descriptorIndex
+            }
+            return .success(successfulConnections)
+        }
+
+        switch outcome {
+        case .success(let connected):
+            if Task.isCancelled {
+                for child in connected {
+                    await child.connection.close()
+                }
+                throw .transport(.cancelled)
+            }
+            return connected
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    private nonisolated static func validatedChildChannelRequests(
+        descriptors: [ChannelDescriptor],
+        mainKey: ChannelKey,
+        duplicateDescription: String
+    ) throws(ChannelError) -> [ChildChannelRequest] {
+        var seenKeys = Set<ChannelKey>()
+        var requests: [ChildChannelRequest] = []
+        requests.reserveCapacity(descriptors.count)
+        for (descriptorIndex, descriptor) in descriptors.enumerated() {
+            let key = ChannelKey(type: descriptor.type, id: descriptor.id)
+            guard seenKeys.insert(key).inserted else {
+                throw .protocolViolation(
+                    "duplicate \(duplicateDescription) type=\(key.type) id=\(key.id)"
+                )
+            }
+            if key != mainKey {
+                requests.append(ChildChannelRequest(
+                    descriptorIndex: descriptorIndex,
+                    key: key
+                ))
+            }
+        }
+        return requests
+    }
+
+    private nonisolated static func connectChildChannel(
+        _ request: ChildChannelRequest,
+        transport: any SpiceTransport,
+        channelFactory: ChannelFactory,
+        connectionID: UInt32,
+        credentials: SpiceCredentialStorage
+    ) async -> ChildChannelConnectOutcome {
+        guard !Task.isCancelled else {
+            await transport.close()
+            return .failure(.transport(.cancelled))
+        }
+        do {
+            let connection = try await channelFactory.connect(
+                transport: transport,
+                key: request.key,
+                connectionID: connectionID,
+                password: credentials.copyPassword()
+            )
+            return .success(ConnectedChildChannel(
+                descriptorIndex: request.descriptorIndex,
+                key: request.key,
+                connection: connection
+            ))
+        } catch {
+            return .failure(channelError(error))
+        }
+    }
+
     private nonisolated static func closePrepared(_ prepared: PreparedSession) async {
         await prepared.imageCache.close()
         await prepared.mainChannel.close()
@@ -1807,24 +1983,19 @@ public actor SpiceSession {
                 advertisesH264: endpoint.videoCodecPolicy == .h264AndMJPEG,
                 advertisesH265: endpoint.videoCodecPolicy == .h265AndMJPEG
             )
-            for descriptor in sourceBootstrap.channels {
-                try Task.checkCancellation()
-                let key = ChannelKey(type: descriptor.type, id: descriptor.id)
-                guard key != connection.key else { continue }
-                guard preparedChannels[key] == nil else {
-                    throw ChannelError.protocolViolation(
-                        "duplicate migration channel type=\(key.type) id=\(key.id)"
-                    )
-                }
-                let connected = try await channelFactory.connect(
-                    key: key,
-                    connectionID: sourceBootstrap.sessionID,
-                    password: credentials.copyPassword()
-                )
-                preparedConnections[key] = connected
-                preparedChannels[key] = Self.makeChannel(
-                    key: key,
-                    connection: connected,
+            let connectedChildren = try await Self.connectChildChannels(
+                descriptors: sourceBootstrap.channels,
+                mainKey: connection.key,
+                duplicateDescription: "migration channel",
+                channelFactory: channelFactory,
+                connectionID: sourceBootstrap.sessionID,
+                credentials: credentials
+            )
+            for child in connectedChildren {
+                preparedConnections[child.key] = child.connection
+                preparedChannels[child.key] = Self.makeChannel(
+                    key: child.key,
+                    connection: child.connection,
                     glzDecoder: glzDecoder,
                     imageCache: imageCache,
                     multimediaClock: multimediaClock,
