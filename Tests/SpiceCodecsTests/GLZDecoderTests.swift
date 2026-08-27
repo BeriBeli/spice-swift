@@ -718,6 +718,205 @@ struct GLZDecoderTests {
         #expect(decoderDiagnostics.reservedImages == 0)
     }
 
+    @Test func retainedOwnerChargesInternalExecutorQueueAtExactBoundary() async throws {
+        let descriptor = SpiceCodecImageDescriptor(width: 2, height: 1)
+        let payload = glzPayload(
+            type: 8,
+            width: 2,
+            height: 1,
+            imageID: 0,
+            windowHeadDistance: 0,
+            compressed: [1, 1, 2, 3, 4, 5, 6]
+        )
+
+        let probeExecutor = SpiceCodecTaskExecutor(limits: .init(maximumConcurrentJobs: 1))
+        let probeGate = GLZOperationGate()
+        let probeBlocker = Task {
+            try await probeExecutor.execute(retainedByteCount: 1) { await probeGate.run() }
+        }
+        await probeGate.waitUntilStarted()
+        let probeDecoder = SpiceGLZDecoder(executor: probeExecutor)
+        let probe = Task {
+            try await probeDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: 0
+            )
+        }
+        await waitForExecutor(probeExecutor) { $0.queuedJobs == 1 }
+        let programBase = await probeExecutor.diagnosticsSnapshot().queuedRetainedBytes
+        #expect(programBase > payload.count)
+        probe.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) { try await probe.value }
+        await waitForExecutor(probeExecutor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForGLZ(probeDecoder) { $0.reservedImages == 0 }
+        await probeGate.release()
+        _ = try await probeBlocker.value
+
+        let ownerBytes = 32 * 1_024
+        let exactCharge = programBase + ownerBytes
+        let admittedExecutor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumQueuedRetainedBytes: exactCharge
+        ))
+        let admittedGate = GLZOperationGate()
+        let admittedBlocker = Task {
+            try await admittedExecutor.execute(retainedByteCount: 1) {
+                await admittedGate.run()
+            }
+        }
+        await admittedGate.waitUntilStarted()
+        let admittedDecoder = SpiceGLZDecoder(executor: admittedExecutor)
+        let admitted = Task {
+            try await admittedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: ownerBytes
+            )
+        }
+        await waitForExecutor(admittedExecutor) {
+            $0.queuedJobs == 1 && $0.queuedRetainedBytes == exactCharge
+        }
+        #expect(await admittedDecoder.diagnosticsSnapshot().reservedImages == 1)
+        admitted.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) { try await admitted.value }
+        await waitForExecutor(admittedExecutor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForGLZ(admittedDecoder) { $0.reservedImages == 0 }
+        await admittedGate.release()
+        _ = try await admittedBlocker.value
+        #expect(await admittedExecutor.diagnosticsSnapshot().currentRetainedBytes == 0)
+
+        let rejectedExecutor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumQueuedRetainedBytes: exactCharge - 1
+        ))
+        let rejectedGate = GLZOperationGate()
+        let rejectedBlocker = Task {
+            try await rejectedExecutor.execute(retainedByteCount: 1) {
+                await rejectedGate.run()
+            }
+        }
+        await rejectedGate.waitUntilStarted()
+        let rejectedDecoder = SpiceGLZDecoder(executor: rejectedExecutor)
+        await #expect(throws: SpiceCodecError.backendFailure(
+            "codec executor rejected GLZ work: queuedRetainedBytesExceeded("
+                + "actual: \(exactCharge), maximum: \(exactCharge - 1))"
+        )) {
+            try await rejectedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: ownerBytes
+            )
+        }
+        #expect(await rejectedDecoder.diagnosticsSnapshot().reservedImages == 0)
+        var rejectedDiagnostics = await rejectedExecutor.diagnosticsSnapshot()
+        #expect(rejectedDiagnostics.queuedJobs == 0)
+        #expect(rejectedDiagnostics.queuedRetainedBytes == 0)
+        #expect(rejectedDiagnostics.rejectedJobs == 1)
+        await rejectedGate.release()
+        _ = try await rejectedBlocker.value
+        rejectedDiagnostics = await rejectedExecutor.diagnosticsSnapshot()
+        #expect(rejectedDiagnostics.currentRetainedBytes == 0)
+    }
+
+    @Test func retainedOwnerChargesDictionaryWaitAndRejectsOverflowAtomically() async throws {
+        let descriptor = SpiceCodecImageDescriptor(width: 2, height: 1)
+        let payload = glzPayload(
+            type: 8,
+            width: 2,
+            height: 1,
+            imageID: 1,
+            windowHeadDistance: 1,
+            compressed: [0x40, 0, 1]
+        )
+        let executor = SpiceCodecTaskExecutor()
+        let probeDecoder = SpiceGLZDecoder(executor: executor)
+        let probe = Task {
+            try await probeDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: 0
+            )
+        }
+        await waitForGLZ(probeDecoder) { $0.pendingDictionaryWaits == 1 }
+        let programBase = await probeDecoder.diagnosticsSnapshot().pendingDictionaryWaitBytes
+        #expect(programBase > payload.count)
+        probe.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) { try await probe.value }
+        await waitForGLZ(probeDecoder) {
+            $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+
+        let ownerBytes = 32 * 1_024
+        let exactCharge = programBase + ownerBytes
+        let admittedDecoder = SpiceGLZDecoder(
+            executor: executor,
+            limits: .init(maximumDictionaryBytes: exactCharge)
+        )
+        let admitted = Task {
+            try await admittedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: ownerBytes
+            )
+        }
+        await waitForGLZ(admittedDecoder) {
+            $0.reservedImages == 1
+                && $0.pendingDictionaryWaits == 1
+                && $0.pendingDictionaryWaitBytes == exactCharge
+        }
+        await admittedDecoder.clear()
+        await #expect(throws: SpiceCodecError.cancelled) { try await admitted.value }
+        await waitForGLZ(admittedDecoder) {
+            $0.dictionaryImages == 0
+                && $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+
+        let rejectedDecoder = SpiceGLZDecoder(
+            executor: executor,
+            limits: .init(maximumDictionaryBytes: exactCharge - 1)
+        )
+        await #expect(throws: SpiceCodecError.decodedImageTooLarge(
+            actual: exactCharge,
+            maximum: exactCharge - 1
+        )) {
+            try await rejectedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: ownerBytes
+            )
+        }
+        await #expect(throws: SpiceCodecError.integerOverflow) {
+            try await rejectedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: -1
+            )
+        }
+        await #expect(throws: SpiceCodecError.integerOverflow) {
+            try await rejectedDecoder.decode(
+                descriptor: descriptor,
+                payload: payload,
+                retainedOwnerByteCount: .max
+            )
+        }
+        let diagnostics = await rejectedDecoder.diagnosticsSnapshot()
+        #expect(diagnostics.dictionaryImages == 0)
+        #expect(diagnostics.dictionaryBytes == 0)
+        #expect(diagnostics.reservedImages == 0)
+        #expect(diagnostics.pendingDictionaryWaits == 0)
+        #expect(diagnostics.pendingDictionaryWaitBytes == 0)
+        #expect(await executor.diagnosticsSnapshot().currentRetainedBytes == 0)
+    }
+
     @Test func inFlightIDsFailuresAndCancellationReleaseEveryReservation() async throws {
         let executor = SpiceCodecTaskExecutor(limits: .init(
             maximumConcurrentJobs: 1,

@@ -2394,6 +2394,124 @@ struct DisplayChannelTests {
         await rejectedChannel.close()
     }
 
+    @Test func fullBatchDirectGLZChargesPhysicalOwnerInInternalQueue() async throws {
+        let payload = glzLiteralPayload()
+        let programBase = try await glzProgramQueueBase(payload: payload)
+        let drawBody = drawCompressedCopyBody(imageType: 102, payload: payload)
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: drawBody),
+                (type: 65_000, body: Data(repeating: 0x47, count: 32 * 1_024)),
+            ]
+        )
+        let exactCharge = programBase + batch.retainedBodyByteCount
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 2,
+            maximumQueuedRetainedBytes: exactCharge
+        ))
+        let gate = DisplayCodecExecutorGate()
+        let blocker = Task {
+            try await executor.execute(retainedByteCount: 1) { await gate.run() }
+        }
+        await gate.waitUntilStarted()
+        let glzDecoder = SpiceGLZDecoder(executor: executor)
+        let channel = try await retainedOwnerCodecChannel(
+            batch: batch.wire,
+            executor: executor,
+            glzDecoder: glzDecoder
+        )
+        _ = try await channel.processNext()
+        let pending = Task { try await channel.processNext() }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 1 && $0.queuedRetainedBytes == exactCharge
+        }
+        #expect(await glzDecoder.diagnosticsSnapshot().reservedImages == 1)
+
+        pending.cancel()
+        await #expect(throws: ChannelError.self) { try await pending.value }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForDisplayGLZ(glzDecoder) { $0.reservedImages == 0 }
+        await gate.release()
+        _ = try await blocker.value
+        #expect(await executor.diagnosticsSnapshot().currentRetainedBytes == 0)
+        await channel.close()
+    }
+
+    @Test func fullBatchZlibGLZSecondPhaseStillChargesPhysicalOwner() async throws {
+        let glzPayload = glzLiteralPayload()
+        let programBase = try await glzProgramQueueBase(payload: glzPayload)
+        let compressed = try #require(Data(base64Encoded:
+            "eJxTUIjyYWBkYJRgYGBgAmJGIOZgQAKMjEzMLKxsACbTASI="
+        ))
+        let drawBody = drawZlibGLZCopyBody(
+            payload: compressed,
+            glzDataSize: UInt32(glzPayload.count)
+        )
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: drawBody),
+                (type: 65_000, body: Data(repeating: 0x93, count: 32 * 1_024)),
+            ]
+        )
+        let exactGLZCharge = programBase + batch.retainedBodyByteCount
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 3,
+            maximumQueuedRetainedBytes: exactGLZCharge
+        ))
+        let firstGate = DisplayCodecExecutorGate()
+        let firstBlocker = Task {
+            try await executor.execute(retainedByteCount: 1) { await firstGate.run() }
+        }
+        await firstGate.waitUntilStarted()
+        let glzDecoder = SpiceGLZDecoder(executor: executor)
+        let channel = try await retainedOwnerCodecChannel(
+            batch: batch.wire,
+            executor: executor,
+            glzDecoder: glzDecoder
+        )
+        _ = try await channel.processNext()
+        let pending = Task { try await channel.processNext() }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 1
+                && $0.queuedRetainedBytes == batch.retainedBodyByteCount
+        }
+
+        let secondGate = DisplayCodecExecutorGate()
+        let secondBlocker = Task {
+            try await executor.execute(retainedByteCount: 1) { await secondGate.run() }
+        }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 2
+                && $0.queuedRetainedBytes == batch.retainedBodyByteCount + 1
+        }
+        await firstGate.release()
+        _ = try await firstBlocker.value
+        await secondGate.waitUntilStarted()
+        await waitForDisplayCodecExecutor(executor) {
+            $0.activeJobs == 1
+                && $0.queuedJobs == 1
+                && $0.queuedRetainedBytes == exactGLZCharge
+        }
+        #expect(await glzDecoder.diagnosticsSnapshot().reservedImages == 1)
+
+        pending.cancel()
+        await #expect(throws: ChannelError.self) { try await pending.value }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForDisplayGLZ(glzDecoder) { $0.reservedImages == 0 }
+        await secondGate.release()
+        _ = try await secondBlocker.value
+        #expect(await executor.diagnosticsSnapshot().currentRetainedBytes == 0)
+        await channel.close()
+    }
+
     @Test func fullBatchOwnerSizeEnforcesCacheMutationTemporaryBudget() async throws {
         let imageID: UInt64 = 0xb102
         let drawBody = drawCompressedCopyBody(
@@ -4573,7 +4691,8 @@ struct DisplayChannelTests {
 
     private func retainedOwnerCodecChannel(
         batch: Data,
-        executor: SpiceCodecTaskExecutor
+        executor: SpiceCodecTaskExecutor,
+        glzDecoder: SpiceGLZDecoder? = nil
     ) async throws -> DisplayChannel {
         let transport = FakeTransport(inbound: try [
             encodeFull(
@@ -4598,8 +4717,37 @@ struct DisplayChannelTests {
             ),
             codecTaskExecutor: executor,
             jpegDecoder: StubJPEGDecoder(result: .success(decoded)),
+            glzDecoder: glzDecoder,
             paletteLZDecoder: StubPaletteLZDecoder(result: .success(decoded))
         )
+    }
+
+    private func glzProgramQueueBase(payload: Data) async throws -> Int {
+        let executor = SpiceCodecTaskExecutor(limits: .init(maximumConcurrentJobs: 1))
+        let gate = DisplayCodecExecutorGate()
+        let blocker = Task {
+            try await executor.execute(retainedByteCount: 1) { await gate.run() }
+        }
+        await gate.waitUntilStarted()
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let decode = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 2, height: 1),
+                payload: payload,
+                retainedOwnerByteCount: 0
+            )
+        }
+        await waitForDisplayCodecExecutor(executor) { $0.queuedJobs == 1 }
+        let result = await executor.diagnosticsSnapshot().queuedRetainedBytes
+        decode.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) { try await decode.value }
+        await waitForDisplayCodecExecutor(executor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForDisplayGLZ(decoder) { $0.reservedImages == 0 }
+        await gate.release()
+        _ = try await blocker.value
+        return result
     }
 
     private func encodeFullList(
@@ -4775,6 +4923,17 @@ private func waitForDisplayCodecExecutor(
         await Task.yield()
     }
     Issue.record("display codec executor diagnostics did not reach expected state")
+}
+
+private func waitForDisplayGLZ(
+    _ decoder: SpiceGLZDecoder,
+    where predicate: (SpiceGLZDecoderDiagnostics) -> Bool
+) async {
+    for _ in 0..<10_000 {
+        if predicate(await decoder.diagnosticsSnapshot()) { return }
+        await Task.yield()
+    }
+    Issue.record("display GLZ diagnostics did not reach expected state")
 }
 
 private actor DisplayCodecExecutorGate {
