@@ -316,12 +316,15 @@ The LZ RGB family is locally closed.
   sources are decoded once per command, even when several clip rectangles are
   present. Standalone package-level Display channels own and close their private
   fallback cache, while one channel cannot close an injected Session cache.
-- `CACHE_ME` and `CACHE_REPLACE_ME` acquire a noncopyable reservation only after
-  decode and before Surface mutation. Entry, committed-byte, and actual pending
-  bitmap-byte capacity are admitted up front; consuming commit cannot throw
-  after Surface success, and failure consumes an abort without publishing cache
-  state. Outcome counters distinguish committed, concurrently invalidated, and
-  teardown-discarded reservations.
+- `CACHE_ME` and `CACHE_REPLACE_ME` register a noncopyable mutation before
+  asynchronous source resolution or decode, stage the decoded bitmap afterward,
+  and consume it through commit or abort around the Surface transaction. This
+  makes invalidation during decode visible before late cache publication while
+  preserving the rule that commit cannot throw after Surface success. Same-ID
+  mutations acquire their active slot through a bounded, cancellation-safe FIFO
+  rather than failing merely because another Display is decoding the same ID.
+  Outcome counters distinguish committed, concurrently invalidated, and
+  teardown-discarded mutations.
 - `CACHE_REPLACE_ME` accepts only a lossless source replacing a committed lossy
   representation. `FROM_CACHE_LOSSLESS` suspends across Display channels until
   that replacement commits. Missing references likewise resolve asynchronously;
@@ -329,10 +332,13 @@ The LZ RGB family is locally closed.
   cache byte budget in aggregate. Clear and Session close resume every waiter
   exactly once.
 - Repeated `CACHE_ME` and targeted invalidation retain compatible reference-count
-  semantics. Invalidation marks only currently pending bounded reservations, so
-  earlier work cannot resurrect invalidated state and fresh or nonexistent IDs
-  leave no retained tombstones. Dimension disagreement, invalid flags, decode
-  failure, and capacity overflow fail without publishing cache state.
+  semantics. Invalidation marks all currently active and queued bounded
+  mutations, so earlier work cannot resurrect invalidated state and fresh or
+  nonexistent IDs leave no retained tombstones. Active/queued counts,
+  mutation-retained message bytes, staged bitmap bytes, and resolver-retained
+  bytes all have hard limits. Cancellation, clear, and Session close resume and
+  release queued work exactly once. Dimension disagreement, invalid flags,
+  decode failure, and capacity overflow fail without publishing cache state.
 - Display `INVAL_LIST` 105 invalidates the Session entry for every Display.
   `INVAL_ALL_PIXMAPS` 106 first observes the AIP-11 processed-serial requirements,
   then clears the Session cache. RESET 103 preserves that image cache while

@@ -14,8 +14,8 @@ rendering, and ownership work is tracked in the
 - Cross-channel serial barriers that advance after physical-message processing
   and terminate dependent waiters on failure, cancellation, or close
 - Basic desktop Display, Cursor, and Inputs paths
-- JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG, and bounded per-Display image-cache
-  behavior; cross-Display Session sharing remains open in AIP-12
+- JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG, and bounded Session-owned image-cache
+  behavior shared across Display channels
 - IOSurface and Metal presentation with a CPU frame fallback
 - Playback, Record, Agent clipboard, file transfer, and monitor configuration
 - Smartcard, USB redirection, WebDAV, and migration state machines

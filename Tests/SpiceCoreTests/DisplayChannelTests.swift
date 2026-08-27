@@ -1813,7 +1813,7 @@ struct DisplayChannelTests {
 
     @Test func closingDisplayKeepsInjectedSessionImageCacheOpen() async throws {
         let imageID: UInt64 = 0xa101
-        let imageCache = DisplayImageCache(maximumEntries: 2, maximumBytes: 16)
+        let imageCache = DisplayImageCache(maximumEntries: 2, maximumBytes: 1_024)
         let transport = FakeTransport(inbound: try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
                 surfaceID: 1,
@@ -2063,6 +2063,231 @@ struct DisplayChannelTests {
         ]))
     }
 
+    @Test func invalidationDuringDecodePreventsLateCachePublication() async throws {
+        let imageID: UInt64 = 0xa102
+        let imageCache = DisplayImageCache()
+        let decoder = GatedPatternJPEGDecoder()
+        let producerTransport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 105,
+                payload: Data([1]),
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+        ].map(Result.success))
+        let invalidatorTransport = FakeTransport(inbound: [
+            .success(encodeMini(id: 105, body: invalidateImagesBody([imageID]))),
+        ])
+        try await producerTransport.connect()
+        try await invalidatorTransport.connect()
+        let producer = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: producerTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            jpegDecoder: decoder
+        )
+        let invalidator = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 1),
+                transport: invalidatorTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache
+        )
+
+        _ = try await producer.processNext()
+        let cacheDraw = Task { try await producer.processNext() }
+        await decoder.waitUntilFirstDecodeStarts()
+        _ = try await invalidator.processNext()
+        #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
+
+        await decoder.releaseFirstDecode()
+        _ = try await cacheDraw.value
+
+        #expect(try await producer.snapshot(surfaceID: 1).pixels == Data([
+            10, 0, 0, 255, 20, 0, 0, 255,
+        ]))
+        let cacheDiagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(cacheDiagnostics.entryCount == 0)
+        #expect(cacheDiagnostics.committedBytes == 0)
+        #expect(cacheDiagnostics.pendingReservationCount == 0)
+        #expect(cacheDiagnostics.pendingInvalidatedReservationCount == 0)
+        let producerDiagnostics = await producer.diagnosticsSnapshot()
+        #expect(producerDiagnostics.imageCacheCommittedMutations == 0)
+        #expect(producerDiagnostics.imageCacheInvalidatedMutations == 1)
+    }
+
+    @Test func overlappingCacheMeMutationsDecodeAndCommitInFIFOOrder() async throws {
+        let imageID: UInt64 = 0xa103
+        let imageCache = DisplayImageCache()
+        let firstDecoder = GatedPatternJPEGDecoder()
+        let secondDecoder = GatedPatternJPEGDecoder()
+        let first = try await makeGatedJPEGCacheDisplay(
+            channelID: 0,
+            imageID: imageID,
+            payload: Data([1]),
+            imageCache: imageCache,
+            decoder: firstDecoder
+        )
+        let second = try await makeGatedJPEGCacheDisplay(
+            channelID: 1,
+            imageID: imageID,
+            payload: Data([2]),
+            imageCache: imageCache,
+            decoder: secondDecoder
+        )
+
+        let firstDraw = Task { try await first.processNext() }
+        await firstDecoder.waitUntilFirstDecodeStarts()
+        let secondDraw = Task { try await second.processNext() }
+        await expectDisplayCacheDiagnostics(imageCache) {
+            $0.pendingReservationCount == 1
+                && $0.queuedMutationCount == 1
+                && $0.pendingMutationCount == 2
+        }
+        #expect(await secondDecoder.payloads.isEmpty)
+
+        await firstDecoder.releaseFirstDecode()
+        _ = try await firstDraw.value
+        await secondDecoder.waitUntilFirstDecodeStarts()
+        #expect(await imageCache.diagnosticsSnapshot().referenceCounts == [imageID: 1])
+
+        await secondDecoder.releaseFirstDecode()
+        _ = try await secondDraw.value
+
+        let diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 1)
+        #expect(diagnostics.referenceCounts == [imageID: 2])
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        #expect(try await imageCache.resolve(id: imageID, requirement: .any).pixels == Data([
+            50, 0, 0, 0, 60, 0, 0, 0,
+        ]))
+        #expect(try await first.snapshot(surfaceID: 1).pixels == Data([
+            10, 0, 0, 255, 20, 0, 0, 255,
+        ]))
+        #expect(try await second.snapshot(surfaceID: 1).pixels == Data([
+            50, 0, 0, 255, 60, 0, 0, 255,
+        ]))
+    }
+
+    @Test func invalidationMarksActiveAndQueuedCacheMutations() async throws {
+        let imageID: UInt64 = 0xa104
+        let imageCache = DisplayImageCache()
+        let firstDecoder = GatedPatternJPEGDecoder()
+        let secondDecoder = GatedPatternJPEGDecoder()
+        let first = try await makeGatedJPEGCacheDisplay(
+            channelID: 0,
+            imageID: imageID,
+            payload: Data([1]),
+            imageCache: imageCache,
+            decoder: firstDecoder
+        )
+        let second = try await makeGatedJPEGCacheDisplay(
+            channelID: 1,
+            imageID: imageID,
+            payload: Data([2]),
+            imageCache: imageCache,
+            decoder: secondDecoder
+        )
+        let invalidatorTransport = FakeTransport(inbound: [
+            .success(encodeMini(id: 105, body: invalidateImagesBody([imageID]))),
+        ])
+        try await invalidatorTransport.connect()
+        let invalidator = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 2),
+                transport: invalidatorTransport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache
+        )
+
+        let firstDraw = Task { try await first.processNext() }
+        await firstDecoder.waitUntilFirstDecodeStarts()
+        let secondDraw = Task { try await second.processNext() }
+        await expectDisplayCacheDiagnostics(imageCache) { $0.queuedMutationCount == 1 }
+        #expect(await secondDecoder.payloads.isEmpty)
+
+        _ = try await invalidator.processNext()
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 2)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 2)
+
+        await firstDecoder.releaseFirstDecode()
+        _ = try await firstDraw.value
+        await secondDecoder.waitUntilFirstDecodeStarts()
+        await secondDecoder.releaseFirstDecode()
+        _ = try await secondDraw.value
+
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.committedBytes == 0)
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.pendingInvalidatedReservationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(await first.diagnosticsSnapshot().imageCacheInvalidatedMutations == 1)
+        #expect(await second.diagnosticsSnapshot().imageCacheInvalidatedMutations == 1)
+    }
+
+    @Test func cancellingQueuedCacheMutationReleasesItsQueueState() async throws {
+        let imageID: UInt64 = 0xa105
+        let imageCache = DisplayImageCache()
+        let firstDecoder = GatedPatternJPEGDecoder()
+        let secondDecoder = GatedPatternJPEGDecoder()
+        let first = try await makeGatedJPEGCacheDisplay(
+            channelID: 0,
+            imageID: imageID,
+            payload: Data([1]),
+            imageCache: imageCache,
+            decoder: firstDecoder
+        )
+        let second = try await makeGatedJPEGCacheDisplay(
+            channelID: 1,
+            imageID: imageID,
+            payload: Data([2]),
+            imageCache: imageCache,
+            decoder: secondDecoder
+        )
+
+        let firstDraw = Task { try await first.processNext() }
+        await firstDecoder.waitUntilFirstDecodeStarts()
+        let activeDiagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(activeDiagnostics.pendingMutationCount == 1)
+        let secondDraw = Task { try await second.processNext() }
+        await expectDisplayCacheDiagnostics(imageCache) { $0.queuedMutationCount == 1 }
+
+        secondDraw.cancel()
+        await #expect(throws: ChannelError.transport(.cancelled)) {
+            try await secondDraw.value
+        }
+        let afterCancellation = await imageCache.diagnosticsSnapshot()
+        #expect(afterCancellation.pendingMutationCount == 1)
+        #expect(afterCancellation.queuedMutationCount == 0)
+        #expect(afterCancellation.mutationRetainedBytes == activeDiagnostics.mutationRetainedBytes)
+        #expect(await secondDecoder.payloads.isEmpty)
+
+        await firstDecoder.releaseFirstDecode()
+        _ = try await firstDraw.value
+        let completed = await imageCache.diagnosticsSnapshot()
+        #expect(completed.pendingMutationCount == 0)
+        #expect(completed.queuedMutationCount == 0)
+        #expect(completed.mutationRetainedBytes == 0)
+        #expect(completed.reservedBytes == 0)
+    }
+
     @Test func invalidationListFromOneDisplayRemovesAnotherDisplaysImage() async throws {
         let imageID: UInt64 = 0xa004
         let imageCache = DisplayImageCache()
@@ -2216,7 +2441,7 @@ struct DisplayChannelTests {
     }
 
     @Test func failedSurfaceMutationAbortsSharedCacheReservationAtomically() async throws {
-        let imageCache = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+        let imageCache = DisplayImageCache(maximumEntries: 1, maximumBytes: 1_024)
         let failingTransport = FakeTransport(inbound: [
             .success(encodeMini(id: 304, body: drawCompressedCopyBody(
                 imageType: 101,
@@ -3504,6 +3729,42 @@ struct DisplayChannelTests {
         return encodeMini(id: id, body: body.data)
     }
 
+    private func makeGatedJPEGCacheDisplay(
+        channelID: UInt8,
+        imageID: UInt64,
+        payload: Data,
+        imageCache: DisplayImageCache,
+        decoder: GatedPatternJPEGDecoder
+    ) async throws -> DisplayChannel {
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 105,
+                payload: payload,
+                descriptorID: imageID,
+                descriptorFlags: 0x01
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: channelID),
+                transport: transport,
+                headerMode: .mini
+            ),
+            imageCache: imageCache,
+            jpegDecoder: decoder
+        )
+        _ = try await channel.processNext()
+        return channel
+    }
+
     private func encodeMini(id: UInt16, body: Data) -> Data {
         var writer = ByteWriter()
         writer.writeUInt16LE(id)
@@ -3529,6 +3790,17 @@ struct DisplayChannelTests {
             revision: revision
         ))
     }
+}
+
+private func expectDisplayCacheDiagnostics(
+    _ cache: DisplayImageCache,
+    where predicate: (DisplayImageCacheDiagnostics) -> Bool
+) async {
+    for _ in 0..<1_000 {
+        if predicate(await cache.diagnosticsSnapshot()) { return }
+        await Task.yield()
+    }
+    Issue.record("display cache diagnostics did not reach expected state")
 }
 
 private actor DisplayProcessProbe {

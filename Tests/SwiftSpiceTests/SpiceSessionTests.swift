@@ -630,11 +630,53 @@ struct SpiceSessionTests {
         }
         #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
 
+        let activeMutation = try await imageCache.begin(
+            id: 0xc002,
+            lossy: false,
+            mode: .cache,
+            retainedByteCount: 3
+        )
+        let queuedMutation = Task { () -> Result<Void, ChannelError> in
+            do {
+                let mutation = try await imageCache.begin(
+                    id: 0xc002,
+                    lossy: false,
+                    mode: .cache,
+                    retainedByteCount: 5
+                )
+                await imageCache.abort(mutation)
+                return .success(())
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().queuedMutationCount == 1 { break }
+            await Task.yield()
+        }
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 2)
+        #expect(diagnostics.pendingReservationCount == 1)
+        #expect(diagnostics.queuedMutationCount == 1)
+        #expect(diagnostics.mutationRetainedBytes == 8)
+
         await session.disconnect()
 
-        let diagnostics = await imageCache.diagnosticsSnapshot()
+        switch await queuedMutation.value {
+        case .success:
+            Issue.record("queued cache mutation unexpectedly survived Session disconnect")
+        case let .failure(error):
+            #expect(error == .transport(.connectionClosed))
+        }
+        #expect(await imageCache.commit(activeMutation) == .discarded)
+        diagnostics = await imageCache.diagnosticsSnapshot()
         #expect(diagnostics.entryCount == 0)
         #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
         #expect(diagnostics.pendingWaiterCount == 0)
         #expect(diagnostics.retainedBytes == 0)
         await #expect(throws: ChannelError.transport(.connectionClosed)) {

@@ -342,6 +342,18 @@ struct DisplayImageCacheTests {
         #expect(diagnostics.pendingInvalidatedReservationCount == 0)
         #expect(diagnostics.reservedBytes == 0)
 
+        let freshReservation = try await targeted.reserve(
+            id: 40,
+            bitmap: cacheBitmap([9, 10, 11, 12]),
+            lossy: false,
+            mode: .cache
+        )
+        #expect(await targeted.commit(freshReservation) == .committed)
+        #expect(
+            try await targeted.resolve(id: 40, requirement: .any)
+                == cacheBitmap([9, 10, 11, 12])
+        )
+
         let global = DisplayImageCache(maximumEntries: 1, maximumBytes: 4)
         let globalReservation = try await global.reserve(
             id: 41,
@@ -409,63 +421,308 @@ struct DisplayImageCacheTests {
         #expect(await closed.commit(closedReservation) == .discarded)
     }
 
-    @Test func pendingReservationsAreExclusivePerIDAndBoundedByActualBytes() async throws {
-        let cache = DisplayImageCache(maximumEntries: 3, maximumBytes: 8)
-        let first = try await cache.reserve(
+    @Test func clearAndCloseResumeQueuedMutationsExactlyOnce() async throws {
+        let cleared = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+        let clearActive = try await cleared.begin(
+            id: 60,
+            lossy: false,
+            mode: .cache,
+            retainedByteCount: 1
+        )
+        let clearQueued = Task { () -> Result<Bool, ChannelError> in
+            do {
+                let mutation = try await cleared.begin(
+                    id: 60,
+                    lossy: false,
+                    mode: .cache,
+                    retainedByteCount: 2
+                )
+                await cleared.abort(mutation)
+                return .success(true)
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        await expectCacheDiagnostics(cleared) { $0.queuedMutationCount == 1 }
+        await cleared.clear()
+        #expect(
+            await clearQueued.value
+                == .failure(.protocolViolation("image cache cleared"))
+        )
+        clearQueued.cancel()
+        await Task.yield()
+        #expect(await cleared.commit(clearActive) == .discarded)
+        var diagnostics = await cleared.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+
+        let closed = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+        let closeActive = try await closed.begin(
+            id: 61,
+            lossy: false,
+            mode: .cache,
+            retainedByteCount: 1
+        )
+        let closeQueued = Task { () -> Result<Bool, ChannelError> in
+            do {
+                let mutation = try await closed.begin(
+                    id: 61,
+                    lossy: false,
+                    mode: .cache,
+                    retainedByteCount: 2
+                )
+                await closed.abort(mutation)
+                return .success(true)
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        await expectCacheDiagnostics(closed) { $0.queuedMutationCount == 1 }
+        await closed.close()
+        #expect(await closeQueued.value == .failure(.transport(.connectionClosed)))
+        closeQueued.cancel()
+        await Task.yield()
+        #expect(await closed.commit(closeActive) == .discarded)
+        diagnostics = await closed.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+    }
+
+    @Test func mutationQueueAndTemporaryBytesHaveHardLimits() async throws {
+        let byteLimited = DisplayImageCache(
+            maximumEntries: 2,
+            maximumBytes: 8,
+            maximumQueuedMutations: 2
+        )
+        let active = try await byteLimited.begin(
+            id: 70,
+            lossy: false,
+            mode: .cache,
+            retainedByteCount: 3
+        )
+        #expect(
+            try await byteLimited.stage(
+                active,
+                bitmap: cacheBitmap([1, 2, 3, 4])
+            ) == .staged
+        )
+        let queued = Task { () -> Result<Bool, ChannelError> in
+            do {
+                let mutation = try await byteLimited.begin(
+                    id: 70,
+                    lossy: false,
+                    mode: .cache,
+                    retainedByteCount: 1
+                )
+                await byteLimited.abort(mutation)
+                return .success(true)
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        await expectCacheDiagnostics(byteLimited) { $0.queuedMutationCount == 1 }
+        let atByteLimit = await byteLimited.diagnosticsSnapshot()
+        #expect(atByteLimit.pendingMutationCount == 2)
+        #expect(atByteLimit.mutationRetainedBytes == 4)
+        #expect(atByteLimit.reservedBytes == 4)
+        await #expect(throws: ChannelError.self) {
+            _ = try await byteLimited.begin(
+                id: 71,
+                lossy: false,
+                mode: .cache,
+                retainedByteCount: 1
+            )
+        }
+        #expect(await byteLimited.diagnosticsSnapshot() == atByteLimit)
+        queued.cancel()
+        #expect(await queued.value == .failure(.transport(.cancelled)))
+        await byteLimited.abort(active)
+        var diagnostics = await byteLimited.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+
+        let queueLimited = DisplayImageCache(
+            maximumEntries: 1,
+            maximumBytes: 64,
+            maximumQueuedMutations: 1
+        )
+        let queueActive = try await queueLimited.begin(
+            id: 72,
+            lossy: false,
+            mode: .cache
+        )
+        let onlyQueued = Task { () -> Result<Bool, ChannelError> in
+            do {
+                let mutation = try await queueLimited.begin(
+                    id: 72,
+                    lossy: false,
+                    mode: .cache
+                )
+                await queueLimited.abort(mutation)
+                return .success(true)
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        await expectCacheDiagnostics(queueLimited) { $0.queuedMutationCount == 1 }
+        let atQueueLimit = await queueLimited.diagnosticsSnapshot()
+        await #expect(throws: ChannelError.self) {
+            _ = try await queueLimited.begin(
+                id: 72,
+                lossy: false,
+                mode: .cache
+            )
+        }
+        #expect(await queueLimited.diagnosticsSnapshot() == atQueueLimit)
+        onlyQueued.cancel()
+        #expect(await onlyQueued.value == .failure(.transport(.cancelled)))
+        await queueLimited.abort(queueActive)
+        diagnostics = await queueLimited.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+    }
+
+    @Test func immediateFIFOPromotionNeverLosesQueuedContinuation() async throws {
+        let cache = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+
+        for iteration in 0..<1_000 {
+            let active = try await cache.begin(
+                id: 80,
+                lossy: false,
+                mode: .cache,
+                retainedByteCount: 1
+            )
+            let queued = Task { () -> Result<Bool, ChannelError> in
+                do {
+                    let mutation = try await cache.begin(
+                        id: 80,
+                        lossy: false,
+                        mode: .cache,
+                        retainedByteCount: 1
+                    )
+                    await cache.abort(mutation)
+                    return .success(true)
+                } catch let error as ChannelError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.invalidState)
+                }
+            }
+
+            await Task.yield()
+            await cache.abort(active)
+            #expect(await queued.value == .success(true), "iteration \(iteration)")
+
+            let diagnostics = await cache.diagnosticsSnapshot()
+            #expect(diagnostics.pendingMutationCount == 0, "iteration \(iteration)")
+            #expect(diagnostics.pendingReservationCount == 0, "iteration \(iteration)")
+            #expect(diagnostics.queuedMutationCount == 0, "iteration \(iteration)")
+            #expect(diagnostics.mutationRetainedBytes == 0, "iteration \(iteration)")
+            #expect(diagnostics.reservedBytes == 0, "iteration \(iteration)")
+        }
+    }
+
+    @Test func pendingReservationsQueuePerIDAndRemainBoundedByActualBytes() async throws {
+        let fifoCache = DisplayImageCache(maximumEntries: 1, maximumBytes: 8)
+        let first = try await fifoCache.reserve(
             id: 30,
             bitmap: cacheBitmap([1, 2, 3, 4]),
             lossy: false,
             mode: .cache
         )
-        let afterFirst = await cache.diagnosticsSnapshot()
+        let afterFirst = await fifoCache.diagnosticsSnapshot()
         #expect(afterFirst.pendingReservationCount == 1)
         #expect(afterFirst.reservedBytes == 4)
 
-        await #expect(throws: ChannelError.self) {
-            _ = try await cache.reserve(
-                id: 30,
-                bitmap: cacheBitmap([5, 6, 7, 8]),
-                lossy: false,
-                mode: .cache
-            )
+        let queued = Task { () -> Result<DisplayImageCacheCommitOutcome, ChannelError> in
+            do {
+                let mutation = try await fifoCache.begin(
+                    id: 30,
+                    lossy: false,
+                    mode: .cache
+                )
+                _ = try await fifoCache.stage(
+                    mutation,
+                    bitmap: cacheBitmap([5, 6, 7, 8])
+                )
+                return .success(await fifoCache.commit(mutation))
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
         }
-        #expect(await cache.diagnosticsSnapshot() == afterFirst)
+        await expectCacheDiagnostics(fifoCache) { $0.queuedMutationCount == 1 }
+        var diagnostics = await fifoCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 2)
+        #expect(diagnostics.pendingReservationCount == 1)
+        #expect(diagnostics.queuedMutationCount == 1)
+        #expect(diagnostics.reservedBytes == 4)
 
-        let second = try await cache.reserve(
+        await fifoCache.abort(first)
+        #expect(await queued.value == .success(.committed))
+        diagnostics = await fifoCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 1)
+        #expect(diagnostics.referenceCounts == [30: 1])
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.reservedBytes == 0)
+
+        let capacityCache = DisplayImageCache(maximumEntries: 3, maximumBytes: 8)
+        let capacityFirst = try await capacityCache.reserve(
             id: 31,
             bitmap: cacheBitmap([9, 10, 11, 12]),
             lossy: false,
             mode: .cache
         )
-        let atBudget = await cache.diagnosticsSnapshot()
+        let capacitySecond = try await capacityCache.reserve(
+            id: 32,
+            bitmap: cacheBitmap([13, 14, 15, 16]),
+            lossy: false,
+            mode: .cache
+        )
+        let atBudget = await capacityCache.diagnosticsSnapshot()
         #expect(atBudget.pendingReservationCount == 2)
         #expect(atBudget.reservedBytes == 8)
         await #expect(throws: ChannelError.self) {
-            _ = try await cache.reserve(
-                id: 32,
-                bitmap: cacheBitmap([13, 14, 15, 16]),
+            _ = try await capacityCache.reserve(
+                id: 33,
+                bitmap: cacheBitmap([17, 18, 19, 20]),
                 lossy: false,
                 mode: .cache
             )
         }
-        #expect(await cache.diagnosticsSnapshot() == atBudget)
+        #expect(await capacityCache.diagnosticsSnapshot() == atBudget)
 
-        await cache.abort(first)
-        #expect(await cache.diagnosticsSnapshot().reservedBytes == 4)
-        #expect(await cache.commit(second) == .committed)
-        var diagnostics = await cache.diagnosticsSnapshot()
+        await capacityCache.abort(capacityFirst)
+        #expect(await capacityCache.diagnosticsSnapshot().reservedBytes == 4)
+        #expect(await capacityCache.commit(capacitySecond) == .committed)
+        diagnostics = await capacityCache.diagnosticsSnapshot()
         #expect(diagnostics.reservedBytes == 0)
         #expect(diagnostics.committedBytes == 4)
 
-        let returnedBudget = try await cache.reserve(
-            id: 32,
-            bitmap: cacheBitmap([17, 18, 19, 20]),
+        let returnedBudget = try await capacityCache.reserve(
+            id: 33,
+            bitmap: cacheBitmap([21, 22, 23, 24]),
             lossy: false,
             mode: .cache
         )
-        #expect(await cache.diagnosticsSnapshot().reservedBytes == 4)
-        await cache.abort(returnedBudget)
-        diagnostics = await cache.diagnosticsSnapshot()
+        #expect(await capacityCache.diagnosticsSnapshot().reservedBytes == 4)
+        await capacityCache.abort(returnedBudget)
+        diagnostics = await capacityCache.diagnosticsSnapshot()
         #expect(diagnostics.reservedBytes == 0)
         #expect(diagnostics.committedBytes == 4)
     }

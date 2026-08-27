@@ -60,11 +60,11 @@ package actor DisplayChannel: SpiceManagedChannel {
         case surface(UInt32)
     }
 
-    private struct ImageCacheMutationPlan: Sendable {
+    private struct ImageCacheMutationIntent: Sendable {
         let id: UInt64
-        let bitmap: RawBitmap
         let lossy: Bool
         let mode: DisplayImageCacheReservationMode
+        let retainedByteCount: Int
     }
 
     private struct VideoStream: Sendable {
@@ -1189,48 +1189,23 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation("scaled DRAW_COPY is not implemented")
         }
 
-        let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
-        let cacheMutation = try cacheMutationPlan(
-            image: command.sourceImage,
-            resolvedSource: resolvedSource
-        )
-
-        if case let .bitmap(bitmap) = resolvedSource {
-            guard sourceArea.x >= 0, sourceArea.y >= 0,
-                  sourceArea.x + sourceArea.width <= bitmap.width,
-                  sourceArea.y + sourceArea.height <= bitmap.height
-            else {
-                throw .protocolViolation("DRAW_COPY source area exceeds image")
-            }
-        }
-
-        if let cacheMutation {
-            let reservation = try await imageCache.reserve(
-                id: cacheMutation.id,
-                bitmap: cacheMutation.bitmap,
-                lossy: cacheMutation.lossy,
-                mode: cacheMutation.mode
+        if let mutationIntent = try cacheMutationIntent(image: command.sourceImage) {
+            let mutation = try await imageCache.begin(
+                id: mutationIntent.id,
+                lossy: mutationIntent.lossy,
+                mode: mutationIntent.mode,
+                retainedByteCount: mutationIntent.retainedByteCount
             )
-            do {
-                let surfaceRevision = try await drawResolvedSource(
-                    resolvedSource,
-                    command: command,
-                    base: base,
-                    sourceArea: sourceArea
-                )
-                if let paletteToCache {
-                    palettes[paletteToCache.uniqueID] = paletteToCache
-                }
-                recordImageCacheCommit(
-                    await imageCache.commit(consume reservation)
-                )
-                return surfaceRevision
-            } catch {
-                await imageCache.abort(consume reservation)
-                throw error
-            }
+            return try await execute(
+                command,
+                base: base,
+                sourceArea: sourceArea,
+                mutation: consume mutation
+            )
         }
 
+        let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
+        try validateSourceArea(sourceArea, for: resolvedSource)
         let surfaceRevision = try await drawResolvedSource(
             resolvedSource,
             command: command,
@@ -1241,6 +1216,57 @@ package actor DisplayChannel: SpiceManagedChannel {
             palettes[paletteToCache.uniqueID] = paletteToCache
         }
         return surfaceRevision
+    }
+
+    private func execute(
+        _ command: SpiceDisplayDrawCopy,
+        base: PixelRect,
+        sourceArea: PixelRect,
+        mutation: consuming DisplayImageCacheMutation
+    ) async throws(ChannelError) -> SurfaceRevision? {
+        do {
+            let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
+            try validateSourceArea(sourceArea, for: resolvedSource)
+            guard case let .bitmap(bitmap) = resolvedSource else {
+                throw ChannelError.protocolViolation(
+                    "only decoded bitmaps can enter shared image cache"
+                )
+            }
+            _ = try await imageCache.stage(mutation, bitmap: bitmap)
+            let surfaceRevision = try await drawResolvedSource(
+                resolvedSource,
+                command: command,
+                base: base,
+                sourceArea: sourceArea
+            )
+            if let paletteToCache {
+                palettes[paletteToCache.uniqueID] = paletteToCache
+            }
+            recordImageCacheCommit(
+                await imageCache.commit(consume mutation)
+            )
+            return surfaceRevision
+        } catch let error as ChannelError {
+            await imageCache.abort(consume mutation)
+            throw error
+        } catch {
+            await imageCache.abort(consume mutation)
+            assertionFailure("unexpected DRAW_COPY cache mutation error: \(error)")
+            throw .invalidState
+        }
+    }
+
+    private func validateSourceArea(
+        _ sourceArea: PixelRect,
+        for resolvedSource: ResolvedSource
+    ) throws(ChannelError) {
+        guard case let .bitmap(bitmap) = resolvedSource else { return }
+        guard sourceArea.x >= 0, sourceArea.y >= 0,
+              sourceArea.x + sourceArea.width <= bitmap.width,
+              sourceArea.y + sourceArea.height <= bitmap.height
+        else {
+            throw .protocolViolation("DRAW_COPY source area exceeds image")
+        }
     }
 
     private func recordImageCacheCommit(_ outcome: DisplayImageCacheCommitOutcome) {
@@ -1445,10 +1471,9 @@ package actor DisplayChannel: SpiceManagedChannel {
         )
     }
 
-    private func cacheMutationPlan(
-        image: SpiceImage,
-        resolvedSource: ResolvedSource
-    ) throws(ChannelError) -> ImageCacheMutationPlan? {
+    private func cacheMutationIntent(
+        image: SpiceImage
+    ) throws(ChannelError) -> ImageCacheMutationIntent? {
         let (descriptor, lossy): (SpiceImageDescriptor, Bool)
         switch image {
         case let .bitmap(value, _), let .quic(value, _), let .lzRGB(value, _),
@@ -1471,25 +1496,28 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard cacheMe || replaceMe else {
             return nil
         }
-        guard case let .bitmap(bitmap) = resolvedSource else {
-            throw .protocolViolation("only decoded bitmaps can enter shared image cache")
+        let retainedByteCount: Int
+        if let currentMessageRetainedByteCount {
+            retainedByteCount = currentMessageRetainedByteCount
+        } else {
+            retainedByteCount = try imageRetainedByteCount(descriptor: descriptor)
         }
         guard !lossy else {
             guard cacheMe else {
                 throw .protocolViolation("CACHE_REPLACE_ME source must be lossless")
             }
-            return ImageCacheMutationPlan(
+            return ImageCacheMutationIntent(
                 id: descriptor.id,
-                bitmap: bitmap,
                 lossy: true,
-                mode: .cache
+                mode: .cache,
+                retainedByteCount: retainedByteCount
             )
         }
-        return ImageCacheMutationPlan(
+        return ImageCacheMutationIntent(
             id: descriptor.id,
-            bitmap: bitmap,
             lossy: false,
-            mode: cacheMe ? .cache : .replace
+            mode: cacheMe ? .cache : .replace,
+            retainedByteCount: retainedByteCount
         )
     }
 
