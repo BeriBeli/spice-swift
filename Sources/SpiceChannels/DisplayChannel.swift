@@ -108,6 +108,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let ownsImageCache: Bool
     private let jpegDecoder: any SpiceImageDecoder
     private let lzDecoder: any SpiceImageDecoder
+    private let codecTaskExecutor: SpiceCodecTaskExecutor
     private let glzDecoder: SpiceGLZDecoder
     private let zlibInflator: SpiceZlibInflator
     private let paletteLZDecoder: any SpicePaletteImageDecoder
@@ -150,9 +151,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         connection: ChannelConnection,
         surfaces: SurfaceStore = SurfaceStore(),
         imageCache: DisplayImageCache? = nil,
+        codecTaskExecutor: SpiceCodecTaskExecutor = SpiceCodecTaskExecutor(),
         jpegDecoder: any SpiceImageDecoder = SpiceJPEGDecoder(),
         lzDecoder: any SpiceImageDecoder = SpiceLZDecoder(),
-        glzDecoder: SpiceGLZDecoder = SpiceGLZDecoder(),
+        glzDecoder: SpiceGLZDecoder? = nil,
         zlibInflator: SpiceZlibInflator = SpiceZlibInflator(),
         paletteLZDecoder: any SpicePaletteImageDecoder = SpiceLZDecoder(),
         quicDecoder: any SpiceImageDecoder = SpiceQUICDecoder(),
@@ -180,7 +182,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
         self.jpegDecoder = jpegDecoder
         self.lzDecoder = lzDecoder
-        self.glzDecoder = glzDecoder
+        self.codecTaskExecutor = codecTaskExecutor
+        self.glzDecoder = glzDecoder ?? SpiceGLZDecoder(executor: codecTaskExecutor)
         self.zlibInflator = zlibInflator
         self.paletteLZDecoder = paletteLZDecoder
         self.quicDecoder = quicDecoder
@@ -1413,18 +1416,23 @@ package actor DisplayChannel: SpiceManagedChannel {
                 descriptor: descriptor,
                 data: data.data,
                 decoder: glzDecoder,
-                name: "GLZ"
+                name: "GLZ",
+                usesCodecExecutor: false
             )), nil)
         case let .zlibGLZ(descriptor, data):
             guard let glzDataSize = Int(exactly: data.glzDataSize) else {
                 throw .protocolViolation("invalid ZLIB GLZ output size")
             }
             let glzPayload: Data
+            let inflator = zlibInflator
             do {
-                glzPayload = try await zlibInflator.inflate(
-                    payload: data.data,
-                    exactOutputByteCount: glzDataSize
-                )
+                glzPayload = try await executeCodecWork(retainedByteCount: data.data.count) {
+                    () async throws(SpiceCodecError) -> Data in
+                    try await inflator.inflate(
+                        payload: data.data,
+                        exactOutputByteCount: glzDataSize
+                    )
+                }
             } catch let error {
                 throw .protocolViolation("ZLIB GLZ inflate failed: \(error.description)")
             }
@@ -1432,7 +1440,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                 descriptor: descriptor,
                 data: glzPayload,
                 decoder: glzDecoder,
-                name: "ZLIB GLZ"
+                name: "ZLIB GLZ",
+                usesCodecExecutor: false
             )), nil)
         case let .lzPalette(descriptor, data):
             guard let width = Int(exactly: descriptor.width),
@@ -1442,12 +1451,16 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
             let paletteResolution = try resolvePalette(data)
             let decoded: SpiceDecodedImage
+            let paletteDecoder = paletteLZDecoder
             do {
-                decoded = try await paletteLZDecoder.decodePalette(
-                    descriptor: SpiceCodecImageDescriptor(width: width, height: height),
-                    payload: data.data,
-                    palette: paletteResolution.palette
-                )
+                decoded = try await executeCodecWork(retainedByteCount: data.data.count) {
+                    () async throws(SpiceCodecError) -> SpiceDecodedImage in
+                    try await paletteDecoder.decodePalette(
+                        descriptor: SpiceCodecImageDescriptor(width: width, height: height),
+                        payload: data.data,
+                        palette: paletteResolution.palette
+                    )
+                }
             } catch let error {
                 throw .protocolViolation("LZ palette decode failed: \(error.description)")
             }
@@ -1462,7 +1475,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         descriptor: SpiceImageDescriptor,
         data: Data,
         decoder: any SpiceImageDecoder,
-        name: String
+        name: String,
+        usesCodecExecutor: Bool = true
     ) async throws(ChannelError) -> RawBitmap {
         guard let width = Int(exactly: descriptor.width),
               let height = Int(exactly: descriptor.height)
@@ -1470,13 +1484,41 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation("invalid \(name) dimensions")
         }
         do {
-            let decoded = try await decoder.decode(
-                descriptor: SpiceCodecImageDescriptor(width: width, height: height),
-                payload: data
-            )
+            let descriptor = SpiceCodecImageDescriptor(width: width, height: height)
+            let decoded: SpiceDecodedImage
+            if usesCodecExecutor {
+                decoded = try await executeCodecWork(retainedByteCount: data.count) {
+                    () async throws(SpiceCodecError) -> SpiceDecodedImage in
+                    try await decoder.decode(descriptor: descriptor, payload: data)
+                }
+            } else {
+                decoded = try await decoder.decode(descriptor: descriptor, payload: data)
+            }
             return rawBitmap(decoded)
         } catch let error {
             throw .protocolViolation("\(name) decode failed: \(error.description)")
+        }
+    }
+
+    private func executeCodecWork<Success: Sendable>(
+        retainedByteCount: Int,
+        operation: @escaping @Sendable () async throws(SpiceCodecError) -> Success
+    ) async throws(SpiceCodecError) -> Success {
+        do {
+            return try await codecTaskExecutor.executeThrowing(
+                retainedByteCount: retainedByteCount,
+                operation: operation
+            )
+        } catch let error {
+            switch error {
+            case let .operation(codecError):
+                throw codecError
+            case let .executor(executorError):
+                if executorError == .cancelled || executorError == .closed {
+                    throw .cancelled
+                }
+                throw .backendFailure("codec executor rejected work: \(executorError)")
+            }
         }
     }
 
