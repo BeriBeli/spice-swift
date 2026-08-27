@@ -1222,7 +1222,12 @@ public actor SpiceSession {
                 generation: generation,
                 server: server
             )
-            return true
+            // The final transport await may reenter this actor. Revalidate the
+            // exact supervision lifecycle before acknowledging delivery to the
+            // server's ordered per-client pipeline.
+            return !Task.isCancelled
+                && generation == supervisionGeneration
+                && webDAVServers[channelID] === server
         } catch SpiceWebDAVPipelineError.cancelled, SpiceError.cancelled {
             return false
         } catch {

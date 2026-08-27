@@ -368,6 +368,83 @@ struct SpiceSessionTests {
         #expect((await webDAV.outbound).count == baseline)
     }
 
+    @Test func disconnectDuringFinalWebDAVSendCancelsSameClientSuffix() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [SpiceChannelID(type: 11, id: 0)]
+        ))
+        let webDAV = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([source, webDAV])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "spice-session-webdav-send-invalidation-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("first".utf8).write(to: root.appendingPathComponent("first.txt"))
+        try Data("second".utf8).write(to: root.appendingPathComponent("second.txt"))
+        let operationGate = SessionWebDAVOperationGate(blockedClientID: .min)
+        let server = try SpiceWebDAVServer(
+            root: root,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            fileOperationWillBegin: operationGate.operationWillBegin
+        )
+        try await session.attachWebDAVServer(server)
+
+        let portName = Data("org.spice-space.webdav.0\0".utf8)
+        var initialization = ByteWriter()
+        initialization.writeUInt32LE(UInt32(portName.count))
+        initialization.writeUInt32LE(9)
+        initialization.writeUInt8(1)
+        initialization.writeBytes(portName)
+        await webDAV.enqueue(encodeMini(id: 201, body: initialization.data))
+        await webDAV.waitForOutboundCount(3)
+        await webDAV.blockNextWrite()
+
+        var pipeline = Data(
+            "GET /first.txt HTTP/1.1\r\nHost: fixture.invalid\r\n\r\n".utf8
+        )
+        pipeline.append(Data(
+            "GET /second.txt HTTP/1.1\r\nHost: fixture.invalid\r\n\r\n".utf8
+        ))
+        await webDAV.enqueue(encodeMini(
+            id: 101,
+            body: try SpiceWebDAVMuxEncoder().encode(clientID: 101, data: pipeline)
+        ))
+        try #require(await operationGate.waitUntilStarted(clientID: 101, sequence: 1))
+        await webDAV.waitUntilWriteIsBlocked()
+        #expect(!operationGate.didStart(clientID: 101, sequence: 2))
+
+        let disconnectGate = AgentMessageProcessingGate()
+        await session.setDisconnectProcessingHookForTesting {
+            await disconnectGate.block()
+        }
+        let disconnect = Task { await session.disconnect() }
+        await disconnectGate.waitUntilEntered()
+
+        await webDAV.releaseBlockedWrite()
+        await waitForSessionWebDAVServer(server) {
+            $0.pendingJobs == 0
+                && $0.currentRetainedBytes == 0
+                && $0.cancelledJobs == 2
+        }
+        #expect(!operationGate.didStart(clientID: 101, sequence: 2))
+        let diagnostics = await server.diagnosticsSnapshot()
+        #expect(diagnostics.completedJobs == 0)
+        #expect(diagnostics.reservedResponseBytes == 0)
+        #expect(diagnostics.executor.currentRetainedBytes == 0)
+
+        await disconnectGate.release()
+        await disconnect.value
+    }
+
     @Test func supervisesWebDAVMuxWithoutImplicitFilesystemAccess() async throws {
         let source = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [SpiceChannelID(type: 11, id: 0)]
@@ -4492,6 +4569,11 @@ private final class SessionWebDAVOperationGate: @unchecked Sendable {
         return await Task.detached { [self] in
             blockingWaitUntilStarted(key)
         }.value
+    }
+
+    func didStart(clientID: Int64, sequence: UInt64) -> Bool {
+        let key = SessionWebDAVOperationKey(clientID: clientID, sequence: sequence)
+        return state.withLock { $0.started.contains(key) }
     }
 
     func releaseBlockedOperation() {

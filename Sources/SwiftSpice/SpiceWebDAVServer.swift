@@ -23,6 +23,11 @@ package enum SpiceWebDAVPipelineError: Error, Sendable, Equatable {
 
 /// A bounded native WebDAV endpoint rooted at one explicitly authorized directory.
 public actor SpiceWebDAVServer {
+    /// All response header names and values are generated locally and fixed;
+    /// none echo request text. This envelope includes status lines, every
+    /// currently emitted header, a 20-digit Content-Length, and ample growth
+    /// room while remaining independent from the inbound header limit.
+    private static let maximumGeneratedResponseHeaderBytes = 4 * 1_024
     package typealias FileOperationObserver = @Sendable (Int64, UInt64) -> Void
     package typealias ResponseSender = @Sendable (
         Result<[Data], SpiceWebDAVPipelineError>
@@ -605,6 +610,10 @@ public actor SpiceWebDAVServer {
             case (.failure, true):
                 break
             }
+            if !delivered {
+                terminateClientPump(clientID: clientID, generation: generation)
+                return
+            }
             if Task.isCancelled {
                 return
             }
@@ -639,6 +648,21 @@ public actor SpiceWebDAVServer {
         guard var client = clients[clientID], client.generation == generation else { return }
         client.worker = nil
         clients[clientID] = client
+    }
+
+    /// A failed response handoff terminates the ordered client pipeline. Any
+    /// later request may be mutating, so it must never execute after its
+    /// predecessor could not be delivered.
+    private func terminateClientPump(clientID: Int64, generation: UInt64) {
+        guard let client = clients[clientID], client.generation == generation else {
+            return
+        }
+        clients.removeValue(forKey: clientID)
+        bufferedInputBytes -= client.buffer.count
+        release(client.submissions)
+        add(&cancelledJobs, client.submissions.reduce(0) {
+            $0 + $1.requests.count
+        })
     }
 
     private func release(_ submissions: [Submission]) {
@@ -686,7 +710,8 @@ public actor SpiceWebDAVServer {
         let bodyLimit = method == "GET" || method == "PROPFIND"
             ? maximumBodyBytes
             : 0
-        let (total, overflow) = maximumHeaderBytes.addingReportingOverflow(bodyLimit)
+        let (total, overflow) = Self.maximumGeneratedResponseHeaderBytes
+            .addingReportingOverflow(bodyLimit)
         guard !overflow else { throw .bodyTooLarge }
         return total
     }
