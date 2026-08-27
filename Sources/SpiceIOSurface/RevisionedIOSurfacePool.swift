@@ -795,6 +795,9 @@ package final class RevisionedIOSurfaceWritableFrame: @unchecked Sendable {
     package var width: Int { slot.key.width }
     package var height: Int { slot.key.height }
     package var bytesPerRow: Int { slot.bytesPerRow }
+    package var requiresSourceSynchronization: Bool {
+        source.map { $0.slot !== slot } ?? false
+    }
 
     fileprivate init(
         slot: RevisionedSurfaceSlot,
@@ -923,6 +926,19 @@ package final class RevisionedIOSurfaceRevision: @unchecked Sendable {
 
     package func makeLease() -> IOSurfaceFrame? {
         pool.makeLease(for: self)
+    }
+
+    /// Performs a synchronous read while the immutable revision is locked.
+    /// The borrowed pointer never escapes the closure.
+    package func withLockedBytes<Result>(
+        _ body: (UnsafeRawPointer, Int) -> Result
+    ) -> Result? {
+        var seed: UInt32 = 0
+        guard IOSurfaceLock(slot.surface, .readOnly, &seed) == 0 else {
+            return nil
+        }
+        defer { IOSurfaceUnlock(slot.surface, .readOnly, &seed) }
+        return body(IOSurfaceGetBaseAddress(slot.surface), slot.bytesPerRow)
     }
 
     package func copyPixels() -> Data? {

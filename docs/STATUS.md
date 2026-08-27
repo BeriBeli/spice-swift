@@ -59,6 +59,22 @@ Agent behavior, including system-trusted TLS.
   and suppresses a late migration-completed event. Terminal connections reject
   raw and typed client sends without writing. Live peer closure remains part of
   AIP-90.
+- AIP-23 is locally complete. When IOSurface is canonical and Data is stale,
+  fill, same-Surface COPY_BITS, bitmap DRAW_COPY, and dual-canonical
+  cross-Surface DRAW_COPY run against an in-place unleased slot or a synchronized
+  immutable candidate. A held published lease remains byte-exact and pool
+  exhaustion falls back atomically to Data.
+- Candidate synchronization is the only suspension point in the direct CPU
+  path. Surface operation locks plus lifecycle/revision/current-identity checks
+  guard the commit, and unsafe pointers remain inside synchronous IOSurface lock
+  closures. Internal catch-up damage resets at direct commit; publication damage
+  survives mismatched requests and is consumed exactly once by a matching
+  snapshot.
+- Focused AIP-23 evidence is six tests / nine parameter cases,
+  `SurfaceStoreTests` 46/46, AddressSanitizer `SurfaceStoreTests` 46/46,
+  `SurfacePublicationDamageTests` 3/3, `DisplayChannelTests` 71/71, and the full
+  Swift 6 warnings-as-errors test gate. The pre-fix focused gate produced 24
+  issues; all are closed on PR #26. No throughput claim is made before AIP-00.
 
 ## Stage B local closure
 

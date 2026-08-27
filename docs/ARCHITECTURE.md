@@ -179,6 +179,15 @@ per row. Surface fill delegates each canonical segment to the arm64 NEON pixel
 kernel. Unsafe byte pointers remain inside synchronous buffer closures and
 never cross an actor suspension point.
 
+When an IOSurface revision is canonical and its Data mirror is stale, eligible
+CPU fill and copy kernels continue directly on an unleased in-place slot or a
+synchronized revision candidate. The actor rechecks lifecycle, revision, and
+canonical object identity after candidate synchronization and before entering a
+synchronous IOSurface lock closure. A successful kernel publishes one immutable
+revision, clears obsolete internal catch-up damage, and retains only clipped
+publication damage. Pool exhaustion or a synchronization/lock failure falls
+back atomically to the Data path before any kernel writes occur.
+
 The image cache and GLZ dictionary have explicit entry and byte limits. Shared
 Display state uses actors and serial barriers so cross-channel invalidation and
 GLZ dependencies follow protocol order.
@@ -193,7 +202,9 @@ frame or GPU command buffer still owns its lease.
 Each Surface advances `lifecycleGeneration` across create/destroy and advances
 `revision` only after a successful mutation. Publication commits only an exact
 lifecycle/revision match, suppressing snapshots invalidated by concurrent
-damage, destroy, or same-ID reconstruction.
+damage, destroy, or same-ID reconstruction. Publication damage is consumed only
+after a matching snapshot succeeds; stale, future, or wrong-lifecycle requests
+cannot clear it, and a duplicate snapshot observes no already-consumed damage.
 
 Display commands always update the canonical Surface and append clipped damage.
 Snapshot construction is demand-driven: no visible subscriber means no
