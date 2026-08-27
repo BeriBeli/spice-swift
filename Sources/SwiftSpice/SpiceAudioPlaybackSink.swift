@@ -71,7 +71,6 @@ public actor SpiceAudioPlaybackSink {
         maximumQueuedMilliseconds: UInt32 = 500,
         delayReportIntervalMilliseconds: UInt32 = 50
     ) {
-        precondition(maximumQueuedMilliseconds > 0)
         precondition(delayReportIntervalMilliseconds > 0)
         self.maximumQueuedMilliseconds = maximumQueuedMilliseconds
         delayReportInterval = .milliseconds(delayReportIntervalMilliseconds)
@@ -361,10 +360,17 @@ public actor SpiceAudioPlaybackSink {
     }
 
     private static func milliseconds(frames: UInt64, sampleRate: UInt64) -> UInt32 {
-        guard frames > 0 else {
+        guard frames > 0, sampleRate > 0 else {
             return 0
         }
-        let value = (frames * 1_000 + sampleRate - 1) / sampleRate
+        let (scaledFrames, scaleOverflow) = frames.multipliedReportingOverflow(by: 1_000)
+        let (roundedFrames, roundingOverflow) = scaledFrames.addingReportingOverflow(
+            sampleRate - 1
+        )
+        guard !scaleOverflow, !roundingOverflow else {
+            return .max
+        }
+        let value = roundedFrames / sampleRate
         return UInt32(min(value, UInt64(UInt32.max)))
     }
 
@@ -405,10 +411,14 @@ public actor SpiceAudioPlaybackSink {
         } catch {
             throw .invalidConfiguration("playback ring slot capacity is invalid")
         }
-        return AudioPacketRingCapacity(
-            capacityBytes: capacityBytes,
-            capacitySlots: capacitySlots
-        )
+        do {
+            return try AudioPacketRingAllocationLimits.validate(
+                capacityBytes: capacityBytes,
+                capacitySlots: capacitySlots
+            )
+        } catch {
+            throw .invalidConfiguration("playback ring allocation exceeds resource limits")
+        }
     }
 
 }
@@ -416,7 +426,9 @@ public actor SpiceAudioPlaybackSink {
 /// Keeps render-thread state outside the actor. All storage and diagnostics are
 /// preallocated; the AVAudioSourceNode callback only takes a bounded lock and
 /// copies into Core Audio-owned buffers.
-private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
+package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
+    package typealias GateObserver = @Sendable () -> Void
+
     private struct GateState: Sendable {
         var minimumStartupBytes: Int
         var isPrimed = false
@@ -427,7 +439,7 @@ private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
     private let sampleRate: Int
     private let gate: Mutex<GateState>
 
-    init(
+    package init(
         capacityBytes: Int,
         capacitySlots: Int,
         bytesPerFrame: Int,
@@ -448,19 +460,30 @@ private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         )))
     }
 
-    func enqueue(_ packet: SpicePlaybackPacket) -> AudioPacketRingEnqueueResult {
-        let result = ring.enqueue(RecordedAudioPacket(
-            timestamp: packet.multimediaTime,
-            data: packet.data
-        ))
-        if case let .enqueued(droppedPackets, droppedBytes) = result,
-           droppedPackets > 0 || droppedBytes > 0 {
-            gate.withLock { $0.isPrimed = false }
+    /// Producer and realtime consumer always acquire `gate` before the ring
+    /// mutex. Keeping replacement publication and the startup reset in this
+    /// critical section prevents the callback from consuming replacement PCM
+    /// with the old primed state. The observer is a non-reentrant test seam and
+    /// production always passes `nil`.
+    package func enqueue(
+        _ packet: SpicePlaybackPacket,
+        overflowReplacementPublished observer: GateObserver? = nil
+    ) -> AudioPacketRingEnqueueResult {
+        gate.withLock { state in
+            let result = ring.enqueue(RecordedAudioPacket(
+                timestamp: packet.multimediaTime,
+                data: packet.data
+            ))
+            if case let .enqueued(droppedPackets, droppedBytes) = result,
+               droppedPackets > 0 || droppedBytes > 0 {
+                observer?()
+                state.isPrimed = false
+            }
+            return result
         }
-        return result
     }
 
-    func setMinimumStartup(milliseconds: UInt32) {
+    package func setMinimumStartup(milliseconds: UInt32) {
         let capacityBytes = ring.diagnostics().capacityBytes
         gate.withLock { state in
             state.minimumStartupBytes = Self.startupBytes(
@@ -472,7 +495,7 @@ private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         }
     }
 
-    func render(
+    package func render(
         frameCount: AVAudioFrameCount,
         into audioBufferList: UnsafeMutablePointer<AudioBufferList>
     ) {
@@ -488,36 +511,50 @@ private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
             let availableBytes = Int(buffers[index].mDataByteSize)
             let byteCount = min(requestedBytes, availableBytes)
             let destination = UnsafeMutableRawBufferPointer(start: pointer, count: byteCount)
-            destination.initializeMemory(as: UInt8.self, repeating: 0)
             guard index == buffers.startIndex, byteCount == requestedBytes else {
+                destination.initializeMemory(as: UInt8.self, repeating: 0)
                 continue
             }
-            let queuedBytes = ring.diagnostics().queuedBytes
-            let shouldRead = gate.withLock { state in
-                if !state.isPrimed {
-                    guard queuedBytes > 0, queuedBytes >= state.minimumStartupBytes else {
-                        return false
-                    }
-                    state.isPrimed = true
-                }
-                return true
-            }
-            guard shouldRead else {
-                continue
-            }
-            let copied = ring.read(into: destination)
-            if copied < requestedBytes {
-                gate.withLock { $0.isPrimed = false }
-            }
+            _ = renderPCM(into: destination)
         }
     }
 
-    func close() {
-        ring.close()
-        gate.withLock { $0.isPrimed = false }
+    /// Package seam shared by the AVAudio callback and deterministic race
+    /// tests. The observer fires immediately before attempting the gate lock.
+    /// No allocation occurs on the production path.
+    package func renderPCM(
+        into destination: UnsafeMutableRawBufferPointer,
+        gateAcquisitionWillBegin observer: GateObserver? = nil
+    ) -> Int {
+        guard destination.count > 0 else {
+            return 0
+        }
+        destination.initializeMemory(as: UInt8.self, repeating: 0)
+        observer?()
+        return gate.withLock { state in
+            let queuedBytes = ring.diagnostics().queuedBytes
+            if !state.isPrimed {
+                guard queuedBytes > 0, queuedBytes >= state.minimumStartupBytes else {
+                    return 0
+                }
+                state.isPrimed = true
+            }
+            let copied = ring.read(into: destination)
+            if copied < destination.count {
+                state.isPrimed = false
+            }
+            return copied
+        }
     }
 
-    func diagnostics() -> AudioPacketRingDiagnostics {
+    package func close() {
+        gate.withLock { state in
+            ring.close()
+            state.isPrimed = false
+        }
+    }
+
+    package func diagnostics() -> AudioPacketRingDiagnostics {
         ring.diagnostics()
     }
 
@@ -527,8 +564,23 @@ private final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         bytesPerFrame: Int,
         capacityBytes: Int
     ) -> Int {
-        let frames = (UInt64(milliseconds) * UInt64(sampleRate) + 999) / 1_000
-        let bytes = frames * UInt64(bytesPerFrame)
+        guard sampleRate > 0, bytesPerFrame > 0, capacityBytes > 0 else {
+            return capacityBytes
+        }
+        let (frameMilliseconds, frameOverflow) = UInt64(milliseconds)
+            .multipliedReportingOverflow(by: UInt64(sampleRate))
+        let (roundedFrameMilliseconds, roundingOverflow) = frameMilliseconds
+            .addingReportingOverflow(999)
+        guard !frameOverflow, !roundingOverflow else {
+            return capacityBytes
+        }
+        let frames = roundedFrameMilliseconds / 1_000
+        let (bytes, byteOverflow) = frames.multipliedReportingOverflow(
+            by: UInt64(bytesPerFrame)
+        )
+        guard !byteOverflow else {
+            return capacityBytes
+        }
         return min(capacityBytes, Int(clamping: bytes))
     }
 }

@@ -50,7 +50,6 @@ public actor SpiceAudioCaptureSource {
     private var configuration: SpiceRecordConfiguration?
 
     public init(maximumQueuedMilliseconds: UInt32 = 500) {
-        precondition(maximumQueuedMilliseconds > 0)
         self.maximumQueuedMilliseconds = maximumQueuedMilliseconds
         let pipe = AsyncStream.makeStream(
             of: SpiceAudioCaptureSourceEvent.self,
@@ -124,16 +123,16 @@ public actor SpiceAudioCaptureSource {
               let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
             throw .invalidConfiguration("AVAudioConverter rejected the requested PCM format")
         }
-        let maximumBytes = try Self.maximumBytes(
+        let ringCapacity = try Self.ringCapacity(
             configuration: configuration,
-            milliseconds: maximumQueuedMilliseconds
+            maximumQueuedMilliseconds: maximumQueuedMilliseconds
         )
         guard let processor = AudioCaptureProcessor(
             converter: converter,
             outputFormat: outputFormat,
             inputSampleRate: inputFormat.sampleRate,
             maximumInputFrames: 1_024,
-            maximumBytes: maximumBytes
+            ringCapacity: ringCapacity
         ) else {
             throw .audioEngine("unable to preallocate capture conversion buffers")
         }
@@ -237,31 +236,66 @@ public actor SpiceAudioCaptureSource {
         )
     }
 
-    private nonisolated static func maximumBytes(
+    package nonisolated static func ringCapacity(
         configuration: SpiceRecordConfiguration,
-        milliseconds: UInt32
-    ) throws(SpiceAudioCaptureSourceError) -> Int {
-        let bytesPerSecond = UInt64(configuration.sampleRate)
-            * UInt64(configuration.channels)
-            * UInt64(MemoryLayout<Int16>.size)
-        let bytes = (bytesPerSecond * UInt64(milliseconds) + 999) / 1_000
-        guard let value = Int(exactly: bytes), value > 0 else {
-            throw .invalidConfiguration("capture buffer size overflow")
+        maximumQueuedMilliseconds: UInt32
+    ) throws(SpiceAudioCaptureSourceError) -> AudioPacketRingCapacity {
+        guard configuration.sampleRate > 0,
+              configuration.channels > 0,
+              maximumQueuedMilliseconds > 0 else {
+            throw .invalidConfiguration("capture ring dimensions must be positive")
         }
-        return value
+        let (frameMilliseconds, frameOverflow) = UInt64(configuration.sampleRate)
+            .multipliedReportingOverflow(by: UInt64(maximumQueuedMilliseconds))
+        let (roundedFrameMilliseconds, roundingOverflow) = frameMilliseconds
+            .addingReportingOverflow(999)
+        guard !frameOverflow, !roundingOverflow else {
+            throw .invalidConfiguration("capture ring frame capacity overflow")
+        }
+        let frames = roundedFrameMilliseconds / 1_000
+        let (bytesPerFrame, frameSizeOverflow) = configuration.channels
+            .multipliedReportingOverflow(by: MemoryLayout<Int16>.size)
+        guard !frameSizeOverflow, bytesPerFrame > 0 else {
+            throw .invalidConfiguration("capture ring frame size overflow")
+        }
+        let (bytes, byteOverflow) = frames.multipliedReportingOverflow(
+            by: UInt64(bytesPerFrame)
+        )
+        guard !byteOverflow, let capacityBytes = Int(exactly: bytes) else {
+            throw .invalidConfiguration("capture ring byte capacity overflow")
+        }
+        do {
+            return try AudioPacketRingAllocationLimits.validate(
+                capacityBytes: capacityBytes,
+                capacitySlots: 256
+            )
+        } catch {
+            throw .invalidConfiguration("capture ring allocation exceeds resource limits")
+        }
     }
 
     private nonisolated static func milliseconds(
         bytes: Int,
         configuration: SpiceRecordConfiguration
     ) -> UInt32 {
-        let bytesPerSecond = UInt64(configuration.sampleRate)
-            * UInt64(configuration.channels)
-            * UInt64(MemoryLayout<Int16>.size)
+        let (sampleChannels, channelOverflow) = UInt64(configuration.sampleRate)
+            .multipliedReportingOverflow(by: UInt64(configuration.channels))
+        let (bytesPerSecond, sampleSizeOverflow) = sampleChannels
+            .multipliedReportingOverflow(by: UInt64(MemoryLayout<Int16>.size))
+        guard !channelOverflow, !sampleSizeOverflow else {
+            return .max
+        }
         guard bytesPerSecond > 0 else {
             return 0
         }
-        let value = (UInt64(bytes) * 1_000 + bytesPerSecond - 1) / bytesPerSecond
+        let (scaledBytes, scaleOverflow) = UInt64(bytes).multipliedReportingOverflow(by: 1_000)
+        let (roundedBytes, roundingOverflow) = scaledBytes.addingReportingOverflow(
+            bytesPerSecond - 1
+        )
+        guard !scaleOverflow, !roundingOverflow else {
+            return .max
+        }
+        let value = roundedBytes / bytesPerSecond
         return UInt32(min(value, UInt64(UInt32.max)))
     }
 
@@ -289,7 +323,7 @@ private final class AudioCaptureProcessor: @unchecked Sendable {
         outputFormat: AVAudioFormat,
         inputSampleRate: Double,
         maximumInputFrames: AVAudioFrameCount,
-        maximumBytes: Int
+        ringCapacity: AudioPacketRingCapacity
     ) {
         let ratio = outputFormat.sampleRate / inputSampleRate
         let estimatedFrames = Double(maximumInputFrames) * ratio
@@ -317,7 +351,10 @@ private final class AudioCaptureProcessor: @unchecked Sendable {
             status.pointee = .haveData
             return input
         }
-        buffer = RecordCaptureBuffer(maximumBytes: maximumBytes)
+        buffer = RecordCaptureBuffer(
+            maximumBytes: ringCapacity.capacityBytes,
+            maximumPackets: ringCapacity.capacitySlots
+        )
     }
 
     func capture(_ input: AVAudioPCMBuffer, timestamp: UInt32) {
@@ -348,10 +385,13 @@ private final class AudioCaptureProcessor: @unchecked Sendable {
         guard outputBuffer.frameLength > 0 else {
             return
         }
-        let byteCount = Int(outputBuffer.frameLength)
-            * Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
+        let (byteCount, byteCountOverflow) = Int(outputBuffer.frameLength)
+            .multipliedReportingOverflow(
+                by: Int(outputFormat.streamDescription.pointee.mBytesPerFrame)
+            )
         let audioBuffer = outputBuffer.audioBufferList.pointee.mBuffers
-        guard byteCount > 0,
+        guard !byteCountOverflow,
+              byteCount > 0,
               byteCount <= Int(audioBuffer.mDataByteSize),
               let pointer = audioBuffer.mData else {
             fail("converter produced invalid PCM storage")

@@ -7,6 +7,50 @@ package enum AudioPacketRingCapacityError: Error, Sendable, Equatable {
     case minimumPacketExceedsCapacity(minimum: Int, capacity: Int)
 }
 
+package enum AudioPacketRingAllocationLimitError: Error, Sendable, Equatable {
+    case invalidCapacityBytes(Int)
+    case invalidCapacitySlots(Int)
+    case payloadCapacityExceeded(actual: Int, maximum: Int)
+    case slotCapacityExceeded(actual: Int, maximum: Int)
+}
+
+/// One resource policy is shared by playback and capture before either path
+/// allocates payload storage or packet metadata. Sixteen MiB covers the default
+/// 500 ms budget at every supported SPICE PCM format, while the independent
+/// slot bound prevents one-frame playback packets from amplifying metadata.
+package enum AudioPacketRingAllocationLimits {
+    package static let maximumPayloadBytes = 16 * 1_024 * 1_024
+    package static let maximumSlotCount = 262_144
+
+    package static func validate(
+        capacityBytes: Int,
+        capacitySlots: Int
+    ) throws(AudioPacketRingAllocationLimitError) -> AudioPacketRingCapacity {
+        guard capacityBytes > 0 else {
+            throw .invalidCapacityBytes(capacityBytes)
+        }
+        guard capacitySlots > 0 else {
+            throw .invalidCapacitySlots(capacitySlots)
+        }
+        guard capacityBytes <= maximumPayloadBytes else {
+            throw .payloadCapacityExceeded(
+                actual: capacityBytes,
+                maximum: maximumPayloadBytes
+            )
+        }
+        guard capacitySlots <= maximumSlotCount else {
+            throw .slotCapacityExceeded(
+                actual: capacitySlots,
+                maximum: maximumSlotCount
+            )
+        }
+        return AudioPacketRingCapacity(
+            capacityBytes: capacityBytes,
+            capacitySlots: capacitySlots
+        )
+    }
+}
+
 package struct AudioPacketRingCapacity: Sendable, Equatable {
     package let capacityBytes: Int
     package let capacitySlots: Int
