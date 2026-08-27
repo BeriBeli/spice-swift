@@ -189,7 +189,26 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         descriptor: SpiceCodecImageDescriptor,
         payload: Data
     ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        try await decode(
+            descriptor: descriptor,
+            payload: payload,
+            retainedOwnerByteCount: 0
+        )
+    }
+
+    /// Decodes while accounting an immutable owner retained independently of
+    /// `payload` across dictionary waits and executor admission.
+    package func decode(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data,
+        retainedOwnerByteCount: Int
+    ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        guard retainedOwnerByteCount >= 0 else { throw .integerOverflow }
         let program = try Self.parseProgram(descriptor: descriptor, payload: payload, limits: limits)
+        let baseRetainedByteCount = try Self.addingRetainedOwner(
+            retainedOwnerByteCount,
+            to: program.waitRetainedByteCount
+        )
         guard dictionary[program.imageID] == nil, reservations[program.imageID] == nil else {
             throw .malformedPayload("duplicate GLZ image id")
         }
@@ -203,14 +222,14 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         }
         let dependencies = try await dependencySnapshot(
             ids: program.dependencyImageIDs,
-            retainedByteCount: program.waitRetainedByteCount
+            retainedByteCount: baseRetainedByteCount
         )
         guard reservations[program.imageID] == reservation,
               generationToken == decodeGeneration else {
             throw SpiceCodecError.cancelled
         }
         let retained = try Self.retainedByteCount(
-            program: program,
+            baseRetainedByteCount: baseRetainedByteCount,
             dependencies: dependencies
         )
         let decoded: SpiceDecodedImage
@@ -275,14 +294,17 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         guard dictionaryWaiters.count < limits.maximumPendingDictionaryWaits else {
             throw .malformedPayload("GLZ dictionary wait limit exceeded")
         }
-        guard retainedByteCount <= limits.maximumDictionaryBytes - pendingDictionaryWaitBytes else {
+        let (aggregateRetainedBytes, retainedOverflow) = pendingDictionaryWaitBytes
+            .addingReportingOverflow(retainedByteCount)
+        guard !retainedOverflow else { throw .integerOverflow }
+        guard aggregateRetainedBytes <= limits.maximumDictionaryBytes else {
             throw .decodedImageTooLarge(
-                actual: pendingDictionaryWaitBytes + retainedByteCount,
+                actual: aggregateRetainedBytes,
                 maximum: limits.maximumDictionaryBytes
             )
         }
         let waiterID = UUID()
-        pendingDictionaryWaitBytes += retainedByteCount
+        pendingDictionaryWaitBytes = aggregateRetainedBytes
         do {
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation {
@@ -401,13 +423,22 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
     }
 
     private static func retainedByteCount(
-        program: GLZProgram,
+        baseRetainedByteCount: Int,
         dependencies: [UInt64: GLZDependencyImage]
     ) throws(SpiceCodecError) -> Int {
-        var result = program.waitRetainedByteCount
+        var result = baseRetainedByteCount
         for dependency in dependencies.values {
             result = try addingDependencySnapshot(dependency.pixels, to: result)
         }
+        return result
+    }
+
+    private static func addingRetainedOwner(
+        _ ownerByteCount: Int,
+        to retainedByteCount: Int
+    ) throws(SpiceCodecError) -> Int {
+        let (result, overflow) = retainedByteCount.addingReportingOverflow(ownerByteCount)
+        guard !overflow else { throw .integerOverflow }
         return result
     }
 

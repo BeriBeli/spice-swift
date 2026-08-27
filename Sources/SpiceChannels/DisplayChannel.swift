@@ -1412,12 +1412,10 @@ package actor DisplayChannel: SpiceManagedChannel {
                 name: "LZ"
             )), nil)
         case let .glzRGB(descriptor, data):
-            return (.bitmap(try await decode(
+            return (.bitmap(try await decodeGLZ(
                 descriptor: descriptor,
                 data: data.data,
-                decoder: glzDecoder,
-                name: "GLZ",
-                usesCodecExecutor: false
+                name: "GLZ"
             )), nil)
         case let .zlibGLZ(descriptor, data):
             guard let glzDataSize = Int(exactly: data.glzDataSize) else {
@@ -1441,14 +1439,13 @@ package actor DisplayChannel: SpiceManagedChannel {
             }
             // Inflation releases the Display executor permit before GLZ
             // coordination begins. The first phase charges the physical wire
-            // owner above; the GLZ executor separately charges its immutable
-            // program, inflated payload, output, and dependency snapshots.
-            return (.bitmap(try await decode(
+            // owner above; the GLZ phase separately charges that still-live
+            // owner together with its immutable program, inflated payload,
+            // output, and dependency snapshots without nesting permits.
+            return (.bitmap(try await decodeGLZ(
                 descriptor: descriptor,
                 data: glzPayload,
-                decoder: glzDecoder,
-                name: "ZLIB GLZ",
-                usesCodecExecutor: false
+                name: "ZLIB GLZ"
             )), nil)
         case let .lzPalette(descriptor, data):
             guard let width = Int(exactly: descriptor.width),
@@ -1485,8 +1482,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         descriptor: SpiceImageDescriptor,
         data: Data,
         decoder: any SpiceImageDecoder,
-        name: String,
-        usesCodecExecutor: Bool = true
+        name: String
     ) async throws(ChannelError) -> RawBitmap {
         guard let width = Int(exactly: descriptor.width),
               let height = Int(exactly: descriptor.height)
@@ -1495,15 +1491,32 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
         do {
             let descriptor = SpiceCodecImageDescriptor(width: width, height: height)
-            let decoded: SpiceDecodedImage
-            if usesCodecExecutor {
-                decoded = try await executeCodecWork(payloadByteCount: data.count) {
-                    () async throws(SpiceCodecError) -> SpiceDecodedImage in
-                    try await decoder.decode(descriptor: descriptor, payload: data)
-                }
-            } else {
-                decoded = try await decoder.decode(descriptor: descriptor, payload: data)
+            let decoded = try await executeCodecWork(payloadByteCount: data.count) {
+                () async throws(SpiceCodecError) -> SpiceDecodedImage in
+                try await decoder.decode(descriptor: descriptor, payload: data)
             }
+            return rawBitmap(decoded)
+        } catch let error {
+            throw .protocolViolation("\(name) decode failed: \(error.description)")
+        }
+    }
+
+    private func decodeGLZ(
+        descriptor: SpiceImageDescriptor,
+        data: Data,
+        name: String
+    ) async throws(ChannelError) -> RawBitmap {
+        guard let width = Int(exactly: descriptor.width),
+              let height = Int(exactly: descriptor.height)
+        else {
+            throw .protocolViolation("invalid \(name) dimensions")
+        }
+        do {
+            let decoded = try await glzDecoder.decode(
+                descriptor: SpiceCodecImageDescriptor(width: width, height: height),
+                payload: data,
+                retainedOwnerByteCount: currentMessageRetainedByteCount ?? 0
+            )
             return rawBitmap(decoded)
         } catch let error {
             throw .protocolViolation("\(name) decode failed: \(error.description)")
