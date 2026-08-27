@@ -432,12 +432,14 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
     private struct GateState: Sendable {
         var minimumStartupBytes: Int
         var isPrimed = false
+        var publicationPending = false
     }
 
     private let ring: PreallocatedAudioPacketRing
     private let bytesPerFrame: Int
     private let sampleRate: Int
     private let gate: Mutex<GateState>
+    private let producer = Mutex(())
 
     package init(
         capacityBytes: Int,
@@ -460,25 +462,41 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         )))
     }
 
-    /// Producer and realtime consumer always acquire `gate` before the ring
-    /// mutex. Keeping replacement publication and the startup reset in this
-    /// critical section prevents the callback from consuming replacement PCM
-    /// with the old primed state. The observer is a non-reentrant test seam and
-    /// production always passes `nil`.
+    /// Producers are serialized, but payload copy happens without holding the
+    /// render gate. `publicationPending` makes the ring publication invisible
+    /// to render until overflow replacement and startup reset are committed in
+    /// one short gate section. No path holds the ring mutex while acquiring the
+    /// gate; render and close retain their gate-before-ring order.
     package func enqueue(
         _ packet: SpicePlaybackPacket,
+        payloadCopyWillBegin payloadObserver: GateObserver? = nil,
         overflowReplacementPublished observer: GateObserver? = nil
     ) -> AudioPacketRingEnqueueResult {
-        gate.withLock { state in
-            let result = ring.enqueue(RecordedAudioPacket(
-                timestamp: packet.multimediaTime,
-                data: packet.data
-            ))
-            if case let .enqueued(droppedPackets, droppedBytes) = result,
-               droppedPackets > 0 || droppedBytes > 0 {
-                observer?()
-                state.isPrimed = false
+        producer.withLock { _ in
+            var publicationCleared = false
+            gate.withLock { state in
+                state.publicationPending = true
             }
+            defer {
+                if !publicationCleared {
+                    gate.withLock { state in
+                        state.publicationPending = false
+                    }
+                }
+            }
+            payloadObserver?()
+            let result = packet.data.withUnsafeBytes { bytes in
+                ring.enqueue(timestamp: packet.multimediaTime, bytes: bytes)
+            }
+            gate.withLock { state in
+                if case let .enqueued(droppedPackets, droppedBytes) = result,
+                   droppedPackets > 0 || droppedBytes > 0 {
+                    observer?()
+                    state.isPrimed = false
+                }
+                state.publicationPending = false
+            }
+            publicationCleared = true
             return result
         }
     }
@@ -532,6 +550,7 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         destination.initializeMemory(as: UInt8.self, repeating: 0)
         observer?()
         return gate.withLock { state in
+            guard !state.publicationPending else { return 0 }
             let queuedBytes = ring.diagnostics().queuedBytes
             if !state.isPrimed {
                 guard queuedBytes > 0, queuedBytes >= state.minimumStartupBytes else {
@@ -551,6 +570,7 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         gate.withLock { state in
             ring.close()
             state.isPrimed = false
+            state.publicationPending = false
         }
     }
 

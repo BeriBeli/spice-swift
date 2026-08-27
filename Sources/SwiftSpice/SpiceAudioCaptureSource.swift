@@ -461,15 +461,14 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
     private func convertInputChunk(timestamp: UInt32) -> Bool {
         outputBuffer.frameLength = 0
         inputProvider.offer(inputChunkBuffer)
-        var conversionError: NSError?
         let status = converter.convert(
             to: outputBuffer,
-            error: &conversionError,
+            error: nil,
             withInputFrom: converterInputBlock
         )
         inputProvider.clear()
         if status == .error {
-            recordFailure(.converter(code: conversionError?.code))
+            recordFailure(.converter)
             return false
         }
         diagnosticState.withLock { state in

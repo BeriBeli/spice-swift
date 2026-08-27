@@ -140,8 +140,7 @@ struct AudioCaptureProcessorTests {
     @Test("callback failures retain typed evidence and format only at drain")
     func callbackFailureFormattingIsDeferredWithoutDynamicAllocation() throws {
         let cases: [(AudioCaptureProcessorFailure, String)] = [
-            (.converter(code: -50), "audio converter failed with error code -50"),
-            (.converter(code: nil), "audio converter failed with an unknown error"),
+            (.converter, "audio converter failed"),
             (.invalidOutputStorage, "converter produced invalid PCM storage"),
         ]
 

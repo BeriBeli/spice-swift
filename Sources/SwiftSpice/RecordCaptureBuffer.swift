@@ -9,7 +9,7 @@ package struct RecordedAudioPacket: Sendable, Equatable {
 package enum AudioCaptureProcessorFailure: Sendable, Equatable {
     case inputFormatChanged
     case invalidInputStorage
-    case converter(code: Int?)
+    case converter
     case invalidOutputStorage
 
     package func formattedDescription() -> String {
@@ -18,10 +18,8 @@ package enum AudioCaptureProcessorFailure: Sendable, Equatable {
             "capture input format changed while the tap was active"
         case .invalidInputStorage:
             "capture input buffer contains invalid PCM storage"
-        case let .converter(.some(code)):
-            "audio converter failed with error code \(code)"
-        case .converter(.none):
-            "audio converter failed with an unknown error"
+        case .converter:
+            "audio converter failed"
         case .invalidOutputStorage:
             "converter produced invalid PCM storage"
         }
@@ -87,9 +85,15 @@ package final class RecordCaptureBuffer: Sendable {
 
     /// Packet `Data` is materialized on the async sender, never in the tap
     /// callback. Queue storage itself remains fixed for the buffer lifetime.
-    package func drain() -> RecordCaptureDrain {
+    package func drain(
+        snapshotCaptured observer: (@Sendable (Int) -> Void)? = nil
+    ) -> RecordCaptureDrain {
+        let packetLimit = ring.diagnostics().queuedSlots
+        observer?(packetLimit)
         var packets: [RecordedAudioPacket] = []
-        while let packet = ring.dequeue() {
+        packets.reserveCapacity(packetLimit)
+        for _ in 0 ..< packetLimit {
+            guard let packet = ring.dequeue() else { break }
             packets.append(packet)
         }
         let currentDroppedBytes = ring.diagnostics().droppedBytes

@@ -85,6 +85,84 @@ struct PlaybackBufferControllerTests {
         buffer.close()
     }
 
+    @Test func producerPayloadCopyDoesNotHoldTheRealtimeRenderGate() {
+        let buffer = AudioPlaybackRenderBuffer(
+            capacityBytes: 8,
+            capacitySlots: 4,
+            bytesPerFrame: 2,
+            sampleRate: 1_000,
+            minimumStartupMilliseconds: 4
+        )
+        #expect(buffer.enqueue(SpicePlaybackPacket(
+            multimediaTime: 1,
+            data: Data([1, 2, 3, 4, 5, 6, 7, 8])
+        )) == .enqueued(droppedPackets: 0, droppedBytes: 0))
+
+        let copyBarrier = PlaybackRaceBarrier()
+        let overflowPublished = DispatchSemaphore(value: 0)
+        let producerFinished = DispatchSemaphore(value: 0)
+        let producerResult = PlaybackLockedValue<AudioPacketRingEnqueueResult?>(nil)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = buffer.enqueue(
+                SpicePlaybackPacket(
+                    multimediaTime: 2,
+                    data: Data([9, 10, 11, 12, 13, 14])
+                ),
+                payloadCopyWillBegin: copyBarrier.block,
+                overflowReplacementPublished: { overflowPublished.signal() }
+            )
+            producerResult.store(result)
+            producerFinished.signal()
+        }
+        #expect(copyBarrier.waitUntilEntered())
+
+        let renderFinished = DispatchSemaphore(value: 0)
+        let renderResult = PlaybackLockedValue<PlaybackRenderResult?>(nil)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var bytes = [UInt8](repeating: 0xff, count: 2)
+            let copied = bytes.withUnsafeMutableBytes {
+                (destination: UnsafeMutableRawBufferPointer) in
+                buffer.renderPCM(into: destination)
+            }
+            renderResult.store(PlaybackRenderResult(copied: copied, bytes: bytes))
+            renderFinished.signal()
+        }
+        #expect(renderFinished.wait(timeout: .now() + 10) == .success)
+        #expect(renderResult.load() == PlaybackRenderResult(copied: 0, bytes: [0, 0]))
+        #expect(producerFinished.wait(timeout: .now()) == .timedOut)
+
+        copyBarrier.release()
+        #expect(overflowPublished.wait(timeout: .now() + 10) == .success)
+        #expect(producerFinished.wait(timeout: .now() + 10) == .success)
+        #expect(producerResult.load() == .enqueued(droppedPackets: 1, droppedBytes: 8))
+
+        var gatedFrame = [UInt8](repeating: 0xff, count: 2)
+        let gatedCount = gatedFrame.withUnsafeMutableBytes {
+            (destination: UnsafeMutableRawBufferPointer) in
+            buffer.renderPCM(into: destination)
+        }
+        #expect(gatedCount == 0)
+        #expect(gatedFrame == [0, 0])
+
+        #expect(buffer.enqueue(SpicePlaybackPacket(
+            multimediaTime: 3,
+            data: Data([15, 16])
+        )) == .enqueued(droppedPackets: 0, droppedBytes: 0))
+        var restartedFrames = [UInt8](repeating: 0xff, count: 8)
+        let restartedCount = restartedFrames.withUnsafeMutableBytes {
+            (destination: UnsafeMutableRawBufferPointer) in
+            buffer.renderPCM(into: destination)
+        }
+        #expect(restartedCount == 8)
+        #expect(restartedFrames == [9, 10, 11, 12, 13, 14, 15, 16])
+        let diagnostics = buffer.diagnostics()
+        #expect(diagnostics.queuedBytes == 0)
+        #expect(diagnostics.retainedSlots == 0)
+        #expect(diagnostics.linearMovementBytes == 0)
+        #expect(diagnostics.callbackDynamicAllocations == 0)
+        buffer.close()
+    }
+
     @Test func audioRingAllocationLimitsAcceptExactBoundsAndRejectOnePastThem() throws {
         let maximumBytes = AudioPacketRingAllocationLimits.maximumPayloadBytes
         let maximumSlots = AudioPacketRingAllocationLimits.maximumSlotCount
