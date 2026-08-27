@@ -1,4 +1,87 @@
-# Live SPICE performance comparison
+# SwiftSpice performance measurement
+
+## Release microbenchmarks
+
+`spice-bench` is the versioned, deterministic microbenchmark harness. Always
+run it as a Release product; a Debug executable exits nonzero instead of
+producing an artifact whose metadata incorrectly claims optimized code. The
+runner also requires a completely clean Git worktree, including no untracked
+files. The script verifies clean status and exact HEAD before and after an
+isolated build in a fresh SwiftPM scratch directory. That verified revision is
+compiled into the executable, and runtime preflight requires the clean current
+HEAD to match it before any benchmark operation runs. A directly built binary
+without embedded revision evidence, or a stale binary from another revision,
+exits nonzero without emitting JSON. This makes the reported commit an exact
+identifier for the measured sources.
+
+```sh
+Benchmarks/run_micro.sh --warmup 3 --iterations 10 > /private/tmp/spice-micro.json
+```
+
+`run_micro.sh` resolves one absolute Swift executable and uses that exact binary
+for the Release build. Its version and target information, the active developer
+directory and toolchain selectors, and the resolved macOS SDK path/version are
+compiled into the executable. Runtime metadata is read from that immutable
+build snapshot, so changing `DEVELOPER_DIR`, `TOOLCHAINS`, or `SDKROOT` after
+the build cannot relabel an artifact. Set `SWIFT_EXECUTABLE` to a specific
+toolchain binary when required. Direct executable invocation without embedded
+revision and build-toolchain evidence is rejected.
+
+The command writes exactly one JSON object to standard output. Schema version
+`3` contains `schema_version`, `artifact_kind`, reproducibility `metadata`, and
+the stable ordered `cases` catalog. Every case records warm-up and measured
+iteration counts, nonzero checksum evidence against dead-code elimination,
+raw duration samples in measured order, derived duration statistics in
+nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
+so later analysis can compute bootstrap confidence intervals instead of trying
+to reconstruct them from lossy summary statistics. In schema 2 and later, an
+even sample count's `median_nanoseconds` is the arithmetic mean of both central
+samples and may be fractional. Metadata schema 3 adds the immutable
+`build_metadata` snapshot. The retained schema-1 artifact used the legacy
+upper-middle sample rule; consumers must use its raw samples when comparing it
+with schema 2 or later.
+The current stable case IDs are:
+
+- `wire.contiguous`
+- `wire.fragmented`
+- `region.normalization`
+- `copy_bits`
+- `lz`
+- `glz`
+- `iosurface.transition`
+- `advanced_video.sample`
+
+Acceptance counters are validated before JSON is emitted. They include zero
+contiguous wire body copies, at most one body-sized fragmented copy, one
+transaction and zero temporary bytes for COPY_BITS, a single bulk/zero-row
+tightly packed full cross-Surface IOSurface copy, zero CPU materialization for the following
+1x1 canonical mutation, and the codec/parser allocation counters. The
+IOSurface case explicitly fails on unsupported hardware rather than silently
+measuring the Data fallback. Metadata includes commit, Swift toolchain,
+hardware model when available plus non-identifying architecture/resource/OS
+fallback details, thermal state, workload version, mode, and UTC date.
+Advanced-video counters distinguish bytes written directly into the single
+AVCC allocation from additional sample materialization; the latter must remain
+zero.
+
+Microbenchmark JSON is not a live-client performance result. `spice-bench
+--live` checks the external endpoint/credential prerequisites but deliberately
+exits nonzero and emits no artifact; formal live results must come from the
+paired runner below.
+
+The first AIP-00 harness artifact is
+[`Results/MICRO_MAC16_8_2026-08-28_cf4338d.json`](Results/MICRO_MAC16_8_2026-08-28_cf4338d.json).
+It contains ten measured samples per case from implementation-and-test commit
+`cf4338d`; it is microbenchmark evidence only and does not replace the live
+paired decision.
+
+That artifact uses workload `aip-00.micro.v1`, whose `iosurface.transition`
+sample timed only the 1x1 canonical mutation. The current harness is
+`aip-00.micro.v2` with schema 3 and also times the preceding full cross-Surface
+copy; v1 and v2 IOSurface durations are therefore not directly comparable. A
+new checked-in v2 artifact remains pending with the external AIP-00 gate.
+
+## Live SPICE performance comparison
 
 This directory contains a low-noise, headless comparison between SwiftSpice and
 the installed `spice-client-glib-2.0` reference client. It is an engineering
