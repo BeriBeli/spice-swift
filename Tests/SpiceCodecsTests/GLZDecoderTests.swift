@@ -202,6 +202,56 @@ struct GLZDecoderTests {
         #expect(decoded.pixelsBGRA == expected)
     }
 
+    @Test func shortDistanceColorOverlapPlanUsesBoundedDoublingChunks() {
+        let referenceCount = 16_383
+        var chunkCount = 0
+        var copiedPixels = 0
+
+        for chunk in SpiceGLZColorOverlapCopyPlan(distance: 1, count: referenceCount) {
+            #expect(chunk.pixelCount > 0)
+            #expect(chunk.pixelCount <= 65_536)
+            #expect(chunk.destinationPixelOffset == copiedPixels)
+            #expect(
+                chunk.sourcePixelOffset + chunk.pixelCount
+                    <= 1 + chunk.destinationPixelOffset
+            )
+            chunkCount += 1
+            copiedPixels += chunk.pixelCount
+        }
+
+        #expect(copiedPixels == referenceCount)
+        #expect(chunkCount <= 16)
+    }
+
+    @Test(arguments: GLZShortDistanceColorFormat.allCases)
+    func shortDistanceColorReferencesRemainBitExact(
+        format: GLZShortDistanceColorFormat
+    ) async throws {
+        let width = 16_384
+        var compressed: [UInt8] = [0]
+        compressed.append(contentsOf: format.literalBytes)
+        appendSameImageReference(
+            length: width - 1,
+            lengthBias: format.referenceLengthBias,
+            pixelOffset: 1,
+            to: &compressed
+        )
+
+        let decoded = try await SpiceGLZDecoder().decode(
+            descriptor: .init(width: width, height: 1),
+            payload: glzPayload(
+                type: format.wireType,
+                width: UInt32(width),
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: compressed
+            )
+        )
+
+        #expect(decoded.pixelsBGRA == uniformPixels(format.expectedBGRA, count: width))
+    }
+
     @Test func largeDistanceCurrentReferencePreservesOffsetsAcrossCopyChunks() async throws {
         let width = 16_384
         let height = 13
@@ -1510,6 +1560,39 @@ private actor GLZOperationGate {
     func release() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+enum GLZShortDistanceColorFormat: CaseIterable, Sendable {
+    case rgb16
+    case rgb24
+
+    var wireType: UInt8 {
+        switch self {
+        case .rgb16: 6
+        case .rgb24: 7
+        }
+    }
+
+    var literalBytes: [UInt8] {
+        switch self {
+        case .rgb16: [0x7c, 0x00]
+        case .rgb24: [0x12, 0x34, 0x56]
+        }
+    }
+
+    var expectedBGRA: [UInt8] {
+        switch self {
+        case .rgb16: [0x00, 0x00, 0xff, 0x00]
+        case .rgb24: [0x12, 0x34, 0x56, 0x00]
+        }
+    }
+
+    var referenceLengthBias: Int {
+        switch self {
+        case .rgb16: 1
+        case .rgb24: 0
+        }
     }
 }
 
