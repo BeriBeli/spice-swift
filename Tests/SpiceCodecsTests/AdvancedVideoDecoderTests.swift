@@ -160,6 +160,31 @@ struct AdvancedVideoDecoderTests {
         }
     }
 
+    @Test func postConstructionCopyDiagnosticsComeFromRealMaterialization() throws {
+        let payload = Data([
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e,
+            0, 0, 1, 0x65, 0x88, 0x84,
+        ])
+        let direct = try SpiceAnnexBParser(
+            sampleConstructionMode: .direct
+        ).parseWithDiagnostics(codec: .h264, payload: payload)
+        let materialized = try SpiceAnnexBParser(
+            sampleConstructionMode: .materializeAfterConstructionForTesting
+        ).parseWithDiagnostics(codec: .h264, payload: payload)
+
+        #expect(direct.accessUnit == materialized.accessUnit)
+        #expect(direct.diagnostics.avccSampleAllocations == 1)
+        #expect(direct.diagnostics.additionalSamplePayloadCopyBytes == 0)
+        #expect(materialized.diagnostics.additionalSamplePayloadCopyBytes > 0)
+        #expect(materialized.diagnostics.additionalSamplePayloadCopyBytes
+            == materialized.accessUnit.sampleData.count)
+        #expect(materialized.diagnostics.samplePayloadCopyBytes
+            == direct.diagnostics.samplePayloadCopyBytes)
+        #expect(materialized.diagnostics.avccSampleAllocations == 2)
+        #expect(materialized.diagnostics.avccSampleBytes
+            == direct.diagnostics.avccSampleBytes)
+    }
+
     @Test func annexBPaddingAndEmptyNALBoundariesAreDeterministic() throws {
         let parser = SpiceAnnexBParser()
         let padded = try parser.parse(

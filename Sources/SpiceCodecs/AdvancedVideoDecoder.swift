@@ -235,6 +235,13 @@ package struct SpiceAnnexBParseResult: Sendable, Equatable {
     package let diagnostics: SpiceAnnexBParserDiagnostics
 }
 
+package enum SpiceAnnexBSampleConstructionMode: Sendable, Equatable {
+    case direct
+    /// Deterministic package seam that performs a real post-construction copy.
+    /// The copied byte count is derived from the materialized sample itself.
+    case materializeAfterConstructionForTesting
+}
+
 package struct SpiceAnnexBParser: Sendable {
     private struct NALDescriptor: Sendable {
         let type: UInt8
@@ -251,9 +258,14 @@ package struct SpiceAnnexBParser: Sendable {
     }
 
     private let limits: SpiceAdvancedVideoDecodeLimits
+    private let sampleConstructionMode: SpiceAnnexBSampleConstructionMode
 
-    package init(limits: SpiceAdvancedVideoDecodeLimits = .init()) {
+    package init(
+        limits: SpiceAdvancedVideoDecodeLimits = .init(),
+        sampleConstructionMode: SpiceAnnexBSampleConstructionMode = .direct
+    ) {
         self.limits = limits
+        self.sampleConstructionMode = sampleConstructionMode
     }
 
     package func parse(
@@ -307,10 +319,12 @@ package struct SpiceAnnexBParser: Sendable {
             }
         }
 
+        let finalizedSample = finalizeSampleData(scanResult.sampleData)
+        let baseSampleAllocations = finalizedSample.data.isEmpty ? 0 : 1
         let accessUnit = SpiceVideoAccessUnit(
             codec: codec,
             nalUnits: nalUnits,
-            sampleData: scanResult.sampleData,
+            sampleData: finalizedSample.data,
             parameterSets: parameterSets,
             containsPicture: scanResult.containsPicture,
             isRandomAccess: scanResult.isRandomAccess
@@ -322,13 +336,32 @@ package struct SpiceAnnexBParser: Sendable {
                 inputCopyBytes: 0,
                 nalPayloadMaterializations: 0,
                 nalPayloadCopyBytes: 0,
-                avccSampleAllocations: scanResult.sampleData.isEmpty ? 0 : 1,
-                avccSampleBytes: scanResult.sampleData.count,
+                avccSampleAllocations: baseSampleAllocations
+                    + finalizedSample.additionalAllocations,
+                avccSampleBytes: finalizedSample.data.count,
                 samplePayloadCopyBytes: scanResult.samplePayloadCopyBytes,
-                additionalSamplePayloadCopyBytes: 0,
+                additionalSamplePayloadCopyBytes: finalizedSample.additionalCopyBytes,
                 nalUnitCount: scanResult.descriptors.count
             )
         )
+    }
+
+    private func finalizeSampleData(
+        _ sampleData: Data
+    ) -> (data: Data, additionalCopyBytes: Int, additionalAllocations: Int) {
+        switch sampleConstructionMode {
+        case .direct:
+            return (sampleData, 0, 0)
+        case .materializeAfterConstructionForTesting:
+            guard !sampleData.isEmpty else {
+                return (sampleData, 0, 0)
+            }
+            let materialized = sampleData.withUnsafeBytes {
+                (source: UnsafeRawBufferPointer) -> Data in
+                Data(bytes: source.baseAddress!, count: source.count)
+            }
+            return (materialized, materialized.count, 1)
+        }
     }
 
     private func scan(

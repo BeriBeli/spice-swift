@@ -6,8 +6,13 @@
 run it as a Release product; a Debug executable exits nonzero instead of
 producing an artifact whose metadata incorrectly claims optimized code. The
 runner also requires a completely clean Git worktree, including no untracked
-files, and verifies the same HEAD again after measurement. This makes the
-reported commit an exact identifier for the measured sources.
+files. The script verifies clean status and exact HEAD before and after an
+isolated build in a fresh SwiftPM scratch directory. That verified revision is
+compiled into the executable, and runtime preflight requires the clean current
+HEAD to match it before any benchmark operation runs. A directly built binary
+without embedded revision evidence, or a stale binary from another revision,
+exits nonzero without emitting JSON. This makes the reported commit an exact
+identifier for the measured sources.
 
 ```sh
 Benchmarks/run_micro.sh --warmup 3 --iterations 10 > /private/tmp/spice-micro.json

@@ -40,6 +40,9 @@ let package = Package(
             name: "CSpicePixelOps"
         ),
         .target(
+            name: "CSpiceBenchBuildInfo"
+        ),
+        .target(
             name: "SpiceVideoToolbox",
             dependencies: ["SpiceCodecs"]
         ),
@@ -113,6 +116,7 @@ let package = Package(
         .target(
             name: "SpiceBenchSupport",
             dependencies: [
+                "CSpiceBenchBuildInfo",
                 "SpiceCodecs",
                 "SpiceRenderer",
                 "SpiceWire",

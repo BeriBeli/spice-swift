@@ -1,3 +1,4 @@
+import CSpiceBenchBuildInfo
 import Dispatch
 import Foundation
 
@@ -187,6 +188,8 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
     case dirtyWorktree
     case repositoryChanged
     case repositoryStateUnavailable
+    case missingBuildRevision
+    case buildRevisionMismatch(expected: String, actual: String)
     case missingToolchainEvidence(String)
     case toolchainEvidenceMismatch
 
@@ -224,6 +227,10 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
             "benchmark repository HEAD changed during measurement"
         case .repositoryStateUnavailable:
             "benchmark repository state could not be verified"
+        case .missingBuildRevision:
+            "benchmark executable does not contain a build revision"
+        case let .buildRevisionMismatch(expected, actual):
+            "benchmark executable revision \(expected) does not match repository HEAD \(actual)"
         case let .missingToolchainEvidence(key):
             "benchmark toolchain evidence \(key) is missing"
         case .toolchainEvidenceMismatch:
@@ -256,13 +263,50 @@ package struct SpiceBenchRepositoryState: Sendable, Equatable {
     }
 }
 
+package struct SpiceBenchExecutableRevision: Sendable, Equatable {
+    private let embeddedRevision: String?
+
+    package init(embeddedRevision: String?) {
+        self.embeddedRevision = embeddedRevision
+    }
+
+    package static var embedded: Self {
+        guard let pointer = spice_bench_build_revision() else {
+            return Self(embeddedRevision: nil)
+        }
+        return Self(embeddedRevision: String(cString: pointer))
+    }
+
+    package func validate(
+        runtimeRevision: String
+    ) throws(SpiceBenchError) -> String {
+        let runtime = runtimeRevision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let embeddedRevision else {
+            throw .missingBuildRevision
+        }
+        let embedded = embeddedRevision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !embedded.isEmpty, embedded.lowercased() != "unknown" else {
+            throw .missingBuildRevision
+        }
+        guard embedded == runtime else {
+            throw .buildRevisionMismatch(expected: embedded, actual: runtime)
+        }
+        return embedded
+    }
+}
+
 package struct SpiceBenchRepositoryPreflight: Sendable {
     package typealias StateProvider = @Sendable () throws -> SpiceBenchRepositoryState
 
     private let stateProvider: StateProvider
+    private let executableRevision: SpiceBenchExecutableRevision
 
-    package init(stateProvider: @escaping StateProvider) {
+    package init(
+        executableRevision: SpiceBenchExecutableRevision,
+        stateProvider: @escaping StateProvider
+    ) {
         self.stateProvider = stateProvider
+        self.executableRevision = executableRevision
     }
 
     /// Runs artifact construction only while HEAD is clean and stable. The
@@ -271,7 +315,10 @@ package struct SpiceBenchRepositoryPreflight: Sendable {
         operation: @Sendable (String) async throws -> Output
     ) async throws -> Output {
         let initial = try validated(currentState())
-        let output = try await operation(initial.commit)
+        let measuredRevision = try executableRevision.validate(
+            runtimeRevision: initial.commit
+        )
+        let output = try await operation(measuredRevision)
         let final = try validated(currentState())
         guard final.commit == initial.commit else {
             throw SpiceBenchError.repositoryChanged
