@@ -34,11 +34,12 @@ iteration counts, nonzero checksum evidence against dead-code elimination,
 raw duration samples in measured order, derived duration statistics in
 nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
 so later analysis can compute bootstrap confidence intervals instead of trying
-to reconstruct them from lossy summary statistics. In schema 2, an even sample
-count's `median_nanoseconds` is the arithmetic mean of both central samples and
-may be fractional. Metadata schema 3 adds the immutable `build_metadata`
-snapshot. The retained schema-1 artifact used the legacy upper-middle
-sample rule; consumers must use its raw samples when comparing it with schema 2.
+to reconstruct them from lossy summary statistics. In schema 2 and later, an
+even sample count's `median_nanoseconds` is the arithmetic mean of both central
+samples and may be fractional. Metadata schema 3 adds the immutable
+`build_metadata` snapshot. The retained schema-1 artifact used the legacy
+upper-middle sample rule; consumers must use its raw samples when comparing it
+with schema 2 or later.
 The current stable case IDs are:
 
 - `wire.contiguous`
@@ -76,7 +77,7 @@ paired decision.
 
 That artifact uses workload `aip-00.micro.v1`, whose `iosurface.transition`
 sample timed only the 1x1 canonical mutation. The current harness is
-`aip-00.micro.v2` with schema 2 and also times the preceding full cross-Surface
+`aip-00.micro.v2` with schema 3 and also times the preceding full cross-Surface
 copy; v1 and v2 IOSurface durations are therefore not directly comparable. A
 new checked-in v2 artifact remains pending with the external AIP-00 gate.
 
