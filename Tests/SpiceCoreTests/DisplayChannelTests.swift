@@ -2302,6 +2302,98 @@ struct DisplayChannelTests {
         await imageCache.clear()
     }
 
+    @Test(arguments: FullBatchCodecAdmissionKind.allCases)
+    func fullBatchCodecAdmissionChargesCompletePhysicalOwner(
+        kind: FullBatchCodecAdmissionKind
+    ) async throws {
+        let drawBody = retainedOwnerCodecDrawBody(kind)
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: drawBody),
+                (type: 65_000, body: Data(repeating: 0x6d, count: 32 * 1_024)),
+            ]
+        )
+        #expect(batch.retainedBodyByteCount > drawBody.count + 32 * 1_024)
+
+        let admittedExecutor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 2,
+            maximumQueuedRetainedBytes: batch.retainedBodyByteCount
+        ))
+        let admittedGate = DisplayCodecExecutorGate()
+        let admittedBlocker = Task {
+            try await admittedExecutor.execute(retainedByteCount: 1) {
+                await admittedGate.run()
+            }
+        }
+        await admittedGate.waitUntilStarted()
+        let admittedChannel = try await retainedOwnerCodecChannel(
+            batch: batch.wire,
+            executor: admittedExecutor
+        )
+        _ = try await admittedChannel.processNext()
+        let admitted = Task { try await admittedChannel.processNext() }
+        await waitForDisplayCodecExecutor(admittedExecutor) {
+            $0.queuedJobs == 1
+                && $0.queuedRetainedBytes == batch.retainedBodyByteCount
+        }
+        var diagnostics = await admittedExecutor.diagnosticsSnapshot()
+        #expect(diagnostics.activeJobs == 1)
+        #expect(diagnostics.activeRetainedBytes == 1)
+        #expect(diagnostics.queuedJobs == 1)
+        #expect(diagnostics.queuedRetainedBytes == batch.retainedBodyByteCount)
+        #expect(diagnostics.currentRetainedBytes == batch.retainedBodyByteCount + 1)
+
+        admitted.cancel()
+        await #expect(throws: ChannelError.self) {
+            try await admitted.value
+        }
+        await waitForDisplayCodecExecutor(admittedExecutor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await admittedGate.release()
+        _ = try await admittedBlocker.value
+        diagnostics = await admittedExecutor.diagnosticsSnapshot()
+        #expect(diagnostics.activeJobs == 0)
+        #expect(diagnostics.queuedJobs == 0)
+        #expect(diagnostics.currentRetainedBytes == 0)
+        #expect(diagnostics.cancelledJobs == 1)
+        await admittedChannel.close()
+
+        let rejectedExecutor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 2,
+            maximumQueuedRetainedBytes: batch.retainedBodyByteCount - 1
+        ))
+        let rejectedGate = DisplayCodecExecutorGate()
+        let rejectedBlocker = Task {
+            try await rejectedExecutor.execute(retainedByteCount: 1) {
+                await rejectedGate.run()
+            }
+        }
+        await rejectedGate.waitUntilStarted()
+        let rejectedChannel = try await retainedOwnerCodecChannel(
+            batch: batch.wire,
+            executor: rejectedExecutor
+        )
+        _ = try await rejectedChannel.processNext()
+        await #expect(throws: ChannelError.self) {
+            try await rejectedChannel.processNext()
+        }
+        diagnostics = await rejectedExecutor.diagnosticsSnapshot()
+        #expect(diagnostics.activeJobs == 1)
+        #expect(diagnostics.queuedJobs == 0)
+        #expect(diagnostics.queuedRetainedBytes == 0)
+        #expect(diagnostics.rejectedJobs == 1)
+        await rejectedGate.release()
+        _ = try await rejectedBlocker.value
+        diagnostics = await rejectedExecutor.diagnosticsSnapshot()
+        #expect(diagnostics.activeJobs == 0)
+        #expect(diagnostics.currentRetainedBytes == 0)
+        await rejectedChannel.close()
+    }
+
     @Test func fullBatchOwnerSizeEnforcesCacheMutationTemporaryBudget() async throws {
         let imageID: UInt64 = 0xb102
         let drawBody = drawCompressedCopyBody(
@@ -4463,6 +4555,53 @@ struct DisplayChannelTests {
         return encodeFull(id: id, body: body.data, serial: serial)
     }
 
+    private func retainedOwnerCodecDrawBody(_ kind: FullBatchCodecAdmissionKind) -> Data {
+        switch kind {
+        case .jpeg:
+            drawCompressedCopyBody(imageType: 105, payload: Data([1]))
+        case .zlibGLZ:
+            drawZlibGLZCopyBody(payload: Data([1]), glzDataSize: 40)
+        case .palette:
+            drawPaletteCopyBody(
+                flags: 0x01,
+                paletteID: 0x7788,
+                entries: [0x0011_2233, 0x0044_5566],
+                payload: Data([1])
+            )
+        }
+    }
+
+    private func retainedOwnerCodecChannel(
+        batch: Data,
+        executor: SpiceCodecTaskExecutor
+    ) async throws -> DisplayChannel {
+        let transport = FakeTransport(inbound: try [
+            encodeFull(
+                SpiceMsgDisplaySurfaceCreate(
+                    surfaceID: 1,
+                    width: 2,
+                    height: 1,
+                    format: 32,
+                    flags: 1
+                ),
+                serial: 1
+            ),
+            batch,
+        ].map(Result.success))
+        try await transport.connect()
+        let decoded = decodedPixels([1, 2, 3, 4, 5, 6])
+        return DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .full
+            ),
+            codecTaskExecutor: executor,
+            jpegDecoder: StubJPEGDecoder(result: .success(decoded)),
+            paletteLZDecoder: StubPaletteLZDecoder(result: .success(decoded))
+        )
+    }
+
     private func encodeFullList(
         serial: UInt64,
         submessages: [(type: UInt16, body: Data)]
@@ -4579,6 +4718,12 @@ enum FullBatchWaiterRelease: CaseIterable, Sendable {
     case close
 }
 
+enum FullBatchCodecAdmissionKind: CaseIterable, Sendable {
+    case jpeg
+    case zlibGLZ
+    case palette
+}
+
 enum RegionWireCommand: CaseIterable, Sendable {
     case drawFill
     case copyBits
@@ -4619,6 +4764,40 @@ private func expectDisplayCacheDiagnostics(
         await Task.yield()
     }
     Issue.record("display cache diagnostics did not reach expected state")
+}
+
+private func waitForDisplayCodecExecutor(
+    _ executor: SpiceCodecTaskExecutor,
+    where predicate: (SpiceCodecTaskExecutorDiagnostics) -> Bool
+) async {
+    for _ in 0..<10_000 {
+        if predicate(await executor.diagnosticsSnapshot()) { return }
+        await Task.yield()
+    }
+    Issue.record("display codec executor diagnostics did not reach expected state")
+}
+
+private actor DisplayCodecExecutorGate {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func run() async {
+        started = true
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
 }
 
 private actor DisplayProcessProbe {
