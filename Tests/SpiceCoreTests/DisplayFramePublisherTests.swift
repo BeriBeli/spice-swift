@@ -528,8 +528,8 @@ struct DisplayFramePublisherTests {
         #expect(state.activeSurfaceIDs.count == testCase.expectedMaximumConcurrency)
         #expect(state.peakActiveCount == testCase.expectedMaximumConcurrency)
 
-        let initiallyStarted = state.startedSurfaceIDs
-        for (finishedCount, surfaceID) in initiallyStarted.reversed().enumerated() {
+        let initiallyStarted = state.startedSurfaceIDs.sorted(by: >)
+        for (finishedCount, surfaceID) in initiallyStarted.enumerated() {
             await probe.succeed(surfaceID: surfaceID)
             await probe.waitUntilFinished(finishedCount + 1)
         }
