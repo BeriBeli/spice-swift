@@ -387,6 +387,8 @@ struct SpiceBenchTests {
 
     @Test("catalog IDs and order are stable and unique")
     func catalogIDsAreStable() {
+        #expect(SpiceBenchCatalog.workloadID == "aip-00.micro.v2")
+
         let expected = [
             "wire.contiguous",
             "wire.fragmented",

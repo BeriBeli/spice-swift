@@ -62,6 +62,12 @@ It contains ten measured samples per case from implementation-and-test commit
 `cf4338d`; it is microbenchmark evidence only and does not replace the live
 paired decision.
 
+That artifact uses workload `aip-00.micro.v1`, whose `iosurface.transition`
+sample timed only the 1x1 canonical mutation. The current harness is
+`aip-00.micro.v2` and also times the preceding full cross-Surface copy; v1 and
+v2 IOSurface durations are therefore not directly comparable. A new checked-in
+v2 artifact remains pending with the external AIP-00 gate.
+
 ## Live SPICE performance comparison
 
 This directory contains a low-noise, headless comparison between SwiftSpice and
