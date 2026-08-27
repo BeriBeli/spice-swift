@@ -120,13 +120,16 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
         }
         let dependencies = try await dependencySnapshot(
             ids: program.dependencyImageIDs,
-            retainedByteCount: program.outputByteCount
+            retainedByteCount: program.waitRetainedByteCount
         )
         guard reservations[program.imageID] == reservation,
               generationToken == decodeGeneration else {
             throw SpiceCodecError.cancelled
         }
-        let retained = try Self.retainedByteCount(payload, dependencies: dependencies)
+        let retained = try Self.retainedByteCount(
+            program: program,
+            dependencies: dependencies
+        )
         let decoded: SpiceDecodedImage
         do {
             decoded = try await executor.executeThrowing(retainedByteCount: retained) {
@@ -159,10 +162,21 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
     ) async throws(SpiceCodecError) -> [UInt64: GLZDependencyImage] {
         var result: [UInt64: GLZDependencyImage] = [:]
         result.reserveCapacity(ids.count)
+        var retainedSnapshotBytes = 0
         for id in ids {
             if Task.isCancelled { throw .cancelled }
-            let image = try await dictionaryImage(id: id, retainedByteCount: retainedByteCount)
+            let (waitRetainedBytes, waitOverflow) = retainedByteCount
+                .addingReportingOverflow(retainedSnapshotBytes)
+            guard !waitOverflow else { throw .integerOverflow }
+            let image = try await dictionaryImage(
+                id: id,
+                retainedByteCount: waitRetainedBytes
+            )
             result[id] = GLZDependencyImage(pixels: image.pixels, pixelCount: image.pixelCount)
+            retainedSnapshotBytes = try Self.addingDependencySnapshot(
+                image.pixels,
+                to: retainedSnapshotBytes
+            )
         }
         return result
     }
@@ -304,16 +318,26 @@ package actor SpiceGLZDecoder: SpiceImageDecoder {
     }
 
     private static func retainedByteCount(
-        _ payload: Data,
+        program: GLZProgram,
         dependencies: [UInt64: GLZDependencyImage]
     ) throws(SpiceCodecError) -> Int {
-        var result = payload.count
+        var result = program.waitRetainedByteCount
         for dependency in dependencies.values {
-            let (next, overflow) = result.addingReportingOverflow(dependency.pixels.count)
-            guard !overflow else { throw .integerOverflow }
-            result = next
+            result = try addingDependencySnapshot(dependency.pixels, to: result)
         }
         return result
+    }
+
+    private static func addingDependencySnapshot(
+        _ pixels: Data,
+        to retainedByteCount: Int
+    ) throws(SpiceCodecError) -> Int {
+        let (withPixels, pixelOverflow) = retainedByteCount.addingReportingOverflow(
+            pixels.count
+        )
+        let (withMetadata, metadataOverflow) = withPixels.addingReportingOverflow(128)
+        guard !pixelOverflow, !metadataOverflow else { throw .integerOverflow }
+        return withMetadata
     }
 
     private static func codecError(
@@ -344,6 +368,7 @@ private struct GLZProgram: Sendable {
     let windowHeadDistance: UInt32
     let pixelCount: Int
     let outputByteCount: Int
+    let waitRetainedByteCount: Int
     let operations: [GLZOperation]
     let dependencyImageIDs: [UInt64]
 }
@@ -444,6 +469,13 @@ private extension SpiceGLZDecoder {
         guard reader.isAtEnd else {
             throw .malformedPayload("trailing compressed bytes")
         }
+        let dependencyImageIDs = dependencies.sorted()
+        let waitRetainedByteCount = try conservativeWaitRetainedByteCount(
+            outputByteCount: outputByteCount,
+            payloadByteCount: payload.count,
+            operationCount: operations.count,
+            dependencyCount: dependencyImageIDs.count
+        )
         return GLZProgram(
             payload: payload,
             width: width,
@@ -454,9 +486,69 @@ private extension SpiceGLZDecoder {
             windowHeadDistance: windowHeadDistance,
             pixelCount: pixelCount,
             outputByteCount: outputByteCount,
+            waitRetainedByteCount: waitRetainedByteCount,
             operations: operations,
-            dependencyImageIDs: dependencies.sorted()
+            dependencyImageIDs: dependencyImageIDs
         )
+    }
+
+    nonisolated static func conservativeWaitRetainedByteCount(
+        outputByteCount: Int,
+        payloadByteCount: Int,
+        operationCount: Int,
+        dependencyCount: Int
+    ) throws(SpiceCodecError) -> Int {
+        var total = 0
+        try addRetainedBytes(outputByteCount, to: &total)
+        try addRetainedBytes(payloadByteCount, to: &total)
+
+        // Array capacity is intentionally opaque. Charge twice the live
+        // element storage plus independent allocator/container allowances so
+        // capacity growth and heap metadata are not represented as exact
+        // count * stride bytes.
+        try addRetainedBytes(
+            try conservativeArrayAllocationByteCount(
+                elementCount: operationCount,
+                elementStride: MemoryLayout<GLZOperation>.stride
+            ),
+            to: &total
+        )
+        try addRetainedBytes(
+            try conservativeArrayAllocationByteCount(
+                elementCount: dependencyCount,
+                elementStride: MemoryLayout<UInt64>.stride
+            ),
+            to: &total
+        )
+        // GLZProgram, Data's owner/reference, the two array values, and the
+        // dependency-snapshot dictionary retained across later waits.
+        try addRetainedBytes(768, to: &total)
+        return total
+    }
+
+    nonisolated static func conservativeArrayAllocationByteCount(
+        elementCount: Int,
+        elementStride: Int
+    ) throws(SpiceCodecError) -> Int {
+        guard elementCount >= 0, elementStride >= 0 else { throw .integerOverflow }
+        let (capacityElements, capacityOverflow) = elementCount.multipliedReportingOverflow(by: 2)
+        let (elementBytes, byteOverflow) = capacityElements.multipliedReportingOverflow(
+            by: elementStride
+        )
+        guard !capacityOverflow, !byteOverflow else { throw .integerOverflow }
+        let (result, overheadOverflow) = elementBytes.addingReportingOverflow(256)
+        guard !overheadOverflow else { throw .integerOverflow }
+        return result
+    }
+
+    nonisolated static func addRetainedBytes(
+        _ bytes: Int,
+        to total: inout Int
+    ) throws(SpiceCodecError) {
+        guard bytes >= 0 else { throw .integerOverflow }
+        let (next, overflow) = total.addingReportingOverflow(bytes)
+        guard !overflow else { throw .integerOverflow }
+        total = next
     }
 
     nonisolated static func parsePlane(
