@@ -119,9 +119,11 @@ struct SpiceBenchCommand {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            // Drain while the child is running. Waiting first can deadlock
+            // when stdout fills the pipe, notably for a very dirty worktree.
+            let output = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return nil }
-            let output = pipe.fileHandleForReading.readDataToEndOfFile()
             let value = String(decoding: output, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty && !allowEmpty ? nil : value

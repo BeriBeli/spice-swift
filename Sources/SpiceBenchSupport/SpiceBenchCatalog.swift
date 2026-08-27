@@ -243,16 +243,14 @@ package enum SpiceBenchCatalog {
     private actor IOSurfaceBenchmarkState {
         struct Result: Sendable {
             let revision: SurfaceRevision
-            let before: SurfaceStoreMetrics
+            let beforeCopy: SurfaceStoreMetrics
+            let beforeMutation: SurfaceStoreMetrics
             let after: SurfaceStoreMetrics
-            let initialBulkCopyCalls: UInt64
-            let initialRowCopyCalls: UInt64
         }
 
         private var store: SurfaceStore?
         private var metricsBeforeMutation: SurfaceStoreMetrics?
-        private var initialBulkCopyCalls: UInt64 = 0
-        private var initialRowCopyCalls: UInt64 = 0
+        private var fullRectangle: PixelRect?
 
         func setUp(bitmap: RawBitmap) async throws {
             await tearDown()
@@ -293,17 +291,8 @@ package enum SpiceBenchCatalog {
                     destination: fullRectangle,
                     bitmap: bitmap
                 )
-                let beforeCopy = await store.metrics()
-                _ = try await store.drawCopy(
-                    surfaceID: 2,
-                    destination: fullRectangle,
-                    sourceSurfaceID: 3,
-                    source: fullRectangle
-                )
-                let afterCopy = await store.metrics()
-                initialBulkCopyCalls = afterCopy.bulkCopyCalls - beforeCopy.bulkCopyCalls
-                initialRowCopyCalls = afterCopy.rowCopyCalls - beforeCopy.rowCopyCalls
-                metricsBeforeMutation = afterCopy
+                metricsBeforeMutation = await store.metrics()
+                self.fullRectangle = fullRectangle
                 self.store = store
             } catch {
                 await store.close()
@@ -312,9 +301,18 @@ package enum SpiceBenchCatalog {
         }
 
         func run() async throws -> Result {
-            guard let store, let metricsBeforeMutation else {
+            guard let store, let metricsBeforeMutation, let fullRectangle else {
                 throw SpiceBenchWorkloadError.missingState("IOSurface transition")
             }
+            // Keep the full cross-Surface copy inside the runner's measured
+            // operation. Setup establishes canonical IOSurface backings only.
+            _ = try await store.drawCopy(
+                surfaceID: 2,
+                destination: fullRectangle,
+                sourceSurfaceID: 3,
+                source: fullRectangle
+            )
+            let beforeMutation = await store.metrics()
             let revision = try await store.fill(
                 surfaceID: 2,
                 rectangle: PixelRect(x: 1, y: 1, width: 1, height: 1),
@@ -322,10 +320,9 @@ package enum SpiceBenchCatalog {
             )
             return Result(
                 revision: revision,
-                before: metricsBeforeMutation,
-                after: await store.metrics(),
-                initialBulkCopyCalls: initialBulkCopyCalls,
-                initialRowCopyCalls: initialRowCopyCalls
+                beforeCopy: metricsBeforeMutation,
+                beforeMutation: beforeMutation,
+                after: await store.metrics()
             )
         }
 
@@ -333,8 +330,7 @@ package enum SpiceBenchCatalog {
             let store = self.store
             self.store = nil
             metricsBeforeMutation = nil
-            initialBulkCopyCalls = 0
-            initialRowCopyCalls = 0
+            fullRectangle = nil
             await store?.close()
         }
     }
@@ -595,14 +591,16 @@ package enum SpiceBenchCatalog {
             checksum: revisionChecksum(result.revision),
             exactCounters: [
                 "cpuMaterializationBytes": result.after.cpuMaterializationBytes
-                    - result.before.cpuMaterializationBytes,
+                    - result.beforeMutation.cpuMaterializationBytes,
                 "cpuMaterializations": result.after.cpuMaterializations
-                    - result.before.cpuMaterializations,
+                    - result.beforeMutation.cpuMaterializations,
                 "revisionedBackingEnabled": 1,
-                "bulkCopyCalls": result.initialBulkCopyCalls,
-                "rowCopyCalls": result.initialRowCopyCalls,
+                "bulkCopyCalls": result.beforeMutation.bulkCopyCalls
+                    - result.beforeCopy.bulkCopyCalls,
+                "rowCopyCalls": result.beforeMutation.rowCopyCalls
+                    - result.beforeCopy.rowCopyCalls,
                 "directIOSurfaceWriteBytes": result.after.directIOSurfaceWriteBytes
-                    - result.before.directIOSurfaceWriteBytes,
+                    - result.beforeMutation.directIOSurfaceWriteBytes,
             ]
         )
     }
