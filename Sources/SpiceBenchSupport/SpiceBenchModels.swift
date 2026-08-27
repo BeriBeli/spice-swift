@@ -109,7 +109,7 @@ package struct SpiceBenchCaseResult: Codable, Sendable, Equatable {
 }
 
 package struct SpiceBenchReport: Codable, Sendable, Equatable {
-    package static let currentSchemaVersion = 1
+    package static let currentSchemaVersion = 2
 
     package let schemaVersion: Int
     package let artifactKind: SpiceBenchArtifactKind

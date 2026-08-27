@@ -7,6 +7,8 @@ import SpiceBenchSupport
 struct SpiceBenchTests {
     @Test("JSON schema is stable, complete, and round-trips")
     func jsonSchemaRoundTrips() throws {
+        #expect(SpiceBenchReport.currentSchemaVersion == 2)
+
         let report = SpiceBenchReport(
             artifactKind: .microbenchmark,
             metadata: fixtureMetadata,
