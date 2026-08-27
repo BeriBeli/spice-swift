@@ -1170,12 +1170,18 @@ public actor SpiceSession {
         _ responses: [Data],
         clientID: Int64,
         channelID: UInt8,
-        generation: UInt64
+        generation: UInt64,
+        server: SpiceWebDAVServer
     ) async throws(SpiceError) {
-        guard generation == supervisionGeneration else { throw .cancelled }
+        guard !Task.isCancelled,
+              generation == supervisionGeneration,
+              webDAVServers[channelID] === server else { throw .cancelled }
         for response in responses {
             var offset = 0
             while offset < response.count {
+                guard !Task.isCancelled,
+                      generation == supervisionGeneration,
+                      webDAVServers[channelID] === server else { throw .cancelled }
                 let end = min(offset + Int(UInt16.max), response.count)
                 try await sendWebDAVResponse(
                     clientID: clientID,
@@ -1185,12 +1191,46 @@ public actor SpiceSession {
                 offset = end
             }
             if response.isEmpty {
+                guard !Task.isCancelled,
+                      generation == supervisionGeneration,
+                      webDAVServers[channelID] === server else { throw .cancelled }
                 try await sendWebDAVResponse(
                     clientID: clientID,
                     data: Data(),
                     channelID: channelID
                 )
             }
+        }
+    }
+
+    private func webDAVBackendCompleted(
+        _ result: Result<[Data], SpiceWebDAVPipelineError>,
+        clientID: Int64,
+        channelID: UInt8,
+        generation: UInt64,
+        server: SpiceWebDAVServer
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              generation == supervisionGeneration,
+              webDAVServers[channelID] === server else { return false }
+        do {
+            let responses = try result.get()
+            try await sendWebDAVBackendResponses(
+                responses,
+                clientID: clientID,
+                channelID: channelID,
+                generation: generation,
+                server: server
+            )
+            return true
+        } catch SpiceWebDAVPipelineError.cancelled, SpiceError.cancelled {
+            return false
+        } catch {
+            await receiveFailed(
+                .protocolViolation("WebDAV backend: \(String(describing: error))"),
+                generation: generation
+            )
+            return false
         }
     }
 
@@ -1647,12 +1687,19 @@ public actor SpiceSession {
             case let .request(clientID, data):
                 if let server = webDAVServers[channelID] {
                     do {
-                        try await sendWebDAVBackendResponses(
-                            try await server.receive(clientID: clientID, data: data),
+                        _ = try await server.submit(
                             clientID: clientID,
-                            channelID: channelID,
-                            generation: generation
-                        )
+                            data: data
+                        ) { [weak self, server] result in
+                            guard let self else { return false }
+                            return await self.webDAVBackendCompleted(
+                                result,
+                                clientID: clientID,
+                                channelID: channelID,
+                                generation: generation,
+                                server: server
+                            )
+                        }
                         publicEvent = nil
                     } catch {
                         await receiveFailed(

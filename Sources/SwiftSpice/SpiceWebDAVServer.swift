@@ -14,13 +14,65 @@ public enum SpiceWebDAVServerError: Error, Sendable, Equatable {
     case pathEscapesRoot
 }
 
+package enum SpiceWebDAVPipelineError: Error, Sendable, Equatable {
+    case protocolError(SpiceWebDAVServerError)
+    case tooManyPendingJobs(actual: Int, maximum: Int)
+    case queuedRetainedBytesExceeded(actual: Int, maximum: Int)
+    case cancelled
+}
+
 /// A bounded native WebDAV endpoint rooted at one explicitly authorized directory.
 public actor SpiceWebDAVServer {
+    package typealias FileOperationObserver = @Sendable (Int64, UInt64) -> Void
+    package typealias ResponseSender = @Sendable (
+        Result<[Data], SpiceWebDAVPipelineError>
+    ) async -> Bool
     private struct Request: Sendable {
         let method: String
         let target: String
         let headers: [String: String]
         let body: Data
+        let inputRetainedByteCount: Int
+        let responseRetainedByteLimit: Int
+        let sequence: UInt64
+    }
+
+    private struct Submission: Sendable {
+        let id: UInt64
+        let clientID: Int64
+        let generation: UInt64
+        let requests: [Request]
+        let inputRetainedByteCount: Int
+        let reservedResponseBytes: Int
+        let responseSender: ResponseSender
+    }
+
+    private struct ClientState: Sendable {
+        var generation: UInt64
+        var nextSequence: UInt64 = 0
+        var buffer = Data()
+        var submissions: [Submission] = []
+        var worker: Task<Void, Never>?
+    }
+
+    package struct Diagnostics: Sendable, Equatable {
+        package let clients: Int
+        package let bufferedInputBytes: Int
+        package let pendingJobs: Int
+        /// Parsed request/body/header ownership awaiting completion.
+        package let pendingRetainedBytes: Int
+        /// Conservative encoded-response reservations, held through send.
+        package let reservedResponseBytes: Int
+        package let currentRetainedBytes: Int
+        package let peakPendingJobs: Int
+        package let peakRetainedBytes: Int
+        package let completedJobs: UInt64
+        package let cancelledJobs: UInt64
+        /// Batch admissions rejected by a client/job/retained-byte bound.
+        /// Malformed HTTP requests are protocol failures, not admission rejects.
+        package let rejectedJobs: UInt64
+        package let discardedLateResults: UInt64
+        package let executor: SpiceFilesystemTaskExecutorDiagnostics
     }
 
     private struct Response: Sendable {
@@ -48,9 +100,27 @@ public actor SpiceWebDAVServer {
     public nonisolated let accessMode: SpiceWebDAVAccessMode
     private let maximumClients: Int
     private let maximumHeaderBytes: Int
-    private let maximumBodyBytes: Int
-    private var buffers: [Int64: Data] = [:]
-    private let fileManager = FileManager()
+    private nonisolated let maximumBodyBytes: Int
+    private let maximumPendingJobs: Int
+    private let maximumQueuedRetainedBytes: Int
+    private nonisolated let filesystemExecutor: SpiceFilesystemTaskExecutor
+    private nonisolated let fileOperationWillBegin: FileOperationObserver?
+    private var clients: [Int64: ClientState] = [:]
+    private var legacyBuffers: [Int64: Data] = [:]
+    private var legacyBufferedInputBytes = 0
+    private var nextClientGeneration: UInt64 = 0
+    private var nextSubmissionID: UInt64 = 0
+    private var bufferedInputBytes = 0
+    private var pendingJobs = 0
+    private var pendingRetainedBytes = 0
+    private var reservedResponseBytes = 0
+    private var peakPendingJobs = 0
+    private var peakRetainedBytes = 0
+    private var completedJobs: UInt64 = 0
+    private var cancelledJobs: UInt64 = 0
+    private var rejectedJobs: UInt64 = 0
+    private var discardedLateResults: UInt64 = 0
+    private var activeResponseSubmissions: Set<UInt64> = []
 
     public init(
         root: URL,
@@ -77,39 +147,348 @@ public actor SpiceWebDAVServer {
         self.maximumClients = maximumClients
         self.maximumHeaderBytes = maximumHeaderBytes
         self.maximumBodyBytes = maximumBodyBytes
+        maximumPendingJobs = 64
+        maximumQueuedRetainedBytes = 256 * 1_024 * 1_024
+        filesystemExecutor = SpiceFilesystemTaskExecutor()
+        fileOperationWillBegin = nil
     }
 
-    /// Incrementally consumes one HTTP byte stream and returns complete responses.
+    package init(
+        root: URL,
+        accessMode: SpiceWebDAVAccessMode = .readOnly,
+        maximumClients: Int = 64,
+        maximumHeaderBytes: Int = 64 * 1_024,
+        maximumBodyBytes: Int = 64 * 1_024 * 1_024,
+        maximumPendingJobs: Int = 64,
+        maximumQueuedRetainedBytes: Int = 256 * 1_024 * 1_024,
+        filesystemExecutor: SpiceFilesystemTaskExecutor,
+        fileOperationWillBegin: FileOperationObserver? = nil
+    ) throws(SpiceWebDAVServerError) {
+        let resolved = root.standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard resolved.isFileURL,
+              FileManager.default.fileExists(
+                atPath: resolved.path,
+                isDirectory: &isDirectory
+              ),
+              isDirectory.boolValue,
+              maximumClients > 0,
+              maximumHeaderBytes > 0,
+              maximumBodyBytes >= 0,
+              maximumPendingJobs >= 0,
+              maximumQueuedRetainedBytes >= 0 else {
+            throw .invalidRoot
+        }
+        self.root = resolved
+        self.accessMode = accessMode
+        self.maximumClients = maximumClients
+        self.maximumHeaderBytes = maximumHeaderBytes
+        self.maximumBodyBytes = maximumBodyBytes
+        self.maximumPendingJobs = maximumPendingJobs
+        self.maximumQueuedRetainedBytes = maximumQueuedRetainedBytes
+        self.filesystemExecutor = filesystemExecutor
+        self.fileOperationWillBegin = fileOperationWillBegin
+    }
+
+    /// Compatibility path preserving the original synchronous actor API.
+    /// Production channel traffic uses the package-only bounded pipeline below.
     public func receive(
         clientID: Int64,
         data: Data
     ) throws(SpiceWebDAVServerError) -> [Data] {
         guard !data.isEmpty else {
-            buffers.removeValue(forKey: clientID)
+            close(clientID: clientID)
             return []
         }
-        if buffers[clientID] == nil {
-            guard buffers.count < maximumClients else { throw .tooManyClients }
-            buffers[clientID] = Data()
+        let existingBuffer = legacyBuffers[clientID]
+        if existingBuffer == nil {
+            guard clients[clientID] == nil else { throw .invalidRequest }
+            let (clientCount, overflow) = legacyBuffers.count.addingReportingOverflow(
+                clients.count
+            )
+            guard !overflow, clientCount < maximumClients else { throw .tooManyClients }
         }
-        buffers[clientID]!.append(data)
+        let (candidateLegacyBytes, legacyOverflow) = legacyBufferedInputBytes
+            .addingReportingOverflow(data.count)
+        let currentPipelineRetained = addingSaturated(
+            addingSaturated(bufferedInputBytes, pendingRetainedBytes),
+            reservedResponseBytes
+        )
+        let (candidateTotal, totalOverflow) = currentPipelineRetained
+            .addingReportingOverflow(legacyOverflow ? .max : candidateLegacyBytes)
+        guard !legacyOverflow, !totalOverflow,
+              candidateTotal <= maximumQueuedRetainedBytes else {
+            throw .bodyTooLarge
+        }
+        var candidateBuffer = existingBuffer ?? Data()
+        candidateBuffer.append(data)
+        legacyBuffers[clientID] = candidateBuffer
+        legacyBufferedInputBytes = candidateLegacyBytes
+        peakRetainedBytes = max(peakRetainedBytes, candidateTotal)
         var responses: [Data] = []
-        while let request = try nextRequest(clientID: clientID) {
-            responses.append(handle(request).encoded(includeBody: request.method != "HEAD"))
+        while let parsed = try nextRequest(
+            buffer: legacyBuffers[clientID] ?? Data(),
+            sequence: 0
+        ) {
+            legacyBuffers[clientID]?.removeFirst(parsed.consumedBytes)
+            legacyBufferedInputBytes -= parsed.consumedBytes
+            responses.append(handle(parsed.request).encoded(
+                includeBody: parsed.request.method != "HEAD"
+            ))
         }
         return responses
     }
 
+    /// Admits work without awaiting filesystem access or response transmission.
+    /// Returns false when the input only extends an incomplete HTTP request.
+    package func submit(
+        clientID: Int64,
+        data: Data,
+        responseSender: @escaping ResponseSender
+    ) throws(SpiceWebDAVPipelineError) -> Bool {
+        guard !data.isEmpty else {
+            return false
+        }
+        return try enqueueBatch(
+            clientID: clientID,
+            data: data,
+            responseSender: responseSender
+        )
+    }
+
     public func close(clientID: Int64) {
-        buffers.removeValue(forKey: clientID)
+        if let legacyBuffer = legacyBuffers.removeValue(forKey: clientID) {
+            legacyBufferedInputBytes -= legacyBuffer.count
+        }
+        guard let client = clients.removeValue(forKey: clientID) else { return }
+        client.worker?.cancel()
+        bufferedInputBytes -= client.buffer.count
+        let submissions = client.submissions
+        let cancellable = submissions.filter {
+            !activeResponseSubmissions.contains($0.id)
+        }
+        release(cancellable)
+        add(&cancelledJobs, cancellable.reduce(0) { $0 + $1.requests.count })
     }
 
     public func closeAll() {
-        buffers.removeAll(keepingCapacity: false)
+        legacyBuffers.removeAll(keepingCapacity: false)
+        legacyBufferedInputBytes = 0
+        let removed = Array(clients.values)
+        clients.removeAll(keepingCapacity: false)
+        bufferedInputBytes = 0
+        for client in removed { client.worker?.cancel() }
+        for client in removed {
+            let cancellable = client.submissions.filter {
+                !activeResponseSubmissions.contains($0.id)
+            }
+            release(cancellable)
+            add(&cancelledJobs, cancellable.reduce(0) { total, submission in
+                total + submission.requests.count
+            })
+        }
     }
 
-    private func nextRequest(clientID: Int64) throws(SpiceWebDAVServerError) -> Request? {
-        guard var buffer = buffers[clientID] else { return nil }
+    package func diagnosticsSnapshot() async -> Diagnostics {
+        let executor = await filesystemExecutor.diagnosticsSnapshot()
+        return Diagnostics(
+            clients: clients.count + legacyBuffers.count,
+            bufferedInputBytes: addingSaturated(
+                legacyBufferedInputBytes,
+                bufferedInputBytes
+            ),
+            pendingJobs: pendingJobs,
+            pendingRetainedBytes: pendingRetainedBytes,
+            reservedResponseBytes: reservedResponseBytes,
+            currentRetainedBytes: addingSaturated(
+                addingSaturated(
+                    addingSaturated(legacyBufferedInputBytes, bufferedInputBytes),
+                    pendingRetainedBytes
+                ),
+                reservedResponseBytes
+            ),
+            peakPendingJobs: peakPendingJobs,
+            peakRetainedBytes: peakRetainedBytes,
+            completedJobs: completedJobs,
+            cancelledJobs: cancelledJobs,
+            rejectedJobs: rejectedJobs,
+            discardedLateResults: discardedLateResults,
+            executor: executor
+        )
+    }
+
+    private func enqueueBatch(
+        clientID: Int64,
+        data: Data,
+        responseSender: @escaping ResponseSender
+    ) throws(SpiceWebDAVPipelineError) -> Bool {
+        var client: ClientState
+        if let existing = clients[clientID] {
+            client = existing
+        } else {
+            guard legacyBuffers[clientID] == nil else {
+                throw .protocolError(.invalidRequest)
+            }
+            let (clientCount, clientCountOverflow) = clients.count
+                .addingReportingOverflow(legacyBuffers.count)
+            guard !clientCountOverflow, clientCount < maximumClients else {
+                reject()
+                throw .protocolError(.tooManyClients)
+            }
+            guard nextClientGeneration < UInt64.max else {
+                throw .protocolError(.invalidRequest)
+            }
+            nextClientGeneration += 1
+            client = ClientState(generation: nextClientGeneration)
+        }
+
+        let (candidateCount, candidateOverflow) = client.buffer.count
+            .addingReportingOverflow(data.count)
+        guard !candidateOverflow else { throw .protocolError(.bodyTooLarge) }
+        let retainedWithoutClientBuffer = addingSaturated(
+            addingSaturated(
+                addingSaturated(pendingRetainedBytes, reservedResponseBytes),
+                legacyBufferedInputBytes
+            ),
+            bufferedInputBytes - client.buffer.count
+        )
+        let (candidateTotal, candidateTotalOverflow) = retainedWithoutClientBuffer
+            .addingReportingOverflow(candidateCount)
+        guard !candidateTotalOverflow,
+              candidateTotal <= maximumQueuedRetainedBytes else {
+            reject()
+            throw .queuedRetainedBytesExceeded(
+                actual: candidateTotalOverflow ? .max : candidateTotal,
+                maximum: maximumQueuedRetainedBytes
+            )
+        }
+
+        var candidateBuffer = client.buffer
+        candidateBuffer.append(data)
+        let parsed: ParsedRequests
+        do {
+            parsed = try parseRequests(
+                buffer: candidateBuffer,
+                nextSequence: client.nextSequence,
+                maximumAdditionalRequests: max(0, maximumPendingJobs - pendingJobs)
+            )
+        } catch let error {
+            throw .protocolError(error)
+        }
+        let addedJobs = parsed.requests.count
+        let (actualJobs, jobOverflow) = pendingJobs.addingReportingOverflow(addedJobs)
+        guard !jobOverflow, actualJobs <= maximumPendingJobs else {
+            reject()
+            throw .tooManyPendingJobs(
+                actual: jobOverflow ? .max : actualJobs,
+                maximum: maximumPendingJobs
+            )
+        }
+        let addedInputRetained: Int
+        let addedResponseReservation: Int
+        do {
+            addedInputRetained = try sumInputRetainedBytes(parsed.requests)
+            addedResponseReservation = try sumResponseReservations(parsed.requests)
+        } catch let error {
+            throw .protocolError(error)
+        }
+        let (newPendingRetained, pendingOverflow) = pendingRetainedBytes
+            .addingReportingOverflow(addedInputRetained)
+        let (newResponseReservation, responseOverflow) = reservedResponseBytes
+            .addingReportingOverflow(addedResponseReservation)
+        let retainedOtherClients = bufferedInputBytes - client.buffer.count
+        let (newBufferedInput, bufferedOverflow) = retainedOtherClients
+            .addingReportingOverflow(parsed.remaining.count)
+        let (newPendingTotal, pendingTotalOverflow) = newPendingRetained
+            .addingReportingOverflow(newResponseReservation)
+        let (withPipelineBuffers, pipelineBufferOverflow) = newPendingTotal
+            .addingReportingOverflow(bufferedOverflow ? .max : newBufferedInput)
+        let (newTotalRetained, totalOverflow) = withPipelineBuffers
+            .addingReportingOverflow(legacyBufferedInputBytes)
+        guard !pendingOverflow, !responseOverflow, !bufferedOverflow,
+              !pendingTotalOverflow, !pipelineBufferOverflow, !totalOverflow,
+              newTotalRetained <= maximumQueuedRetainedBytes else {
+            reject()
+            throw .queuedRetainedBytesExceeded(
+                actual: pendingOverflow || responseOverflow || pendingTotalOverflow
+                    || pipelineBufferOverflow || totalOverflow ? .max : newTotalRetained,
+                maximum: maximumQueuedRetainedBytes
+            )
+        }
+
+        if parsed.requests.isEmpty {
+            client.buffer = parsed.remaining
+            client.nextSequence = parsed.nextSequence
+            bufferedInputBytes = newBufferedInput
+            clients[clientID] = client
+            peakRetainedBytes = max(peakRetainedBytes, newTotalRetained)
+            return false
+        }
+
+        let submissionIDs = try allocatePipelineSubmissionIDs(count: parsed.requests.count)
+        for (request, submissionID) in zip(parsed.requests, submissionIDs) {
+            client.submissions.append(Submission(
+                id: submissionID,
+                clientID: clientID,
+                generation: client.generation,
+                requests: [request],
+                inputRetainedByteCount: request.inputRetainedByteCount,
+                reservedResponseBytes: request.responseRetainedByteLimit,
+                responseSender: responseSender
+            ))
+        }
+        client.buffer = parsed.remaining
+        client.nextSequence = parsed.nextSequence
+        bufferedInputBytes = newBufferedInput
+        pendingJobs = actualJobs
+        pendingRetainedBytes = newPendingRetained
+        reservedResponseBytes = newResponseReservation
+        peakPendingJobs = max(peakPendingJobs, pendingJobs)
+        peakRetainedBytes = max(peakRetainedBytes, newTotalRetained)
+        if client.worker == nil {
+            let generation = client.generation
+            client.worker = Task { [weak self] in
+                await self?.runClient(clientID: clientID, generation: generation)
+            }
+        }
+        clients[clientID] = client
+        return true
+    }
+
+    private struct ParsedRequests {
+        let requests: [Request]
+        let remaining: Data
+        let nextSequence: UInt64
+    }
+
+    private func parseRequests(
+        buffer: Data,
+        nextSequence: UInt64,
+        maximumAdditionalRequests: Int
+    ) throws(SpiceWebDAVServerError) -> ParsedRequests {
+        var remaining = buffer
+        var sequence = nextSequence
+        var requests: [Request] = []
+        while let parsed = try nextRequest(buffer: remaining, sequence: sequence) {
+            requests.append(parsed.request)
+            remaining.removeFirst(parsed.consumedBytes)
+            sequence = parsed.request.sequence
+            // Parsing one beyond the available admission slots is sufficient
+            // to report the exact rejection without materializing an unbounded
+            // request array from one pipelined input buffer.
+            if requests.count > maximumAdditionalRequests { break }
+        }
+        return ParsedRequests(
+            requests: requests,
+            remaining: remaining,
+            nextSequence: sequence
+        )
+    }
+
+    private func nextRequest(
+        buffer: Data,
+        sequence: UInt64
+    ) throws(SpiceWebDAVServerError) -> (request: Request, consumedBytes: Int)? {
         let delimiter = Data("\r\n\r\n".utf8)
         guard let headerRange = buffer.range(of: delimiter) else {
             guard buffer.count <= maximumHeaderBytes else { throw .headerTooLarge }
@@ -152,8 +531,13 @@ public actor SpiceWebDAVServer {
             bodyLength = 0
         }
         guard bodyLength <= maximumBodyBytes else { throw .bodyTooLarge }
-        guard buffer.count >= headerLength + bodyLength else {
-            guard buffer.count <= maximumHeaderBytes + maximumBodyBytes else {
+        let (requestLength, requestLengthOverflow) = headerLength
+            .addingReportingOverflow(bodyLength)
+        let (maximumRequestBytes, maximumOverflow) = maximumHeaderBytes
+            .addingReportingOverflow(maximumBodyBytes)
+        guard !requestLengthOverflow, !maximumOverflow else { throw .bodyTooLarge }
+        guard buffer.count >= requestLength else {
+            guard buffer.count <= maximumRequestBytes else {
                 throw .bodyTooLarge
             }
             return nil
@@ -161,17 +545,214 @@ public actor SpiceWebDAVServer {
         let bodyStart = headerRange.upperBound
         let bodyEnd = buffer.index(bodyStart, offsetBy: bodyLength)
         let body = Data(buffer[bodyStart..<bodyEnd])
-        buffer.removeFirst(headerLength + bodyLength)
-        buffers[clientID] = buffer
-        return Request(
-            method: String(components[0]).uppercased(),
+        guard sequence < UInt64.max else { throw .invalidRequest }
+        let nextSequence = sequence + 1
+        let inputRetainedByteCount = try retainedByteCount(
+            requestLength: requestLength,
+            headerCount: headers.count
+        )
+        let method = String(components[0]).uppercased()
+        let responseRetainedByteLimit = try responseRetainedByteLimit(for: method)
+        return (Request(
+            method: method,
             target: String(components[1]),
             headers: headers,
-            body: body
-        )
+            body: body,
+            inputRetainedByteCount: inputRetainedByteCount,
+            responseRetainedByteLimit: responseRetainedByteLimit,
+            sequence: nextSequence
+        ), requestLength)
     }
 
-    private func handle(_ request: Request) -> Response {
+    private func runClient(clientID: Int64, generation: UInt64) async {
+        while !Task.isCancelled {
+            guard let client = clients[clientID],
+                  client.generation == generation,
+                  let submission = client.submissions.first else {
+                clearWorker(clientID: clientID, generation: generation)
+                return
+            }
+
+            let result = await execute(submission)
+            guard let current = clients[clientID],
+                  current.generation == generation,
+                  current.submissions.first?.id == submission.id else {
+                add(&discardedLateResults, submission.requests.count)
+                return
+            }
+            // The response reservation remains charged while the sender owns
+            // the result. This bounds slow-client response retention without
+            // holding a filesystem executor permit during transport I/O.
+            activeResponseSubmissions.insert(submission.id)
+            clients[clientID] = current
+            let delivered = await submission.responseSender(result)
+
+            guard activeResponseSubmissions.remove(submission.id) != nil else {
+                return
+            }
+            release([submission])
+            if var latest = clients[clientID],
+               latest.generation == generation,
+               latest.submissions.first?.id == submission.id {
+                latest.submissions.removeFirst()
+                clients[clientID] = latest
+            }
+            switch (result, delivered) {
+            case (.success, true):
+                add(&completedJobs, submission.requests.count)
+            case (.failure(.cancelled), _), (_, false):
+                add(&cancelledJobs, submission.requests.count)
+            case (.failure, true):
+                break
+            }
+            if Task.isCancelled {
+                return
+            }
+        }
+    }
+
+    private func execute(
+        _ submission: Submission
+    ) async -> Result<[Data], SpiceWebDAVPipelineError> {
+        var responses: [Data] = []
+        responses.reserveCapacity(submission.requests.count)
+        for request in submission.requests {
+            do {
+                let response = try await filesystemExecutor.execute(
+                    retainedByteCount: request.inputRetainedByteCount
+                ) { [self] in
+                    fileOperationWillBegin?(submission.clientID, request.sequence)
+                    return handle(request).encoded(includeBody: request.method != "HEAD")
+                }
+                guard response.count <= request.responseRetainedByteLimit else {
+                    return .failure(.protocolError(.bodyTooLarge))
+                }
+                responses.append(response)
+            } catch let error {
+                return .failure(map(executorError: error))
+            }
+        }
+        return .success(responses)
+    }
+
+    private func clearWorker(clientID: Int64, generation: UInt64) {
+        guard var client = clients[clientID], client.generation == generation else { return }
+        client.worker = nil
+        clients[clientID] = client
+    }
+
+    private func release(_ submissions: [Submission]) {
+        for submission in submissions {
+            pendingJobs -= submission.requests.count
+            pendingRetainedBytes -= submission.inputRetainedByteCount
+            reservedResponseBytes -= submission.reservedResponseBytes
+        }
+    }
+
+    private func allocatePipelineSubmissionIDs(
+        count: Int
+    ) throws(SpiceWebDAVPipelineError) -> Range<UInt64> {
+        guard count > 0,
+              let unsignedCount = UInt64(exactly: count) else {
+            throw .protocolError(.invalidRequest)
+        }
+        let (end, overflow) = nextSubmissionID.addingReportingOverflow(unsignedCount)
+        guard !overflow else { throw .protocolError(.invalidRequest) }
+        let start = nextSubmissionID
+        nextSubmissionID = end
+        return start..<end
+    }
+
+    private func retainedByteCount(
+        requestLength: Int,
+        headerCount: Int
+    ) throws(SpiceWebDAVServerError) -> Int {
+        let (headerMetadata, headerOverflow) = headerCount.multipliedReportingOverflow(by: 128)
+        let (withHeaders, requestOverflow) = requestLength.addingReportingOverflow(
+            headerOverflow ? .max : headerMetadata
+        )
+        let (total, fixedOverflow) = withHeaders.addingReportingOverflow(512)
+        guard !headerOverflow, !requestOverflow, !fixedOverflow else {
+            throw .bodyTooLarge
+        }
+        return total
+    }
+
+    private func responseRetainedByteLimit(
+        for method: String
+    ) throws(SpiceWebDAVServerError) -> Int {
+        // Body-bearing reads reserve their configured body ceiling. Other
+        // responses are generated solely from bounded headers/status text.
+        let bodyLimit = method == "GET" || method == "PROPFIND"
+            ? maximumBodyBytes
+            : 0
+        let (total, overflow) = maximumHeaderBytes.addingReportingOverflow(bodyLimit)
+        guard !overflow else { throw .bodyTooLarge }
+        return total
+    }
+
+    private func sumInputRetainedBytes(
+        _ requests: [Request]
+    ) throws(SpiceWebDAVServerError) -> Int {
+        var total = 0
+        for request in requests {
+            let (next, overflow) = total.addingReportingOverflow(
+                request.inputRetainedByteCount
+            )
+            guard !overflow else { throw .bodyTooLarge }
+            total = next
+        }
+        return total
+    }
+
+    private func sumResponseReservations(
+        _ requests: [Request]
+    ) throws(SpiceWebDAVServerError) -> Int {
+        var total = 0
+        for request in requests {
+            let (next, overflow) = total.addingReportingOverflow(
+                request.responseRetainedByteLimit
+            )
+            guard !overflow else { throw .bodyTooLarge }
+            total = next
+        }
+        return total
+    }
+
+    private func map(
+        executorError: SpiceFilesystemTaskExecutorError
+    ) -> SpiceWebDAVPipelineError {
+        switch executorError {
+        case let .tooManyPendingJobs(actual, maximum):
+            .tooManyPendingJobs(actual: actual, maximum: maximum)
+        case let .queuedRetainedBytesExceeded(actual, maximum):
+            .queuedRetainedBytesExceeded(actual: actual, maximum: maximum)
+        case .cancelled, .closed:
+            .cancelled
+        case .invalidLimits, .invalidRetainedByteCount:
+            .protocolError(.invalidRequest)
+        }
+    }
+
+    private func reject() {
+        add(&rejectedJobs, 1)
+    }
+
+    private func addingSaturated(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : value
+    }
+
+    private func add(_ value: inout UInt64, _ increment: Int) {
+        guard increment > 0 else { return }
+        let (next, overflow) = value.addingReportingOverflow(UInt64(increment))
+        value = overflow ? .max : next
+    }
+
+    private nonisolated func handle(_ request: Request) -> Response {
+        // Keep resolution and the filesystem operation in one synchronous
+        // executor job. FileManager never crosses an isolation boundary.
+        let fileManager = FileManager()
         do {
             switch request.method {
             case "OPTIONS":
@@ -187,17 +768,17 @@ public actor SpiceWebDAVServer {
                     ]
                 )
             case "PROPFIND":
-                return try propfind(request)
+                return try propfind(request, fileManager: fileManager)
             case "GET", "HEAD":
-                return try get(request)
+                return try get(request, fileManager: fileManager)
             case "PUT":
-                return try put(request)
+                return try put(request, fileManager: fileManager)
             case "MKCOL":
-                return try makeCollection(request)
+                return try makeCollection(request, fileManager: fileManager)
             case "DELETE":
-                return try delete(request)
+                return try delete(request, fileManager: fileManager)
             case "COPY", "MOVE":
-                return try copyOrMove(request)
+                return try copyOrMove(request, fileManager: fileManager)
             default:
                 return Response(status: 405, reason: "Method Not Allowed")
             }
@@ -208,8 +789,11 @@ public actor SpiceWebDAVServer {
         }
     }
 
-    private func propfind(_ request: Request) throws -> Response {
-        let url = try resolve(request.target, mayNotExist: false)
+    private nonisolated func propfind(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
+        let url = try resolve(request.target, mayNotExist: false, fileManager: fileManager)
         guard fileManager.fileExists(atPath: url.path) else {
             return Response(status: 404, reason: "Not Found")
         }
@@ -218,26 +802,44 @@ public actor SpiceWebDAVServer {
             return Response(status: 403, reason: "Forbidden")
         }
         var urls = [url]
-        if depth == "1", isDirectory(url) {
+        if depth == "1", isDirectory(url, fileManager: fileManager) {
             urls += try fileManager.contentsOfDirectory(
                 at: url,
                 includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
             ).sorted { $0.lastPathComponent < $1.lastPathComponent }
         }
-        let entries = try urls.map(propertyResponse).joined()
-        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
-            "<D:multistatus xmlns:D=\"DAV:\">\(entries)</D:multistatus>"
+        let prefix = Data(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>".utf8
+        ) + Data("<D:multistatus xmlns:D=\"DAV:\">".utf8)
+        let suffix = Data("</D:multistatus>".utf8)
+        var xml = prefix
+        for itemURL in urls {
+            let entry = Data(try propertyResponse(
+                itemURL,
+                fileManager: fileManager
+            ).utf8)
+            let (withEntry, entryOverflow) = xml.count.addingReportingOverflow(entry.count)
+            let (finalSize, finalOverflow) = withEntry.addingReportingOverflow(suffix.count)
+            guard !entryOverflow, !finalOverflow, finalSize <= maximumBodyBytes else {
+                return Response(status: 507, reason: "Insufficient Storage")
+            }
+            xml.append(entry)
+        }
+        xml.append(suffix)
         return Response(
             status: 207,
             reason: "Multi-Status",
             headers: ["Content-Type": "application/xml; charset=utf-8"],
-            body: Data(xml.utf8)
+            body: xml
         )
     }
 
-    private func get(_ request: Request) throws -> Response {
-        let url = try resolve(request.target, mayNotExist: false)
+    private nonisolated func get(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
+        let url = try resolve(request.target, mayNotExist: false, fileManager: fileManager)
         var directory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &directory) else {
             return Response(status: 404, reason: "Not Found")
@@ -259,11 +861,14 @@ public actor SpiceWebDAVServer {
         )
     }
 
-    private func put(_ request: Request) throws -> Response {
+    private nonisolated func put(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
         guard accessMode == .readWrite else {
             return Response(status: 403, reason: "Forbidden")
         }
-        let url = try resolve(request.target, mayNotExist: true)
+        let url = try resolve(request.target, mayNotExist: true, fileManager: fileManager)
         guard fileManager.fileExists(atPath: url.deletingLastPathComponent().path) else {
             return Response(status: 409, reason: "Conflict")
         }
@@ -276,14 +881,17 @@ public actor SpiceWebDAVServer {
         return Response(status: existed ? 204 : 201, reason: existed ? "No Content" : "Created")
     }
 
-    private func makeCollection(_ request: Request) throws -> Response {
+    private nonisolated func makeCollection(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
         guard accessMode == .readWrite else {
             return Response(status: 403, reason: "Forbidden")
         }
         guard request.body.isEmpty else {
             return Response(status: 415, reason: "Unsupported Media Type")
         }
-        let url = try resolve(request.target, mayNotExist: true)
+        let url = try resolve(request.target, mayNotExist: true, fileManager: fileManager)
         guard !fileManager.fileExists(atPath: url.path) else {
             return Response(status: 405, reason: "Method Not Allowed")
         }
@@ -294,11 +902,14 @@ public actor SpiceWebDAVServer {
         return Response(status: 201, reason: "Created")
     }
 
-    private func delete(_ request: Request) throws -> Response {
+    private nonisolated func delete(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
         guard accessMode == .readWrite else {
             return Response(status: 403, reason: "Forbidden")
         }
-        let url = try resolve(request.target, mayNotExist: false)
+        let url = try resolve(request.target, mayNotExist: false, fileManager: fileManager)
         guard url != root else { return Response(status: 403, reason: "Forbidden") }
         guard fileManager.fileExists(atPath: url.path) else {
             return Response(status: 404, reason: "Not Found")
@@ -307,20 +918,31 @@ public actor SpiceWebDAVServer {
         return Response(status: 204, reason: "No Content")
     }
 
-    private func copyOrMove(_ request: Request) throws -> Response {
+    private nonisolated func copyOrMove(
+        _ request: Request,
+        fileManager: FileManager
+    ) throws -> Response {
         guard accessMode == .readWrite else {
             return Response(status: 403, reason: "Forbidden")
         }
         guard let destination = request.headers["destination"] else {
             return Response(status: 400, reason: "Bad Request")
         }
-        let source = try resolve(request.target, mayNotExist: false)
-        let target = try resolve(destination, mayNotExist: true)
+        let source = try resolve(
+            request.target,
+            mayNotExist: false,
+            fileManager: fileManager
+        )
+        let target = try resolve(
+            destination,
+            mayNotExist: true,
+            fileManager: fileManager
+        )
         guard source != root, target != root,
               fileManager.fileExists(atPath: source.path) else {
             return Response(status: 404, reason: "Not Found")
         }
-        guard !isDirectory(source) else {
+        guard !isDirectory(source, fileManager: fileManager) else {
             return Response(status: 405, reason: "Method Not Allowed")
         }
         let attributes = try fileManager.attributesOfItem(atPath: source.path)
@@ -346,9 +968,10 @@ public actor SpiceWebDAVServer {
         return Response(status: existed ? 204 : 201, reason: existed ? "No Content" : "Created")
     }
 
-    private func resolve(
+    private nonisolated func resolve(
         _ requestTarget: String,
-        mayNotExist: Bool
+        mayNotExist: Bool,
+        fileManager: FileManager
     ) throws(SpiceWebDAVServerError) -> URL {
         let path: String
         if let components = URLComponents(string: requestTarget),
@@ -383,17 +1006,23 @@ public actor SpiceWebDAVServer {
         return candidate
     }
 
-    private func contains(_ url: URL) -> Bool {
+    private nonisolated func contains(_ url: URL) -> Bool {
         url.path == root.path || url.path.hasPrefix(root.path + "/")
     }
 
-    private func isDirectory(_ url: URL) -> Bool {
+    private nonisolated func isDirectory(
+        _ url: URL,
+        fileManager: FileManager
+    ) -> Bool {
         var directory: ObjCBool = false
         return fileManager.fileExists(atPath: url.path, isDirectory: &directory)
             && directory.boolValue
     }
 
-    private func propertyResponse(_ url: URL) throws -> String {
+    private nonisolated func propertyResponse(
+        _ url: URL,
+        fileManager: FileManager
+    ) throws -> String {
         let resolvedURL = url.standardizedFileURL.resolvingSymlinksInPath()
         guard contains(resolvedURL) else {
             throw SpiceWebDAVServerError.pathEscapesRoot
@@ -433,7 +1062,7 @@ public actor SpiceWebDAVServer {
             "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
     }
 
-    private func xmlEscape(_ value: String) -> String {
+    private nonisolated func xmlEscape(_ value: String) -> String {
         value
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
