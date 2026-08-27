@@ -156,7 +156,7 @@ private actor SpiceCodecTaskAdmission {
     private struct Waiter {
         let ticket: UUID
         let retainedByteCount: Int
-        let continuation: CheckedContinuation<Void, SpiceCodecTaskExecutorError>
+        let continuation: CheckedContinuation<Void, any Error>
     }
 
     private let limits: SpiceCodecTaskExecutorLimits
@@ -226,7 +226,7 @@ private actor SpiceCodecTaskAdmission {
         do {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation {
-                    (continuation: CheckedContinuation<Void, SpiceCodecTaskExecutorError>) in
+                    (continuation: CheckedContinuation<Void, any Error>) in
                     queued.append(Waiter(
                         ticket: ticket,
                         retainedByteCount: retainedByteCount,
@@ -242,7 +242,10 @@ private actor SpiceCodecTaskAdmission {
         } catch let error as SpiceCodecTaskExecutorError {
             throw error
         } catch {
-            preconditionFailure("typed admission emitted unexpected error: \(error)")
+            // The continuation is stored privately and is resumed only with
+            // SpiceCodecTaskExecutorError. Keep the typed API total on older
+            // Swift runtimes whose continuation failure is fixed to any Error.
+            throw .cancelled
         }
     }
 
@@ -282,7 +285,7 @@ private actor SpiceCodecTaskAdmission {
         queuedRetainedBytes = 0
         for waiter in waiters {
             cancel()
-            waiter.continuation.resume(throwing: .closed)
+            waiter.continuation.resume(throwing: SpiceCodecTaskExecutorError.closed)
         }
     }
 
@@ -291,7 +294,7 @@ private actor SpiceCodecTaskAdmission {
         let waiter = queued.remove(at: index)
         queuedRetainedBytes -= waiter.retainedByteCount
         cancel()
-        waiter.continuation.resume(throwing: .cancelled)
+        waiter.continuation.resume(throwing: SpiceCodecTaskExecutorError.cancelled)
     }
 
     private func activate(ticket: UUID, retainedByteCount: Int) {
