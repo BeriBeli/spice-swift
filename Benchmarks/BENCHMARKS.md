@@ -26,7 +26,9 @@ iteration counts, nonzero checksum evidence against dead-code elimination,
 raw duration samples in measured order, derived duration statistics in
 nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
 so later analysis can compute bootstrap confidence intervals instead of trying
-to reconstruct them from lossy summary statistics.
+to reconstruct them from lossy summary statistics. For an even sample count,
+`median_nanoseconds` is the arithmetic mean of both central samples and may be
+fractional.
 The current stable case IDs are:
 
 - `wire.contiguous`
@@ -61,6 +63,12 @@ The first AIP-00 harness artifact is
 It contains ten measured samples per case from implementation-and-test commit
 `cf4338d`; it is microbenchmark evidence only and does not replace the live
 paired decision.
+
+That artifact uses workload `aip-00.micro.v1`, whose `iosurface.transition`
+sample timed only the 1x1 canonical mutation. The current harness is
+`aip-00.micro.v2` and also times the preceding full cross-Surface copy; v1 and
+v2 IOSurface durations are therefore not directly comparable. A new checked-in
+v2 artifact remains pending with the external AIP-00 gate.
 
 ## Live SPICE performance comparison
 

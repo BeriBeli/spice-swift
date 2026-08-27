@@ -35,7 +35,7 @@ struct SpiceBenchCommand {
                     ),
                     hardware: try hardwareDescription(),
                     thermalState: try thermalState(),
-                    workload: "aip-00.micro.v1",
+                    workload: SpiceBenchCatalog.workloadID,
                     date: Date().formatted(.iso8601),
                     source: "local",
                     mode: "release"

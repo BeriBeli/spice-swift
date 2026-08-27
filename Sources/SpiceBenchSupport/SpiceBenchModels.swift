@@ -44,14 +44,14 @@ package struct SpiceBenchMetadata: Codable, Sendable, Equatable {
 
 package struct SpiceBenchDurationStatistics: Codable, Sendable, Equatable {
     package let minimumNanoseconds: UInt64
-    package let medianNanoseconds: UInt64
+    package let medianNanoseconds: Double
     package let meanNanoseconds: Double
     package let p95Nanoseconds: UInt64
     package let maximumNanoseconds: UInt64
 
     package init(
         minimumNanoseconds: UInt64,
-        medianNanoseconds: UInt64,
+        medianNanoseconds: Double,
         meanNanoseconds: Double,
         p95Nanoseconds: UInt64,
         maximumNanoseconds: UInt64
@@ -475,10 +475,18 @@ package struct SpiceBenchRunner: Sendable {
     private static func statistics(_ durations: [UInt64]) -> SpiceBenchDurationStatistics {
         let sorted = durations.sorted()
         let total = sorted.reduce(0.0) { $0 + Double($1) }
+        let upperMiddle = sorted.count / 2
+        let median: Double
+        if sorted.count.isMultiple(of: 2) {
+            median = Double(sorted[upperMiddle - 1]) / 2
+                + Double(sorted[upperMiddle]) / 2
+        } else {
+            median = Double(sorted[upperMiddle])
+        }
         let p95Index = max(0, (sorted.count * 95 + 99) / 100 - 1)
         return SpiceBenchDurationStatistics(
             minimumNanoseconds: sorted[0],
-            medianNanoseconds: sorted[sorted.count / 2],
+            medianNanoseconds: median,
             meanNanoseconds: total / Double(sorted.count),
             p95Nanoseconds: sorted[p95Index],
             maximumNanoseconds: sorted[sorted.count - 1]

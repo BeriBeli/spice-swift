@@ -4,6 +4,8 @@ import SpiceRenderer
 import SpiceWire
 
 package enum SpiceBenchCatalog {
+    package static let workloadID = "aip-00.micro.v2"
+
     package static let stableCaseIDs = [
         "wire.contiguous",
         "wire.fragmented",
