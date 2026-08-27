@@ -5,6 +5,54 @@ import Testing
 
 @Suite("Bounded audio playback buffering")
 struct PlaybackBufferControllerTests {
+    @Test func productionRingCapacityAllowsEveryOneFramePacketInTheByteBudget() throws {
+        let configuration = SpicePlaybackConfiguration(
+            channels: 2,
+            format: .signed16LittleEndian,
+            sampleRate: 48_000
+        )
+        let capacity = try SpiceAudioPlaybackSink.ringCapacity(
+            configuration: configuration,
+            maximumQueuedMilliseconds: 500
+        )
+
+        #expect(capacity.capacityBytes == 96_000)
+        #expect(capacity.capacitySlots == 24_000)
+        let derivedSlotCount = try AudioPacketRingCapacity.slotCount(
+            capacityBytes: capacity.capacityBytes,
+            minimumPacketBytes: 4
+        )
+        #expect(capacity.capacitySlots == derivedSlotCount)
+
+        let ring = PreallocatedAudioPacketRing(
+            capacityBytes: capacity.capacityBytes,
+            capacitySlots: capacity.capacitySlots
+        )
+        let oneStereoFrame: [UInt8] = [1, 2, 3, 4]
+        let allEnqueued = oneStereoFrame.withUnsafeBytes {
+            (bytes: UnsafeRawBufferPointer) in
+            for packetIndex in 0 ..< capacity.capacitySlots {
+                guard ring.enqueue(
+                    timestamp: UInt32(packetIndex),
+                    bytes: bytes
+                ) == .enqueued(droppedPackets: 0, droppedBytes: 0) else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        #expect(allEnqueued)
+        let diagnostics = ring.diagnostics()
+        #expect(diagnostics.queuedBytes == capacity.capacityBytes)
+        #expect(diagnostics.queuedSlots == capacity.capacitySlots)
+        #expect(diagnostics.enqueuedPackets == 24_000)
+        #expect(diagnostics.overruns == 0)
+        #expect(diagnostics.droppedPackets == 0)
+        ring.close()
+        #expect(ring.diagnostics().retainedSlots == 0)
+    }
+
     @Test func lateCompletionFromPreviousPlaybackStreamIsRejected() {
         #expect(SpiceAudioPlaybackSink.isCurrentPlaybackCompletion(
             completedStreamEpoch: 7,

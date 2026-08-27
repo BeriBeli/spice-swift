@@ -1,9 +1,45 @@
 import Foundation
 import Synchronization
 
+package enum AudioPacketRingCapacityError: Error, Sendable, Equatable {
+    case invalidCapacityBytes(Int)
+    case invalidMinimumPacketBytes(Int)
+    case minimumPacketExceedsCapacity(minimum: Int, capacity: Int)
+}
+
+package struct AudioPacketRingCapacity: Sendable, Equatable {
+    package let capacityBytes: Int
+    package let capacitySlots: Int
+
+    package init(capacityBytes: Int, capacitySlots: Int) {
+        self.capacityBytes = capacityBytes
+        self.capacitySlots = capacitySlots
+    }
+
+    package static func slotCount(
+        capacityBytes: Int,
+        minimumPacketBytes: Int
+    ) throws(AudioPacketRingCapacityError) -> Int {
+        guard capacityBytes > 0 else {
+            throw .invalidCapacityBytes(capacityBytes)
+        }
+        guard minimumPacketBytes > 0 else {
+            throw .invalidMinimumPacketBytes(minimumPacketBytes)
+        }
+        guard minimumPacketBytes <= capacityBytes else {
+            throw .minimumPacketExceedsCapacity(
+                minimum: minimumPacketBytes,
+                capacity: capacityBytes
+            )
+        }
+        return capacityBytes / minimumPacketBytes
+    }
+}
+
 package enum AudioPacketRingEnqueueResult: Sendable, Equatable {
     case enqueued(droppedPackets: Int, droppedBytes: Int)
     case droppedOversized(byteCount: Int)
+    case droppedLeaseConflict(byteCount: Int)
     case rejectedClosed(byteCount: Int)
 }
 
@@ -30,6 +66,16 @@ package struct AudioPacketRingDiagnostics: Sendable, Equatable {
     package let retainedSlots: Int
     package let resetCount: UInt64
     package let closeCount: UInt64
+    package let activeDequeueLeases: Int
+    package let dequeueLeaseStarts: UInt64
+    package let dequeueLeaseFinishes: UInt64
+    package let dequeueMaterializations: UInt64
+    package let dequeueMaterializedBytes: UInt64
+    package let dequeueLeaseConflictDrops: UInt64
+    package let dequeueBlockedReads: UInt64
+    package let dequeueBlockedDequeues: UInt64
+    package let deferredResets: UInt64
+    package let deferredCloses: UInt64
     package let isClosed: Bool
 }
 
@@ -39,6 +85,8 @@ package struct AudioPacketRingDiagnostics: Sendable, Equatable {
 /// storage. An overrun discards the complete queued prefix in O(1), preserving
 /// FIFO order among every packet that remains observable.
 package final class PreallocatedAudioPacketRing: @unchecked Sendable {
+    package typealias DequeueObserver = @Sendable () -> Void
+
     private struct Slot: Sendable {
         var timestamp: UInt32 = 0
         var byteCount: Int = 0
@@ -65,11 +113,31 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
         var droppedBytes: UInt64 = 0
         var resetCount: UInt64 = 0
         var closeCount: UInt64 = 0
+        var nextDequeueLeaseToken: UInt64 = 0
+        var activeDequeueLeaseToken: UInt64?
+        var dequeueLeaseStarts: UInt64 = 0
+        var dequeueLeaseFinishes: UInt64 = 0
+        var dequeueMaterializations: UInt64 = 0
+        var dequeueMaterializedBytes: UInt64 = 0
+        var dequeueLeaseConflictDrops: UInt64 = 0
+        var dequeueBlockedReads: UInt64 = 0
+        var dequeueBlockedDequeues: UInt64 = 0
+        var deferredResets: UInt64 = 0
+        var deferredCloses: UInt64 = 0
+        var pendingReset = false
+        var pendingClose = false
         var isClosed = false
 
         init(capacitySlots: Int) {
             slots = Array(repeating: Slot(), count: capacitySlots)
         }
+    }
+
+    private struct DequeueLease: Sendable {
+        let token: UInt64
+        let timestamp: UInt32
+        let byteOffset: Int
+        let byteCount: Int
     }
 
     private let capacityBytes: Int
@@ -122,6 +190,14 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
 
             let mustDiscardQueuedPrefix = state.queuedSlots == capacitySlots
                 || bytes.count > capacityBytes - state.queuedBytes
+            if state.activeDequeueLeaseToken != nil,
+               mustDiscardQueuedPrefix || state.pendingReset {
+                Self.add(&state.overruns, 1)
+                Self.add(&state.droppedPackets, 1)
+                Self.add(&state.droppedBytes, bytes.count)
+                Self.add(&state.dequeueLeaseConflictDrops, 1)
+                return .droppedLeaseConflict(byteCount: bytes.count)
+            }
             let droppedPackets: Int
             let droppedBytes: Int
             if mustDiscardQueuedPrefix {
@@ -160,27 +236,27 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
     }
 
     /// Materializes one packet only on the non-realtime subsystem boundary.
-    /// Packet storage itself remains the single fixed allocation owned here.
-    package func dequeue() -> RecordedAudioPacket? {
-        state.withLock { state in
-            guard state.queuedSlots > 0 else {
-                return nil
-            }
-            let slot = state.slots[state.headSlot]
-            let remaining = slot.byteCount - slot.consumedBytes
-            var data = Data(count: remaining)
-            data.withUnsafeMutableBytes { destination in
-                copyFromStorage(
-                    at: state.readByteOffset,
-                    into: destination,
-                    count: remaining,
-                    state: &state
-                )
-            }
-            let packet = RecordedAudioPacket(timestamp: slot.timestamp, data: data)
-            consumeBytes(remaining, fromHeadSlot: &state)
-            return packet
+    /// A short locked phase reserves the head range; allocation and payload
+    /// copy happen while the producer mutex is released; a second short phase
+    /// consumes the token. The optional observer is invoked after reservation
+    /// and before allocation so deterministic tests can prove the lock is free.
+    package func dequeue(
+        materializationWillBegin observer: DequeueObserver? = nil
+    ) -> RecordedAudioPacket? {
+        guard let lease = beginDequeueLease() else {
+            return nil
         }
+        observer?()
+        var data = Data(count: lease.byteCount)
+        let wrapped = data.withUnsafeMutableBytes { destination in
+            copyFromStorageOutsideLock(
+                at: lease.byteOffset,
+                into: destination,
+                count: lease.byteCount
+            )
+        }
+        finishDequeueLease(lease, wrapped: wrapped)
+        return RecordedAudioPacket(timestamp: lease.timestamp, data: data)
     }
 
     /// Copies the FIFO byte stream into a callback-owned destination. Any
@@ -193,6 +269,10 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
         destination.initializeMemory(as: UInt8.self, repeating: 0)
         return state.withLock { state in
             guard !state.isClosed else {
+                return 0
+            }
+            guard state.activeDequeueLeaseToken == nil else {
+                Self.add(&state.dequeueBlockedReads, 1)
                 return 0
             }
             Self.add(&state.readCalls, 1)
@@ -223,8 +303,13 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
             guard !state.isClosed else {
                 return
             }
-            clearQueue(&state)
             Self.add(&state.resetCount, 1)
+            if state.activeDequeueLeaseToken != nil {
+                state.pendingReset = true
+                Self.add(&state.deferredResets, 1)
+            } else {
+                clearQueue(&state)
+            }
         }
     }
 
@@ -233,9 +318,14 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
             guard !state.isClosed else {
                 return
             }
-            clearQueue(&state)
             state.isClosed = true
             Self.add(&state.closeCount, 1)
+            if state.activeDequeueLeaseToken != nil {
+                state.pendingClose = true
+                Self.add(&state.deferredCloses, 1)
+            } else {
+                clearQueue(&state)
+            }
         }
     }
 
@@ -264,9 +354,88 @@ package final class PreallocatedAudioPacketRing: @unchecked Sendable {
                 retainedSlots: state.queuedSlots,
                 resetCount: state.resetCount,
                 closeCount: state.closeCount,
+                activeDequeueLeases: state.activeDequeueLeaseToken == nil ? 0 : 1,
+                dequeueLeaseStarts: state.dequeueLeaseStarts,
+                dequeueLeaseFinishes: state.dequeueLeaseFinishes,
+                dequeueMaterializations: state.dequeueMaterializations,
+                dequeueMaterializedBytes: state.dequeueMaterializedBytes,
+                dequeueLeaseConflictDrops: state.dequeueLeaseConflictDrops,
+                dequeueBlockedReads: state.dequeueBlockedReads,
+                dequeueBlockedDequeues: state.dequeueBlockedDequeues,
+                deferredResets: state.deferredResets,
+                deferredCloses: state.deferredCloses,
                 isClosed: state.isClosed
             )
         }
+    }
+
+    private func beginDequeueLease() -> DequeueLease? {
+        state.withLock { state in
+            guard state.activeDequeueLeaseToken == nil else {
+                Self.add(&state.dequeueBlockedDequeues, 1)
+                return nil
+            }
+            guard !state.isClosed, state.queuedSlots > 0 else {
+                return nil
+            }
+            let slot = state.slots[state.headSlot]
+            let byteCount = slot.byteCount - slot.consumedBytes
+            state.nextDequeueLeaseToken &+= 1
+            let token = state.nextDequeueLeaseToken
+            state.activeDequeueLeaseToken = token
+            Self.add(&state.dequeueLeaseStarts, 1)
+            return DequeueLease(
+                token: token,
+                timestamp: slot.timestamp,
+                byteOffset: state.readByteOffset,
+                byteCount: byteCount
+            )
+        }
+    }
+
+    private func finishDequeueLease(_ lease: DequeueLease, wrapped: Bool) {
+        state.withLock { state in
+            precondition(state.activeDequeueLeaseToken == lease.token)
+            precondition(state.queuedSlots > 0)
+            state.activeDequeueLeaseToken = nil
+            if wrapped {
+                Self.add(&state.wraparoundCopies, 1)
+            }
+            Self.add(&state.dequeueLeaseFinishes, 1)
+            Self.add(&state.dequeueMaterializations, 1)
+            Self.add(&state.dequeueMaterializedBytes, lease.byteCount)
+            consumeBytes(lease.byteCount, fromHeadSlot: &state)
+            if state.pendingReset || state.pendingClose {
+                clearQueue(&state)
+                state.pendingReset = false
+                state.pendingClose = false
+            }
+        }
+    }
+
+    /// The reserved range remains part of `queuedBytes`, so a producer can
+    /// write only into the disjoint free suffix while this copy is in flight.
+    private func copyFromStorageOutsideLock(
+        at offset: Int,
+        into destination: UnsafeMutableRawBufferPointer,
+        count: Int
+    ) -> Bool {
+        guard count > 0 else {
+            return false
+        }
+        let firstCount = min(count, capacityBytes - offset)
+        destination.baseAddress!.copyMemory(
+            from: storage.baseAddress!.advanced(by: offset),
+            byteCount: firstCount
+        )
+        let secondCount = count - firstCount
+        if secondCount > 0 {
+            destination.baseAddress!.advanced(by: firstCount).copyMemory(
+                from: storage.baseAddress!,
+                byteCount: secondCount
+            )
+        }
+        return secondCount > 0
     }
 
     private func copyIntoStorage(

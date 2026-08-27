@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import SwiftSpice
 
@@ -186,6 +187,157 @@ struct PreallocatedAudioPacketRingTests {
         Self.expectRealtimeCountersRemainZero(diagnostics)
     }
 
+    @Test("dequeue materialization releases the producer mutex and preserves its lease")
+    func dequeueMaterializationDoesNotBlockConcurrentEnqueue() {
+        let ring = PreallocatedAudioPacketRing(capacityBytes: 12, capacitySlots: 3)
+        _ = Self.enqueue([1, 2, 3, 4], timestamp: 1, into: ring)
+        _ = Self.enqueue([5, 6, 7, 8], timestamp: 2, into: ring)
+        let dequeue = Self.startBlockedDequeue(from: ring)
+
+        #expect(dequeue.barrier.waitUntilEntered())
+        let enqueueResult = LockedValue<AudioPacketRingEnqueueResult?>(nil)
+        let enqueueFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            enqueueResult.store(Self.enqueue([9, 10, 11, 12], timestamp: 3, into: ring))
+            enqueueFinished.signal()
+        }
+
+        #expect(enqueueFinished.wait(timeout: .now() + 10) == .success)
+        #expect(enqueueResult.load() == .enqueued(droppedPackets: 0, droppedBytes: 0))
+        let whileBlocked = ring.diagnostics()
+        #expect(whileBlocked.activeDequeueLeases == 1)
+        #expect(whileBlocked.dequeueLeaseStarts == 1)
+        #expect(whileBlocked.dequeueLeaseFinishes == 0)
+        #expect(whileBlocked.dequeueMaterializations == 0)
+        #expect(whileBlocked.queuedBytes == 12)
+        #expect(whileBlocked.queuedSlots == 3)
+
+        dequeue.barrier.release()
+        #expect(dequeue.finished.wait(timeout: .now() + 10) == .success)
+        #expect(dequeue.packet.load() == RecordedAudioPacket(
+            timestamp: 1,
+            data: Data([1, 2, 3, 4])
+        ))
+        let afterFirst = ring.diagnostics()
+        #expect(afterFirst.activeDequeueLeases == 0)
+        #expect(afterFirst.dequeueLeaseFinishes == 1)
+        #expect(afterFirst.dequeueMaterializations == 1)
+        #expect(afterFirst.dequeueMaterializedBytes == 4)
+        #expect(afterFirst.queuedBytes == 8)
+        #expect(afterFirst.queuedSlots == 2)
+        #expect(ring.dequeue() == RecordedAudioPacket(
+            timestamp: 2,
+            data: Data([5, 6, 7, 8])
+        ))
+        #expect(ring.dequeue() == RecordedAudioPacket(
+            timestamp: 3,
+            data: Data([9, 10, 11, 12])
+        ))
+        #expect(ring.diagnostics().retainedSlots == 0)
+    }
+
+    @Test("an active dequeue lease rejects only writes that could overwrite it")
+    func activeLeaseMakesOverrunReadAndSecondDequeueDeterministic() {
+        let ring = PreallocatedAudioPacketRing(capacityBytes: 8, capacitySlots: 2)
+        _ = Self.enqueue([1, 2, 3, 4], timestamp: 1, into: ring)
+        _ = Self.enqueue([5, 6, 7, 8], timestamp: 2, into: ring)
+        let dequeue = Self.startBlockedDequeue(from: ring)
+        #expect(dequeue.barrier.waitUntilEntered())
+
+        #expect(Self.enqueue([9, 10, 11, 12], timestamp: 3, into: ring)
+            == .droppedLeaseConflict(byteCount: 4))
+        var playbackBytes = [UInt8](repeating: 0xff, count: 4)
+        #expect(playbackBytes.withUnsafeMutableBytes {
+            (bytes: UnsafeMutableRawBufferPointer) in ring.read(into: bytes)
+        } == 0)
+        #expect(playbackBytes == [0, 0, 0, 0])
+        #expect(ring.dequeue() == nil)
+
+        let whileBlocked = ring.diagnostics()
+        #expect(whileBlocked.activeDequeueLeases == 1)
+        #expect(whileBlocked.dequeueLeaseConflictDrops == 1)
+        #expect(whileBlocked.dequeueBlockedReads == 1)
+        #expect(whileBlocked.dequeueBlockedDequeues == 1)
+        #expect(whileBlocked.queuedBytes == 8)
+        #expect(whileBlocked.queuedSlots == 2)
+
+        dequeue.barrier.release()
+        #expect(dequeue.finished.wait(timeout: .now() + 10) == .success)
+        #expect(dequeue.packet.load() == RecordedAudioPacket(
+            timestamp: 1,
+            data: Data([1, 2, 3, 4])
+        ))
+        #expect(ring.dequeue() == RecordedAudioPacket(
+            timestamp: 2,
+            data: Data([5, 6, 7, 8])
+        ))
+        #expect(ring.dequeue() == nil)
+        let finished = ring.diagnostics()
+        #expect(finished.activeDequeueLeases == 0)
+        #expect(finished.retainedSlots == 0)
+    }
+
+    @Test("reset and close defer storage reclamation until an active lease finishes")
+    func resetAndCloseDuringActiveLeaseReleaseEverythingExactlyOnce() {
+        let resetRing = PreallocatedAudioPacketRing(capacityBytes: 12, capacitySlots: 3)
+        _ = Self.enqueue([1, 2, 3, 4], timestamp: 1, into: resetRing)
+        _ = Self.enqueue([5, 6, 7, 8], timestamp: 2, into: resetRing)
+        let resetDequeue = Self.startBlockedDequeue(from: resetRing)
+        #expect(resetDequeue.barrier.waitUntilEntered())
+
+        resetRing.reset()
+        let duringReset = resetRing.diagnostics()
+        #expect(duringReset.resetCount == 1)
+        #expect(duringReset.deferredResets == 1)
+        #expect(duringReset.activeDequeueLeases == 1)
+        #expect(duringReset.queuedBytes == 8)
+        #expect(duringReset.retainedSlots == 2)
+        #expect(Self.enqueue([9, 10, 11, 12], timestamp: 3, into: resetRing)
+            == .droppedLeaseConflict(byteCount: 4))
+
+        resetDequeue.barrier.release()
+        #expect(resetDequeue.finished.wait(timeout: .now() + 10) == .success)
+        #expect(resetDequeue.packet.load() == RecordedAudioPacket(
+            timestamp: 1,
+            data: Data([1, 2, 3, 4])
+        ))
+        let afterReset = resetRing.diagnostics()
+        #expect(afterReset.activeDequeueLeases == 0)
+        #expect(afterReset.queuedBytes == 0)
+        #expect(afterReset.queuedSlots == 0)
+        #expect(afterReset.retainedSlots == 0)
+
+        let closeRing = PreallocatedAudioPacketRing(capacityBytes: 12, capacitySlots: 3)
+        _ = Self.enqueue([21, 22, 23, 24], timestamp: 21, into: closeRing)
+        _ = Self.enqueue([25, 26, 27, 28], timestamp: 22, into: closeRing)
+        let closeDequeue = Self.startBlockedDequeue(from: closeRing)
+        #expect(closeDequeue.barrier.waitUntilEntered())
+
+        closeRing.close()
+        closeRing.close()
+        let duringClose = closeRing.diagnostics()
+        #expect(duringClose.isClosed)
+        #expect(duringClose.closeCount == 1)
+        #expect(duringClose.deferredCloses == 1)
+        #expect(duringClose.activeDequeueLeases == 1)
+        #expect(duringClose.queuedBytes == 8)
+        #expect(duringClose.retainedSlots == 2)
+        #expect(Self.enqueue([29], timestamp: 23, into: closeRing)
+            == .rejectedClosed(byteCount: 1))
+
+        closeDequeue.barrier.release()
+        #expect(closeDequeue.finished.wait(timeout: .now() + 10) == .success)
+        #expect(closeDequeue.packet.load() == RecordedAudioPacket(
+            timestamp: 21,
+            data: Data([21, 22, 23, 24])
+        ))
+        let afterClose = closeRing.diagnostics()
+        #expect(afterClose.activeDequeueLeases == 0)
+        #expect(afterClose.queuedBytes == 0)
+        #expect(afterClose.queuedSlots == 0)
+        #expect(afterClose.retainedSlots == 0)
+    }
+
     private static func produce(
         packetCount: Int,
         into ring: PreallocatedAudioPacketRing
@@ -222,6 +374,23 @@ struct PreallocatedAudioPacketRingTests {
         return packets
     }
 
+    private static func startBlockedDequeue(
+        from ring: PreallocatedAudioPacketRing
+    ) -> (
+        barrier: DequeueMaterializationBarrier,
+        packet: LockedValue<RecordedAudioPacket?>,
+        finished: DispatchSemaphore
+    ) {
+        let barrier = DequeueMaterializationBarrier()
+        let packet = LockedValue<RecordedAudioPacket?>(nil)
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            packet.store(ring.dequeue(materializationWillBegin: barrier.block))
+            finished.signal()
+        }
+        return (barrier, packet, finished)
+    }
+
     private static func enqueue(
         _ bytes: [UInt8],
         timestamp: UInt32,
@@ -238,5 +407,39 @@ struct PreallocatedAudioPacketRingTests {
         #expect(diagnostics.linearMovementBytes == 0)
         #expect(diagnostics.callbackDynamicAllocations == 0)
         #expect(diagnostics.perPacketStorageAllocations == 0)
+    }
+}
+
+private final class DequeueMaterializationBarrier: @unchecked Sendable {
+    private let entered = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+
+    func block() {
+        entered.signal()
+        released.wait()
+    }
+
+    func waitUntilEntered() -> Bool {
+        entered.wait(timeout: .now() + 10) == .success
+    }
+
+    func release() {
+        released.signal()
+    }
+}
+
+private final class LockedValue<Value: Sendable>: @unchecked Sendable {
+    private let storage: Mutex<Value>
+
+    init(_ value: Value) {
+        storage = Mutex(value)
+    }
+
+    func store(_ value: Value) {
+        storage.withLock { $0 = value }
+    }
+
+    func load() -> Value {
+        storage.withLock { $0 }
     }
 }

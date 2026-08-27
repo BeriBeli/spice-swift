@@ -182,15 +182,15 @@ public actor SpiceAudioPlaybackSink {
         guard let format = Self.audioFormat(for: configuration) else {
             throw .invalidConfiguration("AVAudioFormat rejected the source format")
         }
-        let maximumBytes = try Self.maximumBytes(
+        let ringCapacity = try Self.ringCapacity(
             configuration: configuration,
-            milliseconds: maximumQueuedMilliseconds
+            maximumQueuedMilliseconds: maximumQueuedMilliseconds
         )
 
         stopStream(emit: self.configuration != nil)
         let renderBuffer = AudioPlaybackRenderBuffer(
-            capacityBytes: maximumBytes,
-            capacitySlots: 256,
+            capacityBytes: ringCapacity.capacityBytes,
+            capacitySlots: ringCapacity.capacitySlots,
             bytesPerFrame: configuration.channels * MemoryLayout<Int16>.size,
             sampleRate: configuration.sampleRate,
             minimumStartupMilliseconds: minimumLatencyMilliseconds
@@ -232,7 +232,7 @@ public actor SpiceAudioPlaybackSink {
         let frameCount = UInt64(packet.data.count / bytesPerFrame)
         let result = renderBuffer.enqueue(packet)
         switch result {
-        case let .droppedOversized(byteCount):
+        case let .droppedOversized(byteCount), let .droppedLeaseConflict(byteCount):
             eventContinuation.yield(.oversizedPacketDropped(
                 milliseconds: Self.milliseconds(
                     frames: UInt64(byteCount / bytesPerFrame),
@@ -368,19 +368,49 @@ public actor SpiceAudioPlaybackSink {
         return UInt32(min(value, UInt64(UInt32.max)))
     }
 
-    private static func maximumBytes(
+    package nonisolated static func ringCapacity(
         configuration: SpicePlaybackConfiguration,
-        milliseconds: UInt32
-    ) throws(SpiceAudioPlaybackSinkError) -> Int {
-        let frames = (UInt64(configuration.sampleRate) * UInt64(milliseconds) + 999) / 1_000
-        let bytes = frames
-            * UInt64(configuration.channels)
-            * UInt64(MemoryLayout<Int16>.size)
-        guard let result = Int(exactly: bytes), result > 0 else {
-            throw .invalidConfiguration("playback ring size overflow")
+        maximumQueuedMilliseconds: UInt32
+    ) throws(SpiceAudioPlaybackSinkError) -> AudioPacketRingCapacity {
+        guard configuration.sampleRate > 0,
+              configuration.channels > 0,
+              maximumQueuedMilliseconds > 0 else {
+            throw .invalidConfiguration("playback ring dimensions must be positive")
         }
-        return result
+        let (frameMilliseconds, frameOverflow) = UInt64(configuration.sampleRate)
+            .multipliedReportingOverflow(by: UInt64(maximumQueuedMilliseconds))
+        let (roundedFrameMilliseconds, roundingOverflow) = frameMilliseconds
+            .addingReportingOverflow(999)
+        guard !frameOverflow, !roundingOverflow else {
+            throw .invalidConfiguration("playback ring frame capacity overflow")
+        }
+        let frames = roundedFrameMilliseconds / 1_000
+        let (bytesPerFrame, bytesPerFrameOverflow) = configuration.channels
+            .multipliedReportingOverflow(by: MemoryLayout<Int16>.size)
+        guard !bytesPerFrameOverflow, bytesPerFrame > 0 else {
+            throw .invalidConfiguration("playback ring frame size overflow")
+        }
+        let (bytes, byteOverflow) = frames.multipliedReportingOverflow(
+            by: UInt64(bytesPerFrame)
+        )
+        guard !byteOverflow, let capacityBytes = Int(exactly: bytes), capacityBytes > 0 else {
+            throw .invalidConfiguration("playback ring byte capacity overflow")
+        }
+        let capacitySlots: Int
+        do {
+            capacitySlots = try AudioPacketRingCapacity.slotCount(
+                capacityBytes: capacityBytes,
+                minimumPacketBytes: bytesPerFrame
+            )
+        } catch {
+            throw .invalidConfiguration("playback ring slot capacity is invalid")
+        }
+        return AudioPacketRingCapacity(
+            capacityBytes: capacityBytes,
+            capacitySlots: capacitySlots
+        )
     }
+
 }
 
 /// Keeps render-thread state outside the actor. All storage and diagnostics are
