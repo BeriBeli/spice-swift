@@ -130,7 +130,10 @@ Consumed owner slots are released immediately, and periodic prefix cleanup moves
 only optional owner references rather than received bytes. Batch parsing peeks
 transactionally and advances the physical boundary only after every submessage
 range validates. Exact diagnostics report coalesces, body-copy bytes, retained
-owners, and zero byte compaction.
+owners, and zero byte compaction. In addition to the byte budget, at most 4,096
+live receive segments may be queued; the next non-empty append is rejected
+before allocating its owner, and consuming or resetting a segment restores that
+capacity.
 
 Production readers borrow a non-escaping Swift `Span` from a `WireSlice` for
 synchronous scalar parsing. Only the Sendable owner and checked range may cross

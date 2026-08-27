@@ -117,7 +117,10 @@ struct MessageFramerTests {
     func incompleteMessageReturnsNilWithoutConsumingBytes(mode: HeaderMode) throws {
         let wire = makeMessage(mode: mode, type: 10, body: Data([1, 2, 3, 4]))
         let split = wire.count - 1
-        var framer = MessageFramer(mode: mode)
+        var framer = MessageFramer(
+            mode: mode,
+            limits: WireLimits(maximumBufferedSegments: 2)
+        )
         try framer.append(Data(wire.prefix(split)))
 
         #expect(try framer.nextMessage() == nil)
@@ -135,7 +138,10 @@ struct MessageFramerTests {
         let first = makeMessage(mode: mode, type: 11, body: Data())
         let secondBody = Data((0..<257).map { UInt8(truncatingIfNeeded: $0) })
         let second = makeMessage(mode: mode, type: 12, body: secondBody)
-        var framer = MessageFramer(mode: mode)
+        var framer = MessageFramer(
+            mode: mode,
+            limits: WireLimits(maximumBufferedSegments: 1)
+        )
 
         try framer.append(first + second)
         let empty = try #require(try framer.nextMessage())
@@ -155,7 +161,10 @@ struct MessageFramerTests {
     ) throws {
         let body = Data((0..<1_025).map { UInt8(truncatingIfNeeded: $0) })
         let wire = makeMessage(mode: mode, type: 13, body: body)
-        var framer = MessageFramer(mode: mode)
+        var framer = MessageFramer(
+            mode: mode,
+            limits: WireLimits(maximumBufferedSegments: 1)
+        )
 
         try framer.append(wire)
         #expect(framer.diagnostics.retainedOwnerCount == 1)
@@ -180,7 +189,10 @@ struct MessageFramerTests {
         let wire = makeMessage(mode: mode, type: 14, body: body)
         let firstEnd = mode.wireSize + 1
         let secondEnd = firstEnd + 31
-        var framer = MessageFramer(mode: mode)
+        var framer = MessageFramer(
+            mode: mode,
+            limits: WireLimits(maximumBufferedSegments: 3)
+        )
 
         try framer.append(Data(wire[..<firstEnd]))
         try framer.append(Data(wire[firstEnd..<secondEnd]))
@@ -210,7 +222,10 @@ struct MessageFramerTests {
             )
         }
         let pipeline = wires.reduce(into: Data()) { $0.append($1) }
-        var framer = MessageFramer(mode: .mini)
+        var framer = MessageFramer(
+            mode: .mini,
+            limits: WireLimits(maximumBufferedSegments: 1)
+        )
 
         try framer.append(pipeline)
         for index in 0..<messageCount {
@@ -245,7 +260,12 @@ struct MessageFramerTests {
             expectedBodies.append(body)
             pipeline.append(makeMessage(mode: .mini, type: 15, body: body))
         }
-        var framer = MessageFramer(mode: .mini)
+        var framer = MessageFramer(
+            mode: .mini,
+            limits: WireLimits(
+                maximumBufferedSegments: HeaderMode.mini.wireSize + bodySize
+            )
+        )
         var received = 0
 
         for byte in pipeline {
@@ -262,6 +282,51 @@ struct MessageFramerTests {
         #expect(framer.diagnostics.queueCompactionBytes == 0)
         #expect(framer.diagnostics.retainedOwnerCount == 0)
         #expect(framer.diagnostics.retainedOwnerBytes == 0)
+        #expect(framer.diagnostics.bufferedSegmentCount == 0)
+    }
+
+    @Test func liveSegmentLimitRejectsAtomicallyAndReusesConsumedCapacity() throws {
+        let firstWire = makeMessage(mode: .mini, type: 20, body: Data([0xaa]))
+        let secondBody = Data([0xbb, 0xcc])
+        let secondWire = makeMessage(mode: .mini, type: 21, body: secondBody)
+        var framer = MessageFramer(
+            mode: .mini,
+            limits: WireLimits(
+                maximumMessageSize: 32,
+                maximumBufferedBytes: 64,
+                maximumBufferedSegments: 3
+            )
+        )
+
+        try framer.append(firstWire)
+        try framer.append(Data(secondWire.prefix(1)))
+        try framer.append(Data(secondWire.dropFirst().prefix(1)))
+        let bufferedBefore = framer.bufferedByteCount
+        let diagnosticsBefore = framer.diagnostics
+
+        #expect(throws: WireError.tooManySegments(actual: 4, maximum: 3)) {
+            try framer.append(Data([secondWire[secondWire.startIndex + 2]]))
+        }
+        #expect(framer.bufferedByteCount == bufferedBefore)
+        #expect(framer.diagnostics == diagnosticsBefore)
+
+        var first = try framer.nextMessage()
+        #expect(first?.type == 20)
+        #expect(first?.body == Data([0xaa]))
+        first = nil
+        #expect(framer.diagnostics.retainedOwnerCount == 2)
+        #expect(framer.diagnostics.bufferedSegmentCount == 2)
+
+        // The consumed dead slot does not count against the live limit.
+        try framer.append(Data(secondWire.dropFirst(2)))
+        let second = try #require(try framer.nextMessage())
+        #expect(second.type == 21)
+        #expect(second.body == secondBody)
+        #expect(framer.diagnostics.bodyCoalesces == 0)
+        #expect(framer.diagnostics.bodyCopyBytes == 0)
+        #expect(framer.diagnostics.queueCompactionBytes == 0)
+        #expect(framer.bufferedByteCount == 0)
+        #expect(framer.diagnostics.retainedOwnerCount == 0)
         #expect(framer.diagnostics.bufferedSegmentCount == 0)
     }
 

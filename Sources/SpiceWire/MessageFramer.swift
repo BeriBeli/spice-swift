@@ -391,20 +391,37 @@ package struct MessageFramer: Sendable {
     }
 
     package mutating func append(_ bytes: Data) throws(WireError) {
-        try append(OwnedBytes(bytes))
+        guard !bytes.isEmpty else { return }
+        let newCount = try validatedBufferedByteCount(appending: bytes.count)
+        segments.append(OwnedBytes(bytes))
+        bufferedBytes = newCount
     }
 
     package mutating func append(_ bytes: OwnedBytes) throws(WireError) {
-        let (newCount, overflow) = bufferedBytes.addingReportingOverflow(bytes.count)
+        guard !bytes.isEmpty else { return }
+        let newCount = try validatedBufferedByteCount(appending: bytes.count)
+        segments.append(bytes)
+        bufferedBytes = newCount
+    }
+
+    private func validatedBufferedByteCount(appending byteCount: Int) throws(WireError) -> Int {
+        let liveSegmentCount = segments.count - headIndex
+        let (newSegmentCount, segmentCountOverflow) = liveSegmentCount.addingReportingOverflow(1)
+        guard !segmentCountOverflow,
+              newSegmentCount <= limits.maximumBufferedSegments else {
+            throw .tooManySegments(
+                actual: segmentCountOverflow ? Int.max : newSegmentCount,
+                maximum: limits.maximumBufferedSegments
+            )
+        }
+        let (newCount, overflow) = bufferedBytes.addingReportingOverflow(byteCount)
         guard !overflow else {
             throw .integerOverflow
         }
         guard newCount <= limits.maximumBufferedBytes else {
             throw .messageTooLarge(actual: newCount, maximum: limits.maximumBufferedBytes)
         }
-        guard !bytes.isEmpty else { return }
-        segments.append(bytes)
-        bufferedBytes = newCount
+        return newCount
     }
 
     package mutating func nextMessage() throws(WireError) -> FramedMessage? {

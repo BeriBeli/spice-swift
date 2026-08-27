@@ -276,7 +276,10 @@ struct InboundMessageBatchTests {
             type: 109,
             body: Data([0xcc])
         )
-        var framer = MessageFramer(mode: .full)
+        var framer = MessageFramer(
+            mode: .full,
+            limits: WireLimits(maximumBufferedSegments: 3)
+        )
         let split = HeaderMode.full.wireSize + 1
         try framer.append(Data(malformedWire.prefix(split)))
         try framer.append(Data(malformedWire.suffix(malformedWire.count - split)) + validWire)
@@ -297,6 +300,18 @@ struct InboundMessageBatchTests {
             )
             #expect(framer.diagnostics.bufferedSegmentCount == 2)
         }
+
+        // The cached coalesced owner is retained and diagnosed, but the
+        // independent append-amplification limit counts only receive segments.
+        try framer.append(Data([0xdd]))
+        #expect(framer.diagnostics.bufferedSegmentCount == 3)
+        #expect(framer.diagnostics.retainedOwnerCount == 4)
+        let diagnosticsBeforeRejectedAppend = framer.diagnostics
+        #expect(throws: WireError.tooManySegments(actual: 4, maximum: 3)) {
+            try framer.append(Data([0xee]))
+        }
+        #expect(framer.diagnostics == diagnosticsBeforeRejectedAppend)
+        #expect(framer.bufferedByteCount == bufferedBefore + 1)
     }
 }
 
