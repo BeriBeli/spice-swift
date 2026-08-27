@@ -160,6 +160,19 @@ package struct SpiceVideoNALUnit: Sendable, Equatable {
         owner === other.owner
     }
 
+    package func contentEquals(_ data: Data) -> Bool {
+        guard sourceRange.count == data.count else {
+            return false
+        }
+        return owner.data.withUnsafeBytes { (sourceBytes: UnsafeRawBufferPointer) in
+            data.withUnsafeBytes { (comparisonBytes: UnsafeRawBufferPointer) in
+                let source = sourceBytes.bindMemory(to: UInt8.self)
+                let comparison = comparisonBytes.bindMemory(to: UInt8.self)
+                return source[sourceRange].elementsEqual(comparison)
+            }
+        }
+    }
+
     package static func == (lhs: Self, rhs: Self) -> Bool {
         guard lhs.type == rhs.type, lhs.sourceRange.count == rhs.sourceRange.count else {
             return false
