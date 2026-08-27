@@ -14,34 +14,43 @@ struct SpiceBenchCommand {
                 )
                 throw SpiceBenchError.liveRequiresExternalRunner
             }
-            let metadata = SpiceBenchMetadata(
-                commit: try requiredCommandOutput(
-                    "/usr/bin/git",
-                    ["rev-parse", "HEAD"],
-                    field: "commit"
-                ),
-                toolchain: try requiredCommandOutput(
-                    "/usr/bin/xcrun",
-                    ["swift", "--version"],
-                    field: "toolchain"
-                ),
-                hardware: try hardwareDescription(),
-                thermalState: try thermalState(),
-                workload: "aip-00.micro.v1",
-                date: Date().formatted(.iso8601),
-                source: "local",
-                mode: "release"
+            let environment = ProcessInfo.processInfo.environment
+            let toolchainEvidence = try SpiceBenchToolchainEvidence.resolve(
+                environment: environment
             )
-            let report = try await SpiceBenchRunner().run(
-                metadata: metadata,
-                catalog: SpiceBenchCatalog.microbenchmarks(
-                    warmUpIterations: configuration.warmUpIterations,
-                    measuredIterations: configuration.measuredIterations
+            let repositoryPreflight = SpiceBenchRepositoryPreflight(
+                stateProvider: repositoryState
+            )
+            let encoded = try await repositoryPreflight.withCleanRepository { commit in
+                guard let observedToolchain = commandOutput(
+                    toolchainEvidence.executablePath,
+                    ["--version"]
+                ) else {
+                    throw SpiceBenchError.toolchainEvidenceMismatch
+                }
+                let metadata = SpiceBenchMetadata(
+                    commit: commit,
+                    toolchain: try toolchainEvidence.validatedVersion(
+                        observedVersion: observedToolchain
+                    ),
+                    hardware: try hardwareDescription(),
+                    thermalState: try thermalState(),
+                    workload: "aip-00.micro.v1",
+                    date: Date().formatted(.iso8601),
+                    source: "local",
+                    mode: "release"
                 )
-            )
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let encoded = try encoder.encode(report)
+                let report = try await SpiceBenchRunner().run(
+                    metadata: metadata,
+                    catalog: SpiceBenchCatalog.microbenchmarks(
+                        warmUpIterations: configuration.warmUpIterations,
+                        measuredIterations: configuration.measuredIterations
+                    )
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                return try encoder.encode(report)
+            }
             FileHandle.standardOutput.write(encoded)
             FileHandle.standardOutput.write(Data([0x0a]))
         } catch {
@@ -84,18 +93,24 @@ struct SpiceBenchCommand {
         return "model=\(model);\(fallback)"
     }
 
-    private static func requiredCommandOutput(
-        _ executable: String,
-        _ arguments: [String],
-        field: String
-    ) throws(SpiceBenchError) -> String {
-        guard let output = commandOutput(executable, arguments) else {
-            throw .invalidMetadata(field: field)
+    private static func repositoryState() throws(SpiceBenchError) -> SpiceBenchRepositoryState {
+        guard let commit = commandOutput("/usr/bin/git", ["rev-parse", "HEAD"]),
+              let status = commandOutput(
+                  "/usr/bin/git",
+                  ["status", "--porcelain=v1", "--untracked-files=all"],
+                  allowEmpty: true
+              )
+        else {
+            throw .repositoryStateUnavailable
         }
-        return output
+        return SpiceBenchRepositoryState(commit: commit, porcelainStatus: status)
     }
 
-    private static func commandOutput(_ executable: String, _ arguments: [String]) -> String? {
+    private static func commandOutput(
+        _ executable: String,
+        _ arguments: [String],
+        allowEmpty: Bool = false
+    ) -> String? {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -109,7 +124,7 @@ struct SpiceBenchCommand {
             let output = pipe.fileHandleForReading.readDataToEndOfFile()
             let value = String(decoding: output, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
+            return value.isEmpty && !allowEmpty ? nil : value
         } catch {
             return nil
         }

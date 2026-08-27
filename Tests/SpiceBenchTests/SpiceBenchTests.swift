@@ -221,6 +221,109 @@ struct SpiceBenchTests {
         }
     }
 
+    @Test("repository preflight rejects tracked and untracked dirt before work")
+    func repositoryPreflightRequiresStableCleanRevision() async throws {
+        let cleanCalls = Mutex(0)
+        let cleanWork = Mutex(0)
+        let clean = SpiceBenchRepositoryPreflight {
+            cleanCalls.withLock { $0 += 1 }
+            return SpiceBenchRepositoryState(commit: "abc123", porcelainStatus: "")
+        }
+        let cleanCommit: String = try await clean.withCleanRepository { commit in
+            cleanWork.withLock { $0 += 1 }
+            return commit
+        }
+        #expect(cleanCommit == "abc123")
+        #expect(cleanCalls.withLock { $0 } == 2)
+        #expect(cleanWork.withLock { $0 } == 1)
+
+        for dirtyStatus in [" M Sources/File.swift", "?? untracked.fixture"] {
+            let providerCalls = Mutex(0)
+            let work = Mutex(0)
+            let dirty = SpiceBenchRepositoryPreflight {
+                providerCalls.withLock { $0 += 1 }
+                return SpiceBenchRepositoryState(
+                    commit: "abc123",
+                    porcelainStatus: dirtyStatus
+                )
+            }
+            await #expect(throws: SpiceBenchError.dirtyWorktree) {
+                let _: String = try await dirty.withCleanRepository { commit in
+                    work.withLock { $0 += 1 }
+                    return commit
+                }
+            }
+            #expect(providerCalls.withLock { $0 } == 1)
+            #expect(work.withLock { $0 } == 0)
+        }
+
+        let states = Mutex([
+            SpiceBenchRepositoryState(commit: "abc123", porcelainStatus: ""),
+            SpiceBenchRepositoryState(commit: "def456", porcelainStatus: ""),
+        ])
+        let changedWork = Mutex(0)
+        let changedProvider: SpiceBenchRepositoryPreflight.StateProvider = {
+            let state = states.withLock { states -> SpiceBenchRepositoryState? in
+                states.isEmpty ? nil : states.removeFirst()
+            }
+            guard let state else { throw SpiceBenchError.repositoryStateUnavailable }
+            return state
+        }
+        let changed = SpiceBenchRepositoryPreflight(stateProvider: changedProvider)
+        await #expect(throws: SpiceBenchError.repositoryChanged) {
+            let _: String = try await changed.withCleanRepository { commit in
+                changedWork.withLock { $0 += 1 }
+                return commit
+            }
+        }
+        #expect(changedWork.withLock { $0 } == 1)
+    }
+
+    @Test("toolchain evidence comes only from exact injected build metadata")
+    func toolchainEvidenceIsExactAndRequired() throws {
+        let executableKey = SpiceBenchToolchainEvidence.executableEnvironmentKey
+        let versionKey = SpiceBenchToolchainEvidence.versionEnvironmentKey
+        #expect(executableKey == "SPICE_BENCH_SWIFT_EXECUTABLE")
+        #expect(versionKey == "SPICE_BENCH_SWIFT_VERSION")
+
+        #expect(throws: SpiceBenchError.missingToolchainEvidence(executableKey)) {
+            _ = try SpiceBenchToolchainEvidence.resolve(environment: [:])
+        }
+        #expect(throws: SpiceBenchError.missingToolchainEvidence(versionKey)) {
+            _ = try SpiceBenchToolchainEvidence.resolve(environment: [
+                executableKey: "/toolchain/usr/bin/swift",
+            ])
+        }
+        let unknown = try SpiceBenchToolchainEvidence.resolve(environment: [
+            executableKey: "/toolchain/usr/bin/swift",
+            versionKey: "unknown",
+        ])
+        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
+            _ = try unknown.validatedVersion(observedVersion: "unknown")
+        }
+
+        let exactVersion = "Apple Swift version 6.4 (fixture-build)"
+        let evidence = try SpiceBenchToolchainEvidence.resolve(environment: [
+            executableKey: "/toolchain/usr/bin/swift",
+            versionKey: exactVersion,
+        ])
+        #expect(evidence.executablePath == "/toolchain/usr/bin/swift")
+        #expect(evidence.capturedVersion == exactVersion)
+        #expect(try evidence.validatedVersion(observedVersion: exactVersion) == exactVersion)
+        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
+            _ = try evidence.validatedVersion(
+                observedVersion: "Apple Swift version 6.4 (different-toolchain)"
+            )
+        }
+        let fallbackCommand = SpiceBenchToolchainEvidence(
+            executablePath: "xcrun",
+            capturedVersion: exactVersion
+        )
+        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
+            _ = try fallbackCommand.validatedVersion(observedVersion: exactVersion)
+        }
+    }
+
     @Test("runner rejects invalid catalogs and observations deterministically")
     func runnerRejectsInvalidInputs() async {
         let runner = SpiceBenchRunner(nowNanoseconds: { 1 })
@@ -414,7 +517,13 @@ struct SpiceBenchTests {
         #expect(video.exactCounters["nalPayloadCopyBytes"] == 0)
         #expect(video.exactCounters["avccSampleAllocations"] == 1)
         #expect(video.exactCounters["samplePayloadCopyBytes"] == 0)
-        #expect(try #require(video.exactCounters["avccPayloadWriteBytes"]) > 0)
+        let avccPayloadWriteBytes = try #require(
+            video.exactCounters["avccPayloadWriteBytes"]
+        )
+        let avccSampleBytes = try #require(video.exactCounters["avccSampleBytes"])
+        let nalUnitCount = try #require(video.exactCounters["nalUnitCount"])
+        #expect(avccPayloadWriteBytes > 0)
+        #expect(avccPayloadWriteBytes + 4 * nalUnitCount == avccSampleBytes)
     }
 
     @Test("counter validator rejects missing and nonconforming acceptance evidence")

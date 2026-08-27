@@ -622,10 +622,10 @@ package enum SpiceBenchCatalog {
                 "nalPayloadCopyBytes": UInt64(diagnostics.nalPayloadCopyBytes),
                 "avccSampleAllocations": UInt64(diagnostics.avccSampleAllocations),
                 "avccSampleBytes": UInt64(diagnostics.avccSampleBytes),
-                // Bytes written directly into the sole AVCC allocation are
-                // construction work, not a second sample materialization.
                 "avccPayloadWriteBytes": UInt64(diagnostics.samplePayloadCopyBytes),
-                "samplePayloadCopyBytes": 0,
+                "samplePayloadCopyBytes": UInt64(
+                    diagnostics.additionalSamplePayloadCopyBytes
+                ),
                 "nalUnitCount": UInt64(diagnostics.nalUnitCount),
             ]
         )

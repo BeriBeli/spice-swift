@@ -4,11 +4,20 @@
 
 `spice-bench` is the versioned, deterministic microbenchmark harness. Always
 run it as a Release product; a Debug executable exits nonzero instead of
-producing an artifact whose metadata incorrectly claims optimized code.
+producing an artifact whose metadata incorrectly claims optimized code. The
+runner also requires a completely clean Git worktree, including no untracked
+files, and verifies the same HEAD again after measurement. This makes the
+reported commit an exact identifier for the measured sources.
 
 ```sh
 Benchmarks/run_micro.sh --warmup 3 --iterations 10 > /private/tmp/spice-micro.json
 ```
+
+`run_micro.sh` resolves one absolute Swift executable, uses that exact binary
+for the Release build, captures its `--version`, and passes both pieces of
+evidence to `spice-bench` for runtime verification. Set `SWIFT_EXECUTABLE` to a
+specific toolchain binary when required. Direct executable invocation without
+matching build-toolchain evidence is rejected.
 
 The command writes exactly one JSON object to standard output. Schema version
 `1` contains `schema_version`, `artifact_kind`, reproducibility `metadata`, and

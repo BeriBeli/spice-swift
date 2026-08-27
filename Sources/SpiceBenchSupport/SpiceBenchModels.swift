@@ -184,6 +184,11 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
     case debugBuildUnsupported
     case invalidMetadata(field: String)
     case unsupportedCapability(String)
+    case dirtyWorktree
+    case repositoryChanged
+    case repositoryStateUnavailable
+    case missingToolchainEvidence(String)
+    case toolchainEvidenceMismatch
 
     package var description: String {
         switch self {
@@ -213,6 +218,16 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
             "benchmark metadata field \(field) is missing or invalid"
         case let .unsupportedCapability(capability):
             "benchmark capability \(capability) is unavailable"
+        case .dirtyWorktree:
+            "benchmark repository contains tracked or untracked changes"
+        case .repositoryChanged:
+            "benchmark repository HEAD changed during measurement"
+        case .repositoryStateUnavailable:
+            "benchmark repository state could not be verified"
+        case let .missingToolchainEvidence(key):
+            "benchmark toolchain evidence \(key) is missing"
+        case .toolchainEvidenceMismatch:
+            "benchmark build toolchain evidence does not match the Swift executable"
         }
     }
 }
@@ -228,6 +243,106 @@ package enum SpiceBenchBuildConfiguration {
 
     package static func requireRelease() throws(SpiceBenchError) {
         guard isRelease else { throw .debugBuildUnsupported }
+    }
+}
+
+package struct SpiceBenchRepositoryState: Sendable, Equatable {
+    package let commit: String
+    package let porcelainStatus: String
+
+    package init(commit: String, porcelainStatus: String) {
+        self.commit = commit
+        self.porcelainStatus = porcelainStatus
+    }
+}
+
+package struct SpiceBenchRepositoryPreflight: Sendable {
+    package typealias StateProvider = @Sendable () throws -> SpiceBenchRepositoryState
+
+    private let stateProvider: StateProvider
+
+    package init(stateProvider: @escaping StateProvider) {
+        self.stateProvider = stateProvider
+    }
+
+    /// Runs artifact construction only while HEAD is clean and stable. The
+    /// returned output may be emitted; a failure must not produce JSON.
+    package func withCleanRepository<Output: Sendable>(
+        operation: @Sendable (String) async throws -> Output
+    ) async throws -> Output {
+        let initial = try validated(currentState())
+        let output = try await operation(initial.commit)
+        let final = try validated(currentState())
+        guard final.commit == initial.commit else {
+            throw SpiceBenchError.repositoryChanged
+        }
+        return output
+    }
+
+    private func currentState() throws(SpiceBenchError) -> SpiceBenchRepositoryState {
+        do {
+            return try stateProvider()
+        } catch let error as SpiceBenchError {
+            throw error
+        } catch {
+            throw .repositoryStateUnavailable
+        }
+    }
+
+    private func validated(
+        _ state: SpiceBenchRepositoryState
+    ) throws(SpiceBenchError) -> SpiceBenchRepositoryState {
+        let commit = state.commit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !commit.isEmpty, commit.lowercased() != "unknown" else {
+            throw .repositoryStateUnavailable
+        }
+        guard state.porcelainStatus.isEmpty else {
+            throw .dirtyWorktree
+        }
+        return SpiceBenchRepositoryState(commit: commit, porcelainStatus: "")
+    }
+}
+
+package struct SpiceBenchToolchainEvidence: Sendable, Equatable {
+    package static let executableEnvironmentKey = "SPICE_BENCH_SWIFT_EXECUTABLE"
+    package static let versionEnvironmentKey = "SPICE_BENCH_SWIFT_VERSION"
+
+    package let executablePath: String
+    package let capturedVersion: String
+
+    package init(executablePath: String, capturedVersion: String) {
+        self.executablePath = executablePath
+        self.capturedVersion = capturedVersion
+    }
+
+    package static func resolve(
+        environment: [String: String]
+    ) throws(SpiceBenchError) -> Self {
+        guard let executable = environment[executableEnvironmentKey], !executable.isEmpty else {
+            throw .missingToolchainEvidence(executableEnvironmentKey)
+        }
+        guard let version = environment[versionEnvironmentKey], !version.isEmpty else {
+            throw .missingToolchainEvidence(versionEnvironmentKey)
+        }
+        return SpiceBenchToolchainEvidence(
+            executablePath: executable,
+            capturedVersion: version
+        )
+    }
+
+    package func validatedVersion(
+        observedVersion: String
+    ) throws(SpiceBenchError) -> String {
+        let captured = capturedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let observed = observedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (executablePath as NSString).isAbsolutePath,
+              !captured.isEmpty,
+              captured.lowercased() != "unknown",
+              observed == captured
+        else {
+            throw .toolchainEvidenceMismatch
+        }
+        return captured
     }
 }
 

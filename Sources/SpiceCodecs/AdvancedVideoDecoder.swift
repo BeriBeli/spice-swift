@@ -222,7 +222,11 @@ package struct SpiceAnnexBParserDiagnostics: Sendable, Equatable {
     package let nalPayloadCopyBytes: Int
     package let avccSampleAllocations: Int
     package let avccSampleBytes: Int
+    /// Source payload bytes written directly into the AVCC allocation.
     package let samplePayloadCopyBytes: Int
+    /// Copies performed after the single AVCC sample allocation has been
+    /// constructed. The direct range writer keeps this at zero.
+    package let additionalSamplePayloadCopyBytes: Int
     package let nalUnitCount: Int
 }
 
@@ -321,6 +325,7 @@ package struct SpiceAnnexBParser: Sendable {
                 avccSampleAllocations: scanResult.sampleData.isEmpty ? 0 : 1,
                 avccSampleBytes: scanResult.sampleData.count,
                 samplePayloadCopyBytes: scanResult.samplePayloadCopyBytes,
+                additionalSamplePayloadCopyBytes: 0,
                 nalUnitCount: scanResult.descriptors.count
             )
         )

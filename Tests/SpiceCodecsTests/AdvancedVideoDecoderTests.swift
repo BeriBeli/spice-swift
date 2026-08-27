@@ -137,6 +137,7 @@ struct AdvancedVideoDecoderTests {
             avccSampleAllocations: 1,
             avccSampleBytes: fixture.expectedSample.count,
             samplePayloadCopyBytes: expectedSamplePayloadBytes,
+            additionalSamplePayloadCopyBytes: 0,
             nalUnitCount: fixture.expectedTypes.count
         ))
 
@@ -256,6 +257,7 @@ struct AdvancedVideoDecoderTests {
         #expect(result.diagnostics.avccSampleAllocations == 0)
         #expect(result.diagnostics.avccSampleBytes == 0)
         #expect(result.diagnostics.samplePayloadCopyBytes == 0)
+        #expect(result.diagnostics.additionalSamplePayloadCopyBytes == 0)
         #expect(result.diagnostics.nalUnitCount == 1)
     }
 
