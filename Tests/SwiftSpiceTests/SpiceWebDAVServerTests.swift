@@ -5,6 +5,11 @@ import Testing
 
 @Suite("Native WebDAV server")
 struct SpiceWebDAVServerTests {
+    enum ActiveMutationCloseMode: Sendable, Equatable {
+        case client
+        case all
+    }
+
     @Test func readOnlyServerReadsExplicitRootAndRejectsMutationAndEscape() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -533,6 +538,132 @@ struct SpiceWebDAVServerTests {
         #expect(status(reusable) == 200)
     }
 
+    @Test(arguments: [ActiveMutationCloseMode.client, .all])
+    func closeWaitsForAnActiveMutationBeforeReusingTheSameClientID(
+        _ mode: ActiveMutationCloseMode
+    ) async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clientID: Int64 = mode == .client ? 121 : 122
+        let operationKey = WebDAVOperationKey(clientID: clientID, sequence: 1)
+        let gate = WebDAVFileOperationGate(blocking: [operationKey])
+        let server = try SpiceWebDAVServer(
+            root: root,
+            accessMode: .readWrite,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            fileOperationWillBegin: gate.operationWillBegin
+        )
+        let oldDelivery = WebDAVDeliveryProbe()
+        #expect(try await server.submit(
+            clientID: clientID,
+            data: request("PUT", "/ordered.txt", body: Data("old".utf8))
+        ) { result in
+            oldDelivery.accept(result)
+        })
+        try #require(await gate.waitUntilStarted(
+            clientID: clientID,
+            sequence: 1,
+            occurrence: 1
+        ))
+
+        switch mode {
+        case .client:
+            await server.close(clientID: clientID)
+        case .all:
+            await server.closeAll()
+        }
+
+        let newDelivery = WebDAVDeliveryProbe()
+        #expect(try await server.submit(
+            clientID: clientID,
+            data: request("PUT", "/ordered.txt", body: Data("new".utf8))
+        ) { result in
+            newDelivery.accept(result)
+        })
+        let newStartedBeforeDrain = await gate.waitUntilStarted(
+            clientID: clientID,
+            sequence: 1,
+            occurrence: 2,
+            timeout: .milliseconds(100)
+        )
+        gate.release(clientID: clientID, sequence: 1)
+        #expect(!newStartedBeforeDrain)
+
+        try #require(await gate.waitUntilStarted(
+            clientID: clientID,
+            sequence: 1,
+            occurrence: 2
+        ))
+        try #require(await newDelivery.waitUntilDelivered(count: 1))
+        await waitForWebDAVServer(server) {
+            $0.pendingJobs == 0
+                && $0.currentRetainedBytes == 0
+                && $0.executor.activeJobs == 0
+                && $0.completedJobs == 1
+                && $0.cancelledJobs == 1
+        }
+        #expect(gate.startedOperations == [operationKey, operationKey])
+        #expect(oldDelivery.outcomes.isEmpty)
+        let response = try #require(newDelivery.outcomes.first?.responses?.first)
+        #expect(status(response) == 204)
+        let finalData = try Data(contentsOf: root.appendingPathComponent("ordered.txt"))
+        #expect(finalData == Data("new".utf8))
+        let diagnostics = await server.diagnosticsSnapshot()
+        #expect(diagnostics.pendingRetainedBytes == 0)
+        #expect(diagnostics.reservedResponseBytes == 0)
+        #expect(diagnostics.executor.currentRetainedBytes == 0)
+    }
+
+    @Test func synchronousReceiveRejectsRetiringClientAndRecoversAfterDrain() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clientID: Int64 = 131
+        let operationKey = WebDAVOperationKey(clientID: clientID, sequence: 1)
+        let gate = WebDAVFileOperationGate(blocking: [operationKey])
+        let server = try SpiceWebDAVServer(
+            root: root,
+            accessMode: .readWrite,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            fileOperationWillBegin: gate.operationWillBegin
+        )
+        let oldDelivery = WebDAVDeliveryProbe()
+        #expect(try await server.submit(
+            clientID: clientID,
+            data: request("PUT", "/retiring.txt", body: Data("old".utf8))
+        ) { result in
+            oldDelivery.accept(result)
+        })
+        try #require(await gate.waitUntilStarted(clientID: clientID, sequence: 1))
+        await server.close(clientID: clientID)
+
+        await #expect(throws: SpiceWebDAVServerError.invalidRequest) {
+            try await server.receive(
+                clientID: clientID,
+                data: request("OPTIONS", "/")
+            )
+        }
+        gate.release(clientID: clientID, sequence: 1)
+        await waitForWebDAVServer(server) {
+            $0.pendingJobs == 0
+                && $0.currentRetainedBytes == 0
+                && $0.executor.activeJobs == 0
+                && $0.discardedLateResults == 1
+        }
+        #expect(oldDelivery.outcomes.isEmpty)
+
+        let response = try #require(await server.receive(
+            clientID: clientID,
+            data: request("OPTIONS", "/")
+        ).first)
+        #expect(status(response) == 200)
+        let diagnostics = await server.diagnosticsSnapshot()
+        #expect(diagnostics.pendingJobs == 0)
+        #expect(diagnostics.pendingRetainedBytes == 0)
+        #expect(diagnostics.reservedResponseBytes == 0)
+        #expect(diagnostics.currentRetainedBytes == 0)
+        #expect(diagnostics.executor.currentRetainedBytes == 0)
+    }
+
     @Test func existingSymlinkCannotEscapeAuthorizedRoot() async throws {
         let root = try temporaryDirectory()
         let outside = try temporaryDirectory()
@@ -729,11 +860,12 @@ private final class WebDAVFileOperationGate: @unchecked Sendable {
     func waitUntilStarted(
         clientID: Int64,
         sequence: UInt64,
+        occurrence: Int = 1,
         timeout: DispatchTimeInterval = .seconds(10)
     ) async -> Bool {
         let key = WebDAVOperationKey(clientID: clientID, sequence: sequence)
         return await Task.detached { [self] in
-            blockingWaitUntilStarted(key, timeout: timeout)
+            blockingWaitUntilStarted(key, occurrence: occurrence, timeout: timeout)
         }.value
     }
 
@@ -744,10 +876,13 @@ private final class WebDAVFileOperationGate: @unchecked Sendable {
 
     private func blockingWaitUntilStarted(
         _ key: WebDAVOperationKey,
+        occurrence: Int,
         timeout: DispatchTimeInterval
     ) -> Bool {
         let deadline = DispatchTime.now() + timeout
-        while !state.withLock({ $0.started.contains(key) }) {
+        while state.withLock({ state in
+            state.started.filter { $0 == key }.count
+        }) < occurrence {
             guard operationStarted.wait(timeout: deadline) == .success else { return false }
         }
         return true

@@ -126,6 +126,9 @@ public actor SpiceWebDAVServer {
     private var rejectedJobs: UInt64 = 0
     private var discardedLateResults: UInt64 = 0
     private var activeResponseSubmissions: Set<UInt64> = []
+    private var activeFilesystemGenerations: [Int64: UInt64] = [:]
+    private var activeFilesystemSubmissions: Set<UInt64> = []
+    private var retiredFilesystemSubmissions: Set<UInt64> = []
 
     public init(
         root: URL,
@@ -207,6 +210,11 @@ public actor SpiceWebDAVServer {
         }
         let existingBuffer = legacyBuffers[clientID]
         if existingBuffer == nil {
+            // This synchronous compatibility API cannot await retirement.
+            // Reject same-ID reuse until the old executor operation drains.
+            guard activeFilesystemGenerations[clientID] == nil else {
+                throw .invalidRequest
+            }
             guard clients[clientID] == nil else { throw .invalidRequest }
             let (clientCount, overflow) = legacyBuffers.count.addingReportingOverflow(
                 clients.count
@@ -269,8 +277,13 @@ public actor SpiceWebDAVServer {
         client.worker?.cancel()
         bufferedInputBytes -= client.buffer.count
         let submissions = client.submissions
+        retiredFilesystemSubmissions.formUnion(
+            submissions.lazy.filter { self.activeFilesystemSubmissions.contains($0.id) }
+                .map(\.id)
+        )
         let cancellable = submissions.filter {
             !activeResponseSubmissions.contains($0.id)
+                && !activeFilesystemSubmissions.contains($0.id)
         }
         release(cancellable)
         add(&cancelledJobs, cancellable.reduce(0) { $0 + $1.requests.count })
@@ -284,8 +297,14 @@ public actor SpiceWebDAVServer {
         bufferedInputBytes = 0
         for client in removed { client.worker?.cancel() }
         for client in removed {
+            retiredFilesystemSubmissions.formUnion(
+                client.submissions.lazy.filter {
+                    self.activeFilesystemSubmissions.contains($0.id)
+                }.map(\.id)
+            )
             let cancellable = client.submissions.filter {
                 !activeResponseSubmissions.contains($0.id)
+                    && !activeFilesystemSubmissions.contains($0.id)
             }
             release(cancellable)
             add(&cancelledJobs, cancellable.reduce(0) { total, submission in
@@ -450,13 +469,8 @@ public actor SpiceWebDAVServer {
         reservedResponseBytes = newResponseReservation
         peakPendingJobs = max(peakPendingJobs, pendingJobs)
         peakRetainedBytes = max(peakRetainedBytes, newTotalRetained)
-        if client.worker == nil {
-            let generation = client.generation
-            client.worker = Task { [weak self] in
-                await self?.runClient(clientID: clientID, generation: generation)
-            }
-        }
         clients[clientID] = client
+        startClientWorkerIfPossible(clientID: clientID)
         return true
     }
 
@@ -582,6 +596,10 @@ public actor SpiceWebDAVServer {
             guard let current = clients[clientID],
                   current.generation == generation,
                   current.submissions.first?.id == submission.id else {
+                if retiredFilesystemSubmissions.remove(submission.id) != nil {
+                    release([submission])
+                    add(&cancelledJobs, submission.requests.count)
+                }
                 add(&discardedLateResults, submission.requests.count)
                 return
             }
@@ -626,22 +644,70 @@ public actor SpiceWebDAVServer {
         var responses: [Data] = []
         responses.reserveCapacity(submission.requests.count)
         for request in submission.requests {
+            guard beginFilesystemOperation(submission) else {
+                return .failure(.cancelled)
+            }
+            let executionResult: Result<Data, SpiceFilesystemTaskExecutorError>
             do {
-                let response = try await filesystemExecutor.execute(
+                executionResult = .success(try await filesystemExecutor.execute(
                     retainedByteCount: request.inputRetainedByteCount
                 ) { [self] in
                     fileOperationWillBegin?(submission.clientID, request.sequence)
                     return handle(request).encoded(includeBody: request.method != "HEAD")
-                }
+                })
+            } catch let error {
+                executionResult = .failure(error)
+            }
+            finishFilesystemOperation(submission)
+            switch executionResult {
+            case let .success(response):
                 guard response.count <= request.responseRetainedByteLimit else {
                     return .failure(.protocolError(.bodyTooLarge))
                 }
                 responses.append(response)
-            } catch let error {
+            case let .failure(error):
                 return .failure(map(executorError: error))
             }
         }
         return .success(responses)
+    }
+
+    private func beginFilesystemOperation(_ submission: Submission) -> Bool {
+        guard !Task.isCancelled,
+              activeFilesystemGenerations[submission.clientID] == nil,
+              clients[submission.clientID]?.generation == submission.generation,
+              clients[submission.clientID]?.submissions.first?.id == submission.id else {
+            return false
+        }
+        activeFilesystemGenerations[submission.clientID] = submission.generation
+        activeFilesystemSubmissions.insert(submission.id)
+        return true
+    }
+
+    private func finishFilesystemOperation(_ submission: Submission) {
+        guard activeFilesystemGenerations[submission.clientID] == submission.generation,
+              activeFilesystemSubmissions.remove(submission.id) != nil else {
+            return
+        }
+        activeFilesystemGenerations.removeValue(forKey: submission.clientID)
+        // If close/reuse installed a newer generation while the old syscall
+        // drained, this is the sole point that starts its pump. Waiting never
+        // consumes an executor permit or blocks this actor.
+        startClientWorkerIfPossible(clientID: submission.clientID)
+    }
+
+    private func startClientWorkerIfPossible(clientID: Int64) {
+        guard activeFilesystemGenerations[clientID] == nil,
+              var client = clients[clientID],
+              client.worker == nil,
+              !client.submissions.isEmpty else {
+            return
+        }
+        let generation = client.generation
+        client.worker = Task { [weak self] in
+            await self?.runClient(clientID: clientID, generation: generation)
+        }
+        clients[clientID] = client
     }
 
     private func clearWorker(clientID: Int64, generation: UInt64) {
