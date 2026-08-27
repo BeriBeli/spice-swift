@@ -26,7 +26,9 @@ iteration counts, nonzero checksum evidence against dead-code elimination,
 raw duration samples in measured order, derived duration statistics in
 nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
 so later analysis can compute bootstrap confidence intervals instead of trying
-to reconstruct them from lossy summary statistics.
+to reconstruct them from lossy summary statistics. For an even sample count,
+`median_nanoseconds` is the arithmetic mean of both central samples and may be
+fractional.
 The current stable case IDs are:
 
 - `wire.contiguous`

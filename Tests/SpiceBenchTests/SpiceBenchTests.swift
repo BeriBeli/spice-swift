@@ -176,6 +176,51 @@ struct SpiceBenchTests {
         #expect(failedEvents.withLock { $0 } == ["setUp", "operation", "tearDown"])
     }
 
+    @Test("even sample medians average both middle values without truncation")
+    func evenSampleMedianUsesBothMiddleValues() async throws {
+        let clock = Mutex((index: 0, values: [
+            UInt64(100), 110,
+            200, 220,
+            300, 331,
+            400, 440,
+        ]))
+        let runner = SpiceBenchRunner {
+            clock.withLock { state in
+                let value = state.values[state.index]
+                state.index += 1
+                return value
+            }
+        }
+        let benchmark = SpiceBenchCase(
+            id: "wire.contiguous",
+            warmUpIterations: 0,
+            measuredIterations: 4
+        ) {
+            SpiceBenchObservation(
+                checksum: 1,
+                exactCounters: [
+                    "bodyCopyBytes": 0,
+                    "bodyCoalesces": 0,
+                    "queueCompactionBytes": 0,
+                ]
+            )
+        }
+
+        let report = try await runner.run(metadata: fixtureMetadata, catalog: [benchmark])
+        let result = try #require(report.cases.first)
+        #expect(result.durationSamplesNanoseconds == [10, 20, 31, 40])
+        #expect(result.duration.medianNanoseconds == 25.5)
+        #expect(result.duration.meanNanoseconds == 25.25)
+
+        let encoded = try JSONEncoder().encode(report)
+        let json = try #require(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        let cases = try #require(json["cases"] as? [[String: Any]])
+        let duration = try #require(cases.first?["duration"] as? [String: Any])
+        #expect(duration["median_nanoseconds"] as? Double == 25.5)
+    }
+
     @Test("metadata preflight rejects empty, unknown, and non-Release evidence")
     func metadataPreflightRejectsPlaceholders() async {
         let executions = Mutex(0)
