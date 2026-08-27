@@ -47,7 +47,7 @@ Use exactly one of these values in the work table:
 
 | ID | Status | Work item | Depends on | Completion gate |
 | --- | --- | --- | --- | --- |
-| AIP-00 | pending | Establish fresh `v0.2.7` metrics and a Release `spice-bench` JSON harness | — | Microbench and live artifacts identify commit, toolchain, hardware, thermal state, workload, and date |
+| AIP-00 | in-progress | Establish fresh `v0.2.7` metrics and a Release `spice-bench` JSON harness | — | Microbench and live artifacts identify commit, toolchain, hardware, thermal state, workload, and date |
 | AIP-10 | done | Add an owned physical-message model and strict full-header submessage lists | — | List-only and main-plus-list ordering, bounds, ACK, fragmentation, and mutation tests pass |
 | AIP-11 | done | Advance the serial barrier after processing and propagate channel failure | AIP-10 | Waiters remain blocked through handler work and terminate on success, failure, cancellation, or close |
 | AIP-12 | done | Move the image cache to Session scope with ordered mutations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, FIFO, cancellation, and capacity tests pass |
