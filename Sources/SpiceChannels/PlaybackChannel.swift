@@ -64,7 +64,7 @@ package actor PlaybackChannel: SpiceManagedChannel {
         do {
             message = try SpiceServerMessageDecoder.decode(
                 id: framed.type,
-                body: framed.body,
+                body: framed.bodySlice,
                 channel: .playback
             )
         } catch let error {

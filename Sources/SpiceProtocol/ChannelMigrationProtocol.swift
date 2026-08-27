@@ -24,6 +24,12 @@ package enum SpiceChannelMigrationCodec {
     package static func decodeFlags(
         _ body: Data
     ) throws(WireError) -> SpiceChannelMigrationFlags {
+        try decodeFlags(OwnedBytes(body).wholeSlice)
+    }
+
+    package static func decodeFlags(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceChannelMigrationFlags {
         var reader = try ByteReader(body)
         let flags = SpiceChannelMigrationFlags(rawValue: try reader.readUInt32LE())
         try reader.requireFullyConsumed()

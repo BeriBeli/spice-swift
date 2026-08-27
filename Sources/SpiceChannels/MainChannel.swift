@@ -747,7 +747,7 @@ package actor MainChannel: SpiceManagedChannel {
         do {
             return try SpiceServerMessageDecoder.decode(
                 id: framed.type,
-                body: framed.body,
+                body: framed.bodySlice,
                 channel: .main
             )
         } catch let error {

@@ -73,7 +73,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
                 do {
                     let data = try SpiceVMCWireCodec().decodeServer(
                         id: framed.type,
-                        body: framed.body
+                        body: framed.bodySlice
                     )
                     frames = try muxDecoder.append(data)
                 } catch let error {
@@ -97,7 +97,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
                     throw .protocolViolation("duplicate WebDAV port initialization")
                 }
                 do {
-                    initialization = try portCodec.decodeInitialization(framed.body)
+                    initialization = try portCodec.decodeInitialization(framed.bodySlice)
                 } catch let error {
                     throw .wire(error)
                 }
@@ -107,7 +107,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
             case SpicePortWire.serverEvent:
                 let event: SpicePortEvent
                 do {
-                    event = try portCodec.decodeEvent(framed.body)
+                    event = try portCodec.decodeEvent(framed.bodySlice)
                 } catch let error {
                     throw .wire(error)
                 }
@@ -121,7 +121,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
             case 3:
                 let setAck: SpiceMsgSetAck
                 do {
-                    var reader = try ByteReader(framed.body)
+                    var reader = try ByteReader(framed.bodySlice)
                     setAck = try SpiceMsgSetAck.decode(from: &reader)
                     try reader.requireFullyConsumed()
                 } catch let error {
@@ -137,7 +137,7 @@ package actor WebDAVChannel: SpiceManagedChannel {
             case 4:
                 let ping: SpiceMsgPing
                 do {
-                    var reader = try ByteReader(framed.body)
+                    var reader = try ByteReader(framed.bodySlice)
                     ping = try SpiceMsgPing.decode(from: &reader)
                 } catch let error {
                     throw .wire(error)

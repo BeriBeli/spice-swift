@@ -2154,7 +2154,10 @@ struct DisplayChannelTests {
                 (type: 65_000, body: Data(repeating: 0xa5, count: 16 * 1_024)),
             ]
         )
-        #expect(batch.retainedBodyByteCount == drawBody.count + 16 * 1_024 + 22)
+        #expect(
+            batch.retainedBodyByteCount
+                == drawBody.count + 16 * 1_024 + 22 + HeaderMode.full.wireSize
+        )
 
         let transport = FakeTransport(inbound: try [
             encodeFull(
@@ -2216,7 +2219,10 @@ struct DisplayChannelTests {
                 (type: 65_000, body: Data(repeating: 0x5a, count: 16 * 1_024)),
             ]
         )
-        #expect(batch.retainedBodyByteCount == drawBody.count + 16 * 1_024 + 22)
+        #expect(
+            batch.retainedBodyByteCount
+                == drawBody.count + 16 * 1_024 + 22 + HeaderMode.full.wireSize
+        )
         let imageCache = DisplayImageCache(
             maximumBytes: batch.retainedBodyByteCount - 1
         )
@@ -2278,7 +2284,10 @@ struct DisplayChannelTests {
                 (type: 65_000, body: Data(repeating: 0x3c, count: 16 * 1_024)),
             ]
         )
-        #expect(batch.retainedBodyByteCount == referenceBody.count + 16 * 1_024 + 22)
+        #expect(
+            batch.retainedBodyByteCount
+                == referenceBody.count + 16 * 1_024 + 22 + HeaderMode.full.wireSize
+        )
         let transport = FakeTransport(inbound: try [
             encodeFull(
                 SpiceMsgDisplaySurfaceCreate(
@@ -4383,10 +4392,8 @@ struct DisplayChannelTests {
         for record in records {
             body.writeBytes(record)
         }
-        return (
-            wire: encodeFull(id: 8, body: body.data, serial: serial, subListOffset: 0),
-            retainedBodyByteCount: body.data.count
-        )
+        let wire = encodeFull(id: 8, body: body.data, serial: serial, subListOffset: 0)
+        return (wire: wire, retainedBodyByteCount: wire.count)
     }
 
     private func encodeFull(

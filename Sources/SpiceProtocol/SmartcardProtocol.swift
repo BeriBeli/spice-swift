@@ -68,6 +68,10 @@ package struct SpiceSmartcardWireCodec: Sendable {
     }
 
     package func decode(_ body: Data) throws(WireError) -> SpiceSmartcardMessage {
+        try decode(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decode(_ body: WireSlice) throws(WireError) -> SpiceSmartcardMessage {
         var reader = try ByteReader(body)
         let rawType = try reader.readUInt32LE()
         guard let type = SpiceSmartcardMessageType(rawValue: rawType) else {

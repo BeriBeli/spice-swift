@@ -81,6 +81,18 @@ package enum SpiceServerMessageDecoder {
         body: Data,
         channel: SpiceChannelKind
     ) throws(WireError) -> SpiceServerMessage {
+        try decode(
+            id: id,
+            body: OwnedBytes(body).wholeSlice,
+            channel: channel
+        )
+    }
+
+    package static func decode(
+        id: UInt16,
+        body: WireSlice,
+        channel: SpiceChannelKind
+    ) throws(WireError) -> SpiceServerMessage {
         switch id {
         case 3:
             return .setAck(try decodeBody(SpiceMsgSetAck.self, from: body))
@@ -127,7 +139,7 @@ package enum SpiceServerMessageDecoder {
                         maximum: VDAgentWireLimits().maximumPacketBytes
                     )
                 }
-                return .mainAgentData(body)
+                return .mainAgentData(body.data)
             case SpiceMainAgentWire.serverToken:
                 var reader = try ByteReader(body)
                 let tokens = try reader.readUInt32LE()
@@ -280,16 +292,13 @@ package enum SpiceServerMessageDecoder {
             return .record(try SpiceRecordWireCodec().decodeServer(id: id, body: body))
         }
 
-        return .unknown(id: id, body: body)
+        return .unknown(id: id, body: body.data)
     }
 
     private static func decodeBody<Message: SpiceGeneratedMessage>(
         _ type: Message.Type,
-        from body: Data
+        from body: WireSlice
     ) throws(WireError) -> Message {
-        var reader = try ByteReader(body)
-        let message = try type.decode(from: &reader)
-        try reader.requireFullyConsumed()
-        return message
+        try type.decode(from: body)
     }
 }

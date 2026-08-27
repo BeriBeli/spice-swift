@@ -29,6 +29,15 @@ package protocol SpiceGeneratedMessage: Sendable, Equatable {
     func encode(to writer: inout ByteWriter) throws(WireError)
 }
 
+package extension SpiceGeneratedMessage {
+    static func decode(from bytes: WireSlice) throws(WireError) -> Self {
+        var reader = try ByteReader(bytes)
+        let message = try decode(from: &reader)
+        try reader.requireFullyConsumed()
+        return message
+    }
+}
+
 package struct SpiceLinkHeader: SpiceGeneratedMessage {
     package static let direction: SpiceMessageDirection = .link
     package static let messageID: UInt16? = nil

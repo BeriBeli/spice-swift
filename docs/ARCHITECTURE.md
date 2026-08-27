@@ -123,6 +123,21 @@ Full and mini headers share the same framing boundary. Header mode is
 connection state established during the Link handshake. Message size limits
 are applied before allocating payload storage.
 
+Receive framing uses a bounded head-index queue of immutable `OwnedBytes`
+segments. A body contained by one receive owner is represented as a checked
+`WireSlice` without a body copy; a body spanning segments is coalesced once.
+Consumed owner slots are released immediately, and periodic prefix cleanup moves
+only optional owner references rather than received bytes. Batch parsing peeks
+transactionally and advances the physical boundary only after every submessage
+range validates. Exact diagnostics report coalesces, body-copy bytes, retained
+owners, and zero byte compaction.
+
+Production readers borrow a non-escaping Swift `Span` from a `WireSlice` for
+synchronous scalar parsing. Only the Sendable owner and checked range may cross
+an actor boundary or suspension point. Display image and stream payloads retain
+their slice until the established codec or event boundary explicitly requests
+`Data`.
+
 Generated protocol declarations come from
 `ProtocolSchema/spice-0.14.5.json`. Regenerate them intentionally with:
 

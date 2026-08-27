@@ -23,10 +23,15 @@ package struct SpiceVMCWireCodec: Sendable {
     }
 
     package func decodeServer(id: UInt16, body: Data) throws(WireError) -> Data {
+        try decodeServer(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeServer(id: UInt16, body: WireSlice) throws(WireError) -> Data {
         switch id {
         case SpiceVMCWire.serverData:
             try validate(body)
-            return body
+            // SpiceVMC events are an existing Data subsystem boundary.
+            return body.data
         case SpiceVMCWire.serverCompressedData:
             throw .unsupportedFeature("compressed SpiceVMC data was not negotiated")
         default:
@@ -45,6 +50,15 @@ package struct SpiceVMCWireCodec: Sendable {
         }
         guard data.count <= limits.maximumPacketBytes else {
             throw .messageTooLarge(actual: data.count, maximum: limits.maximumPacketBytes)
+        }
+    }
+
+    private func validate(_ bytes: WireSlice) throws(WireError) {
+        guard !bytes.isEmpty else {
+            throw .invalidSize(0)
+        }
+        guard bytes.count <= limits.maximumPacketBytes else {
+            throw .messageTooLarge(actual: bytes.count, maximum: limits.maximumPacketBytes)
         }
     }
 }

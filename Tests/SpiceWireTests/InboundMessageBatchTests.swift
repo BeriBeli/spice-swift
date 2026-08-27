@@ -37,6 +37,13 @@ struct InboundMessageBatchTests {
         #expect(batch.logicalMessages.map(\.isLastInPhysicalMessage) == [false, true])
         #expect(batch.body(for: batch.logicalMessages[0]) == Data([0x21, 0x22, 0x23]))
         #expect(batch.body(for: batch.logicalMessages[1]) == Data([0x11, 0x12]))
+        for message in batch.logicalMessages {
+            let bodySlice = batch.bodySlice(for: message)
+            #expect(bodySlice.sharesOwner(with: batch.storageSlice))
+            let lower = batch.storageSlice.range.lowerBound + message.bodyRange.lowerBound
+            let upper = batch.storageSlice.range.lowerBound + message.bodyRange.upperBound
+            #expect(bodySlice.range == lower..<upper)
+        }
     }
 
     @Test func mainMessageExecutesAfterSubmessagesAndUsesOnlyItsPrefix() throws {
@@ -72,6 +79,11 @@ struct InboundMessageBatchTests {
         #expect(batch.logicalMessages.map(\.index) == [0, 1, 2])
         #expect(batch.logicalMessages.map(\.isLastInPhysicalMessage) == [false, false, true])
         #expect(batch.acknowledgmentCount == 1)
+        for index in batch.logicalMessages.indices {
+            let logical = batch.framedMessage(at: index)
+            #expect(logical.bodySlice.sharesOwner(with: batch.storageSlice))
+            #expect(logical.acknowledgmentCount == (index == batch.logicalMessages.count - 1 ? 1 : 0))
+        }
     }
 
     @Test func zeroSubmessageListStillRepresentsOnePhysicalAcknowledgment() throws {
@@ -245,6 +257,45 @@ struct InboundMessageBatchTests {
 
         #expect(throws: WireError.invalidOffset(3)) {
             try framer.nextMessage()
+        }
+    }
+
+    @Test func malformedBatchFailureDoesNotConsumeItsPhysicalBoundary() throws {
+        let malformedBody = Self.littleEndian(UInt16(1))
+            + Self.littleEndian(UInt32(6))
+        let malformedWire = Self.makeWire(
+            mode: .full,
+            serial: 5,
+            type: Self.messageListType,
+            body: malformedBody,
+            subListOffset: 0
+        )
+        let validWire = Self.makeWire(
+            mode: .full,
+            serial: 6,
+            type: 109,
+            body: Data([0xcc])
+        )
+        var framer = MessageFramer(mode: .full)
+        let split = HeaderMode.full.wireSize + 1
+        try framer.append(Data(malformedWire.prefix(split)))
+        try framer.append(Data(malformedWire.suffix(malformedWire.count - split)) + validWire)
+        let bufferedBefore = framer.bufferedByteCount
+
+        for _ in 0..<2 {
+            #expect(throws: WireError.truncated(expected: 6, remaining: 0)) {
+                try framer.nextBatch()
+            }
+            #expect(framer.bufferedByteCount == bufferedBefore)
+            #expect(framer.diagnostics.bodyCoalesces == 1)
+            #expect(framer.diagnostics.bodyCopyBytes == UInt64(malformedBody.count))
+            #expect(framer.diagnostics.queueCompactionBytes == 0)
+            #expect(framer.diagnostics.retainedOwnerCount == 3)
+            #expect(
+                framer.diagnostics.retainedOwnerBytes
+                    == bufferedBefore + malformedBody.count
+            )
+            #expect(framer.diagnostics.bufferedSegmentCount == 2)
         }
     }
 }

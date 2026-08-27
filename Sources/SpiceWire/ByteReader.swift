@@ -1,25 +1,29 @@
 import Foundation
 
 package struct ByteReader: Sendable {
-    private let data: Data
+    private let bytes: WireSlice
     package private(set) var offset: Int
 
     package init(_ data: Data, offset: Int = 0) throws(WireError) {
-        guard offset >= 0, offset <= data.count else {
+        try self.init(OwnedBytes(data).wholeSlice, offset: offset)
+    }
+
+    package init(_ bytes: WireSlice, offset: Int = 0) throws(WireError) {
+        guard offset >= 0, offset <= bytes.count else {
             throw .invalidOffset(UInt64(max(offset, 0)))
         }
-        self.data = data
+        self.bytes = bytes
         self.offset = offset
     }
 
     package var remainingCount: Int {
-        data.count - offset
+        bytes.count - offset
     }
 
     package mutating func readUInt8() throws(WireError) -> UInt8 {
         try require(1)
         defer { offset += 1 }
-        return data[data.startIndex + offset]
+        return bytes.withSpan { $0[offset] }
     }
 
     package mutating func readUInt16LE() throws(WireError) -> UInt16 {
@@ -43,21 +47,28 @@ package struct ByteReader: Sendable {
     }
 
     package mutating func readBytes(count: Int) throws(WireError) -> Data {
+        try readSlice(count: count).data
+    }
+
+    package mutating func readSlice(count: Int) throws(WireError) -> WireSlice {
         guard count >= 0 else {
             throw .invalidSize(count)
         }
         try require(count)
-        let start = data.startIndex + offset
-        let range = start..<(start + count)
+        let start = offset
         offset += count
-        return data.subdata(in: range)
+        return try bytes.slice(start..<offset)
     }
 
     package mutating func readRemainingBytes() -> Data {
-        let start = data.startIndex + offset
-        let bytes = data.subdata(in: start..<data.endIndex)
-        offset = data.count
-        return bytes
+        readRemainingSlice().data
+    }
+
+    package mutating func readRemainingSlice() -> WireSlice {
+        let start = offset
+        offset = bytes.count
+        // Both bounds derive from the already validated reader slice.
+        return try! bytes.slice(start..<bytes.count)
     }
 
     package func requireFullyConsumed() throws(WireError) {
@@ -71,8 +82,14 @@ package struct ByteReader: Sendable {
     ) throws(WireError) -> T {
         let count = MemoryLayout<T>.size
         try require(count)
-        let value = data.withUnsafeBytes {
-            $0.loadUnaligned(fromByteOffset: offset, as: type)
+        let value = bytes.withSpan { span in
+            var value: T = 0
+            withUnsafeMutableBytes(of: &value) { destination in
+                for index in 0..<count {
+                    destination[index] = span[offset + index]
+                }
+            }
+            return value
         }
         offset += count
         return T(littleEndian: value)

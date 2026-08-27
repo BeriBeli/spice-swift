@@ -311,7 +311,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         do {
             message = try SpiceServerMessageDecoder.decode(
                 id: framed.type,
-                body: framed.body,
+                body: framed.bodySlice,
                 channel: .display
             )
         } catch let error {
@@ -1390,28 +1390,28 @@ package actor DisplayChannel: SpiceManagedChannel {
         case let .quic(descriptor, data):
             return (.bitmap(try await decode(
                 descriptor: descriptor,
-                data: data,
+                data: data.data,
                 decoder: quicDecoder,
                 name: "QUIC"
             )), nil)
         case let .jpeg(descriptor, data):
             return (.bitmap(try await decode(
                 descriptor: descriptor,
-                data: data,
+                data: data.data,
                 decoder: jpegDecoder,
                 name: "JPEG"
             )), nil)
         case let .lzRGB(descriptor, data):
             return (.bitmap(try await decode(
                 descriptor: descriptor,
-                data: data,
+                data: data.data,
                 decoder: lzDecoder,
                 name: "LZ"
             )), nil)
         case let .glzRGB(descriptor, data):
             return (.bitmap(try await decode(
                 descriptor: descriptor,
-                data: data,
+                data: data.data,
                 decoder: glzDecoder,
                 name: "GLZ"
             )), nil)
