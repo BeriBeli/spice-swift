@@ -323,6 +323,9 @@ The LZ RGB family is locally closed.
   preserving the rule that commit cannot throw after Surface success. Same-ID
   mutations acquire their active slot through a bounded, cancellation-safe FIFO
   rather than failing merely because another Display is decoding the same ID.
+  When the command is a logical submessage, its retained-byte charge is the
+  complete physical batch body backing the shared `Data` slice, not merely the
+  logical body length.
   Outcome counters distinguish committed, concurrently invalidated, and
   teardown-discarded mutations.
 - `CACHE_REPLACE_ME` accepts only a lossless source replacing a committed lossy

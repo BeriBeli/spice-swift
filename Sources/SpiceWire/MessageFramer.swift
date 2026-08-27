@@ -17,6 +17,12 @@ package struct FramedMessage: Sendable, Equatable {
     package let type: UInt16
     package let subListOffset: UInt32?
     package let body: Data
+    /// Bytes retained by `body`'s physical-message backing storage.
+    ///
+    /// A logical submessage may have a small body while its `Data` slice keeps
+    /// the entire physical SPICE message alive. Callers that suspend while
+    /// retaining the body must account this value rather than `body.count`.
+    package let retainedBodyByteCount: Int
     /// The number of physical messages represented by this dispatched logical
     /// message. This is one only for the final logical message in a batch.
     package let acknowledgmentCount: Int
@@ -26,12 +32,14 @@ package struct FramedMessage: Sendable, Equatable {
         type: UInt16,
         subListOffset: UInt32?,
         body: Data,
+        retainedBodyByteCount: Int? = nil,
         acknowledgmentCount: Int = 1
     ) {
         self.serial = serial
         self.type = type
         self.subListOffset = subListOffset
         self.body = body
+        self.retainedBodyByteCount = max(body.count, retainedBodyByteCount ?? body.count)
         self.acknowledgmentCount = acknowledgmentCount
     }
 
@@ -103,6 +111,7 @@ package struct FramedMessageBatch: Sendable, Equatable {
             type: message.type,
             subListOffset: nil,
             body: body(for: message),
+            retainedBodyByteCount: physicalBodySize,
             acknowledgmentCount: message.isLastInPhysicalMessage ? 1 : 0
         )
     }

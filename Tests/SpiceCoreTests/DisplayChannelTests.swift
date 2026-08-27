@@ -2127,6 +2127,230 @@ struct DisplayChannelTests {
         #expect(producerDiagnostics.imageCacheInvalidatedMutations == 1)
     }
 
+    @Test func fullBatchCacheMutationRetainsPhysicalBodyUntilCompletion() async throws {
+        let imageID: UInt64 = 0xb101
+        let imageCache = DisplayImageCache(maximumBytes: 64 * 1_024)
+        let decoder = GatedPatternJPEGDecoder()
+        let drawBody = drawCompressedCopyBody(
+            imageType: 105,
+            payload: Data([1]),
+            descriptorID: imageID,
+            descriptorFlags: 0x01
+        )
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: drawBody),
+                (type: 65_000, body: Data(repeating: 0xa5, count: 16 * 1_024)),
+            ]
+        )
+        #expect(batch.retainedBodyByteCount == drawBody.count + 16 * 1_024 + 22)
+
+        let transport = FakeTransport(inbound: try [
+            encodeFull(
+                SpiceMsgDisplaySurfaceCreate(
+                    surfaceID: 1,
+                    width: 2,
+                    height: 1,
+                    format: 32,
+                    flags: 1
+                ),
+                serial: 1
+            ),
+            batch.wire,
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .full
+            ),
+            imageCache: imageCache,
+            jpegDecoder: decoder
+        )
+
+        _ = try await channel.processNext()
+        let cacheDraw = Task { try await channel.processNext() }
+        await decoder.waitUntilFirstDecodeStarts()
+
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 1)
+        #expect(diagnostics.mutationRetainedBytes == batch.retainedBodyByteCount)
+        #expect(diagnostics.reservedBytes == 0)
+
+        await decoder.releaseFirstDecode()
+        _ = try await cacheDraw.value
+
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        #expect(diagnostics.entryCount == 1)
+        await channel.close()
+        await imageCache.clear()
+    }
+
+    @Test func fullBatchOwnerSizeEnforcesCacheMutationTemporaryBudget() async throws {
+        let imageID: UInt64 = 0xb102
+        let drawBody = drawCompressedCopyBody(
+            imageType: 105,
+            payload: Data([1]),
+            descriptorID: imageID,
+            descriptorFlags: 0x01
+        )
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: drawBody),
+                (type: 65_000, body: Data(repeating: 0x5a, count: 16 * 1_024)),
+            ]
+        )
+        #expect(batch.retainedBodyByteCount == drawBody.count + 16 * 1_024 + 22)
+        let imageCache = DisplayImageCache(
+            maximumBytes: batch.retainedBodyByteCount - 1
+        )
+        let transport = FakeTransport(inbound: try [
+            encodeFull(
+                SpiceMsgDisplaySurfaceCreate(
+                    surfaceID: 1,
+                    width: 2,
+                    height: 1,
+                    format: 32,
+                    flags: 1
+                ),
+                serial: 1
+            ),
+            batch.wire,
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .full
+            ),
+            imageCache: imageCache,
+            jpegDecoder: StubJPEGDecoder(
+                result: .success(decodedPixels([1, 2, 3, 4, 5, 6]))
+            )
+        )
+
+        _ = try await channel.processNext()
+        await #expect(
+            throws: ChannelError.protocolViolation("image cache temporary byte limit exceeded")
+        ) {
+            try await channel.processNext()
+        }
+
+        let diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        await channel.close()
+    }
+
+    @Test(arguments: FullBatchWaiterRelease.allCases)
+    func fullBatchMissingCacheReferenceReleasesPhysicalBodyExactlyOnce(
+        release: FullBatchWaiterRelease
+    ) async throws {
+        let imageID: UInt64 = 0xb103
+        let imageCache = DisplayImageCache(maximumBytes: 64 * 1_024)
+        let referenceBody = drawCachedCopyBody(
+            imageType: 103,
+            descriptorID: imageID
+        )
+        let batch = encodeFullList(
+            serial: 2,
+            submessages: [
+                (type: 304, body: referenceBody),
+                (type: 65_000, body: Data(repeating: 0x3c, count: 16 * 1_024)),
+            ]
+        )
+        #expect(batch.retainedBodyByteCount == referenceBody.count + 16 * 1_024 + 22)
+        let transport = FakeTransport(inbound: try [
+            encodeFull(
+                SpiceMsgDisplaySurfaceCreate(
+                    surfaceID: 1,
+                    width: 2,
+                    height: 1,
+                    format: 32,
+                    flags: 1
+                ),
+                serial: 1
+            ),
+            batch.wire,
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .full
+            ),
+            imageCache: imageCache
+        )
+
+        _ = try await channel.processNext()
+        let pendingDraw = Task { try await channel.processNext() }
+        await expectDisplayCacheDiagnostics(imageCache) { $0.pendingWaiterCount == 1 }
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.retainedBytes == batch.retainedBodyByteCount)
+
+        switch release {
+        case .complete:
+            let reservation = try await imageCache.reserve(
+                id: imageID,
+                bitmap: RawBitmap(
+                    format: .xRGB8888,
+                    width: 2,
+                    height: 1,
+                    stride: 8,
+                    topDown: true,
+                    pixels: Data([1, 2, 3, 0, 4, 5, 6, 0])
+                ),
+                lossy: false,
+                mode: .cache
+            )
+            #expect(await imageCache.commit(reservation) == .committed)
+            _ = try await pendingDraw.value
+        case .cancel:
+            pendingDraw.cancel()
+            await #expect(throws: ChannelError.transport(.cancelled)) {
+                try await pendingDraw.value
+            }
+        case .clear:
+            await imageCache.clear()
+            await #expect(
+                throws: ChannelError.protocolViolation("image cache cleared")
+            ) {
+                try await pendingDraw.value
+            }
+        case .close:
+            await imageCache.close()
+            await #expect(throws: ChannelError.transport(.connectionClosed)) {
+                try await pendingDraw.value
+            }
+        }
+
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingWaiterCount == 0)
+        #expect(diagnostics.retainedBytes == 0)
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+
+        // A second terminal cleanup must not release the same retained owner again.
+        await imageCache.clear()
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingWaiterCount == 0)
+        #expect(diagnostics.retainedBytes == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.reservedBytes == 0)
+        await channel.close()
+    }
+
     @Test func overlappingCacheMeMutationsDecodeAndCommitInFIFOOrder() async throws {
         let imageID: UInt64 = 0xa103
         let imageCache = DisplayImageCache()
@@ -3729,6 +3953,64 @@ struct DisplayChannelTests {
         return encodeMini(id: id, body: body.data)
     }
 
+    private func encodeFull<Message: SpiceGeneratedMessage>(
+        _ message: Message,
+        serial: UInt64
+    ) throws -> Data {
+        let id = try #require(Message.messageID)
+        var body = ByteWriter()
+        try message.encode(to: &body)
+        return encodeFull(id: id, body: body.data, serial: serial)
+    }
+
+    private func encodeFullList(
+        serial: UInt64,
+        submessages: [(type: UInt16, body: Data)]
+    ) -> (wire: Data, retainedBodyByteCount: Int) {
+        var records: [Data] = []
+        var offsets: [UInt32] = []
+        records.reserveCapacity(submessages.count)
+        offsets.reserveCapacity(submessages.count)
+        var nextOffset = 2 + submessages.count * 4
+        for message in submessages {
+            var record = ByteWriter()
+            record.writeUInt16LE(message.type)
+            record.writeUInt32LE(UInt32(message.body.count))
+            record.writeBytes(message.body)
+            records.append(record.data)
+            offsets.append(UInt32(nextOffset))
+            nextOffset += record.data.count
+        }
+
+        var body = ByteWriter()
+        body.writeUInt16LE(UInt16(submessages.count))
+        for offset in offsets {
+            body.writeUInt32LE(offset)
+        }
+        for record in records {
+            body.writeBytes(record)
+        }
+        return (
+            wire: encodeFull(id: 8, body: body.data, serial: serial, subListOffset: 0),
+            retainedBodyByteCount: body.data.count
+        )
+    }
+
+    private func encodeFull(
+        id: UInt16,
+        body: Data,
+        serial: UInt64,
+        subListOffset: UInt32 = 0
+    ) -> Data {
+        var writer = ByteWriter()
+        writer.writeUInt64LE(serial)
+        writer.writeUInt16LE(id)
+        writer.writeUInt32LE(UInt32(body.count))
+        writer.writeUInt32LE(subListOffset)
+        writer.writeBytes(body)
+        return writer.data
+    }
+
     private func makeGatedJPEGCacheDisplay(
         channelID: UInt8,
         imageID: UInt64,
@@ -3790,6 +4072,13 @@ struct DisplayChannelTests {
             revision: revision
         ))
     }
+}
+
+enum FullBatchWaiterRelease: CaseIterable, Sendable {
+    case complete
+    case cancel
+    case clear
+    case close
 }
 
 private func expectDisplayCacheDiagnostics(

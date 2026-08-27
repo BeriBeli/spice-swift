@@ -306,7 +306,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         completedFrameSourceTiming = nil
         let framed = try await connection.receive()
         currentMessageReceivedAt = diagnosticsClock.now
-        currentMessageRetainedByteCount = framed.body.count
+        currentMessageRetainedByteCount = framed.retainedBodyByteCount
         let message: SpiceServerMessage
         do {
             message = try SpiceServerMessageDecoder.decode(
