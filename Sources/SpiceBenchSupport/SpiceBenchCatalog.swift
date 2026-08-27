@@ -272,7 +272,7 @@ package enum SpiceBenchCatalog {
                 )
                 let createdMetrics = await store.metrics()
                 guard createdMetrics.revisionedBackingEnabled else {
-                    throw SpiceBenchWorkloadError.unsupportedIOSurfaceBacking
+                    throw SpiceBenchError.unsupportedCapability("revisioned-iosurface")
                 }
                 let fullRectangle = PixelRect(
                     x: 0,
@@ -787,5 +787,4 @@ package enum SpiceBenchCatalog {
 private enum SpiceBenchWorkloadError: Error {
     case missingOutput(String)
     case missingState(String)
-    case unsupportedIOSurfaceBacking
 }

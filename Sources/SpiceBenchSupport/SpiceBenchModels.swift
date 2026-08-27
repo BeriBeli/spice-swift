@@ -183,6 +183,7 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
     case liveRequiresExternalRunner
     case debugBuildUnsupported
     case invalidMetadata(field: String)
+    case unsupportedCapability(String)
 
     package var description: String {
         switch self {
@@ -210,6 +211,8 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
             "spice-bench artifacts require a Release build"
         case let .invalidMetadata(field):
             "benchmark metadata field \(field) is missing or invalid"
+        case let .unsupportedCapability(capability):
+            "benchmark capability \(capability) is unavailable"
         }
     }
 }

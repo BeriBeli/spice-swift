@@ -314,16 +314,43 @@ struct SpiceBenchTests {
                 return value
             }
         }
-        let report = try await runner.run(
-            metadata: fixtureMetadata,
-            catalog: SpiceBenchCatalog.microbenchmarks(
-                warmUpIterations: 1,
-                measuredIterations: 1
-            )
+        let catalog = SpiceBenchCatalog.microbenchmarks(
+            warmUpIterations: 1,
+            measuredIterations: 1
         )
+        let report: SpiceBenchReport
+        let supportsRevisionedIOSurface: Bool
+        do {
+            report = try await runner.run(metadata: fixtureMetadata, catalog: catalog)
+            supportsRevisionedIOSurface = true
+        } catch SpiceBenchError.unsupportedCapability(let capability)
+            where capability == "revisioned-iosurface"
+        {
+            let remainingCatalog = catalog.filter { $0.id != "iosurface.transition" }
+            report = try await runner.run(
+                metadata: fixtureMetadata,
+                catalog: remainingCatalog
+            )
+            supportsRevisionedIOSurface = false
+
+            let ioSurfaceCase = try #require(
+                catalog.first { $0.id == "iosurface.transition" }
+            )
+            await #expect(throws: SpiceBenchError.unsupportedCapability(
+                "revisioned-iosurface"
+            )) {
+                _ = try await runner.run(
+                    metadata: fixtureMetadata,
+                    catalog: [ioSurfaceCase]
+                )
+            }
+        }
 
         #expect(report.artifactKind == .microbenchmark)
-        #expect(report.cases.map(\.id) == SpiceBenchCatalog.stableCaseIDs)
+        let expectedIDs = SpiceBenchCatalog.stableCaseIDs.filter {
+            supportsRevisionedIOSurface || $0 != "iosurface.transition"
+        }
+        #expect(report.cases.map(\.id) == expectedIDs)
         #expect(report.cases.allSatisfy { $0.checksum != 0 })
         #expect(report.cases.allSatisfy {
             $0.durationSamplesNanoseconds.count == $0.measuredIterations
@@ -371,10 +398,14 @@ struct SpiceBenchTests {
         #expect(glz.exactCounters["pendingDictionaryWaitBytes"] == 0)
         #expect(glz.exactCounters["overlapReferencePixels"] == 16_383)
 
-        let ioSurface = try #require(byID["iosurface.transition"])
-        #expect(ioSurface.exactCounters["cpuMaterializationBytes"] == 0)
-        #expect(ioSurface.exactCounters["cpuMaterializations"] == 0)
-        #expect(ioSurface.exactCounters["directIOSurfaceWriteBytes"] == 4)
+        if supportsRevisionedIOSurface {
+            let ioSurface = try #require(byID["iosurface.transition"])
+            #expect(ioSurface.exactCounters["cpuMaterializationBytes"] == 0)
+            #expect(ioSurface.exactCounters["cpuMaterializations"] == 0)
+            #expect(ioSurface.exactCounters["directIOSurfaceWriteBytes"] == 4)
+        } else {
+            #expect(byID["iosurface.transition"] == nil)
+        }
 
         let video = try #require(byID["advanced_video.sample"])
         #expect(video.exactCounters["scanPassCount"] == 1)
