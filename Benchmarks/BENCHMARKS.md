@@ -18,14 +18,17 @@ identifier for the measured sources.
 Benchmarks/run_micro.sh --warmup 3 --iterations 10 > /private/tmp/spice-micro.json
 ```
 
-`run_micro.sh` resolves one absolute Swift executable, uses that exact binary
-for the Release build, captures its `--version`, and passes both pieces of
-evidence to `spice-bench` for runtime verification. Set `SWIFT_EXECUTABLE` to a
-specific toolchain binary when required. Direct executable invocation without
-matching build-toolchain evidence is rejected.
+`run_micro.sh` resolves one absolute Swift executable and uses that exact binary
+for the Release build. Its version and target information, the active developer
+directory and toolchain selectors, and the resolved macOS SDK path/version are
+compiled into the executable. Runtime metadata is read from that immutable
+build snapshot, so changing `DEVELOPER_DIR`, `TOOLCHAINS`, or `SDKROOT` after
+the build cannot relabel an artifact. Set `SWIFT_EXECUTABLE` to a specific
+toolchain binary when required. Direct executable invocation without embedded
+revision and build-toolchain evidence is rejected.
 
 The command writes exactly one JSON object to standard output. Schema version
-`2` contains `schema_version`, `artifact_kind`, reproducibility `metadata`, and
+`3` contains `schema_version`, `artifact_kind`, reproducibility `metadata`, and
 the stable ordered `cases` catalog. Every case records warm-up and measured
 iteration counts, nonzero checksum evidence against dead-code elimination,
 raw duration samples in measured order, derived duration statistics in
@@ -33,7 +36,8 @@ nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
 so later analysis can compute bootstrap confidence intervals instead of trying
 to reconstruct them from lossy summary statistics. In schema 2, an even sample
 count's `median_nanoseconds` is the arithmetic mean of both central samples and
-may be fractional. The retained schema-1 artifact used the legacy upper-middle
+may be fractional. Metadata schema 3 adds the immutable `build_metadata`
+snapshot. The retained schema-1 artifact used the legacy upper-middle
 sample rule; consumers must use its raw samples when comparing it with schema 2.
 The current stable case IDs are:
 

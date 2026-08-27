@@ -14,32 +14,22 @@ struct SpiceBenchCommand {
                 )
                 throw SpiceBenchError.liveRequiresExternalRunner
             }
-            let environment = ProcessInfo.processInfo.environment
-            let toolchainEvidence = try SpiceBenchToolchainEvidence.resolve(
-                environment: environment
-            )
+            let buildInfo = try SpiceBenchExecutableBuildInfo.current()
             let repositoryPreflight = SpiceBenchRepositoryPreflight(
-                executableRevision: .embedded,
+                executableRevision: buildInfo.revision,
                 stateProvider: repositoryState
             )
             let encoded = try await repositoryPreflight.withCleanRepository { commit in
-                guard let observedToolchain = commandOutput(
-                    toolchainEvidence.executablePath,
-                    ["--version"]
-                ) else {
-                    throw SpiceBenchError.toolchainEvidenceMismatch
-                }
                 let metadata = SpiceBenchMetadata(
                     commit: commit,
-                    toolchain: try toolchainEvidence.validatedVersion(
-                        observedVersion: observedToolchain
-                    ),
+                    toolchain: buildInfo.metadata.swiftVersion,
                     hardware: try hardwareDescription(),
                     thermalState: try thermalState(),
                     workload: SpiceBenchCatalog.workloadID,
                     date: Date().formatted(.iso8601),
                     source: "local",
-                    mode: "release"
+                    mode: "release",
+                    buildMetadata: buildInfo.metadata
                 )
                 let report = try await SpiceBenchRunner().run(
                     metadata: metadata,

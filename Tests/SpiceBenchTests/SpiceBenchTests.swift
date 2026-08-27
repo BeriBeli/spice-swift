@@ -8,7 +8,7 @@ import SpiceBenchSupport
 struct SpiceBenchTests {
     @Test("JSON schema is stable, complete, and round-trips")
     func jsonSchemaRoundTrips() throws {
-        #expect(SpiceBenchReport.currentSchemaVersion == 2)
+        #expect(SpiceBenchReport.currentSchemaVersion == 3)
 
         let report = SpiceBenchReport(
             artifactKind: .microbenchmark,
@@ -48,7 +48,13 @@ struct SpiceBenchTests {
         let metadata = try #require(json["metadata"] as? [String: Any])
         #expect(Set(metadata.keys) == [
             "commit", "toolchain", "hardware", "thermal_state",
-            "workload", "date", "source", "mode",
+            "workload", "date", "source", "mode", "build_metadata",
+        ])
+        let buildMetadata = try #require(metadata["build_metadata"] as? [String: Any])
+        #expect(Set(buildMetadata.keys) == [
+            "swift_executable", "swift_version", "swift_target_info",
+            "developer_directory", "toolchains", "sdk_root", "sdk_path",
+            "sdk_version", "configuration",
         ])
 
         let cases = try #require(json["cases"] as? [[String: Any]])
@@ -406,51 +412,6 @@ struct SpiceBenchTests {
         #expect(matchingWorkCalls.withLock { $0 } == 1)
     }
 
-    @Test("toolchain evidence comes only from exact injected build metadata")
-    func toolchainEvidenceIsExactAndRequired() throws {
-        let executableKey = SpiceBenchToolchainEvidence.executableEnvironmentKey
-        let versionKey = SpiceBenchToolchainEvidence.versionEnvironmentKey
-        #expect(executableKey == "SPICE_BENCH_SWIFT_EXECUTABLE")
-        #expect(versionKey == "SPICE_BENCH_SWIFT_VERSION")
-
-        #expect(throws: SpiceBenchError.missingToolchainEvidence(executableKey)) {
-            _ = try SpiceBenchToolchainEvidence.resolve(environment: [:])
-        }
-        #expect(throws: SpiceBenchError.missingToolchainEvidence(versionKey)) {
-            _ = try SpiceBenchToolchainEvidence.resolve(environment: [
-                executableKey: "/toolchain/usr/bin/swift",
-            ])
-        }
-        let unknown = try SpiceBenchToolchainEvidence.resolve(environment: [
-            executableKey: "/toolchain/usr/bin/swift",
-            versionKey: "unknown",
-        ])
-        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
-            _ = try unknown.validatedVersion(observedVersion: "unknown")
-        }
-
-        let exactVersion = "Apple Swift version 6.4 (fixture-build)"
-        let evidence = try SpiceBenchToolchainEvidence.resolve(environment: [
-            executableKey: "/toolchain/usr/bin/swift",
-            versionKey: exactVersion,
-        ])
-        #expect(evidence.executablePath == "/toolchain/usr/bin/swift")
-        #expect(evidence.capturedVersion == exactVersion)
-        #expect(try evidence.validatedVersion(observedVersion: exactVersion) == exactVersion)
-        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
-            _ = try evidence.validatedVersion(
-                observedVersion: "Apple Swift version 6.4 (different-toolchain)"
-            )
-        }
-        let fallbackCommand = SpiceBenchToolchainEvidence(
-            executablePath: "xcrun",
-            capturedVersion: exactVersion
-        )
-        #expect(throws: SpiceBenchError.toolchainEvidenceMismatch) {
-            _ = try fallbackCommand.validatedVersion(observedVersion: exactVersion)
-        }
-    }
-
     @Test("runner rejects invalid catalogs and observations deterministically")
     func runnerRejectsInvalidInputs() async {
         let runner = SpiceBenchRunner(nowNanoseconds: { 1 })
@@ -768,7 +729,22 @@ struct SpiceBenchTests {
             workload: "microbenchmark-catalog-v1",
             date: "2026-08-28T00:00:00Z",
             source: "spice-bench",
-            mode: "release"
+            mode: "release",
+            buildMetadata: fixtureBuildMetadata
+        )
+    }
+
+    private var fixtureBuildMetadata: SpiceBenchBuildMetadata {
+        SpiceBenchBuildMetadata(
+            swiftExecutable: "/fixture/toolchain/usr/bin/swift",
+            swiftVersion: "Swift 6.3",
+            swiftTargetInfo: #"{"target":{"triple":"arm64-apple-macosx14.0"}}"#,
+            developerDirectory: "/Applications/Xcode-fixture.app/Contents/Developer",
+            toolchains: "fixture-toolchain",
+            sdkRoot: "/fixture/MacOSX.sdk",
+            sdkPath: "/fixture/MacOSX.sdk",
+            sdkVersion: "26.0",
+            configuration: "release"
         )
     }
 
@@ -782,7 +758,8 @@ struct SpiceBenchTests {
             workload: field == "workload" ? value : metadata.workload,
             date: field == "date" ? value : metadata.date,
             source: field == "source" ? value : metadata.source,
-            mode: field == "mode" ? value : metadata.mode
+            mode: field == "mode" ? value : metadata.mode,
+            buildMetadata: metadata.buildMetadata
         )
     }
 
