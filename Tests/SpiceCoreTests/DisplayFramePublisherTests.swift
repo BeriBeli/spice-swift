@@ -828,6 +828,59 @@ struct DisplayFramePublisherTests {
         #expect(await publisher.metrics().pendingSurfaces == 0)
     }
 
+    @Test func evictedReplacementRecoversLatestRevisionWithoutAnotherSubmit() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let original = revisions[0]
+        let evictedForCapacity = revisions[1]
+        let retained = revisions[2]
+        let snapshots = PublicationSnapshotReturnGate(
+            store: store,
+            blockedOnce: [original.surfaceID]
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: 2,
+            maximumConcurrentSnapshots: 1,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        await publisher.submit(original)
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilConsumed(surfaceID: original.surfaceID)
+        let replacement = try await store.fill(
+            surfaceID: original.surfaceID,
+            rectangle: PixelRect(x: 6, y: 2, width: 1, height: 1),
+            colorARGB: 0x00AA_BBCC
+        )
+        await publisher.submit(replacement)
+        await publisher.submit(evictedForCapacity)
+        await publisher.submit(retained)
+        await publisher.remove(surfaceID: evictedForCapacity.surfaceID)
+        firstFlush.cancel()
+        await firstFlush.value
+
+        var metrics = await publisher.metrics()
+        #expect(metrics.submissions == 4)
+        #expect(metrics.pendingEvictions == 1)
+        #expect(metrics.pendingSurfaces == 2)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [replacement, retained])
+        #expect(await observations.emittedFullDamage == [true, false])
+        metrics = await publisher.metrics()
+        #expect(metrics.submissions == 4)
+        #expect(metrics.snapshotAttempts == 3)
+        #expect(metrics.emittedFrames == 2)
+        #expect(metrics.staleSnapshots == 0)
+        #expect(metrics.pendingSurfaces == 0)
+    }
+
     @Test(arguments: [3, 4])
     func completedSnapshotsHoldAWindowUntilOrderedPrefixEmits(
         maximumConcurrency: Int
