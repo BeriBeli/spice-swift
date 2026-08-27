@@ -475,7 +475,7 @@ struct DisplayFramePublisherTests {
             surfaceCount: 5
         ),
         SnapshotConcurrencyCase(
-            expectedMaximumConcurrency: 4,
+            expectedMaximumConcurrency: 3,
             configuredMaximumConcurrency: nil,
             surfaceCount: 5
         ),
@@ -651,6 +651,124 @@ struct DisplayFramePublisherTests {
         #expect(await publisher.metrics().pendingSurfaces == 1)
     }
 
+    @Test(arguments: [3, 4])
+    func completedSnapshotsHoldAWindowUntilOrderedPrefixEmits(
+        maximumConcurrency: Int
+    ) async {
+        let surfaceCount = maximumConcurrency * 2
+        let snapshots = ControlledSnapshotProbe()
+        let emissions = ControlledEmissionProbe()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: surfaceCount,
+            maximumConcurrentSnapshots: maximumConcurrency,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await emissions.emit(frame)
+            }
+        )
+        let revisions = (1...surfaceCount).map {
+            surfaceRevision(surfaceID: UInt32($0), revision: 1)
+        }
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(maximumConcurrency)
+        for surfaceID in UInt32(2)...UInt32(maximumConcurrency) {
+            let finishedCount = await snapshots.state().finishedSurfaceIDs.count
+            await snapshots.succeed(surfaceID: surfaceID)
+            await snapshots.waitUntilFinished(finishedCount + 1)
+        }
+        #expect(await emissions.revisions().isEmpty)
+
+        await snapshots.succeed(surfaceID: 1)
+        await snapshots.waitUntilFinished(maximumConcurrency)
+        for expectedEmissionCount in 1...maximumConcurrency {
+            await emissions.waitUntilEmitted(expectedEmissionCount)
+            await snapshots.waitUntilStarted(
+                maximumConcurrency + expectedEmissionCount - 1
+            )
+            let snapshotState = await snapshots.state()
+            #expect(
+                snapshotState.startedSurfaceIDs.count
+                    == maximumConcurrency + expectedEmissionCount - 1
+            )
+            #expect(
+                snapshotState.startedSurfaceIDs.count - (expectedEmissionCount - 1)
+                    == maximumConcurrency
+            )
+            #expect(snapshotState.activeSurfaceIDs.count <= maximumConcurrency)
+            #expect(
+                await emissions.revisions()
+                    == Array(revisions.prefix(expectedEmissionCount))
+            )
+            await emissions.release(surfaceID: UInt32(expectedEmissionCount))
+        }
+
+        await snapshots.waitUntilStarted(surfaceCount)
+        var snapshotState = await snapshots.state()
+        #expect(snapshotState.peakActiveCount == maximumConcurrency)
+        #expect(snapshotState.startedSurfaceIDs.count == surfaceCount)
+        for surfaceID in snapshotState.activeSurfaceIDs.sorted(by: >) {
+            let finishedCount = await snapshots.state().finishedSurfaceIDs.count
+            await snapshots.succeed(surfaceID: surfaceID)
+            await snapshots.waitUntilFinished(finishedCount + 1)
+        }
+        for expectedEmissionCount in (maximumConcurrency + 1)...surfaceCount {
+            await emissions.waitUntilEmitted(expectedEmissionCount)
+            #expect(
+                await emissions.revisions()
+                    == Array(revisions.prefix(expectedEmissionCount))
+            )
+            await emissions.release(surfaceID: UInt32(expectedEmissionCount))
+        }
+        await flush.value
+
+        snapshotState = await snapshots.state()
+        #expect(snapshotState.activeSurfaceIDs.isEmpty)
+        #expect(snapshotState.finishedSurfaceIDs.count == surfaceCount)
+        #expect(snapshotState.peakActiveCount == maximumConcurrency)
+        #expect(await emissions.revisions() == revisions)
+    }
+
+    @Test func cancellationDrainsBufferedAndActiveSnapshotWindowWithoutRefill() async {
+        let snapshots = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 3,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for surfaceID in 1...6 {
+            await publisher.submit(surfaceRevision(surfaceID: UInt32(surfaceID), revision: 1))
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(3)
+        await snapshots.succeed(surfaceID: 2)
+        await snapshots.waitUntilFinished(1)
+        await publisher.cancel()
+        await snapshots.succeed(surfaceID: 1)
+        await snapshots.waitUntilFinished(3)
+        await flush.value
+
+        let state = await snapshots.state()
+        #expect(state.startedSurfaceIDs.count == 3)
+        #expect(state.finishedSurfaceIDs.count == 3)
+        #expect(state.activeSurfaceIDs.isEmpty)
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
     private func makePublisher(
         observations: FramePublisherObservations,
         maximumPendingSurfaces: Int = 16
@@ -820,6 +938,56 @@ private actor ControlledSnapshotProbe {
             }
         }
         finishedWaiters = remainingFinished
+    }
+}
+
+private actor ControlledEmissionProbe {
+    private var emittedRevisions: [SurfaceRevision] = []
+    private var continuations: [UInt32: CheckedContinuation<Void, Never>] = [:]
+    private var earlyReleases: Set<UInt32> = []
+    private var emittedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func emit(_ frame: FrameSnapshot) async {
+        emittedRevisions.append(frame.surfaceRevision)
+        resumeSatisfiedWaiters()
+        await withCheckedContinuation { continuation in
+            if earlyReleases.remove(frame.surfaceID) != nil {
+                continuation.resume()
+            } else {
+                continuations[frame.surfaceID] = continuation
+            }
+        }
+    }
+
+    func release(surfaceID: UInt32) {
+        if let continuation = continuations.removeValue(forKey: surfaceID) {
+            continuation.resume()
+        } else {
+            earlyReleases.insert(surfaceID)
+        }
+    }
+
+    func waitUntilEmitted(_ count: Int) async {
+        guard emittedRevisions.count < count else { return }
+        await withCheckedContinuation { continuation in
+            emittedWaiters.append((count, continuation))
+        }
+    }
+
+    func revisions() -> [SurfaceRevision] {
+        emittedRevisions
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in emittedWaiters {
+            if emittedRevisions.count >= count {
+                continuation.resume()
+            } else {
+                remaining.append((count, continuation))
+            }
+        }
+        emittedWaiters = remaining
     }
 }
 
