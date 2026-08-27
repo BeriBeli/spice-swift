@@ -364,10 +364,29 @@ package actor DisplayFramePublisher {
     private struct Request: Sendable, Equatable {
         let surfaceRevision: SurfaceRevision
         let invalidationGeneration: UInt64
+        let queueAge: UInt64
+    }
+
+    private struct SnapshotPreparation: Sendable {
+        let requestIndex: Int
+        var frame: FrameSnapshot?
+        let duration: Duration
+    }
+
+    private struct SnapshotRunResult: Sendable {
+        let completedAllRequests: Bool
+        let settledRequestCount: Int
+    }
+
+    private enum SnapshotProcessingOutcome: Sendable {
+        case settledContinue
+        case unsettledStop
+        case settledStop
     }
 
     private let interval: Duration
     private let maximumPendingSurfaces: Int
+    private let maximumConcurrentSnapshots: Int
     private let requiresExplicitDemand: Bool
     private let waitsForConsumption: Bool
     private let snapshot: Snapshot
@@ -388,6 +407,7 @@ package actor DisplayFramePublisher {
     private var lastBatchStart: ContinuousClock.Instant?
     private var lastFramedReceiveBatchStart: ContinuousClock.Instant?
     private var generation: UInt64 = 0
+    private var nextQueueAge: UInt64 = 0
     private var submissions: UInt64 = 0
     private var snapshotAttempts: UInt64 = 0
     private var emittedFrames: UInt64 = 0
@@ -412,6 +432,7 @@ package actor DisplayFramePublisher {
     package init(
         interval: Duration = .milliseconds(16),
         maximumPendingSurfaces: Int = 16,
+        maximumConcurrentSnapshots: Int = 3,
         requiresExplicitDemand: Bool = false,
         waitsForConsumption: Bool = false,
         snapshot: @escaping Snapshot,
@@ -419,6 +440,7 @@ package actor DisplayFramePublisher {
     ) {
         self.interval = interval
         self.maximumPendingSurfaces = max(1, maximumPendingSurfaces)
+        self.maximumConcurrentSnapshots = max(1, maximumConcurrentSnapshots)
         self.requiresExplicitDemand = requiresExplicitDemand
         self.waitsForConsumption = waitsForConsumption
         self.snapshot = snapshot
@@ -481,22 +503,26 @@ package actor DisplayFramePublisher {
             }
         }
 
-        if pending[surfaceID] == nil {
+        let queueAge: UInt64
+        if let existing = pending[surfaceID] {
+            queueAge = existing.queueAge
+            pendingRevisionCoalesces &+= 1
+        } else {
             if pending.count >= maximumPendingSurfaces, let oldest = order.first {
                 pending.removeValue(forKey: oldest)
                 order.removeFirst()
                 pendingEvictions &+= 1
             }
             order.append(surfaceID)
-        } else {
-            pendingRevisionCoalesces &+= 1
+            queueAge = takeNextQueueAge()
         }
         if preparedRevisions[surfaceID] != nil {
             preparedFrameCoalesces &+= 1
         }
         pending[surfaceID] = Request(
             surfaceRevision: surfaceRevision,
-            invalidationGeneration: invalidationGeneration
+            invalidationGeneration: invalidationGeneration,
+            queueAge: queueAge
         )
 
         scheduleFlushIfNeeded()
@@ -557,9 +583,16 @@ package actor DisplayFramePublisher {
             // does not mutate while hidden. Resume must publish one fresh
             // authoritative lease instead of replaying a retained UI frame.
             if let latest = latestSubmittedRevisions[surfaceID] {
+                let queueAge: UInt64
+                if let existing = pending[surfaceID] {
+                    queueAge = existing.queueAge
+                } else {
+                    queueAge = takeNextQueueAge()
+                }
                 let request = Request(
                     surfaceRevision: latest,
-                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0
+                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0,
+                    queueAge: queueAge
                 )
                 if pending[surfaceID] == nil {
                     if pending.count >= maximumPendingSurfaces, let oldest = order.first {
@@ -656,6 +689,8 @@ package actor DisplayFramePublisher {
         lastFlushStart = flushStartedAt
         flushes &+= 1
         let emittedAtFlushStart = emittedFrames
+        let preFlushOrder = order
+        let preFlushRequests = pending
         let eligibleSurfaceIDs = order.filter(canPrepare)
         let requests = eligibleSurfaceIDs.compactMap { pending[$0] }
         for surfaceID in eligibleSurfaceIDs {
@@ -665,69 +700,243 @@ package actor DisplayFramePublisher {
         order.removeAll { eligibleSet.contains($0) }
         flushTask = nil
 
-        for request in requests {
-            snapshotAttempts &+= 1
-            let snapshotStartedAt = clock.now
-            guard let frame = await snapshot(request.surfaceRevision) else {
-                snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
-                staleSnapshots &+= 1
-                continue
+        let snapshotRun = await prepareSnapshots(
+            requests,
+            flushGeneration: flushGeneration
+        )
+        guard snapshotRun.completedAllRequests,
+              generation == flushGeneration,
+              !isCancelled,
+              !Task.isCancelled
+        else {
+            if generation == flushGeneration, !isCancelled {
+                restoreQueuedRequestsAfterAbortedFlush(
+                    requests,
+                    settledRequestCount: snapshotRun.settledRequestCount,
+                    preFlushOrder: preFlushOrder,
+                    preFlushRequests: preFlushRequests,
+                    extractedSurfaceIDs: eligibleSet
+                )
+                isFlushing = false
+                scheduleFlushIfNeeded()
             }
-            snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
-            guard generation == flushGeneration else { return }
-            guard isCurrent(request),
-                  canPrepare(request.surfaceRevision.surfaceID),
-                  frameCovers(frame, request: request)
-            else {
-                staleSnapshots &+= 1
-                forceFullDamage.insert(request.surfaceRevision.surfaceID)
-                continue
-            }
-            let replacement = pending[request.surfaceRevision.surfaceID]
-            if let replacement {
-                let replacementLifecycle = replacement.surfaceRevision.lifecycleGeneration
-                guard replacement.invalidationGeneration == request.invalidationGeneration,
-                      replacementLifecycle == request.surfaceRevision.lifecycleGeneration
-                else {
-                    staleSnapshots &+= 1
-                    continue
+            return
+        }
+        guard generation == flushGeneration else { return }
+        if emittedFrames == emittedAtFlushStart {
+            flushesWithoutEmission &+= 1
+        }
+        isFlushing = false
+        scheduleFlushIfNeeded()
+    }
+
+    private func prepareSnapshots(
+        _ requests: [Request],
+        flushGeneration: UInt64
+    ) async -> SnapshotRunResult {
+        guard !requests.isEmpty else {
+            return SnapshotRunResult(
+                completedAllRequests: true,
+                settledRequestCount: 0
+            )
+        }
+        let snapshot = self.snapshot
+        let clock = self.clock
+        let snapshotWindow = Swift.min(
+            maximumConcurrentSnapshots,
+            requests.count
+        )
+        return await withTaskGroup(
+            of: SnapshotPreparation.self,
+            returning: SnapshotRunResult.self
+        ) { group in
+            var nextAdmissionIndex = 0
+            var nextEmissionIndex = 0
+            var admissionOpen = true
+            var buffered: [Int: SnapshotPreparation] = [:]
+            buffered.reserveCapacity(snapshotWindow)
+
+            while nextAdmissionIndex < snapshotWindow {
+                let requestIndex = nextAdmissionIndex
+                let request = requests[requestIndex]
+                nextAdmissionIndex += 1
+                snapshotAttempts &+= 1
+                group.addTask {
+                    let startedAt = clock.now
+                    let frame = await snapshot(request.surfaceRevision)
+                    return SnapshotPreparation(
+                        requestIndex: requestIndex,
+                        frame: frame,
+                        duration: startedAt.duration(to: clock.now)
+                    )
                 }
             }
-            guard frameMatchesSubmittedRevision(
-                frame,
-                request: request,
-                replacement: replacement
-            ) else {
-                // The surface advanced beyond every revision this publisher
-                // observed. Wait for its commit event instead of publishing a
-                // possible intermediate state from a multi-rectangle command.
-                forceFullDamage.insert(request.surfaceRevision.surfaceID)
-                continue
+
+            while var preparation = await group.next() {
+                snapshotDuration.record(preparation.duration)
+                if admissionOpen,
+                   (generation != flushGeneration || isCancelled || Task.isCancelled)
+                {
+                    admissionOpen = false
+                    buffered.removeAll(keepingCapacity: false)
+                    group.cancelAll()
+                }
+
+                guard admissionOpen else {
+                    // The late result and its immutable frame leave this
+                    // iteration immediately. Continue draining every started
+                    // child so no snapshot lease escapes the structured group.
+                    continue
+                }
+
+                let completedRequestIndex = preparation.requestIndex
+                buffered[completedRequestIndex] = preparation
+                // The buffer is now the sole publisher-owned reference to the
+                // immutable frame; do not let this result local retain a lease
+                // across the refill below.
+                preparation.frame = nil
+                while admissionOpen {
+                    let outcome: SnapshotProcessingOutcome
+                    do {
+                        guard let ordered = buffered.removeValue(
+                            forKey: nextEmissionIndex
+                        ) else {
+                            break
+                        }
+                        outcome = await processSnapshotPreparation(
+                            consume ordered,
+                            request: requests[nextEmissionIndex],
+                            flushGeneration: flushGeneration
+                        )
+                    }
+                    // The ordered preparation's lexical scope has ended, so
+                    // its lease is gone before a replacement child starts.
+                    switch outcome {
+                    case .settledContinue:
+                        nextEmissionIndex += 1
+                    case .settledStop:
+                        nextEmissionIndex += 1
+                        admissionOpen = false
+                    case .unsettledStop:
+                        admissionOpen = false
+                    }
+                    if !admissionOpen {
+                        buffered.removeAll(keepingCapacity: false)
+                        group.cancelAll()
+                    }
+                    if admissionOpen,
+                       (generation != flushGeneration
+                           || isCancelled
+                           || Task.isCancelled)
+                    {
+                        admissionOpen = false
+                        buffered.removeAll(keepingCapacity: false)
+                        group.cancelAll()
+                    }
+                    if admissionOpen,
+                       nextAdmissionIndex < requests.count,
+                       nextAdmissionIndex - nextEmissionIndex
+                           < snapshotWindow
+                    {
+                        let requestIndex = nextAdmissionIndex
+                        let request = requests[requestIndex]
+                        nextAdmissionIndex += 1
+                        snapshotAttempts &+= 1
+                        group.addTask {
+                            let startedAt = clock.now
+                            let frame = await snapshot(request.surfaceRevision)
+                            return SnapshotPreparation(
+                                requestIndex: requestIndex,
+                                frame: frame,
+                                duration: startedAt.duration(to: clock.now)
+                            )
+                        }
+                    }
+                }
             }
-            if replacement != nil {
-                removePendingCovered(
-                    by: frame,
-                    invalidationGeneration: request.invalidationGeneration
-                )
-                // A different revision from this lifecycle that is not covered
-                // remains pending; it does not invalidate the immutable snapshot.
+
+            return SnapshotRunResult(
+                completedAllRequests: admissionOpen
+                    && nextAdmissionIndex == requests.count
+                    && nextEmissionIndex == requests.count
+                    && buffered.isEmpty,
+                settledRequestCount: nextEmissionIndex
+            )
+        }
+    }
+
+    /// Validates and publishes exactly one ordered preparation. Keeping the
+    /// frame inside this helper ensures its immutable IOSurface lease is
+    /// released before the TaskGroup driver refills the admission window.
+    private func processSnapshotPreparation(
+        _ preparation: consuming SnapshotPreparation,
+        request: Request,
+        flushGeneration: UInt64
+    ) async -> SnapshotProcessingOutcome {
+        guard generation == flushGeneration,
+              !isCancelled,
+              !Task.isCancelled
+        else {
+            return .unsettledStop
+        }
+        guard let frame = preparation.frame else {
+            staleSnapshots &+= 1
+            return .settledContinue
+        }
+        guard isCurrent(request),
+              canPrepare(request.surfaceRevision.surfaceID),
+              frameCovers(frame, request: request)
+        else {
+            staleSnapshots &+= 1
+            forceFullDamage.insert(request.surfaceRevision.surfaceID)
+            return .settledContinue
+        }
+        let replacement = pending[request.surfaceRevision.surfaceID]
+        if let replacement {
+            let replacementLifecycle = replacement.surfaceRevision.lifecycleGeneration
+            guard replacement.invalidationGeneration == request.invalidationGeneration,
+                  replacementLifecycle == request.surfaceRevision.lifecycleGeneration
+            else {
+                staleSnapshots &+= 1
+                return .settledContinue
             }
-            var publishedFrame = frame
-            if forceFullDamage.remove(frame.surfaceID) != nil {
-                var fullDamage = SurfaceDamageJournal(
-                    width: frame.width,
-                    height: frame.height
-                )
-                fullDamage.markFull()
-                publishedFrame = frame.withPublicationDamage(fullDamage)
-            }
-            if waitsForConsumption {
-                preparedRevisions[frame.surfaceID] = frame.surfaceRevision
-            }
-            let emitStartedAt = clock.now
-            await emit(publishedFrame)
-            emitDuration.record(emitStartedAt.duration(to: clock.now))
-            guard generation == flushGeneration else { return }
+        }
+        guard frameMatchesSubmittedRevision(
+            frame,
+            request: request,
+            replacement: replacement
+        ) else {
+            // The surface advanced beyond every revision this publisher
+            // observed. Wait for its commit event instead of publishing a
+            // possible intermediate state from a multi-rectangle command.
+            forceFullDamage.insert(request.surfaceRevision.surfaceID)
+            return .settledContinue
+        }
+        if replacement != nil {
+            removePendingCovered(
+                by: frame,
+                invalidationGeneration: request.invalidationGeneration
+            )
+            // A different revision from this lifecycle that is not covered
+            // remains pending; it does not invalidate the immutable snapshot.
+        }
+        var publishedFrame = frame
+        if forceFullDamage.remove(frame.surfaceID) != nil {
+            var fullDamage = SurfaceDamageJournal(
+                width: frame.width,
+                height: frame.height
+            )
+            fullDamage.markFull()
+            publishedFrame = frame.withPublicationDamage(fullDamage)
+        }
+        if waitsForConsumption {
+            preparedRevisions[frame.surfaceID] = frame.surfaceRevision
+        }
+        let emitStartedAt = clock.now
+        await emit(publishedFrame)
+        emitDuration.record(emitStartedAt.duration(to: clock.now))
+        let publisherStillOwnsFlush = generation == flushGeneration && !isCancelled
+        if publisherStillOwnsFlush {
             if isCurrent(request) {
                 lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
                 removePendingCovered(
@@ -742,12 +951,124 @@ package actor DisplayFramePublisher {
                 emittedIOSurfaceFrames &+= 1
             }
         }
-        guard generation == flushGeneration else { return }
-        if emittedFrames == emittedAtFlushStart {
-            flushesWithoutEmission &+= 1
+        // Returning from `emit` is the ownership-transfer boundary. Even when
+        // cancellation became visible while it was suspended, the frame was
+        // handed to the consumer and this request must never be replayed.
+        guard publisherStillOwnsFlush, !Task.isCancelled else {
+            return .settledStop
         }
-        isFlushing = false
-        scheduleFlushIfNeeded()
+        return .settledContinue
+    }
+
+    private func restoreQueuedRequestsAfterAbortedFlush(
+        _ requests: [Request],
+        settledRequestCount: Int,
+        preFlushOrder: [UInt32],
+        preFlushRequests: [UInt32: Request],
+        extractedSurfaceIDs: Set<UInt32>
+    ) {
+        let currentOrder = order
+        var recoveredSurfaceIDs: Set<UInt32> = []
+        recoveredSurfaceIDs.reserveCapacity(requests.count)
+        for (requestIndex, request) in requests.enumerated() {
+            guard requestIndex >= settledRequestCount, isCurrent(request) else {
+                continue
+            }
+            let surfaceID = request.surfaceRevision.surfaceID
+            if let replacement = pending[surfaceID] {
+                guard replacement.invalidationGeneration
+                    == request.invalidationGeneration,
+                    replacement.surfaceRevision.lifecycleGeneration
+                        == request.surfaceRevision.lifecycleGeneration
+                else {
+                    continue
+                }
+                // Preserve the newer pending revision. A snapshot for the
+                // interrupted request may already have consumed the canonical
+                // publication journal, so its replacement must redraw fully.
+                pending[surfaceID] = Request(
+                    surfaceRevision: replacement.surfaceRevision,
+                    invalidationGeneration: replacement.invalidationGeneration,
+                    queueAge: request.queueAge
+                )
+                forceFullDamage.insert(surfaceID)
+                recoveredSurfaceIDs.insert(surfaceID)
+                continue
+            }
+            let currentInvalidationGeneration = invalidationGenerations[surfaceID] ?? 0
+            guard currentInvalidationGeneration == request.invalidationGeneration,
+                  let latest = latestSubmittedRevisions[surfaceID],
+                  latest.surfaceID == surfaceID,
+                  latest.lifecycleGeneration
+                    == request.surfaceRevision.lifecycleGeneration,
+                  latest.revision >= request.surfaceRevision.revision
+            else {
+                continue
+            }
+            let recovered = Request(
+                surfaceRevision: latest,
+                invalidationGeneration: currentInvalidationGeneration,
+                queueAge: request.queueAge
+            )
+            guard lastEmittedRevisions[surfaceID].map({
+                isNewer(recovered.surfaceRevision, than: $0)
+            }) ?? true else {
+                continue
+            }
+            pending[surfaceID] = recovered
+            forceFullDamage.insert(surfaceID)
+            recoveredSurfaceIDs.insert(surfaceID)
+        }
+
+        // Pre-flush requests that never left the queue keep their age. Of the
+        // extracted requests, only the unsettled suffix recovered above may
+        // return to its old position. A newer pending revision for an already
+        // settled request was submitted during the flush and therefore keeps
+        // its newer position in `currentOrder`.
+        var originalAgeOrder: [UInt32] = []
+        originalAgeOrder.reserveCapacity(preFlushOrder.count)
+        for surfaceID in preFlushOrder {
+            guard let original = preFlushRequests[surfaceID],
+                  let current = pending[surfaceID],
+                  hasSameQueueIdentity(current, original),
+                  current.queueAge == original.queueAge,
+                  !extractedSurfaceIDs.contains(surfaceID)
+                    || recoveredSurfaceIDs.contains(surfaceID)
+            else {
+                continue
+            }
+            originalAgeOrder.append(surfaceID)
+        }
+        let originalAgeSet = Set(originalAgeOrder)
+        let currentAgeOrder = currentOrder.filter { surfaceID in
+            pending[surfaceID] != nil && !originalAgeSet.contains(surfaceID)
+        }
+        order = originalAgeOrder + currentAgeOrder
+
+        // Restoration is synchronous actor work, so the temporary merged set
+        // is never observable. Apply the same oldest-first capacity eviction
+        // used by normal submissions before yielding again. Recovered requests
+        // keep their original age and are therefore evicted before newer work
+        // when capacity filled concurrently. Full-damage marks intentionally
+        // survive eviction so a later submission still repairs a publication
+        // journal that an interrupted snapshot may have drained.
+        while pending.count > maximumPendingSurfaces, let oldest = order.first {
+            order.removeFirst()
+            if pending.removeValue(forKey: oldest) != nil {
+                pendingEvictions &+= 1
+            }
+        }
+    }
+
+    private func hasSameQueueIdentity(_ lhs: Request, _ rhs: Request) -> Bool {
+        lhs.invalidationGeneration == rhs.invalidationGeneration
+            && lhs.surfaceRevision.lifecycleGeneration
+                == rhs.surfaceRevision.lifecycleGeneration
+    }
+
+    private func takeNextQueueAge() -> UInt64 {
+        defer { nextQueueAge &+= 1 }
+        return nextQueueAge
     }
 
     private func isCurrent(_ request: Request) -> Bool {

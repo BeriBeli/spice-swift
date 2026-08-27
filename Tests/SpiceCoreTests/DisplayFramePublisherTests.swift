@@ -313,8 +313,7 @@ struct DisplayFramePublisherTests {
         #expect(metrics.submissions == 2)
         #expect(metrics.snapshotAttempts == 2)
         #expect(metrics.emittedFrames == 1)
-        #expect(metrics.emittedIOSurfaceFrames == 1)
-        #expect(metrics.emittedCPUOnlyFrames == 0)
+        #expect(metrics.emittedIOSurfaceFrames + metrics.emittedCPUOnlyFrames == 1)
         #expect(metrics.staleSnapshots == 0)
         #expect(metrics.pendingSurfaces == 0)
         #expect(metrics.flushes == 2)
@@ -463,6 +462,543 @@ struct DisplayFramePublisherTests {
         #expect(metrics.pendingRevisionCoalesces >= 999)
     }
 
+    @Test(arguments: [
+        SnapshotConcurrencyCase(
+            expectedMaximumConcurrency: 2,
+            configuredMaximumConcurrency: 2,
+            surfaceCount: 3
+        ),
+        SnapshotConcurrencyCase(
+            expectedMaximumConcurrency: 4,
+            configuredMaximumConcurrency: 4,
+            surfaceCount: 5
+        ),
+        SnapshotConcurrencyCase(
+            expectedMaximumConcurrency: 3,
+            configuredMaximumConcurrency: nil,
+            surfaceCount: 5
+        ),
+    ])
+    fileprivate func snapshotsUseBoundedConcurrencyAndEmitInSubmissionOrder(
+        _ testCase: SnapshotConcurrencyCase
+    ) async {
+        let probe = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher: DisplayFramePublisher
+        if let configuredMaximumConcurrency = testCase.configuredMaximumConcurrency {
+            publisher = DisplayFramePublisher(
+                interval: .seconds(10),
+                maximumPendingSurfaces: testCase.surfaceCount,
+                maximumConcurrentSnapshots: configuredMaximumConcurrency,
+                snapshot: { revision in
+                    await probe.snapshot(revision: revision)
+                },
+                emit: { frame in
+                    await observations.emit(frame)
+                }
+            )
+        } else {
+            publisher = DisplayFramePublisher(
+                interval: .seconds(10),
+                maximumPendingSurfaces: testCase.surfaceCount,
+                snapshot: { revision in
+                    await probe.snapshot(revision: revision)
+                },
+                emit: { frame in
+                    await observations.emit(frame)
+                }
+            )
+        }
+        let revisions = (1...testCase.surfaceCount).map {
+            surfaceRevision(surfaceID: UInt32($0), revision: 1)
+        }
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await probe.waitUntilStarted(testCase.expectedMaximumConcurrency)
+        var state = await probe.state()
+        #expect(state.startedSurfaceIDs.count == testCase.expectedMaximumConcurrency)
+        #expect(
+            Set(state.startedSurfaceIDs)
+                == Set(revisions.prefix(testCase.expectedMaximumConcurrency).map(\.surfaceID))
+        )
+        #expect(state.activeSurfaceIDs.count == testCase.expectedMaximumConcurrency)
+        #expect(state.peakActiveCount == testCase.expectedMaximumConcurrency)
+
+        let initiallyStarted = state.startedSurfaceIDs.sorted(by: >)
+        for (finishedCount, surfaceID) in initiallyStarted.enumerated() {
+            await probe.succeed(surfaceID: surfaceID)
+            await probe.waitUntilFinished(finishedCount + 1)
+        }
+
+        await probe.waitUntilStarted(testCase.surfaceCount)
+        state = await probe.state()
+        #expect(state.startedSurfaceIDs.count == testCase.surfaceCount)
+        #expect(state.peakActiveCount == testCase.expectedMaximumConcurrency)
+        for surfaceID in state.activeSurfaceIDs.sorted(by: >) {
+            let finishedCount = await probe.state().finishedSurfaceIDs.count
+            await probe.succeed(surfaceID: surfaceID)
+            await probe.waitUntilFinished(finishedCount + 1)
+        }
+        await flush.value
+
+        state = await probe.state()
+        #expect(state.activeSurfaceIDs.isEmpty)
+        #expect(state.finishedSurfaceIDs.count == testCase.surfaceCount)
+        #expect(state.peakActiveCount == testCase.expectedMaximumConcurrency)
+        #expect(state.completionOrder != revisions.map(\.surfaceID))
+        #expect(await observations.emittedRevisions == revisions)
+    }
+
+    @Test func removingSurfaceWhileSnapshotsAreConcurrentSuppressesItsLateFrame() async {
+        let probe = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await probe.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        let removed = surfaceRevision(surfaceID: 1, revision: 1)
+        let retained = surfaceRevision(surfaceID: 2, revision: 1)
+        await publisher.submit(removed)
+        await publisher.submit(retained)
+
+        let flush = Task { await publisher.flushNow() }
+        await probe.waitUntilStarted(2)
+        await publisher.remove(surfaceID: removed.surfaceID)
+        await probe.succeed(surfaceID: retained.surfaceID)
+        await probe.waitUntilFinished(1)
+        await probe.succeed(surfaceID: removed.surfaceID)
+        await probe.waitUntilFinished(2)
+        await flush.value
+
+        #expect(await observations.emittedRevisions == [retained])
+        #expect(await probe.state().activeSurfaceIDs.isEmpty)
+        let metrics = await publisher.metrics()
+        #expect(metrics.snapshotAttempts == 2)
+        #expect(metrics.staleSnapshots == 1)
+        #expect(metrics.emittedFrames == 1)
+    }
+
+    @Test func publisherCancellationDoesNotAdmitQueuedSnapshotOrPublishLateFrames() async {
+        let probe = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await probe.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for surfaceID in 1...3 {
+            await publisher.submit(surfaceRevision(surfaceID: UInt32(surfaceID), revision: 1))
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await probe.waitUntilStarted(2)
+        await publisher.cancel()
+        let releasedSurfaceID = try! #require(await probe.state().activeSurfaceIDs.min())
+        await probe.succeed(surfaceID: releasedSurfaceID)
+        await probe.waitUntilFinished(2)
+        await flush.value
+
+        let state = await probe.state()
+        #expect(state.startedSurfaceIDs.count == 2)
+        #expect(state.finishedSurfaceIDs.count == 2)
+        #expect(state.activeSurfaceIDs.isEmpty)
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func cancellingFlushTaskCancelsActiveSnapshotsAndDoesNotAdmitQueuedWork() async {
+        let probe = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await probe.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for surfaceID in 1...3 {
+            await publisher.submit(surfaceRevision(surfaceID: UInt32(surfaceID), revision: 1))
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await probe.waitUntilStarted(2)
+        flush.cancel()
+        await flush.value
+
+        let state = await probe.state()
+        #expect(state.startedSurfaceIDs.count == 2)
+        #expect(state.finishedSurfaceIDs.count == 2)
+        #expect(state.activeSurfaceIDs.isEmpty)
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+    }
+
+    @Test func cancelledFlushRestoresConsumedActiveBufferedAndUnadmittedDamage() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let snapshots = PublicationSnapshotGate(
+            store: store,
+            blockedOnce: [revisions[0].surfaceID]
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(2)
+        await snapshots.waitUntilCompleted(surfaceID: revisions[1].surfaceID)
+        let consumedDuplicate = try #require(
+            await store.publicationSnapshot(atLeast: revisions[1])
+        )
+        #expect(consumedDuplicate.publicationDamage.isEmpty)
+
+        firstFlush.cancel()
+        await firstFlush.value
+
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == revisions)
+        #expect(await observations.emittedFullDamage == [true, true, true])
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func cancellationAfterEmitDeliveryDoesNotRequeueDeliveredRequest() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let emissions = SelfCancellingEmissionProbe()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await store.publicationSnapshot(atLeast: revision)
+            },
+            emit: { frame in
+                await emissions.emit(frame)
+            }
+        )
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await firstFlush.value
+
+        #expect(await emissions.revisions() == [revisions[0]])
+        #expect(await emissions.fullDamage() == [false])
+        #expect(await publisher.metrics().pendingSurfaces == 2)
+        await publisher.flushNow()
+
+        #expect(await emissions.revisions() == revisions)
+        #expect(await emissions.fullDamage() == [false, true, true])
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func restoredRequestKeepsOriginalQueueAgeWhenCapacityEvictsOldest() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 4)
+        let hidden = revisions[0]
+        let interrupted = revisions[1]
+        let later = Array(revisions[2...])
+        let snapshots = PublicationSnapshotReturnGate(
+            store: store,
+            blockedOnce: [interrupted.surfaceID]
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: 3,
+            maximumConcurrentSnapshots: 1,
+            requiresExplicitDemand: true,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        await publisher.setDemand(surfaceID: interrupted.surfaceID, isDemanded: true)
+        for revision in later {
+            await publisher.setDemand(surfaceID: revision.surfaceID, isDemanded: true)
+        }
+        await publisher.submit(hidden)
+        await publisher.submit(interrupted)
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilConsumed(surfaceID: interrupted.surfaceID)
+        let consumedDuplicate = try #require(
+            await store.publicationSnapshot(atLeast: interrupted)
+        )
+        #expect(consumedDuplicate.publicationDamage.isEmpty)
+        for revision in later {
+            await publisher.submit(revision)
+        }
+        firstFlush.cancel()
+        await firstFlush.value
+
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [interrupted] + later)
+        #expect(await observations.emittedFullDamage == [true, false, false])
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func newerReplacementAfterSettledRequestKeepsItsNewQueueAge() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 4)
+        let hidden = revisions[0]
+        let delivered = revisions[1]
+        let between = revisions[2]
+        let newestSurface = revisions[3]
+        let emissions = ControlledEmissionProbe()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: 3,
+            maximumConcurrentSnapshots: 1,
+            requiresExplicitDemand: true,
+            snapshot: { revision in
+                await store.publicationSnapshot(atLeast: revision)
+            },
+            emit: { frame in
+                await emissions.emit(frame)
+            }
+        )
+        for revision in [delivered, between, newestSurface] {
+            await publisher.setDemand(surfaceID: revision.surfaceID, isDemanded: true)
+        }
+        await publisher.submit(hidden)
+        await publisher.submit(delivered)
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await emissions.waitUntilEmitted(1)
+        await publisher.submit(between)
+        let replacement = try await store.fill(
+            surfaceID: delivered.surfaceID,
+            rectangle: PixelRect(x: 6, y: 2, width: 1, height: 1),
+            colorARGB: 0x00AA_BBCC
+        )
+        await publisher.submit(replacement)
+        firstFlush.cancel()
+        await emissions.release(surfaceID: delivered.surfaceID)
+        await firstFlush.value
+
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+        await publisher.submit(newestSurface)
+        let secondFlush = Task { await publisher.flushNow() }
+        let expected = [delivered, between, replacement, newestSurface]
+        for expectedEmissionCount in 2...expected.count {
+            await emissions.waitUntilEmitted(expectedEmissionCount)
+            #expect(
+                await emissions.revisions()
+                    == Array(expected.prefix(expectedEmissionCount))
+            )
+            await emissions.release(
+                surfaceID: expected[expectedEmissionCount - 1].surfaceID
+            )
+        }
+        await secondFlush.value
+
+        #expect(await emissions.revisions() == expected)
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func evictedReplacementRecoversLatestRevisionWithoutAnotherSubmit() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let original = revisions[0]
+        let evictedForCapacity = revisions[1]
+        let retained = revisions[2]
+        let snapshots = PublicationSnapshotReturnGate(
+            store: store,
+            blockedOnce: [original.surfaceID]
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: 2,
+            maximumConcurrentSnapshots: 1,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        await publisher.submit(original)
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilConsumed(surfaceID: original.surfaceID)
+        let replacement = try await store.fill(
+            surfaceID: original.surfaceID,
+            rectangle: PixelRect(x: 6, y: 2, width: 1, height: 1),
+            colorARGB: 0x00AA_BBCC
+        )
+        await publisher.submit(replacement)
+        await publisher.submit(evictedForCapacity)
+        await publisher.submit(retained)
+        await publisher.remove(surfaceID: evictedForCapacity.surfaceID)
+        firstFlush.cancel()
+        await firstFlush.value
+
+        var metrics = await publisher.metrics()
+        #expect(metrics.submissions == 4)
+        #expect(metrics.pendingEvictions == 1)
+        #expect(metrics.pendingSurfaces == 2)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [replacement, retained])
+        #expect(await observations.emittedFullDamage == [true, false])
+        metrics = await publisher.metrics()
+        #expect(metrics.submissions == 4)
+        #expect(metrics.snapshotAttempts == 3)
+        #expect(metrics.emittedFrames == 2)
+        #expect(metrics.staleSnapshots == 0)
+        #expect(metrics.pendingSurfaces == 0)
+    }
+
+    @Test(arguments: [3, 4])
+    func completedSnapshotsHoldAWindowUntilOrderedPrefixEmits(
+        maximumConcurrency: Int
+    ) async {
+        let surfaceCount = maximumConcurrency * 2
+        let snapshots = ControlledSnapshotProbe()
+        let emissions = ControlledEmissionProbe()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumPendingSurfaces: surfaceCount,
+            maximumConcurrentSnapshots: maximumConcurrency,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await emissions.emit(frame)
+            }
+        )
+        let revisions = (1...surfaceCount).map {
+            surfaceRevision(surfaceID: UInt32($0), revision: 1)
+        }
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(maximumConcurrency)
+        for surfaceID in UInt32(2)...UInt32(maximumConcurrency) {
+            let finishedCount = await snapshots.state().finishedSurfaceIDs.count
+            await snapshots.succeed(surfaceID: surfaceID)
+            await snapshots.waitUntilFinished(finishedCount + 1)
+        }
+        #expect(await emissions.revisions().isEmpty)
+
+        await snapshots.succeed(surfaceID: 1)
+        await snapshots.waitUntilFinished(maximumConcurrency)
+        for expectedEmissionCount in 1...maximumConcurrency {
+            await emissions.waitUntilEmitted(expectedEmissionCount)
+            await snapshots.waitUntilStarted(
+                maximumConcurrency + expectedEmissionCount - 1
+            )
+            let snapshotState = await snapshots.state()
+            #expect(
+                snapshotState.startedSurfaceIDs.count
+                    == maximumConcurrency + expectedEmissionCount - 1
+            )
+            #expect(
+                snapshotState.startedSurfaceIDs.count - (expectedEmissionCount - 1)
+                    == maximumConcurrency
+            )
+            #expect(snapshotState.activeSurfaceIDs.count <= maximumConcurrency)
+            #expect(
+                await emissions.revisions()
+                    == Array(revisions.prefix(expectedEmissionCount))
+            )
+            await emissions.release(surfaceID: UInt32(expectedEmissionCount))
+        }
+
+        await snapshots.waitUntilStarted(surfaceCount)
+        var snapshotState = await snapshots.state()
+        #expect(snapshotState.peakActiveCount == maximumConcurrency)
+        #expect(snapshotState.startedSurfaceIDs.count == surfaceCount)
+        for surfaceID in snapshotState.activeSurfaceIDs.sorted(by: >) {
+            let finishedCount = await snapshots.state().finishedSurfaceIDs.count
+            await snapshots.succeed(surfaceID: surfaceID)
+            await snapshots.waitUntilFinished(finishedCount + 1)
+        }
+        for expectedEmissionCount in (maximumConcurrency + 1)...surfaceCount {
+            await emissions.waitUntilEmitted(expectedEmissionCount)
+            #expect(
+                await emissions.revisions()
+                    == Array(revisions.prefix(expectedEmissionCount))
+            )
+            await emissions.release(surfaceID: UInt32(expectedEmissionCount))
+        }
+        await flush.value
+
+        snapshotState = await snapshots.state()
+        #expect(snapshotState.activeSurfaceIDs.isEmpty)
+        #expect(snapshotState.finishedSurfaceIDs.count == surfaceCount)
+        #expect(snapshotState.peakActiveCount == maximumConcurrency)
+        #expect(await emissions.revisions() == revisions)
+    }
+
+    @Test func cancellationDrainsBufferedAndActiveSnapshotWindowWithoutRefill() async {
+        let snapshots = ControlledSnapshotProbe()
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 3,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for surfaceID in 1...6 {
+            await publisher.submit(surfaceRevision(surfaceID: UInt32(surfaceID), revision: 1))
+        }
+
+        let flush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(3)
+        await snapshots.succeed(surfaceID: 2)
+        await snapshots.waitUntilFinished(1)
+        await publisher.cancel()
+        await snapshots.succeed(surfaceID: 1)
+        await snapshots.waitUntilFinished(3)
+        await flush.value
+
+        let state = await snapshots.state()
+        #expect(state.startedSurfaceIDs.count == 3)
+        #expect(state.finishedSurfaceIDs.count == 3)
+        #expect(state.activeSurfaceIDs.isEmpty)
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
     private func makePublisher(
         observations: FramePublisherObservations,
         maximumPendingSurfaces: Int = 16
@@ -477,6 +1013,33 @@ struct DisplayFramePublisherTests {
                 await observations.emit(frame)
             }
         )
+    }
+
+    private func makePartiallyDamagedSurfaces(
+        count: Int
+    ) async throws -> (SurfaceStore, [SurfaceRevision]) {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        var revisions: [SurfaceRevision] = []
+        revisions.reserveCapacity(count)
+        for surfaceID in 1...count {
+            try await store.create(
+                id: UInt32(surfaceID),
+                width: 8,
+                height: 4,
+                format: 32
+            )
+            let created = try await store.descriptor(
+                surfaceID: UInt32(surfaceID)
+            ).surfaceRevision
+            _ = try #require(await store.publicationSnapshot(atLeast: created))
+            let revision = try await store.fill(
+                surfaceID: UInt32(surfaceID),
+                rectangle: PixelRect(x: surfaceID, y: 1, width: 1, height: 1),
+                colorARGB: UInt32(surfaceID)
+            )
+            revisions.append(revision)
+        }
+        return (store, revisions)
     }
 
     private func surfaceRevision(
@@ -501,6 +1064,363 @@ struct DisplayFramePublisherTests {
         while await observations.emitCount == 0 {
             await Task.yield()
         }
+    }
+}
+
+private struct SnapshotConcurrencyCase: Sendable {
+    let expectedMaximumConcurrency: Int
+    let configuredMaximumConcurrency: Int?
+    let surfaceCount: Int
+}
+
+private actor ControlledSnapshotProbe {
+    struct State: Sendable {
+        let startedSurfaceIDs: [UInt32]
+        let activeSurfaceIDs: Set<UInt32>
+        let finishedSurfaceIDs: Set<UInt32>
+        let completionOrder: [UInt32]
+        let peakActiveCount: Int
+    }
+
+    private enum Resolution {
+        case success
+        case cancelled
+    }
+
+    private var startedSurfaceIDs: [UInt32] = []
+    private var activeSurfaceIDs: Set<UInt32> = []
+    private var finishedSurfaceIDs: Set<UInt32> = []
+    private var completionOrder: [UInt32] = []
+    private var peakActiveCount = 0
+    private var continuations: [UInt32: CheckedContinuation<Resolution, Never>] = [:]
+    private var earlyResolutions: [UInt32: Resolution] = [:]
+    private var startedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var finishedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func snapshot(revision: SurfaceRevision) async -> FrameSnapshot? {
+        let surfaceID = revision.surfaceID
+        startedSurfaceIDs.append(surfaceID)
+        activeSurfaceIDs.insert(surfaceID)
+        peakActiveCount = max(peakActiveCount, activeSurfaceIDs.count)
+        resumeSatisfiedWaiters()
+
+        let resolution = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if let early = earlyResolutions.removeValue(forKey: surfaceID) {
+                    continuation.resume(returning: early)
+                } else {
+                    continuations[surfaceID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(surfaceID: surfaceID) }
+        }
+
+        activeSurfaceIDs.remove(surfaceID)
+        finishedSurfaceIDs.insert(surfaceID)
+        completionOrder.append(surfaceID)
+        resumeSatisfiedWaiters()
+        guard case .success = resolution else { return nil }
+        let pixel = UInt8(truncatingIfNeeded: revision.revision)
+        return FrameSnapshot(
+            surfaceID: surfaceID,
+            width: 1,
+            height: 1,
+            bytesPerRow: 4,
+            lifecycleGeneration: revision.lifecycleGeneration,
+            revision: revision.revision,
+            pixels: Data([pixel, pixel, pixel, 255]),
+            ioSurfaceFrame: nil
+        )
+    }
+
+    func succeed(surfaceID: UInt32) {
+        resolve(surfaceID: surfaceID, as: .success)
+    }
+
+    func waitUntilStarted(_ count: Int) async {
+        guard startedSurfaceIDs.count < count else { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append((count, continuation))
+        }
+    }
+
+    func waitUntilFinished(_ count: Int) async {
+        guard finishedSurfaceIDs.count < count else { return }
+        await withCheckedContinuation { continuation in
+            finishedWaiters.append((count, continuation))
+        }
+    }
+
+    func state() -> State {
+        State(
+            startedSurfaceIDs: startedSurfaceIDs,
+            activeSurfaceIDs: activeSurfaceIDs,
+            finishedSurfaceIDs: finishedSurfaceIDs,
+            completionOrder: completionOrder,
+            peakActiveCount: peakActiveCount
+        )
+    }
+
+    private func cancel(surfaceID: UInt32) {
+        resolve(surfaceID: surfaceID, as: .cancelled)
+    }
+
+    private func resolve(surfaceID: UInt32, as resolution: Resolution) {
+        guard !finishedSurfaceIDs.contains(surfaceID) else { return }
+        if let continuation = continuations.removeValue(forKey: surfaceID) {
+            continuation.resume(returning: resolution)
+        } else {
+            earlyResolutions[surfaceID] = resolution
+        }
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remainingStarted: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in startedWaiters {
+            if startedSurfaceIDs.count >= count {
+                continuation.resume()
+            } else {
+                remainingStarted.append((count, continuation))
+            }
+        }
+        startedWaiters = remainingStarted
+
+        var remainingFinished: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in finishedWaiters {
+            if finishedSurfaceIDs.count >= count {
+                continuation.resume()
+            } else {
+                remainingFinished.append((count, continuation))
+            }
+        }
+        finishedWaiters = remainingFinished
+    }
+}
+
+private actor ControlledEmissionProbe {
+    private var emittedRevisions: [SurfaceRevision] = []
+    private var continuations: [UInt32: CheckedContinuation<Void, Never>] = [:]
+    private var earlyReleases: Set<UInt32> = []
+    private var emittedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func emit(_ frame: FrameSnapshot) async {
+        emittedRevisions.append(frame.surfaceRevision)
+        resumeSatisfiedWaiters()
+        await withCheckedContinuation { continuation in
+            if earlyReleases.remove(frame.surfaceID) != nil {
+                continuation.resume()
+            } else {
+                continuations[frame.surfaceID] = continuation
+            }
+        }
+    }
+
+    func release(surfaceID: UInt32) {
+        if let continuation = continuations.removeValue(forKey: surfaceID) {
+            continuation.resume()
+        } else {
+            earlyReleases.insert(surfaceID)
+        }
+    }
+
+    func waitUntilEmitted(_ count: Int) async {
+        guard emittedRevisions.count < count else { return }
+        await withCheckedContinuation { continuation in
+            emittedWaiters.append((count, continuation))
+        }
+    }
+
+    func revisions() -> [SurfaceRevision] {
+        emittedRevisions
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in emittedWaiters {
+            if emittedRevisions.count >= count {
+                continuation.resume()
+            } else {
+                remaining.append((count, continuation))
+            }
+        }
+        emittedWaiters = remaining
+    }
+}
+
+private actor PublicationSnapshotGate {
+    private let store: SurfaceStore
+    private var blockedOnce: Set<UInt32>
+    private var startedSurfaceIDs: Set<UInt32> = []
+    private var completedSurfaceIDs: Set<UInt32> = []
+    private var blockContinuations: [UInt32: CheckedContinuation<Bool, Never>] = [:]
+    private var earlyCancellations: Set<UInt32> = []
+    private var startedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var completedWaiters: [(UInt32, CheckedContinuation<Void, Never>)] = []
+
+    init(store: SurfaceStore, blockedOnce: Set<UInt32>) {
+        self.store = store
+        self.blockedOnce = blockedOnce
+    }
+
+    func snapshot(revision: SurfaceRevision) async -> FrameSnapshot? {
+        let surfaceID = revision.surfaceID
+        startedSurfaceIDs.insert(surfaceID)
+        resumeSatisfiedWaiters()
+        if blockedOnce.remove(surfaceID) != nil {
+            let shouldContinue = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if earlyCancellations.remove(surfaceID) != nil {
+                        continuation.resume(returning: false)
+                    } else {
+                        blockContinuations[surfaceID] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancel(surfaceID: surfaceID) }
+            }
+            guard shouldContinue else {
+                completedSurfaceIDs.insert(surfaceID)
+                resumeSatisfiedWaiters()
+                return nil
+            }
+        }
+        let frame = await store.publicationSnapshot(atLeast: revision)
+        completedSurfaceIDs.insert(surfaceID)
+        resumeSatisfiedWaiters()
+        return frame
+    }
+
+    func waitUntilStarted(_ count: Int) async {
+        guard startedSurfaceIDs.count < count else { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append((count, continuation))
+        }
+    }
+
+    func waitUntilCompleted(surfaceID: UInt32) async {
+        guard !completedSurfaceIDs.contains(surfaceID) else { return }
+        await withCheckedContinuation { continuation in
+            completedWaiters.append((surfaceID, continuation))
+        }
+    }
+
+    private func cancel(surfaceID: UInt32) {
+        if let continuation = blockContinuations.removeValue(forKey: surfaceID) {
+            continuation.resume(returning: false)
+        } else {
+            earlyCancellations.insert(surfaceID)
+        }
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remainingStarted: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in startedWaiters {
+            if startedSurfaceIDs.count >= count {
+                continuation.resume()
+            } else {
+                remainingStarted.append((count, continuation))
+            }
+        }
+        startedWaiters = remainingStarted
+
+        var remainingCompleted: [(UInt32, CheckedContinuation<Void, Never>)] = []
+        for (surfaceID, continuation) in completedWaiters {
+            if completedSurfaceIDs.contains(surfaceID) {
+                continuation.resume()
+            } else {
+                remainingCompleted.append((surfaceID, continuation))
+            }
+        }
+        completedWaiters = remainingCompleted
+    }
+}
+
+private actor SelfCancellingEmissionProbe {
+    private var shouldCancelNext = true
+    private var emittedRevisions: [SurfaceRevision] = []
+    private var emittedFullDamage: [Bool] = []
+
+    func emit(_ frame: FrameSnapshot) {
+        emittedRevisions.append(frame.surfaceRevision)
+        emittedFullDamage.append(frame.publicationDamage.isFullFrame)
+        if shouldCancelNext {
+            shouldCancelNext = false
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+        }
+    }
+
+    func revisions() -> [SurfaceRevision] {
+        emittedRevisions
+    }
+
+    func fullDamage() -> [Bool] {
+        emittedFullDamage
+    }
+}
+
+private actor PublicationSnapshotReturnGate {
+    private let store: SurfaceStore
+    private var blockedOnce: Set<UInt32>
+    private var consumedSurfaceIDs: Set<UInt32> = []
+    private var continuations: [UInt32: CheckedContinuation<Bool, Never>] = [:]
+    private var earlyCancellations: Set<UInt32> = []
+    private var consumedWaiters: [(UInt32, CheckedContinuation<Void, Never>)] = []
+
+    init(store: SurfaceStore, blockedOnce: Set<UInt32>) {
+        self.store = store
+        self.blockedOnce = blockedOnce
+    }
+
+    func snapshot(revision: SurfaceRevision) async -> FrameSnapshot? {
+        let frame = await store.publicationSnapshot(atLeast: revision)
+        let surfaceID = revision.surfaceID
+        consumedSurfaceIDs.insert(surfaceID)
+        resumeSatisfiedWaiters()
+        guard blockedOnce.remove(surfaceID) != nil else {
+            return frame
+        }
+        let shouldReturnFrame = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if earlyCancellations.remove(surfaceID) != nil {
+                    continuation.resume(returning: false)
+                } else {
+                    continuations[surfaceID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(surfaceID: surfaceID) }
+        }
+        return shouldReturnFrame ? frame : nil
+    }
+
+    func waitUntilConsumed(surfaceID: UInt32) async {
+        guard !consumedSurfaceIDs.contains(surfaceID) else { return }
+        await withCheckedContinuation { continuation in
+            consumedWaiters.append((surfaceID, continuation))
+        }
+    }
+
+    private func cancel(surfaceID: UInt32) {
+        if let continuation = continuations.removeValue(forKey: surfaceID) {
+            continuation.resume(returning: false)
+        } else {
+            earlyCancellations.insert(surfaceID)
+        }
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [(UInt32, CheckedContinuation<Void, Never>)] = []
+        for (surfaceID, continuation) in consumedWaiters {
+            if consumedSurfaceIDs.contains(surfaceID) {
+                continuation.resume()
+            } else {
+                remaining.append((surfaceID, continuation))
+            }
+        }
+        consumedWaiters = remaining
     }
 }
 
