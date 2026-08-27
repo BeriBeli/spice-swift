@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "SwiftSpice", targets: ["SwiftSpice"]),
         .executable(name: "spice-probe", targets: ["SpiceProbe"]),
         .executable(name: "spice-viewer", targets: ["SpiceViewer"]),
+        .executable(name: "spice-bench", targets: ["SpiceBench"]),
     ],
     targets: [
         .target(
@@ -110,6 +111,14 @@ let package = Package(
             dependencies: ["SpiceProtocol", "SpiceTransport", "SpiceWire"]
         ),
         .target(
+            name: "SpiceBenchSupport",
+            dependencies: [
+                "SpiceCodecs",
+                "SpiceRenderer",
+                "SpiceWire",
+            ]
+        ),
+        .target(
             name: "SwiftSpice",
             dependencies: [
                 "SpiceCore",
@@ -135,6 +144,10 @@ let package = Package(
         .executableTarget(
             name: "SpiceViewer",
             dependencies: ["SpiceRenderer", "SwiftSpice"]
+        ),
+        .executableTarget(
+            name: "SpiceBench",
+            dependencies: ["SpiceBenchSupport"]
         ),
         .executableTarget(
             name: "SpiceProtocolGenerator"
@@ -232,6 +245,10 @@ let package = Package(
         .testTarget(
             name: "SpiceViewerTests",
             dependencies: ["SpiceViewer", "SwiftSpice"]
+        ),
+        .testTarget(
+            name: "SpiceBenchTests",
+            dependencies: ["SpiceBenchSupport"]
         ),
     ],
     swiftLanguageModes: [.v6]

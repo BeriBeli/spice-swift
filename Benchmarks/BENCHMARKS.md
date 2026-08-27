@@ -1,4 +1,53 @@
-# Live SPICE performance comparison
+# SwiftSpice performance measurement
+
+## Release microbenchmarks
+
+`spice-bench` is the versioned, deterministic microbenchmark harness. Always
+run it as a Release product; a Debug executable exits nonzero instead of
+producing an artifact whose metadata incorrectly claims optimized code.
+
+```sh
+Benchmarks/run_micro.sh --warmup 3 --iterations 10 > /private/tmp/spice-micro.json
+```
+
+The command writes exactly one JSON object to standard output. Schema version
+`1` contains `schema_version`, `artifact_kind`, reproducibility `metadata`, and
+the stable ordered `cases` catalog. Every case records warm-up and measured
+iteration counts, nonzero checksum evidence against dead-code elimination,
+raw duration samples in measured order, derived duration statistics in
+nanoseconds, and its owning algorithm's exact counters. Raw samples are retained
+so later analysis can compute bootstrap confidence intervals instead of trying
+to reconstruct them from lossy summary statistics.
+The current stable case IDs are:
+
+- `wire.contiguous`
+- `wire.fragmented`
+- `region.normalization`
+- `copy_bits`
+- `lz`
+- `glz`
+- `iosurface.transition`
+- `advanced_video.sample`
+
+Acceptance counters are validated before JSON is emitted. They include zero
+contiguous wire body copies, at most one body-sized fragmented copy, one
+transaction and zero temporary bytes for COPY_BITS, a single bulk/zero-row
+tightly packed full cross-Surface IOSurface copy, zero CPU materialization for the following
+1x1 canonical mutation, and the codec/parser allocation counters. The
+IOSurface case explicitly fails on unsupported hardware rather than silently
+measuring the Data fallback. Metadata includes commit, Swift toolchain,
+hardware model when available plus non-identifying architecture/resource/OS
+fallback details, thermal state, workload version, mode, and UTC date.
+Advanced-video counters distinguish bytes written directly into the single
+AVCC allocation from additional sample materialization; the latter must remain
+zero.
+
+Microbenchmark JSON is not a live-client performance result. `spice-bench
+--live` checks the external endpoint/credential prerequisites but deliberately
+exits nonzero and emits no artifact; formal live results must come from the
+paired runner below.
+
+## Live SPICE performance comparison
 
 This directory contains a low-noise, headless comparison between SwiftSpice and
 the installed `spice-client-glib-2.0` reference client. It is an engineering
