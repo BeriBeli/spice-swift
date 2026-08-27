@@ -1423,19 +1423,26 @@ package actor DisplayChannel: SpiceManagedChannel {
             guard let glzDataSize = Int(exactly: data.glzDataSize) else {
                 throw .protocolViolation("invalid ZLIB GLZ output size")
             }
+            let compressedPayload = data.data
             let glzPayload: Data
             let inflator = zlibInflator
             do {
-                glzPayload = try await executeCodecWork(retainedByteCount: data.data.count) {
+                glzPayload = try await executeCodecWork(
+                    payloadByteCount: compressedPayload.count
+                ) {
                     () async throws(SpiceCodecError) -> Data in
                     try await inflator.inflate(
-                        payload: data.data,
+                        payload: compressedPayload,
                         exactOutputByteCount: glzDataSize
                     )
                 }
             } catch let error {
                 throw .protocolViolation("ZLIB GLZ inflate failed: \(error.description)")
             }
+            // Inflation releases the Display executor permit before GLZ
+            // coordination begins. The first phase charges the physical wire
+            // owner above; the GLZ executor separately charges its immutable
+            // program, inflated payload, output, and dependency snapshots.
             return (.bitmap(try await decode(
                 descriptor: descriptor,
                 data: glzPayload,
@@ -1450,14 +1457,17 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation("invalid LZ palette dimensions")
             }
             let paletteResolution = try resolvePalette(data)
+            let compressedPayload = data.data
             let decoded: SpiceDecodedImage
             let paletteDecoder = paletteLZDecoder
             do {
-                decoded = try await executeCodecWork(retainedByteCount: data.data.count) {
+                decoded = try await executeCodecWork(
+                    payloadByteCount: compressedPayload.count
+                ) {
                     () async throws(SpiceCodecError) -> SpiceDecodedImage in
                     try await paletteDecoder.decodePalette(
                         descriptor: SpiceCodecImageDescriptor(width: width, height: height),
-                        payload: data.data,
+                        payload: compressedPayload,
                         palette: paletteResolution.palette
                     )
                 }
@@ -1487,7 +1497,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             let descriptor = SpiceCodecImageDescriptor(width: width, height: height)
             let decoded: SpiceDecodedImage
             if usesCodecExecutor {
-                decoded = try await executeCodecWork(retainedByteCount: data.count) {
+                decoded = try await executeCodecWork(payloadByteCount: data.count) {
                     () async throws(SpiceCodecError) -> SpiceDecodedImage in
                     try await decoder.decode(descriptor: descriptor, payload: data)
                 }
@@ -1501,9 +1511,18 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     private func executeCodecWork<Success: Sendable>(
-        retainedByteCount: Int,
+        payloadByteCount: Int,
         operation: @escaping @Sendable () async throws(SpiceCodecError) -> Success
     ) async throws(SpiceCodecError) -> Success {
+        // `processNextImpl` retains the decoded logical message across this
+        // suspension. A small payload slice can therefore keep the complete
+        // physical FramedMessageBatch owner alive while waiting for executor
+        // admission. Charge that owner once for this admission phase, falling
+        // back to the independently retained Data boundary outside wire dispatch.
+        let retainedByteCount = max(
+            currentMessageRetainedByteCount ?? 0,
+            payloadByteCount
+        )
         do {
             return try await codecTaskExecutor.executeThrowing(
                 retainedByteCount: retainedByteCount,
