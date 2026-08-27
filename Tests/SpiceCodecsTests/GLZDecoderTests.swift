@@ -230,7 +230,7 @@ struct GLZDecoderTests {
         )
 
         #expect(decoded.pixelsBGRA.count == pixelCount * 4)
-        decoded.pixelsBGRA.withUnsafeBytes { rawBytes in
+        decoded.pixelsBGRA.withUnsafeBytes { (rawBytes: UnsafeRawBufferPointer) in
             let bytes = rawBytes.bindMemory(to: UInt8.self)
             for pixel in 0..<pixelCount {
                 let sourcePixel = pixel < pixelOffset ? pixel : (pixel - pixelOffset) % pixelOffset
@@ -444,6 +444,230 @@ struct GLZDecoderTests {
         #expect(executorDiagnostics.completedJobs == 2)
     }
 
+    @Test func concurrentHostileWaitersChargeAggregateProgramRetentionAtExactLimit() async throws {
+        let pixelCount = 4_096
+        let descriptor = SpiceCodecImageDescriptor(width: pixelCount, height: 1)
+        let payloads = [UInt64(1), 3, 5].map {
+            hostileMissingDependencyPayload(pixelCount: pixelCount, imageID: $0)
+        }
+        let programLimits = SpiceGLZDecodeLimits(maximumProgramOperations: pixelCount)
+
+        let probeExecutor = SpiceCodecTaskExecutor()
+        let probeDecoder = SpiceGLZDecoder(executor: probeExecutor, limits: programLimits)
+        let probe = Task {
+            try await probeDecoder.decode(descriptor: descriptor, payload: payloads[0])
+        }
+        await waitForGLZ(probeDecoder) {
+            $0.reservedImages == 1 && $0.pendingDictionaryWaits == 1
+        }
+        let baseCharge = await probeDecoder.diagnosticsSnapshot().pendingDictionaryWaitBytes
+        #expect(baseCharge > pixelCount * 4 + payloads[0].count)
+        #expect(await probeExecutor.diagnosticsSnapshot().currentRetainedBytes == 0)
+        probe.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await probe.value
+        }
+        await waitForGLZ(probeDecoder) {
+            $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+
+        let aggregateLimit = baseCharge * 2
+        let executor = SpiceCodecTaskExecutor()
+        let decoder = SpiceGLZDecoder(
+            executor: executor,
+            limits: .init(
+                maximumDictionaryBytes: aggregateLimit,
+                maximumProgramOperations: pixelCount
+            )
+        )
+        let first = Task {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[0])
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 1
+                && $0.pendingDictionaryWaits == 1
+                && $0.pendingDictionaryWaitBytes == baseCharge
+        }
+        let second = Task {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[1])
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 2
+                && $0.pendingDictionaryWaits == 2
+                && $0.pendingDictionaryWaitBytes == aggregateLimit
+        }
+
+        await #expect(throws: SpiceCodecError.decodedImageTooLarge(
+            actual: baseCharge * 3,
+            maximum: aggregateLimit
+        )) {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[2])
+        }
+        var diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.dictionaryImages == 0)
+        #expect(diagnostics.dictionaryBytes == 0)
+        #expect(diagnostics.reservedImages == 2)
+        #expect(diagnostics.pendingDictionaryWaits == 2)
+        #expect(diagnostics.pendingDictionaryWaitBytes == aggregateLimit)
+        var executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+        #expect(executorDiagnostics.completedJobs == 0)
+        #expect(executorDiagnostics.failedJobs == 0)
+        #expect(executorDiagnostics.rejectedJobs == 0)
+
+        first.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await first.value
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 1
+                && $0.pendingDictionaryWaits == 1
+                && $0.pendingDictionaryWaitBytes == baseCharge
+        }
+
+        let replacement = Task {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[2])
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 2
+                && $0.pendingDictionaryWaits == 2
+                && $0.pendingDictionaryWaitBytes == aggregateLimit
+        }
+        await decoder.clear()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await second.value
+        }
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await replacement.value
+        }
+        await waitForGLZ(decoder) {
+            $0.dictionaryImages == 0
+                && $0.dictionaryBytes == 0
+                && $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+        diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.pendingDictionaryWaitBytes == 0)
+        executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+    }
+
+    @Test func queuedHostileProgramsChargeConservativeRetentionAtExactLimit() async throws {
+        let pixelCount = 4_096
+        let descriptor = SpiceCodecImageDescriptor(width: pixelCount, height: 1)
+        let payloads = [UInt64(0), 1].map {
+            largeLiteralGLZPayload(
+                width: pixelCount,
+                height: 1,
+                imageID: $0
+            )
+        }
+        let decoderLimits = SpiceGLZDecodeLimits(maximumProgramOperations: pixelCount)
+
+        let probeExecutor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 2,
+            maximumQueuedRetainedBytes: 256 * 1_024 * 1_024
+        ))
+        let probeGate = GLZOperationGate()
+        let probeBlocker = Task {
+            try await probeExecutor.execute(retainedByteCount: 1) {
+                await probeGate.run()
+            }
+        }
+        await probeGate.waitUntilStarted()
+        let probeDecoder = SpiceGLZDecoder(executor: probeExecutor, limits: decoderLimits)
+        let probe = Task {
+            try await probeDecoder.decode(descriptor: descriptor, payload: payloads[0])
+        }
+        await waitForExecutor(probeExecutor) {
+            $0.queuedJobs == 1 && $0.queuedRetainedBytes > 0
+        }
+        let baseCharge = await probeExecutor.diagnosticsSnapshot().queuedRetainedBytes
+        #expect(baseCharge > pixelCount * 4 + payloads[0].count)
+        #expect(await probeDecoder.diagnosticsSnapshot().reservedImages == 1)
+        probe.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await probe.value
+        }
+        await waitForExecutor(probeExecutor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForGLZ(probeDecoder) { $0.reservedImages == 0 }
+        await probeGate.release()
+        _ = try await probeBlocker.value
+        #expect(await probeExecutor.diagnosticsSnapshot().currentRetainedBytes == 0)
+
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 2,
+            maximumQueuedRetainedBytes: baseCharge
+        ))
+        let gate = GLZOperationGate()
+        let blocker = Task {
+            try await executor.execute(retainedByteCount: 1) {
+                await gate.run()
+            }
+        }
+        await gate.waitUntilStarted()
+        let decoder = SpiceGLZDecoder(executor: executor, limits: decoderLimits)
+        let admitted = Task {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[0])
+        }
+        await waitForExecutor(executor) {
+            $0.queuedJobs == 1 && $0.queuedRetainedBytes == baseCharge
+        }
+        #expect(await decoder.diagnosticsSnapshot().reservedImages == 1)
+
+        await #expect(throws: SpiceCodecError.backendFailure(
+            "codec executor rejected GLZ work: queuedRetainedBytesExceeded("
+                + "actual: \(baseCharge * 2), maximum: \(baseCharge))"
+        )) {
+            try await decoder.decode(descriptor: descriptor, payload: payloads[1])
+        }
+        var executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 1)
+        #expect(executorDiagnostics.queuedJobs == 1)
+        #expect(executorDiagnostics.queuedRetainedBytes == baseCharge)
+        #expect(executorDiagnostics.rejectedJobs == 1)
+        var decoderDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(decoderDiagnostics.dictionaryImages == 0)
+        #expect(decoderDiagnostics.reservedImages == 1)
+        #expect(decoderDiagnostics.pendingDictionaryWaits == 0)
+        #expect(decoderDiagnostics.pendingDictionaryWaitBytes == 0)
+
+        admitted.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await admitted.value
+        }
+        await waitForExecutor(executor) {
+            $0.queuedJobs == 0 && $0.queuedRetainedBytes == 0
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+        await gate.release()
+        _ = try await blocker.value
+        executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+        #expect(executorDiagnostics.cancelledJobs == 1)
+        #expect(executorDiagnostics.rejectedJobs == 1)
+        decoderDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(decoderDiagnostics.dictionaryImages == 0)
+        #expect(decoderDiagnostics.reservedImages == 0)
+    }
+
     @Test func inFlightIDsFailuresAndCancellationReleaseEveryReservation() async throws {
         let executor = SpiceCodecTaskExecutor(limits: .init(
             maximumConcurrentJobs: 1,
@@ -532,7 +756,7 @@ struct GLZDecoderTests {
         let executor = SpiceCodecTaskExecutor(limits: .init(
             maximumConcurrentJobs: 1,
             maximumPendingJobs: 4,
-            maximumQueuedRetainedBytes: 1_024
+            maximumQueuedRetainedBytes: 64 * 1_024
         ))
         let blockerGate = GLZOperationGate()
         let blocker = Task {
@@ -571,7 +795,7 @@ struct GLZDecoderTests {
         await waitForGLZ(decoder) {
             $0.reservedImages == 2
                 && $0.pendingDictionaryWaits == 1
-                && $0.pendingDictionaryWaitBytes == 4
+                && $0.pendingDictionaryWaitBytes > 4
         }
         await waitForExecutor(executor) { $0.queuedJobs == 1 }
         let generation = await decoder.diagnosticsSnapshot().generation
@@ -753,7 +977,7 @@ struct GLZDecoderTests {
         await waitForGLZ(decoder) {
             $0.reservedImages == 1
                 && $0.pendingDictionaryWaits == 1
-                && $0.pendingDictionaryWaitBytes == 4
+                && $0.pendingDictionaryWaitBytes > 4
         }
 
         _ = try await decoder.decode(
@@ -1114,6 +1338,24 @@ struct GLZDecoderTests {
         return commands
     }
 
+    private func hostileMissingDependencyPayload(
+        pixelCount: Int,
+        imageID: UInt64
+    ) -> Data {
+        precondition(pixelCount > 1)
+        precondition(imageID > 0)
+        var compressed: [UInt8] = [0x20, 0, 1]
+        compressed.append(contentsOf: literalGLZCommands(count: pixelCount - 1))
+        return glzPayload(
+            type: 8,
+            width: UInt32(pixelCount),
+            height: 1,
+            imageID: imageID,
+            windowHeadDistance: 0,
+            compressed: compressed
+        )
+    }
+
     private func largeRepeatedGLZPayload(
         width: Int,
         height: Int,
@@ -1190,7 +1432,7 @@ struct GLZDecoderTests {
     private func expectUniformPixels(_ pixels: Data, pixel: [UInt8], count: Int) {
         #expect(pixel.count == 4)
         #expect(pixels.count == count * 4)
-        let mismatch = pixels.withUnsafeBytes { bytes -> Int? in
+        let mismatch = pixels.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
             for index in 0..<count {
                 let offset = index * 4
                 if bytes[offset] != pixel[0]
@@ -1208,7 +1450,7 @@ struct GLZDecoderTests {
 
     private func expectLiteralPixels(_ pixels: Data, count: Int) {
         #expect(pixels.count == count * 4)
-        let mismatch = pixels.withUnsafeBytes { bytes -> Int? in
+        let mismatch = pixels.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
             for index in 0..<count {
                 let offset = index * 4
                 if bytes[offset] != UInt8(truncatingIfNeeded: index * 3 + 1)
