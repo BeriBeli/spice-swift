@@ -57,9 +57,9 @@ exits nonzero and emits no artifact; formal live results must come from the
 paired runner below.
 
 The first AIP-00 harness artifact is
-[`Results/MICRO_MAC16_8_2026-08-28_fb0091d.json`](Results/MICRO_MAC16_8_2026-08-28_fb0091d.json).
+[`Results/MICRO_MAC16_8_2026-08-28_cf4338d.json`](Results/MICRO_MAC16_8_2026-08-28_cf4338d.json).
 It contains ten measured samples per case from implementation-and-test commit
-`fb0091d`; it is microbenchmark evidence only and does not replace the live
+`cf4338d`; it is microbenchmark evidence only and does not replace the live
 paired decision.
 
 ## Live SPICE performance comparison
