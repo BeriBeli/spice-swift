@@ -648,7 +648,78 @@ struct DisplayFramePublisherTests {
         #expect(state.finishedSurfaceIDs.count == 2)
         #expect(state.activeSurfaceIDs.isEmpty)
         #expect(await observations.emittedRevisions.isEmpty)
-        #expect(await publisher.metrics().pendingSurfaces == 1)
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+    }
+
+    @Test func cancelledFlushRestoresConsumedActiveBufferedAndUnadmittedDamage() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let snapshots = PublicationSnapshotGate(
+            store: store,
+            blockedOnce: [revisions[0].surfaceID]
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await snapshots.snapshot(revision: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await snapshots.waitUntilStarted(2)
+        await snapshots.waitUntilCompleted(surfaceID: revisions[1].surfaceID)
+        let consumedDuplicate = try #require(
+            await store.publicationSnapshot(atLeast: revisions[1])
+        )
+        #expect(consumedDuplicate.publicationDamage.isEmpty)
+
+        firstFlush.cancel()
+        await firstFlush.value
+
+        #expect(await observations.emittedRevisions.isEmpty)
+        #expect(await publisher.metrics().pendingSurfaces == 3)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == revisions)
+        #expect(await observations.emittedFullDamage == [true, true, true])
+        #expect(await publisher.metrics().pendingSurfaces == 0)
+    }
+
+    @Test func cancellationAfterEmitDeliveryDoesNotRequeueDeliveredRequest() async throws {
+        let (store, revisions) = try await makePartiallyDamagedSurfaces(count: 3)
+        let emissions = SelfCancellingEmissionProbe()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await store.publicationSnapshot(atLeast: revision)
+            },
+            emit: { frame in
+                await emissions.emit(frame)
+            }
+        )
+        for revision in revisions {
+            await publisher.submit(revision)
+        }
+
+        let firstFlush = Task { await publisher.flushNow() }
+        await firstFlush.value
+
+        #expect(await emissions.revisions() == [revisions[0]])
+        #expect(await emissions.fullDamage() == [false])
+        #expect(await publisher.metrics().pendingSurfaces == 2)
+        await publisher.flushNow()
+
+        #expect(await emissions.revisions() == revisions)
+        #expect(await emissions.fullDamage() == [false, true, true])
+        #expect(await publisher.metrics().pendingSurfaces == 0)
     }
 
     @Test(arguments: [3, 4])
@@ -783,6 +854,33 @@ struct DisplayFramePublisherTests {
                 await observations.emit(frame)
             }
         )
+    }
+
+    private func makePartiallyDamagedSurfaces(
+        count: Int
+    ) async throws -> (SurfaceStore, [SurfaceRevision]) {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        var revisions: [SurfaceRevision] = []
+        revisions.reserveCapacity(count)
+        for surfaceID in 1...count {
+            try await store.create(
+                id: UInt32(surfaceID),
+                width: 8,
+                height: 4,
+                format: 32
+            )
+            let created = try await store.descriptor(
+                surfaceID: UInt32(surfaceID)
+            ).surfaceRevision
+            _ = try #require(await store.publicationSnapshot(atLeast: created))
+            let revision = try await store.fill(
+                surfaceID: UInt32(surfaceID),
+                rectangle: PixelRect(x: surfaceID, y: 1, width: 1, height: 1),
+                colorARGB: UInt32(surfaceID)
+            )
+            revisions.append(revision)
+        }
+        return (store, revisions)
     }
 
     private func surfaceRevision(
@@ -988,6 +1086,119 @@ private actor ControlledEmissionProbe {
             }
         }
         emittedWaiters = remaining
+    }
+}
+
+private actor PublicationSnapshotGate {
+    private let store: SurfaceStore
+    private var blockedOnce: Set<UInt32>
+    private var startedSurfaceIDs: Set<UInt32> = []
+    private var completedSurfaceIDs: Set<UInt32> = []
+    private var blockContinuations: [UInt32: CheckedContinuation<Bool, Never>] = [:]
+    private var earlyCancellations: Set<UInt32> = []
+    private var startedWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var completedWaiters: [(UInt32, CheckedContinuation<Void, Never>)] = []
+
+    init(store: SurfaceStore, blockedOnce: Set<UInt32>) {
+        self.store = store
+        self.blockedOnce = blockedOnce
+    }
+
+    func snapshot(revision: SurfaceRevision) async -> FrameSnapshot? {
+        let surfaceID = revision.surfaceID
+        startedSurfaceIDs.insert(surfaceID)
+        resumeSatisfiedWaiters()
+        if blockedOnce.remove(surfaceID) != nil {
+            let shouldContinue = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if earlyCancellations.remove(surfaceID) != nil {
+                        continuation.resume(returning: false)
+                    } else {
+                        blockContinuations[surfaceID] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancel(surfaceID: surfaceID) }
+            }
+            guard shouldContinue else {
+                completedSurfaceIDs.insert(surfaceID)
+                resumeSatisfiedWaiters()
+                return nil
+            }
+        }
+        let frame = await store.publicationSnapshot(atLeast: revision)
+        completedSurfaceIDs.insert(surfaceID)
+        resumeSatisfiedWaiters()
+        return frame
+    }
+
+    func waitUntilStarted(_ count: Int) async {
+        guard startedSurfaceIDs.count < count else { return }
+        await withCheckedContinuation { continuation in
+            startedWaiters.append((count, continuation))
+        }
+    }
+
+    func waitUntilCompleted(surfaceID: UInt32) async {
+        guard !completedSurfaceIDs.contains(surfaceID) else { return }
+        await withCheckedContinuation { continuation in
+            completedWaiters.append((surfaceID, continuation))
+        }
+    }
+
+    private func cancel(surfaceID: UInt32) {
+        if let continuation = blockContinuations.removeValue(forKey: surfaceID) {
+            continuation.resume(returning: false)
+        } else {
+            earlyCancellations.insert(surfaceID)
+        }
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remainingStarted: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (count, continuation) in startedWaiters {
+            if startedSurfaceIDs.count >= count {
+                continuation.resume()
+            } else {
+                remainingStarted.append((count, continuation))
+            }
+        }
+        startedWaiters = remainingStarted
+
+        var remainingCompleted: [(UInt32, CheckedContinuation<Void, Never>)] = []
+        for (surfaceID, continuation) in completedWaiters {
+            if completedSurfaceIDs.contains(surfaceID) {
+                continuation.resume()
+            } else {
+                remainingCompleted.append((surfaceID, continuation))
+            }
+        }
+        completedWaiters = remainingCompleted
+    }
+}
+
+private actor SelfCancellingEmissionProbe {
+    private var shouldCancelNext = true
+    private var emittedRevisions: [SurfaceRevision] = []
+    private var emittedFullDamage: [Bool] = []
+
+    func emit(_ frame: FrameSnapshot) {
+        emittedRevisions.append(frame.surfaceRevision)
+        emittedFullDamage.append(frame.publicationDamage.isFullFrame)
+        if shouldCancelNext {
+            shouldCancelNext = false
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+        }
+    }
+
+    func revisions() -> [SurfaceRevision] {
+        emittedRevisions
+    }
+
+    func fullDamage() -> [Bool] {
+        emittedFullDamage
     }
 }
 
