@@ -1483,6 +1483,104 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1) == before)
     }
 
+    @Test func statelessWireCodecsShareExecutorWhileMJPEGAvoidsIt() async throws {
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 2,
+            maximumPendingJobs: 64,
+            maximumQueuedRetainedBytes: 256 * 1_024 * 1_024
+        ))
+        let decoded = decodedPixels([1, 2, 3, 4, 5, 6])
+        let jpeg = CountingPatternJPEGDecoder()
+        let mjpegLimiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
+        let compressedZlib = try #require(Data(base64Encoded:
+            "eJxTUIjyYWBkYJRgYGBgAmJGIOZgQAKMjEzMLKxsACbTASI="
+        ))
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 1,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 101,
+                payload: Data([1])
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 105,
+                payload: Data([2])
+            )),
+            encodeMini(id: 304, body: drawCompressedCopyBody(
+                imageType: 1,
+                payload: Data([3])
+            )),
+            encodeMini(id: 304, body: drawPaletteCopyBody(
+                flags: 0x01,
+                paletteID: 1,
+                entries: [0x0011_2233, 0x0044_5566],
+                payload: Data([4])
+            )),
+            encodeMini(id: 304, body: drawZlibGLZCopyBody(
+                payload: compressedZlib,
+                glzDataSize: 40
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 1,
+                streamWidth: 2,
+                streamHeight: 1,
+                sourceWidth: 2,
+                sourceHeight: 1,
+                destination: (top: 0, left: 0, bottom: 1, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 1,
+                multimediaTime: 1,
+                data: Data([5])
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            codecTaskExecutor: executor,
+            jpegDecoder: jpeg,
+            lzDecoder: StubLZDecoder(result: .success(decoded)),
+            paletteLZDecoder: StubPaletteLZDecoder(result: .success(decoded)),
+            quicDecoder: StubQUICDecoder(result: .success(decoded)),
+            mjpegDecodeLimiter: mjpegLimiter
+        )
+
+        for _ in 0..<6 {
+            _ = try await channel.processNext()
+        }
+        var diagnostics = await executor.diagnosticsSnapshot()
+        // LZ, JPEG, QUIC, and palette each consume one job. ZLIB_GLZ consumes
+        // one inflate job and one GLZ CPU job on the same Session executor.
+        #expect(diagnostics.completedJobs == 6)
+        #expect(diagnostics.activeJobs == 0)
+        #expect(diagnostics.queuedJobs == 0)
+        #expect(diagnostics.currentRetainedBytes == 0)
+        #expect(await jpeg.decodeCount == 1)
+
+        _ = try await channel.processNext()
+        _ = try await channel.processNext()
+        await waitForJPEGDecodeCount(jpeg, count: 2)
+        diagnostics = await executor.diagnosticsSnapshot()
+        #expect(diagnostics.completedJobs == 6)
+        #expect(diagnostics.activeJobs == 0)
+        #expect(diagnostics.queuedJobs == 0)
+        #expect(diagnostics.currentRetainedBytes == 0)
+        let mjpegDiagnostics = await mjpegLimiter.diagnosticsSnapshot()
+        #expect(mjpegDiagnostics.activeDecodeCount == 0)
+        #expect(mjpegDiagnostics.queuedDecodeCount == 0)
+        #expect(mjpegDiagnostics.peakDecodeCount == 1)
+    }
+
     @Test func decodesAndCommitsGLZRGBWireBody() async throws {
         let payload = glzLiteralPayload()
         let body = drawCompressedCopyBody(imageType: 102, payload: payload)
@@ -4938,4 +5036,44 @@ private struct StubLZDecoder: SpiceImageDecoder {
     ) async throws(SpiceCodecError) -> SpiceDecodedImage {
         try result.get()
     }
+}
+
+private struct StubQUICDecoder: SpiceImageDecoder {
+    nonisolated let format = SpiceImageFormat.quic
+    let result: Result<SpiceDecodedImage, SpiceCodecError>
+
+    func decode(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data
+    ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        _ = descriptor
+        _ = payload
+        return try result.get()
+    }
+}
+
+private struct StubPaletteLZDecoder: SpicePaletteImageDecoder {
+    let result: Result<SpiceDecodedImage, SpiceCodecError>
+
+    func decodePalette(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data,
+        palette: SpiceLZPalette
+    ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        _ = descriptor
+        _ = payload
+        _ = palette
+        return try result.get()
+    }
+}
+
+private func waitForJPEGDecodeCount(
+    _ decoder: CountingPatternJPEGDecoder,
+    count: Int
+) async {
+    for _ in 0..<10_000 {
+        if await decoder.decodeCount >= count { return }
+        await Task.yield()
+    }
+    Issue.record("JPEG decoder did not reach the expected count")
 }

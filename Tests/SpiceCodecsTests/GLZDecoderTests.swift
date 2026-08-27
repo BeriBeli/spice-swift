@@ -202,6 +202,47 @@ struct GLZDecoderTests {
         #expect(decoded.pixelsBGRA == expected)
     }
 
+    @Test func largeDistanceCurrentReferencePreservesOffsetsAcrossCopyChunks() async throws {
+        let width = 16_384
+        let height = 13
+        let pixelCount = width * height
+        let pixelOffset = 65_537
+        let referenceCount = pixelCount - pixelOffset
+        #expect(referenceCount > 2 * 65_536)
+
+        var compressed = indexedRGBLiteralCommands(count: pixelOffset)
+        appendLargeSameImageReference(
+            length: referenceCount,
+            pixelOffset: pixelOffset,
+            to: &compressed
+        )
+
+        let decoded = try await SpiceGLZDecoder().decode(
+            descriptor: .init(width: width, height: height),
+            payload: glzPayload(
+                type: 8,
+                width: UInt32(width),
+                height: UInt32(height),
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: compressed
+            )
+        )
+
+        #expect(decoded.pixelsBGRA.count == pixelCount * 4)
+        decoded.pixelsBGRA.withUnsafeBytes { rawBytes in
+            let bytes = rawBytes.bindMemory(to: UInt8.self)
+            for pixel in 0..<pixelCount {
+                let sourcePixel = pixel < pixelOffset ? pixel : (pixel - pixelOffset) % pixelOffset
+                let byteOffset = pixel * 4
+                #expect(bytes[byteOffset] == UInt8(truncatingIfNeeded: sourcePixel))
+                #expect(bytes[byteOffset + 1] == UInt8(truncatingIfNeeded: sourcePixel >> 8))
+                #expect(bytes[byteOffset + 2] == UInt8(truncatingIfNeeded: sourcePixel >> 16))
+                #expect(bytes[byteOffset + 3] == 0)
+            }
+        }
+    }
+
     @Test func malformedInputDoesNotMutateDictionary() async throws {
         let decoder = SpiceGLZDecoder()
         let image0 = glzPayload(
@@ -349,6 +390,410 @@ struct GLZDecoderTests {
                 )
             )
         }
+    }
+
+    @Test func widthOneExecutorLeavesDictionaryDependencyWaitOutsidePermit() async throws {
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 4,
+            maximumQueuedRetainedBytes: 1_024
+        ))
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let dependent = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 2, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 2,
+                    height: 1,
+                    imageID: 1,
+                    windowHeadDistance: 1,
+                    compressed: [0x40, 0, 1]
+                )
+            )
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 1 && $0.pendingDictionaryWaits == 1
+        }
+        var executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+
+        let source = try await decoder.decode(
+            descriptor: .init(width: 2, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 2,
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: [1, 1, 2, 3, 4, 5, 6]
+            )
+        )
+        #expect(try await dependent.value.pixelsBGRA == source.pixelsBGRA)
+
+        let glzDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(glzDiagnostics.reservedImages == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaits == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaitBytes == 0)
+        executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+        #expect(executorDiagnostics.peakActiveJobs == 1)
+        #expect(executorDiagnostics.completedJobs == 2)
+    }
+
+    @Test func inFlightIDsFailuresAndCancellationReleaseEveryReservation() async throws {
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 4,
+            maximumQueuedRetainedBytes: 1_024
+        ))
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let dependentPayload = glzPayload(
+            type: 8,
+            width: 2,
+            height: 1,
+            imageID: 1,
+            windowHeadDistance: 1,
+            compressed: [0x40, 0, 1]
+        )
+        let dependent = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 2, height: 1),
+                payload: dependentPayload
+            )
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 1 && $0.pendingDictionaryWaits == 1
+        }
+
+        await #expect(throws: SpiceCodecError.malformedPayload(
+            "duplicate GLZ image id"
+        )) {
+            try await decoder.decode(
+                descriptor: .init(width: 2, height: 1),
+                payload: dependentPayload
+            )
+        }
+        #expect(await decoder.diagnosticsSnapshot().reservedImages == 1)
+        dependent.cancel()
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await dependent.value
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+
+        await #expect(throws: SpiceCodecError.malformedPayload(
+            "truncated GLZ stream"
+        )) {
+            try await decoder.decode(
+                descriptor: .init(width: 2, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 2,
+                    height: 1,
+                    imageID: 1,
+                    windowHeadDistance: 1,
+                    compressed: [1, 1, 2]
+                )
+            )
+        }
+        #expect(await decoder.diagnosticsSnapshot().reservedImages == 0)
+
+        let source = try await decoder.decode(
+            descriptor: .init(width: 2, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 2,
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: [1, 9, 8, 7, 6, 5, 4]
+            )
+        )
+        let recovered = try await decoder.decode(
+            descriptor: .init(width: 2, height: 1),
+            payload: dependentPayload
+        )
+        #expect(recovered.pixelsBGRA == source.pixelsBGRA)
+        let finalGLZ = await decoder.diagnosticsSnapshot()
+        #expect(finalGLZ.reservedImages == 0)
+        #expect(finalGLZ.pendingDictionaryWaits == 0)
+        #expect(finalGLZ.pendingDictionaryWaitBytes == 0)
+        #expect(await executor.diagnosticsSnapshot().currentRetainedBytes == 0)
+    }
+
+    @Test func clearRejectsAQueuedOldGenerationWithoutLateDictionaryCommit() async throws {
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 1,
+            maximumPendingJobs: 4,
+            maximumQueuedRetainedBytes: 1_024
+        ))
+        let blockerGate = GLZOperationGate()
+        let blocker = Task {
+            try await executor.execute(retainedByteCount: 1) {
+                await blockerGate.run()
+            }
+        }
+        await blockerGate.waitUntilStarted()
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let stale = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 1, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 1,
+                    height: 1,
+                    imageID: 0,
+                    windowHeadDistance: 0,
+                    compressed: [0, 1, 2, 3]
+                )
+            )
+        }
+        let dependencyWaiter = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 1, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 1,
+                    height: 1,
+                    imageID: 2,
+                    windowHeadDistance: 1,
+                    compressed: [0x20, 0, 1]
+                )
+            )
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 2
+                && $0.pendingDictionaryWaits == 1
+                && $0.pendingDictionaryWaitBytes == 4
+        }
+        await waitForExecutor(executor) { $0.queuedJobs == 1 }
+        let generation = await decoder.diagnosticsSnapshot().generation
+
+        await decoder.clear()
+        #expect(await decoder.diagnosticsSnapshot().generation == generation + 1)
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await dependencyWaiter.value
+        }
+        await blockerGate.release()
+        _ = try await blocker.value
+        await #expect(throws: SpiceCodecError.cancelled) {
+            try await stale.value
+        }
+        await waitForGLZ(decoder) {
+            $0.dictionaryImages == 0
+                && $0.dictionaryBytes == 0
+                && $0.reservedImages == 0
+                && $0.pendingDictionaryWaits == 0
+                && $0.pendingDictionaryWaitBytes == 0
+        }
+
+        let replacement = try await decoder.decode(
+            descriptor: .init(width: 1, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 1,
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: [0, 9, 8, 7]
+            )
+        )
+        let dependent = try await decoder.decode(
+            descriptor: .init(width: 1, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 1,
+                height: 1,
+                imageID: 1,
+                windowHeadDistance: 1,
+                compressed: [0x20, 0, 1]
+            )
+        )
+        #expect(replacement.pixelsBGRA == Data([9, 8, 7, 0]))
+        #expect(dependent.pixelsBGRA == replacement.pixelsBGRA)
+        #expect(await executor.diagnosticsSnapshot().currentRetainedBytes == 0)
+    }
+
+    @Test func independentLargeImagesOverlapAtWidthTwoAndEvictDeterministically() async throws {
+        let executor = SpiceCodecTaskExecutor(limits: .init(
+            maximumConcurrentJobs: 2,
+            maximumPendingJobs: 4,
+            maximumQueuedRetainedBytes: 1_024 * 1_024
+        ))
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let width = 16_384
+        let height = 64
+        let pixelCount = width * height
+        let secondPixel: [UInt8] = [4, 5, 6, 0]
+        let firstPayload = largeLiteralGLZPayload(
+            width: width,
+            height: height,
+            imageID: 0
+        )
+        let first = Task {
+            try await decoder.decode(
+                descriptor: .init(width: width, height: height),
+                payload: firstPayload
+            )
+        }
+        await waitForExecutor(executor, maximumYields: 1_000_000) {
+            $0.activeJobs == 1
+        }
+        let second = Task {
+            try await decoder.decode(
+                descriptor: .init(width: width, height: height),
+                payload: largeRepeatedGLZPayload(
+                    width: width,
+                    height: height,
+                    imageID: 1,
+                    pixel: Array(secondPixel.prefix(3))
+                )
+            )
+        }
+
+        let firstImage = try await first.value
+        let secondImage = try await second.value
+        expectLiteralPixels(firstImage.pixelsBGRA, count: pixelCount)
+        expectUniformPixels(secondImage.pixelsBGRA, pixel: secondPixel, count: pixelCount)
+        let executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.peakActiveJobs == 2)
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+        #expect(executorDiagnostics.completedJobs == 2)
+        let glzDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(glzDiagnostics.dictionaryImages == 1)
+        #expect(glzDiagnostics.dictionaryBytes == pixelCount * 4)
+        #expect(glzDiagnostics.reservedImages == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaits == 0)
+    }
+
+    @Test(arguments: [1, 3, 32])
+    func boundedProgramRejectsBeforeReservationOrExecutorAdmission(
+        maximumOperations: Int
+    ) async throws {
+        let executor = SpiceCodecTaskExecutor()
+        let decoder = SpiceGLZDecoder(
+            executor: executor,
+            limits: .init(maximumProgramOperations: maximumOperations)
+        )
+        let excessiveCommands = literalGLZCommands(count: maximumOperations + 1)
+        await #expect(throws: SpiceCodecError.malformedPayload(
+            "GLZ operation limit exceeded"
+        )) {
+            try await decoder.decode(
+                descriptor: .init(width: maximumOperations + 1, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: UInt32(maximumOperations + 1),
+                    height: 1,
+                    imageID: 0,
+                    windowHeadDistance: 0,
+                    compressed: excessiveCommands
+                )
+            )
+        }
+        var glzDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(glzDiagnostics.dictionaryImages == 0)
+        #expect(glzDiagnostics.dictionaryBytes == 0)
+        #expect(glzDiagnostics.reservedImages == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaits == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaitBytes == 0)
+        var executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+        #expect(executorDiagnostics.completedJobs == 0)
+        #expect(executorDiagnostics.failedJobs == 0)
+        #expect(executorDiagnostics.rejectedJobs == 0)
+
+        let recovered = try await decoder.decode(
+            descriptor: .init(width: maximumOperations, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: UInt32(maximumOperations),
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: literalGLZCommands(count: maximumOperations)
+            )
+        )
+        #expect(recovered.pixelsBGRA == literalGLZPixels(count: maximumOperations))
+        glzDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(glzDiagnostics.dictionaryImages == 1)
+        #expect(glzDiagnostics.reservedImages == 0)
+        executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.completedJobs == 1)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
+    }
+
+    @Test func outOfOrderTailAdvanceEvictsOlderWaiterAndReleasesItsBudget() async throws {
+        let executor = SpiceCodecTaskExecutor()
+        let decoder = SpiceGLZDecoder(executor: executor)
+        let dependent = Task {
+            try await decoder.decode(
+                descriptor: .init(width: 1, height: 1),
+                payload: glzPayload(
+                    type: 8,
+                    width: 1,
+                    height: 1,
+                    imageID: 2,
+                    windowHeadDistance: 1,
+                    compressed: [0x20, 0, 2]
+                )
+            )
+        }
+        await waitForGLZ(decoder) {
+            $0.reservedImages == 1
+                && $0.pendingDictionaryWaits == 1
+                && $0.pendingDictionaryWaitBytes == 4
+        }
+
+        _ = try await decoder.decode(
+            descriptor: .init(width: 1, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 1,
+                height: 1,
+                imageID: 1,
+                windowHeadDistance: 0,
+                compressed: [0, 9, 8, 7]
+            )
+        )
+        _ = try await decoder.decode(
+            descriptor: .init(width: 1, height: 1),
+            payload: glzPayload(
+                type: 8,
+                width: 1,
+                height: 1,
+                imageID: 0,
+                windowHeadDistance: 0,
+                compressed: [0, 1, 2, 3]
+            )
+        )
+        await #expect(throws: SpiceCodecError.malformedPayload(
+            "GLZ dictionary image 0 was evicted"
+        )) {
+            try await dependent.value
+        }
+
+        let glzDiagnostics = await decoder.diagnosticsSnapshot()
+        #expect(glzDiagnostics.dictionaryImages == 1)
+        #expect(glzDiagnostics.dictionaryBytes == 4)
+        #expect(glzDiagnostics.reservedImages == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaits == 0)
+        #expect(glzDiagnostics.pendingDictionaryWaitBytes == 0)
+        let executorDiagnostics = await executor.diagnosticsSnapshot()
+        #expect(executorDiagnostics.activeJobs == 0)
+        #expect(executorDiagnostics.queuedJobs == 0)
+        #expect(executorDiagnostics.currentRetainedBytes == 0)
     }
 
     @Test func decodesLongPixelOffsetAndLongImageDistance() async throws {
@@ -624,6 +1069,115 @@ struct GLZDecoderTests {
         bytes.append(0)
     }
 
+    private func appendLargeSameImageReference(
+        length: Int,
+        pixelOffset: Int,
+        to bytes: inout [UInt8]
+    ) {
+        precondition(length >= 7)
+        precondition(pixelOffset > 65_536)
+        let encodedOffset = pixelOffset - 1
+        precondition(encodedOffset < 1 << 25)
+
+        bytes.append(0xf0 | UInt8(encodedOffset & 0x0f))
+        var remainingLength = length - 7
+        while remainingLength >= 255 {
+            bytes.append(255)
+            remainingLength -= 255
+        }
+        bytes.append(UInt8(remainingLength))
+        bytes.append(UInt8(truncatingIfNeeded: encodedOffset >> 4))
+        var referenceCode = UInt8((encodedOffset >> 12) & 0x1f)
+        if encodedOffset >= 1 << 17 {
+            referenceCode |= 0x20
+        }
+        bytes.append(referenceCode)
+        if referenceCode & 0x20 != 0 {
+            bytes.append(UInt8(truncatingIfNeeded: encodedOffset >> 17))
+        }
+    }
+
+    private func indexedRGBLiteralCommands(count: Int) -> [UInt8] {
+        var commands: [UInt8] = []
+        commands.reserveCapacity(count * 3 + (count + 31) / 32)
+        var pixel = 0
+        while pixel < count {
+            let literalCount = min(32, count - pixel)
+            commands.append(UInt8(literalCount - 1))
+            for index in pixel..<(pixel + literalCount) {
+                commands.append(UInt8(truncatingIfNeeded: index))
+                commands.append(UInt8(truncatingIfNeeded: index >> 8))
+                commands.append(UInt8(truncatingIfNeeded: index >> 16))
+            }
+            pixel += literalCount
+        }
+        return commands
+    }
+
+    private func largeRepeatedGLZPayload(
+        width: Int,
+        height: Int,
+        imageID: UInt64,
+        pixel: [UInt8]
+    ) -> Data {
+        precondition(pixel.count == 3)
+        let pixelCount = width * height
+        var compressed: [UInt8] = [0]
+        compressed.append(contentsOf: pixel)
+        appendSameImageReference(
+            length: pixelCount - 1,
+            lengthBias: 0,
+            pixelOffset: 1,
+            to: &compressed
+        )
+        return glzPayload(
+            type: 8,
+            width: UInt32(width),
+            height: UInt32(height),
+            imageID: imageID,
+            windowHeadDistance: 0,
+            compressed: compressed
+        )
+    }
+
+    private func largeLiteralGLZPayload(
+        width: Int,
+        height: Int,
+        imageID: UInt64
+    ) -> Data {
+        glzPayload(
+            type: 8,
+            width: UInt32(width),
+            height: UInt32(height),
+            imageID: imageID,
+            windowHeadDistance: 0,
+            compressed: literalGLZCommands(count: width * height)
+        )
+    }
+
+    private func literalGLZCommands(count: Int) -> [UInt8] {
+        var commands: [UInt8] = []
+        commands.reserveCapacity(count * 4)
+        for index in 0..<count {
+            commands.append(0)
+            commands.append(UInt8(truncatingIfNeeded: index * 3 + 1))
+            commands.append(UInt8(truncatingIfNeeded: index * 3 + 2))
+            commands.append(UInt8(truncatingIfNeeded: index * 3 + 3))
+        }
+        return commands
+    }
+
+    private func literalGLZPixels(count: Int) -> Data {
+        var pixels = Data(capacity: count * 4)
+        for index in 0..<count {
+            pixels.append(UInt8(truncatingIfNeeded: index * 3 + 1))
+            pixels.append(UInt8(truncatingIfNeeded: index * 3 + 2))
+            pixels.append(UInt8(truncatingIfNeeded: index * 3 + 3))
+            pixels.append(0)
+        }
+        return pixels
+    }
+
     private func uniformPixels(_ pixel: [UInt8], count: Int) -> Data {
         var pixels: [UInt8] = []
         pixels.reserveCapacity(pixel.count * count)
@@ -631,6 +1185,89 @@ struct GLZDecoderTests {
             pixels.append(contentsOf: pixel)
         }
         return Data(pixels)
+    }
+
+    private func expectUniformPixels(_ pixels: Data, pixel: [UInt8], count: Int) {
+        #expect(pixel.count == 4)
+        #expect(pixels.count == count * 4)
+        let mismatch = pixels.withUnsafeBytes { bytes -> Int? in
+            for index in 0..<count {
+                let offset = index * 4
+                if bytes[offset] != pixel[0]
+                    || bytes[offset + 1] != pixel[1]
+                    || bytes[offset + 2] != pixel[2]
+                    || bytes[offset + 3] != pixel[3]
+                {
+                    return index
+                }
+            }
+            return nil
+        }
+        #expect(mismatch == nil, "first mismatching pixel: \(String(describing: mismatch))")
+    }
+
+    private func expectLiteralPixels(_ pixels: Data, count: Int) {
+        #expect(pixels.count == count * 4)
+        let mismatch = pixels.withUnsafeBytes { bytes -> Int? in
+            for index in 0..<count {
+                let offset = index * 4
+                if bytes[offset] != UInt8(truncatingIfNeeded: index * 3 + 1)
+                    || bytes[offset + 1] != UInt8(truncatingIfNeeded: index * 3 + 2)
+                    || bytes[offset + 2] != UInt8(truncatingIfNeeded: index * 3 + 3)
+                    || bytes[offset + 3] != 0
+                {
+                    return index
+                }
+            }
+            return nil
+        }
+        #expect(mismatch == nil, "first mismatching pixel: \(String(describing: mismatch))")
+    }
+}
+
+private func waitForGLZ(
+    _ decoder: SpiceGLZDecoder,
+    where predicate: (SpiceGLZDecoderDiagnostics) -> Bool
+) async {
+    for _ in 0..<10_000 {
+        if predicate(await decoder.diagnosticsSnapshot()) { return }
+        await Task.yield()
+    }
+    Issue.record("GLZ diagnostics did not reach the expected state")
+}
+
+private func waitForExecutor(
+    _ executor: SpiceCodecTaskExecutor,
+    maximumYields: Int = 10_000,
+    where predicate: (SpiceCodecTaskExecutorDiagnostics) -> Bool
+) async {
+    for _ in 0..<maximumYields {
+        if predicate(await executor.diagnosticsSnapshot()) { return }
+        await Task.yield()
+    }
+    Issue.record("codec executor diagnostics did not reach the expected state")
+}
+
+private actor GLZOperationGate {
+    private var started = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func run() async {
+        started = true
+        for waiter in startWaiters { waiter.resume() }
+        startWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 
