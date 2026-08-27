@@ -148,3 +148,38 @@ void spice_copy_bgra_alpha_overlap(
         copied += chunk;
     }
 }
+
+void spice_fill_bgra32(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t width,
+    size_t height,
+    uint32_t value
+)
+{
+    if (destination == NULL || width == 0 || height == 0) {
+        return;
+    }
+
+    const uint32x4_t pixels = vdupq_n_u32(value);
+    const uint32x4x4_t pixel_block = {{pixels, pixels, pixels, pixels}};
+    for (size_t y = 0; y < height; y += 1) {
+        uint32_t *row = (uint32_t *)(destination + y * destination_stride);
+        size_t remaining = width;
+        while (remaining >= 16) {
+            vst1q_u32_x4(row, pixel_block);
+            row += 16;
+            remaining -= 16;
+        }
+        while (remaining >= 4) {
+            vst1q_u32(row, pixels);
+            row += 4;
+            remaining -= 4;
+        }
+        while (remaining != 0) {
+            *row = value;
+            row += 1;
+            remaining -= 1;
+        }
+    }
+}

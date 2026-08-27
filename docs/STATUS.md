@@ -178,6 +178,10 @@ Agent behavior, including system-trusted TLS.
   and output at 65,536 segments before Surface mutation. Each non-empty wire
   fill or copy validates the complete region and commits one Surface revision,
   mutation generation, and transaction; empty or failed regions commit none.
+  Same-Surface copy then uses quadrant-safe segment order and direction-aware
+  row `memmove`; cross-Surface copy reads directly from its synchronized source.
+  No Surface copy allocates area-sized staging, contiguous non-overlapping
+  rectangles use one bulk call, and fill segments use the arm64 NEON kernel.
 - A complete Mini-header transcript test from Surface Create through real draw
   wire bodies to the expected framebuffer and Surface Destroy.
 - An external JSON golden-frame fixture that replays Surface Create, DRAW_FILL,

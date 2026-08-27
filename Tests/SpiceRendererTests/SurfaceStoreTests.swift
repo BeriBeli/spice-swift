@@ -38,6 +38,366 @@ struct SurfaceStoreTests {
         }
     }
 
+    @Test(arguments: CopyVector.singleRectangleCases)
+    func copyBitsMatchesCommandStartSnapshotInEveryDirection(
+        vector: CopyVector
+    ) async throws {
+        let store = try await seededStore(width: 8, height: 8)
+        let source = PixelRect(x: 2, y: 2, width: 3, height: 3)
+        let destination = PixelRect(
+            x: source.x + vector.deltaX,
+            y: source.y + vector.deltaY,
+            width: source.width,
+            height: source.height
+        )
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: PixelRect(x: 0, y: 0, width: 8, height: 8),
+            clips: nil
+        )
+        let before = try await store.snapshot(surfaceID: 1)
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let transactionCountBefore = await store.metrics().mutationTransactions
+        let expected = copiedPixels(
+            from: before,
+            source: source,
+            destination: destination,
+            region: region
+        )
+
+        _ = try #require(await store.copyBits(
+            surfaceID: 1,
+            region: region,
+            destination: destination,
+            sourceX: source.x,
+            sourceY: source.y
+        ))
+
+        let after = try await store.snapshot(surfaceID: 1)
+        let descriptorAfter = try await store.descriptor(surfaceID: 1)
+        #expect(after.pixels == expected)
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            await store.metrics().mutationTransactions
+                == transactionCountBefore + 1
+        )
+    }
+
+    @Test(arguments: CopyVector.overlappingDirections)
+    func clippedMultiSegmentCopyBitsMatchesCommandStartSnapshot(
+        vector: CopyVector
+    ) async throws {
+        let store = try await seededStore(width: 8, height: 8)
+        let source = PixelRect(x: 2, y: 2, width: 4, height: 4)
+        let destination = PixelRect(
+            x: source.x + vector.deltaX,
+            y: source.y + vector.deltaY,
+            width: source.width,
+            height: source.height
+        )
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: PixelRect(x: 0, y: 0, width: 8, height: 8),
+            clips: [
+                PixelRect(
+                    x: destination.x + 2,
+                    y: destination.y + 2,
+                    width: 2,
+                    height: 2
+                ),
+                PixelRect(x: destination.x, y: destination.y, width: 1, height: 1),
+                PixelRect(
+                    x: destination.x + 2,
+                    y: destination.y,
+                    width: 2,
+                    height: 1
+                ),
+                PixelRect(
+                    x: destination.x,
+                    y: destination.y + 2,
+                    width: 1,
+                    height: 2
+                ),
+            ]
+        )
+        #expect(region.segmentCount == 4)
+        let before = try await store.snapshot(surfaceID: 1)
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let transactionCountBefore = await store.metrics().mutationTransactions
+        let expected = copiedPixels(
+            from: before,
+            source: source,
+            destination: destination,
+            region: region
+        )
+
+        _ = try #require(await store.copyBits(
+            surfaceID: 1,
+            region: region,
+            destination: destination,
+            sourceX: source.x,
+            sourceY: source.y
+        ))
+
+        let after = try await store.snapshot(surfaceID: 1)
+        let descriptorAfter = try await store.descriptor(surfaceID: 1)
+        #expect(after.pixels == expected)
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            await store.metrics().mutationTransactions
+                == transactionCountBefore + 1
+        )
+    }
+
+    @Test(arguments: SurfaceCopyCommand.allCases)
+    func successfulSurfaceCopiesUseNoTemporaryPixelStaging(
+        command: SurfaceCopyCommand
+    ) async throws {
+        let store = try await seededStore(width: 6, height: 6, surfaceIDs: [1, 2])
+        let destination = PixelRect(x: 2, y: 2, width: 3, height: 3)
+        let source = PixelRect(x: 1, y: 1, width: 3, height: 3)
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: PixelRect(x: 0, y: 0, width: 6, height: 6),
+            clips: [
+                PixelRect(x: 2, y: 2, width: 2, height: 1),
+                PixelRect(x: 4, y: 4, width: 1, height: 1),
+            ]
+        )
+        let appliedRegion: PixelRegion
+        if command.isRegionTransaction {
+            appliedRegion = region
+        } else {
+            appliedRegion = try PixelRegion(
+                destination: destination,
+                surfaceBounds: PixelRect(x: 0, y: 0, width: 6, height: 6),
+                clips: nil
+            )
+        }
+        let destinationBefore = try await store.snapshot(surfaceID: 1)
+        let sourceBefore = command.usesCrossSurface
+            ? try await store.snapshot(surfaceID: 2)
+            : destinationBefore
+        let expected = copiedPixels(
+            from: destinationBefore,
+            sourceSnapshot: sourceBefore,
+            source: source,
+            destination: destination,
+            region: appliedRegion
+        )
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let metricsBefore = await store.metrics()
+
+        let revision: SurfaceRevision?
+        switch command {
+        case .regionCopyBits:
+            revision = try await store.copyBits(
+                surfaceID: 1,
+                region: region,
+                destination: destination,
+                sourceX: source.x,
+                sourceY: source.y
+            )
+        case .regionSameSurfaceDrawCopy:
+            revision = try await store.drawCopy(
+                surfaceID: 1,
+                region: region,
+                destination: destination,
+                sourceSurfaceID: 1,
+                source: source
+            )
+        case .regionCrossSurfaceDrawCopy:
+            revision = try await store.drawCopy(
+                surfaceID: 1,
+                region: region,
+                destination: destination,
+                sourceSurfaceID: 2,
+                source: source
+            )
+        case .rectangleCopyBits:
+            revision = try await store.copyBits(
+                surfaceID: 1,
+                destination: destination,
+                sourceX: source.x,
+                sourceY: source.y
+            )
+        case .rectangleSameSurfaceDrawCopy:
+            revision = try await store.drawCopy(
+                surfaceID: 1,
+                destination: destination,
+                sourceSurfaceID: 1,
+                source: source
+            )
+        case .rectangleCrossSurfaceDrawCopy:
+            revision = try await store.drawCopy(
+                surfaceID: 1,
+                destination: destination,
+                sourceSurfaceID: 2,
+                source: source
+            )
+        }
+
+        #expect(revision != nil)
+        let descriptorAfter = try await store.descriptor(surfaceID: 1)
+        let metricsAfter = await store.metrics()
+        #expect(try await store.snapshot(surfaceID: 1).pixels == expected)
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(metricsAfter.temporaryCopyBytes == metricsBefore.temporaryCopyBytes)
+        if command.isRegionTransaction {
+            #expect(
+                metricsAfter.mutationTransactions
+                    == metricsBefore.mutationTransactions + 1
+            )
+        } else {
+            #expect(metricsAfter.mutationTransactions == metricsBefore.mutationTransactions)
+        }
+    }
+
+    @Test(arguments: CopyKernelCase.cases)
+    func copyKernelUsesExpectedBulkOrRowCallShape(testCase: CopyKernelCase) async throws {
+        let store = try await seededStore(
+            width: testCase.surfaceWidth,
+            height: testCase.surfaceHeight,
+            surfaceIDs: [1, 2]
+        )
+        let region = try PixelRegion(
+            destination: testCase.destination,
+            surfaceBounds: PixelRect(
+                x: 0,
+                y: 0,
+                width: testCase.surfaceWidth,
+                height: testCase.surfaceHeight
+            ),
+            clips: nil
+        )
+        let destinationBefore = try await store.snapshot(surfaceID: 1)
+        let sourceBefore = testCase.crossSurface
+            ? try await store.snapshot(surfaceID: 2)
+            : destinationBefore
+        let expected = copiedPixels(
+            from: destinationBefore,
+            sourceSnapshot: sourceBefore,
+            source: testCase.source,
+            destination: testCase.destination,
+            region: region
+        )
+        let metricsBefore = await store.metrics()
+
+        if testCase.crossSurface {
+            _ = try #require(await store.drawCopy(
+                surfaceID: 1,
+                region: region,
+                destination: testCase.destination,
+                sourceSurfaceID: 2,
+                source: testCase.source
+            ))
+        } else {
+            _ = try #require(await store.copyBits(
+                surfaceID: 1,
+                region: region,
+                destination: testCase.destination,
+                sourceX: testCase.source.x,
+                sourceY: testCase.source.y
+            ))
+        }
+
+        let metricsAfter = await store.metrics()
+        #expect(try await store.snapshot(surfaceID: 1).pixels == expected)
+        #expect(
+            metricsAfter.bulkCopyCalls
+                == metricsBefore.bulkCopyCalls + testCase.expectedBulkCalls
+        )
+        #expect(
+            metricsAfter.rowCopyCalls
+                == metricsBefore.rowCopyCalls + testCase.expectedRowCalls
+        )
+        #expect(metricsAfter.temporaryCopyBytes == metricsBefore.temporaryCopyBytes)
+        #expect(metricsAfter.mutationTransactions == metricsBefore.mutationTransactions + 1)
+    }
+
+    @Test(arguments: FillKernelCase.cases)
+    func fillKernelPreservesSurfaceAlphaSemantics(testCase: FillKernelCase) async throws {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        try await store.create(id: 1, width: 4, height: 3, format: testCase.format)
+        let region = try PixelRegion(
+            destination: PixelRect(x: 0, y: 0, width: 4, height: 3),
+            surfaceBounds: PixelRect(x: 0, y: 0, width: 4, height: 3),
+            clips: [
+                PixelRect(x: 0, y: 0, width: 2, height: 1),
+                PixelRect(x: 3, y: 2, width: 1, height: 1),
+            ]
+        )
+        #expect(region.segmentCount == 2)
+        let metricsBefore = await store.metrics()
+
+        _ = try #require(await store.fill(
+            surfaceID: 1,
+            region: region,
+            colorARGB: 0x7f11_2233
+        ))
+
+        let snapshot = try await store.snapshot(surfaceID: 1)
+        let metricsAfter = await store.metrics()
+        let expectedColor: [UInt8] = [0x33, 0x22, 0x11, testCase.expectedAlpha]
+        #expect(pixel(snapshot, x: 0, y: 0) == expectedColor)
+        #expect(pixel(snapshot, x: 1, y: 0) == expectedColor)
+        #expect(pixel(snapshot, x: 3, y: 2) == expectedColor)
+        #expect(pixel(snapshot, x: 2, y: 0) == [0, 0, 0, 0])
+        #expect(
+            metricsAfter.fillKernelCalls
+                == metricsBefore.fillKernelCalls + UInt64(region.segmentCount)
+        )
+        #expect(metricsAfter.mutationTransactions == metricsBefore.mutationTransactions + 1)
+    }
+
+    @Test func invalidLaterCopySegmentDoesNotPublishOrRecordKernelCalls() async throws {
+        let store = try await seededStore(width: 5, height: 1)
+        let destination = PixelRect(x: 0, y: 0, width: 5, height: 1)
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: destination,
+            clips: [
+                PixelRect(x: 0, y: 0, width: 1, height: 1),
+                PixelRect(x: 4, y: 0, width: 1, height: 1),
+            ]
+        )
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let pixelsBefore = try await store.snapshot(surfaceID: 1).pixels
+        let metricsBefore = await store.metrics()
+
+        await #expect(throws: RenderError.invalidRectangle) {
+            try await store.copyBits(
+                surfaceID: 1,
+                region: region,
+                destination: destination,
+                sourceX: 1,
+                sourceY: 0
+            )
+        }
+
+        let metricsAfter = await store.metrics()
+        #expect(try await store.descriptor(surfaceID: 1) == descriptorBefore)
+        #expect(try await store.snapshot(surfaceID: 1).pixels == pixelsBefore)
+        #expect(metricsAfter.mutationTransactions == metricsBefore.mutationTransactions)
+        #expect(metricsAfter.damageOperations == metricsBefore.damageOperations)
+        #expect(metricsAfter.damageBytes == metricsBefore.damageBytes)
+        #expect(metricsAfter.temporaryCopyBytes == metricsBefore.temporaryCopyBytes)
+        #expect(metricsAfter.bulkCopyCalls == metricsBefore.bulkCopyCalls)
+        #expect(metricsAfter.rowCopyCalls == metricsBefore.rowCopyCalls)
+    }
+
     @Test func drawsTopDownAndBottomUpRawBitmaps() async throws {
         let topDownStore = SurfaceStore(backingPolicy: .dataOnly)
         try await topDownStore.create(id: 1, width: 1, height: 2, format: 96)
@@ -1359,6 +1719,78 @@ struct SurfaceStoreTests {
         #expect(pixel(newFrame, x: 0, y: 0).allSatisfy { $0 >= 254 })
     }
 
+    private func seededStore(
+        width: Int,
+        height: Int,
+        surfaceIDs: [UInt32] = [1]
+    ) async throws -> SurfaceStore {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        for surfaceID in surfaceIDs {
+            try await store.create(
+                id: surfaceID,
+                width: UInt32(width),
+                height: UInt32(height),
+                format: 32
+            )
+            try await store.drawCopy(
+                surfaceID: surfaceID,
+                destination: PixelRect(x: 0, y: 0, width: width, height: height),
+                bitmap: seededBitmap(
+                    width: width,
+                    height: height,
+                    seed: UInt8(truncatingIfNeeded: surfaceID &* 53)
+                )
+            )
+        }
+        return store
+    }
+
+    private func seededBitmap(width: Int, height: Int, seed: UInt8) -> RawBitmap {
+        var pixels = Data(capacity: width * height * 4)
+        for index in 0..<(width * height) {
+            let value = seed &+ UInt8(truncatingIfNeeded: index)
+            pixels.append(value)
+            pixels.append(value &* 3 &+ 1)
+            pixels.append(value &* 5 &+ 2)
+            pixels.append(0xff)
+        }
+        return RawBitmap(
+            format: .xRGB8888,
+            width: width,
+            height: height,
+            stride: width * 4,
+            topDown: true,
+            pixels: pixels
+        )
+    }
+
+    private func copiedPixels(
+        from snapshot: FrameSnapshot,
+        sourceSnapshot: FrameSnapshot? = nil,
+        source: PixelRect,
+        destination: PixelRect,
+        region: PixelRegion
+    ) -> Data {
+        let sourceSnapshot = sourceSnapshot ?? snapshot
+        var expected = snapshot.pixels
+        for rectangle in region {
+            for destinationY in rectangle.y..<(rectangle.y + rectangle.height) {
+                for destinationX in rectangle.x..<(rectangle.x + rectangle.width) {
+                    let sourceX = source.x + destinationX - destination.x
+                    let sourceY = source.y + destinationY - destination.y
+                    let sourceOffset = sourceY * sourceSnapshot.bytesPerRow + sourceX * 4
+                    let destinationOffset = destinationY * snapshot.bytesPerRow
+                        + destinationX * 4
+                    expected.replaceSubrange(
+                        destinationOffset..<(destinationOffset + 4),
+                        with: sourceSnapshot.pixels[sourceOffset..<(sourceOffset + 4)]
+                    )
+                }
+            }
+        }
+        return expected
+    }
+
     private func pixel(_ snapshot: FrameSnapshot, x: Int, y: Int) -> [UInt8] {
         let offset = y * snapshot.bytesPerRow + x * 4
         return Array(snapshot.pixels[offset..<(offset + 4)])
@@ -1415,6 +1847,139 @@ struct SurfaceStoreTests {
         )
         return pixelBuffer
     }
+}
+
+struct CopyVector: Sendable, CustomTestStringConvertible {
+    let name: String
+    let deltaX: Int
+    let deltaY: Int
+
+    var testDescription: String { name }
+
+    static let overlappingDirections: [Self] = [
+        Self(name: "N", deltaX: 0, deltaY: -1),
+        Self(name: "NE", deltaX: 1, deltaY: -1),
+        Self(name: "E", deltaX: 1, deltaY: 0),
+        Self(name: "SE", deltaX: 1, deltaY: 1),
+        Self(name: "S", deltaX: 0, deltaY: 1),
+        Self(name: "SW", deltaX: -1, deltaY: 1),
+        Self(name: "W", deltaX: -1, deltaY: 0),
+        Self(name: "NW", deltaX: -1, deltaY: -1),
+    ]
+
+    static let singleRectangleCases: [Self] = overlappingDirections + [
+        Self(name: "zero displacement", deltaX: 0, deltaY: 0),
+        Self(name: "horizontal overlap boundary", deltaX: 3, deltaY: 0),
+        Self(name: "vertical overlap boundary", deltaX: 0, deltaY: 3),
+    ]
+}
+
+enum SurfaceCopyCommand: CaseIterable, Sendable {
+    case regionCopyBits
+    case regionSameSurfaceDrawCopy
+    case regionCrossSurfaceDrawCopy
+    case rectangleCopyBits
+    case rectangleSameSurfaceDrawCopy
+    case rectangleCrossSurfaceDrawCopy
+
+    var isRegionTransaction: Bool {
+        switch self {
+        case .regionCopyBits, .regionSameSurfaceDrawCopy, .regionCrossSurfaceDrawCopy:
+            true
+        case .rectangleCopyBits,
+             .rectangleSameSurfaceDrawCopy,
+             .rectangleCrossSurfaceDrawCopy:
+            false
+        }
+    }
+
+    var usesCrossSurface: Bool {
+        switch self {
+        case .regionCrossSurfaceDrawCopy, .rectangleCrossSurfaceDrawCopy:
+            true
+        default:
+            false
+        }
+    }
+}
+
+struct CopyKernelCase: Sendable, CustomTestStringConvertible {
+    let name: String
+    let surfaceWidth: Int
+    let surfaceHeight: Int
+    let destination: PixelRect
+    let source: PixelRect
+    let crossSurface: Bool
+    let expectedBulkCalls: UInt64
+    let expectedRowCalls: UInt64
+
+    var testDescription: String { name }
+
+    static let cases: [Self] = [
+        Self(
+            name: "tightly packed full cross-Surface copy",
+            surfaceWidth: 4,
+            surfaceHeight: 3,
+            destination: PixelRect(x: 0, y: 0, width: 4, height: 3),
+            source: PixelRect(x: 0, y: 0, width: 4, height: 3),
+            crossSurface: true,
+            expectedBulkCalls: 1,
+            expectedRowCalls: 0
+        ),
+        Self(
+            name: "non-contiguous cross-Surface subrectangle",
+            surfaceWidth: 6,
+            surfaceHeight: 5,
+            destination: PixelRect(x: 1, y: 1, width: 3, height: 3),
+            source: PixelRect(x: 2, y: 0, width: 3, height: 3),
+            crossSurface: true,
+            expectedBulkCalls: 0,
+            expectedRowCalls: 3
+        ),
+        Self(
+            name: "overlapping same-Surface subrectangle",
+            surfaceWidth: 6,
+            surfaceHeight: 5,
+            destination: PixelRect(x: 2, y: 1, width: 3, height: 3),
+            source: PixelRect(x: 1, y: 1, width: 3, height: 3),
+            crossSurface: false,
+            expectedBulkCalls: 0,
+            expectedRowCalls: 3
+        ),
+        Self(
+            name: "single-row horizontal same-Surface overlap",
+            surfaceWidth: 6,
+            surfaceHeight: 3,
+            destination: PixelRect(x: 2, y: 1, width: 3, height: 1),
+            source: PixelRect(x: 1, y: 1, width: 3, height: 1),
+            crossSurface: false,
+            expectedBulkCalls: 0,
+            expectedRowCalls: 1
+        ),
+        Self(
+            name: "full-width vertical same-Surface overlap",
+            surfaceWidth: 6,
+            surfaceHeight: 5,
+            destination: PixelRect(x: 0, y: 1, width: 6, height: 3),
+            source: PixelRect(x: 0, y: 0, width: 6, height: 3),
+            crossSurface: false,
+            expectedBulkCalls: 0,
+            expectedRowCalls: 3
+        ),
+    ]
+}
+
+struct FillKernelCase: Sendable, CustomTestStringConvertible {
+    let name: String
+    let format: UInt32
+    let expectedAlpha: UInt8
+
+    var testDescription: String { name }
+
+    static let cases: [Self] = [
+        Self(name: "ARGB8888 preserves alpha", format: 96, expectedAlpha: 0x7f),
+        Self(name: "xRGB8888 forces opaque alpha", format: 32, expectedAlpha: 0xff),
+    ]
 }
 
 private enum TestError: Error {
