@@ -153,6 +153,14 @@ Parsing, decoding, and rendering are transactional. A malformed stream, failed
 decode, invalid cache reference, or capacity error must not partially modify a
 surface or publish a cache entry.
 
+Every Display destination is normalized as one bounded `PixelRegion` before
+Surface mutation: `destination ∩ surfaceBounds ∩ union(clips)`. The canonical
+form is ordered y bands containing sorted, disjoint x intervals; identical
+adjacent bands are merged. No-clip and single-rectangle commands retain an
+inline O(1)-space path. Wire clips are capped at 4,096 and canonical output at
+65,536 segments, with checked half-open coordinates and failure before the
+first Surface mutation.
+
 The image cache and GLZ dictionary have explicit entry and byte limits. Shared
 Display state uses actors and serial barriers so cross-channel invalidation and
 GLZ dependencies follow protocol order.

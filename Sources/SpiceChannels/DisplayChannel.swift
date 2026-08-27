@@ -433,7 +433,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamClip(clip):
-            try updateStreamClip(clip)
+            try await updateStreamClip(clip)
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayStreamDestroy(streamID):
@@ -786,7 +786,11 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation(String(describing: error))
         }
         try validateStreamDestination(destination, in: descriptor)
-        _ = try clippedRectangles(destination: create.destination, clip: create.clip)
+        _ = try pixelRegion(
+            destination: create.destination,
+            clip: create.clip,
+            surface: descriptor
+        )
 
         let advancedDecoder: (any SpiceAdvancedVideoDecoder)?
         let mjpegDecoder: SpiceMJPEGStreamDecoder?
@@ -846,13 +850,31 @@ package actor DisplayChannel: SpiceManagedChannel {
         )
     }
 
-    private func updateStreamClip(_ update: SpiceDisplayStreamClip) throws(ChannelError) {
-        guard var stream = streams[update.streamID] else {
+    private func updateStreamClip(_ update: SpiceDisplayStreamClip) async throws(ChannelError) {
+        guard let stream = streams[update.streamID] else {
             throw .protocolViolation("clip for unknown stream \(update.streamID)")
         }
-        _ = try clippedRectangles(destination: stream.destination, clip: update.clip)
-        stream.clip = update.clip
-        streams[update.streamID] = stream
+        let expectedGeneration = stream.generation
+        let expectedSurfaceID = stream.surfaceID
+        let descriptor: SurfaceDescriptor
+        do {
+            descriptor = try await surfaces.descriptor(surfaceID: expectedSurfaceID)
+        } catch {
+            throw .protocolViolation(String(describing: error))
+        }
+        guard var current = streams[update.streamID],
+              current.generation == expectedGeneration,
+              current.surfaceID == expectedSurfaceID
+        else {
+            throw .protocolViolation("clip for retired stream \(update.streamID)")
+        }
+        _ = try pixelRegion(
+            destination: current.destination,
+            clip: update.clip,
+            surface: descriptor
+        )
+        current.clip = update.clip
+        streams[update.streamID] = current
     }
 
     private func renderStreamFrame(
@@ -979,11 +1001,18 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
 
         let destination = try pixelRect(destinationRect)
-        let clipped = try clippedRectangles(
+        let surfaceDescriptor: SurfaceDescriptor
+        do {
+            surfaceDescriptor = try await surfaces.descriptor(surfaceID: stream.surfaceID)
+        } catch {
+            throw .protocolViolation(String(describing: error))
+        }
+        let clippedRegion = try pixelRegion(
             destination: destinationRect,
-            clip: clipOverride ?? stream.clip
+            clip: clipOverride ?? stream.clip,
+            surface: surfaceDescriptor
         )
-        if clipped.isEmpty {
+        if clippedRegion.isEmpty {
             guard var committed = streams[streamID],
                   committed.generation == stream.generation
             else {
@@ -1002,6 +1031,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         )
         var usedNativeVideoPath = false
         var surfaceRevision: SurfaceRevision?
+        let clipped = Array(clippedRegion)
         if (stream.codec != .mjpeg || decodedFrame is SpiceMJPEGFrame),
            !stream.metalCompositorDisabled
         {
@@ -1137,8 +1167,9 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard case let .solid(color) = command.brush else {
             throw .protocolViolation("only solid DRAW_FILL brushes are implemented")
         }
+        let region = try await pixelRegion(command.base)
         var surfaceRevision: SurfaceRevision?
-        for rectangle in try clippedRectangles(command.base) {
+        for rectangle in region {
             do {
                 surfaceRevision = try await surfaces.fill(
                     surfaceID: command.base.surfaceID,
@@ -1155,9 +1186,10 @@ package actor DisplayChannel: SpiceManagedChannel {
     private func execute(
         _ command: SpiceDisplayCopyBits
     ) async throws(ChannelError) -> SurfaceRevision? {
-        let base = try pixelRect(command.base.box)
+        let base = try pixelRectAllowingEmpty(command.base.box)
+        let region = try await pixelRegion(command.base)
         var surfaceRevision: SurfaceRevision?
-        for destination in try clippedRectangles(command.base) {
+        for destination in region {
             let sourceX = Int(command.sourcePosition.x) + destination.x - base.x
             let sourceY = Int(command.sourcePosition.y) + destination.y - base.y
             do {
@@ -1183,8 +1215,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         guard command.mask.bitmap == nil else {
             throw .protocolViolation("masked DRAW_COPY is not implemented")
         }
-        let base = try pixelRect(command.base.box)
-        let sourceArea = try pixelRect(command.sourceArea)
+        let base = try pixelRectAllowingEmpty(command.base.box)
+        let sourceArea = try pixelRectAllowingEmpty(command.sourceArea)
         guard base.width == sourceArea.width, base.height == sourceArea.height else {
             throw .protocolViolation("scaled DRAW_COPY is not implemented")
         }
@@ -1204,13 +1236,15 @@ package actor DisplayChannel: SpiceManagedChannel {
             )
         }
 
+        let region = try await pixelRegion(command.base)
         let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
         try validateSourceArea(sourceArea, for: resolvedSource)
         let surfaceRevision = try await drawResolvedSource(
             resolvedSource,
             command: command,
             base: base,
-            sourceArea: sourceArea
+            sourceArea: sourceArea,
+            region: region
         )
         if let paletteToCache {
             palettes[paletteToCache.uniqueID] = paletteToCache
@@ -1225,6 +1259,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         mutation: consuming DisplayImageCacheMutation
     ) async throws(ChannelError) -> SurfaceRevision? {
         do {
+            let region = try await pixelRegion(command.base)
             let (resolvedSource, paletteToCache) = try await resolveSource(command.sourceImage)
             try validateSourceArea(sourceArea, for: resolvedSource)
             guard case let .bitmap(bitmap) = resolvedSource else {
@@ -1237,7 +1272,8 @@ package actor DisplayChannel: SpiceManagedChannel {
                 resolvedSource,
                 command: command,
                 base: base,
-                sourceArea: sourceArea
+                sourceArea: sourceArea,
+                region: region
             )
             if let paletteToCache {
                 palettes[paletteToCache.uniqueID] = paletteToCache
@@ -1261,9 +1297,12 @@ package actor DisplayChannel: SpiceManagedChannel {
         for resolvedSource: ResolvedSource
     ) throws(ChannelError) {
         guard case let .bitmap(bitmap) = resolvedSource else { return }
+        let (right, rightOverflow) = sourceArea.x.addingReportingOverflow(sourceArea.width)
+        let (bottom, bottomOverflow) = sourceArea.y.addingReportingOverflow(sourceArea.height)
         guard sourceArea.x >= 0, sourceArea.y >= 0,
-              sourceArea.x + sourceArea.width <= bitmap.width,
-              sourceArea.y + sourceArea.height <= bitmap.height
+              !rightOverflow, !bottomOverflow,
+              right <= bitmap.width,
+              bottom <= bitmap.height
         else {
             throw .protocolViolation("DRAW_COPY source area exceeds image")
         }
@@ -1284,10 +1323,11 @@ package actor DisplayChannel: SpiceManagedChannel {
         _ resolvedSource: ResolvedSource,
         command: SpiceDisplayDrawCopy,
         base: PixelRect,
-        sourceArea: PixelRect
+        sourceArea: PixelRect,
+        region: PixelRegion
     ) async throws(ChannelError) -> SurfaceRevision? {
         var surfaceRevision: SurfaceRevision?
-        for destination in try clippedRectangles(command.base) {
+        for destination in region {
             let source = PixelRect(
                 x: sourceArea.x + destination.x - base.x,
                 y: sourceArea.y + destination.y - base.y,
@@ -1562,27 +1602,51 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
     }
 
-    private func clippedRectangles(_ base: SpiceDisplayBase) throws(ChannelError) -> [PixelRect] {
-        try clippedRectangles(destination: base.box, clip: base.clip)
+    private func pixelRegion(_ base: SpiceDisplayBase) async throws(ChannelError) -> PixelRegion {
+        let descriptor: SurfaceDescriptor
+        do {
+            descriptor = try await surfaces.descriptor(surfaceID: base.surfaceID)
+        } catch {
+            throw .protocolViolation(String(describing: error))
+        }
+        return try pixelRegion(
+            destination: base.box,
+            clip: base.clip,
+            surface: descriptor
+        )
     }
 
-    private func clippedRectangles(
+    private func pixelRegion(
         destination destinationRect: SpiceRect,
-        clip: SpiceClip
-    ) throws(ChannelError) -> [PixelRect] {
-        let destination = try pixelRect(destinationRect)
+        clip: SpiceClip,
+        surface: SurfaceDescriptor
+    ) throws(ChannelError) -> PixelRegion {
+        let destination = try pixelRectAllowingEmpty(destinationRect)
+        let clips: [PixelRect]?
         switch clip {
         case .none:
-            return [destination]
+            clips = nil
         case let .rectangles(rectangles):
-            var clipped: [PixelRect] = []
-            clipped.reserveCapacity(rectangles.count)
+            var converted: [PixelRect] = []
+            converted.reserveCapacity(rectangles.count)
             for rectangle in rectangles {
-                if let intersection = intersection(destination, try pixelRect(rectangle)) {
-                    clipped.append(intersection)
-                }
+                converted.append(try pixelRectAllowingEmpty(rectangle))
             }
-            return clipped
+            clips = converted
+        }
+        do {
+            return try PixelRegion(
+                destination: destination,
+                surfaceBounds: PixelRect(
+                    x: 0,
+                    y: 0,
+                    width: surface.width,
+                    height: surface.height
+                ),
+                clips: clips
+            )
+        } catch let error {
+            throw .protocolViolation(String(describing: error))
         }
     }
 
@@ -1601,27 +1665,26 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     private func pixelRect(_ rectangle: SpiceRect) throws(ChannelError) -> PixelRect {
+        let result = try pixelRectAllowingEmpty(rectangle)
+        guard result.width > 0, result.height > 0 else {
+            throw .protocolViolation("invalid Display rectangle")
+        }
+        return result
+    }
+
+    private func pixelRectAllowingEmpty(
+        _ rectangle: SpiceRect
+    ) throws(ChannelError) -> PixelRect {
         let left = Int(rectangle.left)
         let top = Int(rectangle.top)
         let width = Int64(rectangle.right) - Int64(rectangle.left)
         let height = Int64(rectangle.bottom) - Int64(rectangle.top)
-        guard width > 0, height > 0,
+        guard width >= 0, height >= 0,
               let width = Int(exactly: width), let height = Int(exactly: height)
         else {
             throw .protocolViolation("invalid Display rectangle")
         }
         return PixelRect(x: left, y: top, width: width, height: height)
-    }
-
-    private func intersection(_ lhs: PixelRect, _ rhs: PixelRect) -> PixelRect? {
-        let left = max(lhs.x, rhs.x)
-        let top = max(lhs.y, rhs.y)
-        let right = min(lhs.x + lhs.width, rhs.x + rhs.width)
-        let bottom = min(lhs.y + lhs.height, rhs.y + rhs.height)
-        guard right > left, bottom > top else {
-            return nil
-        }
-        return PixelRect(x: left, y: top, width: right - left, height: bottom - top)
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {

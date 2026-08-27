@@ -1788,11 +1788,20 @@ struct DisplayChannelTests {
 
     @Test func closingDisplayClosesOwnedImageCachePendingResolve() async throws {
         let transport = GatedDisplayTransport(
-            inbound: [encodeMini(id: 304, body: drawCachedCopyBody(
-                imageType: 103,
-                descriptorID: 0xa100
-            ))],
-            gateAfterReads: 1
+            inbound: try [
+                encodeMini(SpiceMsgDisplaySurfaceCreate(
+                    surfaceID: 1,
+                    width: 2,
+                    height: 1,
+                    format: 32,
+                    flags: 1
+                )),
+                encodeMini(id: 304, body: drawCachedCopyBody(
+                    imageType: 103,
+                    descriptorID: 0xa100
+                )),
+            ],
+            gateAfterReads: 2
         )
         try await transport.connect()
         let channel = DisplayChannel(connection: ChannelConnection(
@@ -1800,9 +1809,10 @@ struct DisplayChannelTests {
             transport: transport,
             headerMode: .mini
         ))
+        _ = try await channel.processNext()
         let probe = DisplayProcessProbe()
         let processing = Task { await probe.process(on: channel) }
-        await transport.waitUntilReadCount(1)
+        await transport.waitUntilReadCount(2)
         await expectDisplayProcessWaiting(probe)
 
         await channel.close()
@@ -3453,6 +3463,48 @@ struct DisplayChannelTests {
         #expect(try outbound.map(miniMessageID) == [1, 2, 2, 2, 2])
     }
 
+    @Test func excessiveNormalizedClipRegionFailsBeforeSurfaceMutation() async throws {
+        let clips = segmentExplosionClipRectangles()
+        #expect(clips.count == 513)
+        let transport = FakeTransport(inbound: try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 513,
+                height: 512,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 302, body: drawFillBody(
+                box: (top: 0, left: 0, bottom: 512, right: 513),
+                clipRectangles: clips
+            )),
+        ].map(Result.success))
+        try await transport.connect()
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+
+        _ = try await channel.processNext()
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let pixelsBefore = try await store.snapshot(surfaceID: 1).pixels
+
+        await #expect(throws: ChannelError.protocolViolation(
+            "regionSegmentLimitExceeded(actual: 65789, maximum: 65536)"
+        )) {
+            try await channel.processNext()
+        }
+
+        #expect(try await store.descriptor(surfaceID: 1) == descriptorBefore)
+        #expect(try await store.snapshot(surfaceID: 1).pixels == pixelsBefore)
+        await channel.close()
+    }
+
     @Test func rejectsImagePointerIntoFixedMessageBody() throws {
         var body = drawCopyBody()
         body.replaceSubrange(21..<25, with: Data([1, 0, 0, 0]))
@@ -3521,6 +3573,12 @@ struct DisplayChannelTests {
     }
 
     private func drawFillBody(
+        box: (top: Int32, left: Int32, bottom: Int32, right: Int32) = (
+            top: 0,
+            left: 0,
+            bottom: 2,
+            right: 4
+        ),
         clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)] = [
             (top: 0, left: 0, bottom: 2, right: 2),
         ]
@@ -3529,7 +3587,7 @@ struct DisplayChannelTests {
         writeBase(
             to: &writer,
             surfaceID: 1,
-            box: (top: 0, left: 0, bottom: 2, right: 4),
+            box: box,
             clipRectangles: clipRectangles
         )
         writer.writeUInt8(1) // SPICE_BRUSH_TYPE_SOLID
@@ -3537,6 +3595,38 @@ struct DisplayChannelTests {
         writer.writeUInt16LE(0x08) // SPICE_ROPD_OP_PUT
         writeEmptyMask(to: &writer)
         return writer.data
+    }
+
+    private func segmentExplosionClipRectangles() -> [(
+        top: Int32,
+        left: Int32,
+        bottom: Int32,
+        right: Int32
+    )] {
+        var rectangles: [(
+            top: Int32,
+            left: Int32,
+            bottom: Int32,
+            right: Int32
+        )] = []
+        rectangles.reserveCapacity(513)
+        for index in 0..<257 {
+            rectangles.append((
+                top: Int32(0),
+                left: Int32(index * 2),
+                bottom: Int32(512),
+                right: Int32(index * 2 + 1)
+            ))
+        }
+        for index in 0..<256 {
+            rectangles.append((
+                top: Int32(index * 2 + 1),
+                left: Int32(0),
+                bottom: Int32(index * 2 + 2),
+                right: Int32(513)
+            ))
+        }
+        return rectangles
     }
 
     private func streamCreateBody(

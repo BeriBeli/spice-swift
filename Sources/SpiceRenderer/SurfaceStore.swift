@@ -361,6 +361,8 @@ package enum RenderError: Error, Sendable, Equatable {
     case invalidBitmap
     case backingMaterializationFailed
     case integerOverflow
+    case regionClipLimitExceeded(actual: Int, maximum: Int)
+    case regionSegmentLimitExceeded(actual: Int, maximum: Int)
 }
 
 package enum SurfaceVideoCompositionError: Error, Sendable, Equatable {
