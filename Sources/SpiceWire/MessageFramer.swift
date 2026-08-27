@@ -562,7 +562,7 @@ package struct MessageFramer: Sendable {
         }
 
         var coalesced = Data(count: count)
-        coalesced.withUnsafeMutableBytes { destination in
+        coalesced.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
             var destinationOffset = 0
             var segmentIndex = start.segmentIndex
             var segmentOffset = start.offset
