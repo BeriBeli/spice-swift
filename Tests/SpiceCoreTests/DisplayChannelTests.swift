@@ -3480,6 +3480,99 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
+    @Test(arguments: RegionWireCommand.allCases)
+    func multiSegmentWireCommandCommitsOneSurfaceTransaction(
+        command: RegionWireCommand
+    ) async throws {
+        let store = try await regionTransactionStore()
+        let encoded = regionWireCommand(command, empty: false, invalidLaterSource: false)
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: encoded.messageID, body: encoded.body)),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let metricsBefore = await surfaceMutationMetrics(store)
+
+        _ = try await channel.processNext()
+
+        let descriptorAfter = try await store.descriptor(surfaceID: 1)
+        let metricsAfter = await store.metrics()
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(descriptorAfter.mutationGeneration == descriptorBefore.mutationGeneration + 1)
+        #expect(metricsAfter.mutationTransactions == metricsBefore.mutationTransactions + 1)
+        await channel.close()
+    }
+
+    @Test(arguments: RegionWireCommand.allCases)
+    func emptyRegionWireCommandDoesNotMutateSurface(command: RegionWireCommand) async throws {
+        let store = try await regionTransactionStore()
+        let encoded = regionWireCommand(command, empty: true, invalidLaterSource: false)
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: encoded.messageID, body: encoded.body)),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+        let descriptorBefore = try await store.descriptor(surfaceID: 1)
+        let metricsBefore = await surfaceMutationMetrics(store)
+
+        #expect(try await channel.processNext() == .ignored(encoded.messageID))
+
+        #expect(try await store.descriptor(surfaceID: 1) == descriptorBefore)
+        #expect(await surfaceMutationMetrics(store) == metricsBefore)
+        await channel.close()
+    }
+
+    @Test(arguments: RegionWireCommand.sourceValidatedCases)
+    func invalidLaterSourceSegmentLeavesSurfaceAndMetricsUnchanged(
+        command: RegionWireCommand
+    ) async throws {
+        let store = try await regionTransactionStore()
+        let destinationBefore = try await store.descriptor(surfaceID: 1)
+        let destinationPixelsBefore = try await store.snapshot(surfaceID: 1).pixels
+        let sourceBefore = try await store.descriptor(surfaceID: 2)
+        let sourcePixelsBefore = try await store.snapshot(surfaceID: 2).pixels
+        let metricsBefore = await surfaceMutationMetrics(store)
+        let encoded = regionWireCommand(command, empty: false, invalidLaterSource: true)
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: encoded.messageID, body: encoded.body)),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            surfaces: store
+        )
+
+        await #expect(throws: ChannelError.protocolViolation("invalidRectangle")) {
+            try await channel.processNext()
+        }
+
+        #expect(try await store.descriptor(surfaceID: 1) == destinationBefore)
+        #expect(try await store.descriptor(surfaceID: 2) == sourceBefore)
+        #expect(await surfaceMutationMetrics(store) == metricsBefore)
+        #expect(try await store.snapshot(surfaceID: 1).pixels == destinationPixelsBefore)
+        #expect(try await store.snapshot(surfaceID: 2).pixels == sourcePixelsBefore)
+        await channel.close()
+    }
+
     @Test func fullyClippedCommandsDoNotPublishButStillCacheAndAcknowledge() async throws {
         let imageID: UInt64 = 0x4455
         let transport = FakeTransport(inbound: try [
@@ -3789,13 +3882,15 @@ struct DisplayChannelTests {
         }
     }
 
-    private func drawCopyBody() -> Data {
+    private func drawCopyBody(
+        clipRectangles: [(top: Int32, left: Int32, bottom: Int32, right: Int32)]? = nil
+    ) -> Data {
         var writer = ByteWriter()
         writeBase(
             to: &writer,
             surfaceID: 1,
             box: (top: 0, left: 2, bottom: 2, right: 4),
-            clipRectangles: nil
+            clipRectangles: clipRectangles
         )
         let imageOffset = UInt32(writer.data.count + 36)
         writer.writeUInt32LE(imageOffset)
@@ -4109,6 +4204,90 @@ struct DisplayChannelTests {
         Data(values.flatMap { [UInt8($0), 0, 0, 0xff] })
     }
 
+    private func surfaceMutationMetrics(_ store: SurfaceStore) async -> SurfaceMutationMetrics {
+        let metrics = await store.metrics()
+        return SurfaceMutationMetrics(
+            mutationTransactions: metrics.mutationTransactions,
+            damageOperations: metrics.damageOperations,
+            damageBytes: metrics.damageBytes,
+            fullFrameCopyBytes: metrics.fullFrameCopyBytes,
+            partialFrameCopyBytes: metrics.partialFrameCopyBytes,
+            directIOSurfaceWriteBytes: metrics.directIOSurfaceWriteBytes,
+            cpuMaterializations: metrics.cpuMaterializations,
+            cpuMaterializationBytes: metrics.cpuMaterializationBytes,
+            poolExhaustions: metrics.poolExhaustions,
+            gpuCopyBytes: metrics.gpuCopyBytes,
+            gpuErrors: metrics.gpuErrors,
+            compositorErrors: metrics.compositorErrors,
+            nativeVideoFrames: metrics.nativeVideoFrames,
+            nativeVideoFallbacks: metrics.nativeVideoFallbacks
+        )
+    }
+
+    private func regionTransactionStore() async throws -> SurfaceStore {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        try await store.create(id: 1, width: 5, height: 5, format: 32)
+        try await store.drawCopy(
+            surfaceID: 1,
+            destination: PixelRect(x: 0, y: 0, width: 5, height: 5),
+            bitmap: linearBitmap(width: 5, height: 5)
+        )
+        try await store.create(id: 2, width: 5, height: 5, format: 32)
+        try await store.drawCopy(
+            surfaceID: 2,
+            destination: PixelRect(x: 0, y: 0, width: 5, height: 5),
+            bitmap: linearBitmap(width: 5, height: 5)
+        )
+        return store
+    }
+
+    private func regionWireCommand(
+        _ command: RegionWireCommand,
+        empty: Bool,
+        invalidLaterSource: Bool
+    ) -> (messageID: UInt16, body: Data) {
+        switch command {
+        case .drawFill:
+            return (302, drawFillBody(
+                box: (top: 0, left: 0, bottom: 5, right: 5),
+                clipRectangles: empty ? [] : [
+                    (top: 0, left: 0, bottom: 1, right: 1),
+                    (top: 4, left: 4, bottom: 5, right: 5),
+                ]
+            ))
+        case .copyBits:
+            return (104, copyBitsBody(
+                box: invalidLaterSource
+                    ? (top: 0, left: 0, bottom: 1, right: 5)
+                    : (top: 0, left: 2, bottom: 1, right: 5),
+                sourcePosition: invalidLaterSource ? (x: 1, y: 0) : (x: 0, y: 0),
+                clipRectangles: empty ? [] : [
+                    (top: 0, left: invalidLaterSource ? 0 : 2, bottom: 1, right: 1 + (invalidLaterSource ? 0 : 2)),
+                    (top: 0, left: 4, bottom: 1, right: 5),
+                ]
+            ))
+        case .bitmapDrawCopy:
+            return (304, drawCopyBody(clipRectangles: empty ? [] : [
+                (top: 0, left: 2, bottom: 1, right: 3),
+                (top: 1, left: 3, bottom: 2, right: 4),
+            ]))
+        case .sameSurfaceDrawCopy, .crossSurfaceDrawCopy:
+            return (304, drawSurfaceCopyBody(
+                box: invalidLaterSource
+                    ? (top: 0, left: 0, bottom: 1, right: 5)
+                    : (top: 0, left: 2, bottom: 1, right: 5),
+                sourceArea: invalidLaterSource
+                    ? (top: 0, left: 1, bottom: 1, right: 6)
+                    : (top: 0, left: 0, bottom: 1, right: 3),
+                sourceSurfaceID: command == .sameSurfaceDrawCopy ? 1 : 2,
+                clipRectangles: empty ? [] : [
+                    (top: 0, left: invalidLaterSource ? 0 : 2, bottom: 1, right: 1 + (invalidLaterSource ? 0 : 2)),
+                    (top: 0, left: 4, bottom: 1, right: 5),
+                ]
+            ))
+        }
+    }
+
     private func writeBase(
         to writer: inout ByteWriter,
         surfaceID: UInt32,
@@ -4293,6 +4472,37 @@ enum FullBatchWaiterRelease: CaseIterable, Sendable {
     case cancel
     case clear
     case close
+}
+
+enum RegionWireCommand: CaseIterable, Sendable {
+    case drawFill
+    case copyBits
+    case bitmapDrawCopy
+    case sameSurfaceDrawCopy
+    case crossSurfaceDrawCopy
+
+    static let sourceValidatedCases: [Self] = [
+        .copyBits,
+        .sameSurfaceDrawCopy,
+        .crossSurfaceDrawCopy,
+    ]
+}
+
+private struct SurfaceMutationMetrics: Equatable {
+    let mutationTransactions: UInt64
+    let damageOperations: UInt64
+    let damageBytes: UInt64
+    let fullFrameCopyBytes: UInt64
+    let partialFrameCopyBytes: UInt64
+    let directIOSurfaceWriteBytes: UInt64
+    let cpuMaterializations: UInt64
+    let cpuMaterializationBytes: UInt64
+    let poolExhaustions: UInt64
+    let gpuCopyBytes: UInt64
+    let gpuErrors: UInt64
+    let compositorErrors: UInt64
+    let nativeVideoFrames: UInt64
+    let nativeVideoFallbacks: UInt64
 }
 
 private func expectDisplayCacheDiagnostics(

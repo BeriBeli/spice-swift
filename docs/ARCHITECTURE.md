@@ -161,6 +161,14 @@ inline O(1)-space path. Wire clips are capped at 4,096 and canonical output at
 65,536 segments, with checked half-open coordinates and failure before the
 first Surface mutation.
 
+Each non-empty wire fill or copy submits that complete region as one
+`SurfaceStore` transaction. The actor acquires the required Surface operation
+locks once, validates every translated source and destination, prepares backing
+once, and then publishes one revision and mutation generation. Empty regions
+and failed validation publish no pixels or damage and advance no Surface
+transaction metrics. Cache entry publication remains ordered after successful
+Surface commit. Cross-Surface locks are acquired in Surface-ID order.
+
 The image cache and GLZ dictionary have explicit entry and byte limits. Shared
 Display state uses actors and serial barriers so cross-channel invalidation and
 GLZ dependencies follow protocol order.

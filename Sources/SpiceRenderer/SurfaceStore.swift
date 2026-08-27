@@ -118,6 +118,7 @@ package struct SurfaceDescriptor: Sendable, Equatable {
 }
 
 package struct SurfaceStoreMetrics: Sendable, Equatable {
+    package let mutationTransactions: UInt64
     package let damageOperations: UInt64
     package let damageBytes: UInt64
     package let snapshots: UInt64
@@ -436,6 +437,7 @@ package actor SurfaceStore {
         storage: FramePixelStorage
     )] = [:]
     private var lifecycleGenerations: [UInt32: UInt64] = [:]
+    private var mutationTransactions: UInt64 = 0
     private var damageOperations: UInt64 = 0
     private var damageBytes: UInt64 = 0
     private var snapshots: UInt64 = 0
@@ -881,6 +883,303 @@ package actor SurfaceStore {
         surfaces[surfaceID] = destinationSurface
         recordDamage(destination)
         return surfaceRevision(of: destinationSurface)
+    }
+
+    /// Applies one wire DRAW_FILL as one Surface transaction regardless of the
+    /// canonical region's segment count.
+    @discardableResult
+    package func fill(
+        surfaceID: UInt32,
+        region: PixelRegion,
+        colorARGB: UInt32
+    ) async throws(RenderError) -> SurfaceRevision? {
+        guard !region.isEmpty else { return nil }
+        try await acquireSurfaceOperation(surfaceID: surfaceID)
+        defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+
+        var surface = try surface(id: surfaceID)
+        for rectangle in region {
+            try validate(rectangle, in: surface)
+        }
+        let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
+        let blue = UInt8(truncatingIfNeeded: colorARGB)
+        let green = UInt8(truncatingIfNeeded: colorARGB >> 8)
+        let red = UInt8(truncatingIfNeeded: colorARGB >> 16)
+        let alpha = surface.format == .argb8888
+            ? UInt8(truncatingIfNeeded: colorARGB >> 24)
+            : 255
+        let colorBGRA = UInt32(blue)
+            | UInt32(green) << 8
+            | UInt32(red) << 16
+            | UInt32(alpha) << 24
+
+        try prepareForMutation(&surface)
+        let destinationBytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            for rectangle in region {
+                for y in rectangle.y..<(rectangle.y + rectangle.height) {
+                    var pixel = baseAddress.advanced(
+                        by: y * destinationBytesPerRow + rectangle.x * 4
+                    )
+                    for _ in 0..<rectangle.width {
+                        pixel.storeBytes(of: colorBGRA, as: UInt32.self)
+                        pixel = pixel.advanced(by: 4)
+                    }
+                }
+            }
+        }
+        return commitRegionMutation(
+            &surface,
+            region: region,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration
+        )
+    }
+
+    /// Applies one wire COPY_BITS as one Surface transaction. Segment order is
+    /// chosen from the command-wide translation so overlapping same-Surface
+    /// sources remain bit exact.
+    @discardableResult
+    package func copyBits(
+        surfaceID: UInt32,
+        region: PixelRegion,
+        destination: PixelRect,
+        sourceX: Int,
+        sourceY: Int
+    ) async throws(RenderError) -> SurfaceRevision? {
+        guard !region.isEmpty else { return nil }
+        try await acquireSurfaceOperation(surfaceID: surfaceID)
+        defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+
+        var surface = try surface(id: surfaceID)
+        let source = PixelRect(
+            x: sourceX,
+            y: sourceY,
+            width: destination.width,
+            height: destination.height
+        )
+        for rectangle in region {
+            try validate(rectangle, in: surface)
+            let sourceRectangle = try translatedSource(
+                for: rectangle,
+                destination: destination,
+                source: source
+            )
+            try validate(sourceRectangle, in: surface)
+        }
+        let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
+
+        try prepareForMutation(&surface)
+        for rectangle in region.copyTraversal(source: source, destination: destination) {
+            let sourceRectangle = translatedSourceAfterValidation(
+                for: rectangle,
+                destination: destination,
+                source: source
+            )
+            copyBits(
+                in: &surface,
+                destination: rectangle,
+                source: sourceRectangle
+            )
+        }
+        return commitRegionMutation(
+            &surface,
+            region: region,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration
+        )
+    }
+
+    /// Applies one bitmap DRAW_COPY as one Surface transaction.
+    @discardableResult
+    package func drawCopy(
+        surfaceID: UInt32,
+        region: PixelRegion,
+        destination: PixelRect,
+        bitmap: RawBitmap,
+        source: PixelRect
+    ) async throws(RenderError) -> SurfaceRevision? {
+        guard !region.isEmpty else { return nil }
+        try await acquireSurfaceOperation(surfaceID: surfaceID)
+        defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+
+        var surface = try surface(id: surfaceID)
+        try validate(bitmap)
+        for rectangle in region {
+            try validate(rectangle, in: surface)
+            let sourceRectangle = try translatedSource(
+                for: rectangle,
+                destination: destination,
+                source: source
+            )
+            try validate(sourceRectangle, in: bitmap)
+        }
+        let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
+        let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
+        let fullSurface = PixelRect(
+            x: 0,
+            y: 0,
+            width: surface.width,
+            height: surface.height
+        )
+        if region.singleRectangle == fullSurface {
+            let fullSource = translatedSourceAfterValidation(
+                for: fullSurface,
+                destination: destination,
+                source: source
+            )
+            if var unified = surface.storage.unifiedBacking,
+               let writable = unified.pool.checkoutWritable(
+                   namespace: unified.namespace,
+                   surfaceID: surfaceID,
+                   width: surface.width,
+                   height: surface.height,
+                   source: unified.current,
+                   allowsInPlaceSource: true
+               ),
+               writable.withLockedMutableBytes({ destinationBase, bytesPerRow in
+                   copyRawBitmap(
+                       bitmap,
+                       source: fullSource,
+                       to: destinationBase,
+                       destinationBytesPerRow: bytesPerRow,
+                       preservesAlpha: preservesAlpha
+                   )
+               }) != nil,
+               let committed = writable.finish(revision: nextRevision)
+            {
+                surface.revision = nextRevision
+                surface.mutationGeneration = nextMutationGeneration
+                unified.current = committed
+                unified.damageJournal.clear()
+                unified.damageHistory.reset(at: nextRevision)
+                surface.storage.unifiedBacking = unified
+                surface.storage.recordPublicationDamage(fullSurface)
+                currentFramePixelStorage[surfaceID] = nil
+                surfaces[surfaceID] = surface
+                directIOSurfaceWriteBytes &+= UInt64(surface.width * surface.height * 4)
+                recordDamage(fullSurface)
+                recordMutationTransaction()
+                return surfaceRevision(of: surface)
+            }
+        }
+
+        try prepareForMutation(&surface)
+        let destinationBytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { destinationBytes in
+            guard let destinationBase = destinationBytes.baseAddress else { return }
+            for rectangle in region {
+                let sourceRectangle = translatedSourceAfterValidation(
+                    for: rectangle,
+                    destination: destination,
+                    source: source
+                )
+                copyRawBitmap(
+                    bitmap,
+                    source: sourceRectangle,
+                    to: destinationBase.advanced(
+                        by: rectangle.y * destinationBytesPerRow + rectangle.x * 4
+                    ),
+                    destinationBytesPerRow: destinationBytesPerRow,
+                    preservesAlpha: preservesAlpha
+                )
+            }
+        }
+        return commitRegionMutation(
+            &surface,
+            region: region,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration
+        )
+    }
+
+    /// Applies one Surface-image DRAW_COPY as one transaction. Cross-Surface
+    /// operations acquire both Surface locks in ID order before validation.
+    @discardableResult
+    package func drawCopy(
+        surfaceID: UInt32,
+        region: PixelRegion,
+        destination: PixelRect,
+        sourceSurfaceID: UInt32,
+        source: PixelRect
+    ) async throws(RenderError) -> SurfaceRevision? {
+        guard !region.isEmpty else { return nil }
+        if sourceSurfaceID == surfaceID {
+            guard destination.width == source.width,
+                  destination.height == source.height
+            else {
+                throw .invalidRectangle
+            }
+            return try await copyBits(
+                surfaceID: surfaceID,
+                region: region,
+                destination: destination,
+                sourceX: source.x,
+                sourceY: source.y
+            )
+        }
+
+        let operationSurfaceIDs = [surfaceID, sourceSurfaceID].sorted()
+        var acquiredSurfaceIDs: [UInt32] = []
+        do {
+            for operationSurfaceID in operationSurfaceIDs {
+                try await acquireSurfaceOperation(surfaceID: operationSurfaceID)
+                acquiredSurfaceIDs.append(operationSurfaceID)
+            }
+        } catch {
+            for operationSurfaceID in acquiredSurfaceIDs.reversed() {
+                releaseSurfaceOperation(surfaceID: operationSurfaceID)
+            }
+            throw error
+        }
+        defer {
+            for operationSurfaceID in acquiredSurfaceIDs.reversed() {
+                releaseSurfaceOperation(surfaceID: operationSurfaceID)
+            }
+        }
+
+        var destinationSurface = try surface(id: surfaceID)
+        var sourceSurface = try surface(id: sourceSurfaceID)
+        for rectangle in region {
+            try validate(rectangle, in: destinationSurface)
+            let sourceRectangle = try translatedSource(
+                for: rectangle,
+                destination: destination,
+                source: source
+            )
+            try validate(sourceRectangle, in: sourceSurface)
+        }
+        let nextRevision = try advancedRevision(destinationSurface.revision)
+        let nextMutationGeneration = try advancedRevision(
+            destinationSurface.mutationGeneration
+        )
+        try prepareForCrossSurfaceCopy(
+            destination: &destinationSurface,
+            source: &sourceSurface
+        )
+        for rectangle in region {
+            let sourceRectangle = translatedSourceAfterValidation(
+                for: rectangle,
+                destination: destination,
+                source: source
+            )
+            copyBits(
+                from: sourceSurface,
+                to: &destinationSurface,
+                destination: rectangle,
+                source: sourceRectangle
+            )
+        }
+        return commitRegionMutation(
+            &destinationSurface,
+            region: region,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration
+        )
     }
 
     @discardableResult
@@ -1345,6 +1644,7 @@ package actor SurfaceStore {
         let poolMetrics = framePool.metrics()
         let revisionedMetrics = revisionedFramePool?.metrics()
         return SurfaceStoreMetrics(
+            mutationTransactions: mutationTransactions,
             damageOperations: damageOperations,
             damageBytes: damageBytes,
             snapshots: snapshots,
@@ -1782,6 +2082,169 @@ package actor SurfaceStore {
                     )
                 }
             }
+        }
+    }
+
+    private func copyBits(
+        in surface: inout Surface,
+        destination: PixelRect,
+        source: PixelRect
+    ) {
+        let rowBytes = destination.width * 4
+        var copied = Data(capacity: rowBytes * destination.height)
+        for row in 0..<source.height {
+            let start = (source.y + row) * surface.bytesPerRow + source.x * 4
+            copied.append(surface.pixels[start..<(start + rowBytes)])
+        }
+        for row in 0..<destination.height {
+            let sourceStart = row * rowBytes
+            let destinationStart = (destination.y + row) * surface.bytesPerRow
+                + destination.x * 4
+            surface.pixels.replaceSubrange(
+                destinationStart..<(destinationStart + rowBytes),
+                with: copied[sourceStart..<(sourceStart + rowBytes)]
+            )
+        }
+    }
+
+    private func copyBits(
+        from sourceSurface: Surface,
+        to destinationSurface: inout Surface,
+        destination: PixelRect,
+        source: PixelRect
+    ) {
+        let rowBytes = destination.width * 4
+        var copied = Data(capacity: rowBytes * destination.height)
+        for row in 0..<source.height {
+            let start = (source.y + row) * sourceSurface.bytesPerRow + source.x * 4
+            copied.append(sourceSurface.pixels[start..<(start + rowBytes)])
+        }
+        for row in 0..<destination.height {
+            let sourceStart = row * rowBytes
+            let destinationStart = (destination.y + row) * destinationSurface.bytesPerRow
+                + destination.x * 4
+            destinationSurface.pixels.replaceSubrange(
+                destinationStart..<(destinationStart + rowBytes),
+                with: copied[sourceStart..<(sourceStart + rowBytes)]
+            )
+        }
+    }
+
+    private func translatedSource(
+        for rectangle: PixelRect,
+        destination: PixelRect,
+        source: PixelRect
+    ) throws(RenderError) -> PixelRect {
+        guard destination.width == source.width,
+              destination.height == source.height,
+              destination.width > 0,
+              destination.height > 0
+        else {
+            throw .invalidRectangle
+        }
+        let (offsetX, offsetXOverflow) = rectangle.x.subtractingReportingOverflow(
+            destination.x
+        )
+        let (offsetY, offsetYOverflow) = rectangle.y.subtractingReportingOverflow(
+            destination.y
+        )
+        let (offsetRight, offsetRightOverflow) = offsetX.addingReportingOverflow(
+            rectangle.width
+        )
+        let (offsetBottom, offsetBottomOverflow) = offsetY.addingReportingOverflow(
+            rectangle.height
+        )
+        guard !offsetXOverflow, !offsetYOverflow,
+              !offsetRightOverflow, !offsetBottomOverflow,
+              offsetX >= 0, offsetY >= 0,
+              offsetRight <= destination.width,
+              offsetBottom <= destination.height
+        else {
+            throw .invalidRectangle
+        }
+        let (translatedX, translatedXOverflow) = source.x.addingReportingOverflow(offsetX)
+        let (translatedY, translatedYOverflow) = source.y.addingReportingOverflow(offsetY)
+        guard !translatedXOverflow, !translatedYOverflow else {
+            throw .integerOverflow
+        }
+        return PixelRect(
+            x: translatedX,
+            y: translatedY,
+            width: rectangle.width,
+            height: rectangle.height
+        )
+    }
+
+    /// Used only after `translatedSource` has validated every region segment.
+    private func translatedSourceAfterValidation(
+        for rectangle: PixelRect,
+        destination: PixelRect,
+        source: PixelRect
+    ) -> PixelRect {
+        let offsetX = rectangle.x - destination.x
+        let offsetY = rectangle.y - destination.y
+        return PixelRect(
+            x: source.x + offsetX,
+            y: source.y + offsetY,
+            width: rectangle.width,
+            height: rectangle.height
+        )
+    }
+
+    private func validate(_ bitmap: RawBitmap) throws(RenderError) {
+        guard bitmap.width > 0, bitmap.height > 0 else {
+            throw .invalidBitmap
+        }
+        let (minimumStride, strideOverflow) = bitmap.width.multipliedReportingOverflow(by: 4)
+        guard !strideOverflow, bitmap.stride >= minimumStride else {
+            throw .invalidBitmap
+        }
+        let (requiredBytes, sizeOverflow) = bitmap.stride.multipliedReportingOverflow(
+            by: bitmap.height
+        )
+        guard !sizeOverflow, requiredBytes == bitmap.pixels.count else {
+            throw .invalidBitmap
+        }
+    }
+
+    private func validate(_ rectangle: PixelRect, in bitmap: RawBitmap) throws(RenderError) {
+        guard rectangle.x >= 0, rectangle.y >= 0,
+              rectangle.width > 0, rectangle.height > 0
+        else {
+            throw .invalidBitmap
+        }
+        let (right, rightOverflow) = rectangle.x.addingReportingOverflow(rectangle.width)
+        let (bottom, bottomOverflow) = rectangle.y.addingReportingOverflow(rectangle.height)
+        guard !rightOverflow, !bottomOverflow,
+              right <= bitmap.width, bottom <= bitmap.height
+        else {
+            throw .invalidBitmap
+        }
+    }
+
+    private func commitRegionMutation(
+        _ surface: inout Surface,
+        region: PixelRegion,
+        revision: UInt64,
+        mutationGeneration: UInt64
+    ) -> SurfaceRevision {
+        surface.revision = revision
+        surface.mutationGeneration = mutationGeneration
+        for rectangle in region {
+            surface.storage.recordDamage(rectangle, revision: revision)
+        }
+        currentFramePixelStorage[surface.id] = nil
+        surfaces[surface.id] = surface
+        for rectangle in region {
+            recordDamage(rectangle)
+        }
+        recordMutationTransaction()
+        return surfaceRevision(of: surface)
+    }
+
+    private func recordMutationTransaction() {
+        if mutationTransactions < UInt64.max {
+            mutationTransactions += 1
         }
     }
 
