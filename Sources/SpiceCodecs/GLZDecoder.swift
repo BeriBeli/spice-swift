@@ -38,6 +38,89 @@ package struct SpiceGLZDecoderDiagnostics: Sendable, Equatable {
     package let pendingDictionaryWaitBytes: Int
 }
 
+package struct SpiceGLZColorOverlapCopyChunk: Sendable, Equatable {
+    package let sourcePixelOffset: Int
+    package let destinationPixelOffset: Int
+    package let pixelCount: Int
+}
+
+/// Enumerates a forward-overlapping color reference without allocating a copy plan.
+///
+/// Both offsets are relative to the original source and destination pointers. After
+/// the initial reference-distance prefix has been copied, source offsets address
+/// that initialized destination prefix through its equivalent offset from the
+/// original source. Each yielded span is therefore safe to copy independently.
+package struct SpiceGLZColorOverlapCopyPlan: Sequence, Sendable {
+    package struct Iterator: IteratorProtocol, Sendable {
+        private static let maximumChunkPixels = 65_536
+
+        private let distance: Int
+        private let count: Int
+        private var copiedPixels = 0
+        private var spanPixels = 0
+        private var spanOffset = 0
+
+        fileprivate init(distance: Int, count: Int) {
+            self.distance = distance
+            self.count = count
+        }
+
+        package mutating func next() -> SpiceGLZColorOverlapCopyChunk? {
+            guard copiedPixels < count else { return nil }
+
+            let initialPixels = Swift.min(distance, count)
+            if copiedPixels < initialPixels {
+                let chunkPixels = Swift.min(
+                    Self.maximumChunkPixels,
+                    initialPixels - copiedPixels
+                )
+                let chunk = SpiceGLZColorOverlapCopyChunk(
+                    sourcePixelOffset: copiedPixels,
+                    destinationPixelOffset: copiedPixels,
+                    pixelCount: chunkPixels
+                )
+                copiedPixels += chunkPixels
+                return chunk
+            }
+
+            if spanPixels == 0 {
+                spanPixels = Swift.min(copiedPixels, count - copiedPixels)
+                spanOffset = 0
+            }
+            let chunkPixels = Swift.min(
+                Self.maximumChunkPixels,
+                spanPixels - spanOffset
+            )
+            let chunk = SpiceGLZColorOverlapCopyChunk(
+                sourcePixelOffset: distance + spanOffset,
+                destinationPixelOffset: copiedPixels + spanOffset,
+                pixelCount: chunkPixels
+            )
+            spanOffset += chunkPixels
+            if spanOffset == spanPixels {
+                copiedPixels += spanPixels
+                spanPixels = 0
+                spanOffset = 0
+            }
+            return chunk
+        }
+    }
+
+    private let distance: Int
+    private let count: Int
+
+    package init(distance: Int, count: Int) {
+        precondition(distance > 0, "GLZ reference distance must be positive")
+        precondition(count >= 0, "GLZ reference count must not be negative")
+        self.distance = distance
+        self.count = count
+    }
+
+    package func makeIterator() -> Iterator {
+        Iterator(distance: distance, count: count)
+    }
+}
+
 package actor SpiceGLZDecoder: SpiceImageDecoder {
     private struct DictionaryImage: Sendable {
         let pixels: Data
@@ -776,39 +859,19 @@ private extension SpiceGLZDecoder {
                 let source = base.advanced(by: sourcePixel * 4)
                 let destination = base.advanced(by: destinationPixel * 4)
                 let distance = destinationPixel - sourcePixel
-                var copiedPixels = 0
-                while copiedPixels < min(distance, count) {
+                for chunk in SpiceGLZColorOverlapCopyPlan(
+                    distance: distance,
+                    count: count
+                ) {
                     if Task.isCancelled {
                         cancelled = true
                         return
                     }
-                    let chunkPixels = min(
-                        65_536,
-                        min(distance, count) - copiedPixels
-                    )
                     memmove(
-                        destination.advanced(by: copiedPixels * 4),
-                        source.advanced(by: copiedPixels * 4),
-                        chunkPixels * 4
+                        destination.advanced(by: chunk.destinationPixelOffset * 4),
+                        source.advanced(by: chunk.sourcePixelOffset * 4),
+                        chunk.pixelCount * 4
                     )
-                    copiedPixels += chunkPixels
-                }
-                while copiedPixels < count {
-                    if Task.isCancelled {
-                        cancelled = true
-                        return
-                    }
-                    let patternOffset = copiedPixels % distance
-                    let chunkPixels = min(
-                        65_536,
-                        min(distance - patternOffset, count - copiedPixels)
-                    )
-                    memmove(
-                        destination.advanced(by: copiedPixels * 4),
-                        destination.advanced(by: patternOffset * 4),
-                        chunkPixels * 4
-                    )
-                    copiedPixels += chunkPixels
                 }
                 return
             }
