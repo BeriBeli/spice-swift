@@ -20,6 +20,40 @@ SWIFT_VERSION=$("$SWIFT_PATH" --version) || {
     echo "spice-bench: unable to capture Swift toolchain version" >&2
     exit 1
 }
+SWIFT_TARGET_INFO=$("$SWIFT_PATH" -print-target-info) || {
+    echo "spice-bench: unable to capture Swift target information" >&2
+    exit 1
+}
+
+if [ -n "${DEVELOPER_DIR:-}" ]; then
+    BUILD_DEVELOPER_DIRECTORY=$DEVELOPER_DIR
+else
+    BUILD_DEVELOPER_DIRECTORY=$(/usr/bin/xcode-select -p) || {
+        echo "spice-bench: unable to resolve the active developer directory" >&2
+        exit 1
+    }
+fi
+case "$BUILD_DEVELOPER_DIRECTORY" in
+    /*) ;;
+    *)
+        echo "spice-bench: developer directory is not absolute" >&2
+        exit 1
+        ;;
+esac
+BUILD_DEVELOPER_DIRECTORY=$(CDPATH= cd -- "$BUILD_DEVELOPER_DIRECTORY" && pwd -P) || {
+    echo "spice-bench: unable to canonicalize the developer directory" >&2
+    exit 1
+}
+BUILD_TOOLCHAINS=${TOOLCHAINS:-}
+BUILD_SDKROOT=${SDKROOT:-}
+BUILD_SDK_PATH=$(/usr/bin/xcrun --sdk macosx --show-sdk-path) || {
+    echo "spice-bench: unable to resolve the macOS SDK path" >&2
+    exit 1
+}
+BUILD_SDK_VERSION=$(/usr/bin/xcrun --sdk macosx --show-sdk-version) || {
+    echo "spice-bench: unable to resolve the macOS SDK version" >&2
+    exit 1
+}
 
 cd "$PACKAGE_ROOT"
 BUILD_REVISION=$(/usr/bin/git rev-parse --verify HEAD) || {
@@ -46,7 +80,31 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-REVISION_DEFINE="-DSPICE_BENCH_BUILD_REVISION=\\\"$BUILD_REVISION\\\""
+BUILD_INFO_FILE="$SCRATCH_PATH/spice-bench-build-info"
+{
+    printf '%s\0' "$SWIFT_PATH"
+    printf '%s\0' "$SWIFT_VERSION"
+    printf '%s\0' "$SWIFT_TARGET_INFO"
+    printf '%s\0' "$BUILD_DEVELOPER_DIRECTORY"
+    printf '%s\0' "$BUILD_TOOLCHAINS"
+    printf '%s\0' "$BUILD_SDKROOT"
+    printf '%s\0' "$BUILD_SDK_PATH"
+    printf '%s\0' "$BUILD_SDK_VERSION"
+    printf '%s\0' 'release'
+} > "$BUILD_INFO_FILE"
+BUILD_INFO_HEX=$(/usr/bin/od -An -tx1 -v "$BUILD_INFO_FILE" | /usr/bin/tr -d ' \n') || {
+    echo "spice-bench: unable to encode build metadata" >&2
+    exit 1
+}
+if [ -z "$BUILD_INFO_HEX" ]; then
+    echo "spice-bench: encoded build metadata is empty" >&2
+    exit 1
+fi
+
+# The quotes are bytes in the compiler argument; the shell escape is only
+# syntax and does not pass a backslash to SwiftPM or Clang.
+REVISION_DEFINE="-DSPICE_BENCH_BUILD_REVISION=\"$BUILD_REVISION\""
+BUILD_INFO_DEFINE="-DSPICE_BENCH_BUILD_METADATA_HEX=\"$BUILD_INFO_HEX\""
 BINARY_DIRECTORY=$("$SWIFT_PATH" build \
     -c release \
     --disable-sandbox \
@@ -60,7 +118,8 @@ BINARY_DIRECTORY=$("$SWIFT_PATH" build \
     --disable-sandbox \
     --product spice-bench \
     --scratch-path "$SCRATCH_PATH" \
-    -Xcc "$REVISION_DEFINE" >&2
+    -Xcc "$REVISION_DEFINE" \
+    -Xcc "$BUILD_INFO_DEFINE" >&2
 
 FINAL_REVISION=$(/usr/bin/git rev-parse --verify HEAD) || {
     echo "spice-bench: unable to re-resolve repository HEAD after build" >&2
@@ -75,6 +134,4 @@ if [ "$FINAL_REVISION" != "$BUILD_REVISION" ] || [ -n "$FINAL_STATUS" ]; then
     exit 1
 fi
 
-export SPICE_BENCH_SWIFT_EXECUTABLE="$SWIFT_PATH"
-export SPICE_BENCH_SWIFT_VERSION="$SWIFT_VERSION"
 "$BINARY_DIRECTORY/spice-bench" "$@"

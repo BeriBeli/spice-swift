@@ -16,6 +16,7 @@ package struct SpiceBenchMetadata: Codable, Sendable, Equatable {
     package let date: String
     package let source: String
     package let mode: String
+    package let buildMetadata: SpiceBenchBuildMetadata
 
     package init(
         commit: String,
@@ -25,7 +26,8 @@ package struct SpiceBenchMetadata: Codable, Sendable, Equatable {
         workload: String,
         date: String,
         source: String,
-        mode: String
+        mode: String,
+        buildMetadata: SpiceBenchBuildMetadata
     ) {
         self.commit = commit
         self.toolchain = toolchain
@@ -35,11 +37,59 @@ package struct SpiceBenchMetadata: Codable, Sendable, Equatable {
         self.date = date
         self.source = source
         self.mode = mode
+        self.buildMetadata = buildMetadata
     }
 
     enum CodingKeys: String, CodingKey {
         case commit, toolchain, hardware, workload, date, source, mode
         case thermalState = "thermal_state"
+        case buildMetadata = "build_metadata"
+    }
+}
+
+package struct SpiceBenchBuildMetadata: Codable, Sendable, Equatable {
+    package let swiftExecutable: String
+    package let swiftVersion: String
+    package let swiftTargetInfo: String
+    package let developerDirectory: String
+    package let toolchains: String?
+    package let sdkRoot: String?
+    package let sdkPath: String
+    package let sdkVersion: String
+    package let configuration: String
+
+    package init(
+        swiftExecutable: String,
+        swiftVersion: String,
+        swiftTargetInfo: String,
+        developerDirectory: String,
+        toolchains: String?,
+        sdkRoot: String?,
+        sdkPath: String,
+        sdkVersion: String,
+        configuration: String
+    ) {
+        self.swiftExecutable = swiftExecutable
+        self.swiftVersion = swiftVersion
+        self.swiftTargetInfo = swiftTargetInfo
+        self.developerDirectory = developerDirectory
+        self.toolchains = toolchains
+        self.sdkRoot = sdkRoot
+        self.sdkPath = sdkPath
+        self.sdkVersion = sdkVersion
+        self.configuration = configuration
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case swiftExecutable = "swift_executable"
+        case swiftVersion = "swift_version"
+        case swiftTargetInfo = "swift_target_info"
+        case developerDirectory = "developer_directory"
+        case toolchains
+        case sdkRoot = "sdk_root"
+        case sdkPath = "sdk_path"
+        case sdkVersion = "sdk_version"
+        case configuration
     }
 }
 
@@ -110,7 +160,7 @@ package struct SpiceBenchCaseResult: Codable, Sendable, Equatable {
 }
 
 package struct SpiceBenchReport: Codable, Sendable, Equatable {
-    package static let currentSchemaVersion = 2
+    package static let currentSchemaVersion = 3
 
     package let schemaVersion: Int
     package let artifactKind: SpiceBenchArtifactKind
@@ -190,8 +240,8 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
     case repositoryStateUnavailable
     case missingBuildRevision
     case buildRevisionMismatch(expected: String, actual: String)
-    case missingToolchainEvidence(String)
-    case toolchainEvidenceMismatch
+    case missingBuildMetadata
+    case malformedBuildMetadata
 
     package var description: String {
         switch self {
@@ -231,10 +281,10 @@ package enum SpiceBenchError: Error, Sendable, Equatable, CustomStringConvertibl
             "benchmark executable does not contain a build revision"
         case let .buildRevisionMismatch(expected, actual):
             "benchmark executable revision \(expected) does not match repository HEAD \(actual)"
-        case let .missingToolchainEvidence(key):
-            "benchmark toolchain evidence \(key) is missing"
-        case .toolchainEvidenceMismatch:
-            "benchmark build toolchain evidence does not match the Swift executable"
+        case .missingBuildMetadata:
+            "benchmark executable does not contain build metadata"
+        case .malformedBuildMetadata:
+            "benchmark executable contains malformed build metadata"
         }
     }
 }
@@ -295,6 +345,82 @@ package struct SpiceBenchExecutableRevision: Sendable, Equatable {
     }
 }
 
+package enum SpiceBenchExecutableBuildInfo {
+    package static func current() throws(SpiceBenchError) -> (
+        revision: SpiceBenchExecutableRevision,
+        metadata: SpiceBenchBuildMetadata
+    ) {
+        let revision = spice_bench_build_revision().map { String(cString: $0) }
+        let metadata = spice_bench_build_metadata_hex().map { String(cString: $0) }
+        return try decode(embeddedRevision: revision, metadataHex: metadata)
+    }
+
+    package static func decode(
+        embeddedRevision: String?,
+        metadataHex: String?
+    ) throws(SpiceBenchError) -> (
+        revision: SpiceBenchExecutableRevision,
+        metadata: SpiceBenchBuildMetadata
+    ) {
+        guard let encoded = metadataHex else { throw .missingBuildMetadata }
+        guard !encoded.isEmpty else { throw .missingBuildMetadata }
+        guard let bytes = decodeHex(encoded) else { throw .malformedBuildMetadata }
+
+        var fields: [String] = []
+        var start = bytes.startIndex
+        for index in bytes.indices where bytes[index] == 0 {
+            guard let field = String(bytes: bytes[start ..< index], encoding: .utf8) else {
+                throw .malformedBuildMetadata
+            }
+            fields.append(field)
+            start = bytes.index(after: index)
+        }
+        guard start == bytes.endIndex, fields.count == 9 else {
+            throw .malformedBuildMetadata
+        }
+        let requiredIndexes = [0, 1, 2, 3, 6, 7, 8]
+        guard requiredIndexes.allSatisfy({ !fields[$0].isEmpty }) else {
+            throw .malformedBuildMetadata
+        }
+        let metadata = SpiceBenchBuildMetadata(
+            swiftExecutable: fields[0],
+            swiftVersion: fields[1],
+            swiftTargetInfo: fields[2],
+            developerDirectory: fields[3],
+            toolchains: fields[4].isEmpty ? nil : fields[4],
+            sdkRoot: fields[5].isEmpty ? nil : fields[5],
+            sdkPath: fields[6],
+            sdkVersion: fields[7],
+            configuration: fields[8]
+        )
+        guard metadata.configuration == "release" else {
+            throw .malformedBuildMetadata
+        }
+        return (SpiceBenchExecutableRevision(embeddedRevision: embeddedRevision), metadata)
+    }
+
+    private static func decodeHex(_ encoded: String) -> Data? {
+        guard encoded.utf8.count.isMultiple(of: 2) else { return nil }
+        var result = Data()
+        result.reserveCapacity(encoded.utf8.count / 2)
+        var iterator = encoded.utf8.makeIterator()
+        while let high = iterator.next(), let low = iterator.next() {
+            guard let highValue = hexValue(high), let lowValue = hexValue(low) else { return nil }
+            result.append((highValue << 4) | lowValue)
+        }
+        return result
+    }
+
+    private static func hexValue(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case 48 ... 57: byte - 48
+        case 65 ... 70: byte - 55
+        case 97 ... 102: byte - 87
+        default: nil
+        }
+    }
+}
+
 package struct SpiceBenchRepositoryPreflight: Sendable {
     package typealias StateProvider = @Sendable () throws -> SpiceBenchRepositoryState
 
@@ -347,49 +473,6 @@ package struct SpiceBenchRepositoryPreflight: Sendable {
             throw .dirtyWorktree
         }
         return SpiceBenchRepositoryState(commit: commit, porcelainStatus: "")
-    }
-}
-
-package struct SpiceBenchToolchainEvidence: Sendable, Equatable {
-    package static let executableEnvironmentKey = "SPICE_BENCH_SWIFT_EXECUTABLE"
-    package static let versionEnvironmentKey = "SPICE_BENCH_SWIFT_VERSION"
-
-    package let executablePath: String
-    package let capturedVersion: String
-
-    package init(executablePath: String, capturedVersion: String) {
-        self.executablePath = executablePath
-        self.capturedVersion = capturedVersion
-    }
-
-    package static func resolve(
-        environment: [String: String]
-    ) throws(SpiceBenchError) -> Self {
-        guard let executable = environment[executableEnvironmentKey], !executable.isEmpty else {
-            throw .missingToolchainEvidence(executableEnvironmentKey)
-        }
-        guard let version = environment[versionEnvironmentKey], !version.isEmpty else {
-            throw .missingToolchainEvidence(versionEnvironmentKey)
-        }
-        return SpiceBenchToolchainEvidence(
-            executablePath: executable,
-            capturedVersion: version
-        )
-    }
-
-    package func validatedVersion(
-        observedVersion: String
-    ) throws(SpiceBenchError) -> String {
-        let captured = capturedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
-        let observed = observedVersion.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (executablePath as NSString).isAbsolutePath,
-              !captured.isEmpty,
-              captured.lowercased() != "unknown",
-              observed == captured
-        else {
-            throw .toolchainEvidenceMismatch
-        }
-        return captured
     }
 }
 
@@ -507,6 +590,13 @@ package struct SpiceBenchRunner: Sendable {
             ("date", metadata.date),
             ("source", metadata.source),
             ("mode", metadata.mode),
+            ("buildMetadata.swiftExecutable", metadata.buildMetadata.swiftExecutable),
+            ("buildMetadata.swiftVersion", metadata.buildMetadata.swiftVersion),
+            ("buildMetadata.swiftTargetInfo", metadata.buildMetadata.swiftTargetInfo),
+            ("buildMetadata.developerDirectory", metadata.buildMetadata.developerDirectory),
+            ("buildMetadata.sdkPath", metadata.buildMetadata.sdkPath),
+            ("buildMetadata.sdkVersion", metadata.buildMetadata.sdkVersion),
+            ("buildMetadata.configuration", metadata.buildMetadata.configuration),
         ]
         for (field, value) in required {
             let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -516,6 +606,12 @@ package struct SpiceBenchRunner: Sendable {
         }
         guard metadata.mode.lowercased() == "release" else {
             throw SpiceBenchError.invalidMetadata(field: "mode")
+        }
+        guard metadata.buildMetadata.configuration == "release" else {
+            throw SpiceBenchError.invalidMetadata(field: "buildMetadata.configuration")
+        }
+        guard metadata.toolchain == metadata.buildMetadata.swiftVersion else {
+            throw SpiceBenchError.invalidMetadata(field: "toolchain")
         }
     }
 
