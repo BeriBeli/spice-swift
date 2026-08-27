@@ -374,7 +374,13 @@ package actor DisplayFramePublisher {
 
     private struct SnapshotRunResult: Sendable {
         let completedAllRequests: Bool
-        let admittedRequestCount: Int
+        let settledRequestCount: Int
+    }
+
+    private enum SnapshotProcessingOutcome: Sendable {
+        case settledContinue
+        case unsettledStop
+        case settledStop
     }
 
     private let interval: Duration
@@ -691,7 +697,7 @@ package actor DisplayFramePublisher {
             if generation == flushGeneration, !isCancelled {
                 restoreQueuedRequestsAfterAbortedFlush(
                     requests,
-                    admittedRequestCount: snapshotRun.admittedRequestCount
+                    settledRequestCount: snapshotRun.settledRequestCount
                 )
                 isFlushing = false
                 scheduleFlushIfNeeded()
@@ -713,7 +719,7 @@ package actor DisplayFramePublisher {
         guard !requests.isEmpty else {
             return SnapshotRunResult(
                 completedAllRequests: true,
-                admittedRequestCount: 0
+                settledRequestCount: 0
             )
         }
         let snapshot = self.snapshot
@@ -772,14 +778,14 @@ package actor DisplayFramePublisher {
                 // across the refill below.
                 preparation.frame = nil
                 while admissionOpen {
-                    let shouldContinue: Bool
+                    let outcome: SnapshotProcessingOutcome
                     do {
                         guard let ordered = buffered.removeValue(
                             forKey: nextEmissionIndex
                         ) else {
                             break
                         }
-                        shouldContinue = await processSnapshotPreparation(
+                        outcome = await processSnapshotPreparation(
                             consume ordered,
                             request: requests[nextEmissionIndex],
                             flushGeneration: flushGeneration
@@ -787,8 +793,24 @@ package actor DisplayFramePublisher {
                     }
                     // The ordered preparation's lexical scope has ended, so
                     // its lease is gone before a replacement child starts.
-                    nextEmissionIndex += 1
-                    if !shouldContinue {
+                    switch outcome {
+                    case .settledContinue:
+                        nextEmissionIndex += 1
+                    case .settledStop:
+                        nextEmissionIndex += 1
+                        admissionOpen = false
+                    case .unsettledStop:
+                        admissionOpen = false
+                    }
+                    if !admissionOpen {
+                        buffered.removeAll(keepingCapacity: false)
+                        group.cancelAll()
+                    }
+                    if admissionOpen,
+                       (generation != flushGeneration
+                           || isCancelled
+                           || Task.isCancelled)
+                    {
                         admissionOpen = false
                         buffered.removeAll(keepingCapacity: false)
                         group.cancelAll()
@@ -820,7 +842,7 @@ package actor DisplayFramePublisher {
                     && nextAdmissionIndex == requests.count
                     && nextEmissionIndex == requests.count
                     && buffered.isEmpty,
-                admittedRequestCount: nextAdmissionIndex
+                settledRequestCount: nextEmissionIndex
             )
         }
     }
@@ -832,16 +854,16 @@ package actor DisplayFramePublisher {
         _ preparation: consuming SnapshotPreparation,
         request: Request,
         flushGeneration: UInt64
-    ) async -> Bool {
+    ) async -> SnapshotProcessingOutcome {
         guard generation == flushGeneration,
               !isCancelled,
               !Task.isCancelled
         else {
-            return false
+            return .unsettledStop
         }
         guard let frame = preparation.frame else {
             staleSnapshots &+= 1
-            return true
+            return .settledContinue
         }
         guard isCurrent(request),
               canPrepare(request.surfaceRevision.surfaceID),
@@ -849,7 +871,7 @@ package actor DisplayFramePublisher {
         else {
             staleSnapshots &+= 1
             forceFullDamage.insert(request.surfaceRevision.surfaceID)
-            return true
+            return .settledContinue
         }
         let replacement = pending[request.surfaceRevision.surfaceID]
         if let replacement {
@@ -858,7 +880,7 @@ package actor DisplayFramePublisher {
                   replacementLifecycle == request.surfaceRevision.lifecycleGeneration
             else {
                 staleSnapshots &+= 1
-                return true
+                return .settledContinue
             }
         }
         guard frameMatchesSubmittedRevision(
@@ -870,7 +892,7 @@ package actor DisplayFramePublisher {
             // observed. Wait for its commit event instead of publishing a
             // possible intermediate state from a multi-rectangle command.
             forceFullDamage.insert(request.surfaceRevision.surfaceID)
-            return true
+            return .settledContinue
         }
         if replacement != nil {
             removePendingCovered(
@@ -895,55 +917,80 @@ package actor DisplayFramePublisher {
         let emitStartedAt = clock.now
         await emit(publishedFrame)
         emitDuration.record(emitStartedAt.duration(to: clock.now))
-        guard generation == flushGeneration,
-              !isCancelled,
-              !Task.isCancelled
-        else {
-            return false
+        let publisherStillOwnsFlush = generation == flushGeneration && !isCancelled
+        if publisherStillOwnsFlush {
+            if isCurrent(request) {
+                lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
+                removePendingCovered(
+                    by: frame,
+                    invalidationGeneration: request.invalidationGeneration
+                )
+            }
+            emittedFrames &+= 1
+            if frame.ioSurfaceFrame == nil {
+                emittedCPUOnlyFrames &+= 1
+            } else {
+                emittedIOSurfaceFrames &+= 1
+            }
         }
-        if isCurrent(request) {
-            lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
-            removePendingCovered(
-                by: frame,
-                invalidationGeneration: request.invalidationGeneration
-            )
+        // Returning from `emit` is the ownership-transfer boundary. Even when
+        // cancellation became visible while it was suspended, the frame was
+        // handed to the consumer and this request must never be replayed.
+        guard publisherStillOwnsFlush, !Task.isCancelled else {
+            return .settledStop
         }
-        emittedFrames &+= 1
-        if frame.ioSurfaceFrame == nil {
-            emittedCPUOnlyFrames &+= 1
-        } else {
-            emittedIOSurfaceFrames &+= 1
-        }
-        return true
+        return .settledContinue
     }
 
     private func restoreQueuedRequestsAfterAbortedFlush(
         _ requests: [Request],
-        admittedRequestCount: Int
+        settledRequestCount: Int
     ) {
         var restoredSurfaceIDs: [UInt32] = []
         restoredSurfaceIDs.reserveCapacity(requests.count)
         for (requestIndex, request) in requests.enumerated() {
-            guard requestIndex >= admittedRequestCount else {
+            guard requestIndex >= settledRequestCount, isCurrent(request) else {
                 continue
             }
             let surfaceID = request.surfaceRevision.surfaceID
-            guard pending[surfaceID] == nil,
-                  pending.count < maximumPendingSurfaces,
-                  isCurrent(request),
-                  lastEmittedRevisions[surfaceID].map({
-                      isNewer(request.surfaceRevision, than: $0)
-                  }) ?? true
-            else {
+            if let replacement = pending[surfaceID] {
+                guard replacement.invalidationGeneration
+                    == request.invalidationGeneration,
+                    replacement.surfaceRevision.lifecycleGeneration
+                        == request.surfaceRevision.lifecycleGeneration
+                else {
+                    continue
+                }
+                // Preserve the newer pending revision. A snapshot for the
+                // interrupted request may already have consumed the canonical
+                // publication journal, so its replacement must redraw fully.
+                forceFullDamage.insert(surfaceID)
+                continue
+            }
+            guard lastEmittedRevisions[surfaceID].map({
+                isNewer(request.surfaceRevision, than: $0)
+            }) ?? true else {
                 continue
             }
             pending[surfaceID] = request
+            forceFullDamage.insert(surfaceID)
             restoredSurfaceIDs.append(surfaceID)
         }
         guard !restoredSurfaceIDs.isEmpty else { return }
         let restored = Set(restoredSurfaceIDs)
         order.removeAll { restored.contains($0) }
         order.insert(contentsOf: restoredSurfaceIDs, at: 0)
+        // Restoration is synchronous actor work, so the temporary merged set
+        // is never observable. Apply the same oldest-first capacity eviction
+        // used by normal submissions before yielding again. Full-damage marks
+        // intentionally survive eviction so a later submission still repairs
+        // a publication journal that an interrupted snapshot may have drained.
+        while pending.count > maximumPendingSurfaces, let oldest = order.first {
+            order.removeFirst()
+            if pending.removeValue(forKey: oldest) != nil {
+                pendingEvictions &+= 1
+            }
+        }
     }
 
     private func isCurrent(_ request: Request) -> Bool {
