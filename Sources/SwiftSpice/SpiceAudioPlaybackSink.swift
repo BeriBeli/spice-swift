@@ -414,7 +414,8 @@ public actor SpiceAudioPlaybackSink {
         do {
             return try AudioPacketRingAllocationLimits.validate(
                 capacityBytes: capacityBytes,
-                capacitySlots: capacitySlots
+                capacitySlots: capacitySlots,
+                stagingBytes: capacityBytes
             )
         } catch {
             throw .invalidConfiguration("playback ring allocation exceeds resource limits")
@@ -432,7 +433,6 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
     private struct GateState: Sendable {
         var minimumStartupBytes: Int
         var isPrimed = false
-        var publicationPending = false
     }
 
     private let ring: PreallocatedAudioPacketRing
@@ -450,7 +450,8 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
     ) {
         ring = PreallocatedAudioPacketRing(
             capacityBytes: capacityBytes,
-            capacitySlots: capacitySlots
+            capacitySlots: capacitySlots,
+            supportsStagedEnqueue: true
         )
         self.bytesPerFrame = bytesPerFrame
         self.sampleRate = sampleRate
@@ -462,42 +463,34 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         )))
     }
 
-    /// Producers are serialized, but payload copy happens without holding the
-    /// render gate. `publicationPending` makes the ring publication invisible
-    /// to render until overflow replacement and startup reset are committed in
-    /// one short gate section. No path holds the ring mutex while acquiring the
-    /// gate; render and close retain their gate-before-ring order.
+    /// Producers are serialized, but payload copy happens into an unpublished
+    /// preallocated ring range without holding the render gate. The short final
+    /// gate section publishes slot metadata (or swaps the overflow bank) and
+    /// resets startup atomically. No path holds the ring mutex while acquiring
+    /// the gate; publication, render, and close retain gate-before-ring order.
     package func enqueue(
         _ packet: SpicePlaybackPacket,
         payloadCopyWillBegin payloadObserver: GateObserver? = nil,
         overflowReplacementPublished observer: GateObserver? = nil
     ) -> AudioPacketRingEnqueueResult {
         producer.withLock { _ in
-            var publicationCleared = false
-            gate.withLock { state in
-                state.publicationPending = true
-            }
-            defer {
-                if !publicationCleared {
+            packet.data.withUnsafeBytes { bytes in
+                ring.enqueueStaged(
+                    timestamp: packet.multimediaTime,
+                    bytes: bytes,
+                    copyWillBegin: payloadObserver
+                ) { commit in
                     gate.withLock { state in
-                        state.publicationPending = false
+                        let result = commit()
+                        if case let .enqueued(droppedPackets, droppedBytes) = result,
+                           droppedPackets > 0 || droppedBytes > 0 {
+                            observer?()
+                            state.isPrimed = false
+                        }
+                        return result
                     }
                 }
             }
-            payloadObserver?()
-            let result = packet.data.withUnsafeBytes { bytes in
-                ring.enqueue(timestamp: packet.multimediaTime, bytes: bytes)
-            }
-            gate.withLock { state in
-                if case let .enqueued(droppedPackets, droppedBytes) = result,
-                   droppedPackets > 0 || droppedBytes > 0 {
-                    observer?()
-                    state.isPrimed = false
-                }
-                state.publicationPending = false
-            }
-            publicationCleared = true
-            return result
         }
     }
 
@@ -550,7 +543,6 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         destination.initializeMemory(as: UInt8.self, repeating: 0)
         observer?()
         return gate.withLock { state in
-            guard !state.publicationPending else { return 0 }
             let queuedBytes = ring.diagnostics().queuedBytes
             if !state.isPrimed {
                 guard queuedBytes > 0, queuedBytes >= state.minimumStartupBytes else {
@@ -570,7 +562,6 @@ package final class AudioPlaybackRenderBuffer: @unchecked Sendable {
         gate.withLock { state in
             ring.close()
             state.isPrimed = false
-            state.publicationPending = false
         }
     }
 

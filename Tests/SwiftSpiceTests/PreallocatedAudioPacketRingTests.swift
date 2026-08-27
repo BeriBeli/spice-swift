@@ -187,6 +187,65 @@ struct PreallocatedAudioPacketRingTests {
         Self.expectRealtimeCountersRemainZero(diagnostics)
     }
 
+    @Test("reset rebases a late staged commit without reviving stale PCM")
+    func resetDuringStagedEnqueuePublishesOnlyTheReservedPacket() {
+        let ring = PreallocatedAudioPacketRing(
+            capacityBytes: 16,
+            capacitySlots: 4,
+            supportsStagedEnqueue: true
+        )
+        #expect(Self.enqueue([1, 2, 3, 4], timestamp: 1, into: ring)
+            == .enqueued(droppedPackets: 0, droppedBytes: 0))
+
+        let barrier = StagedEnqueueBarrier()
+        let stagedResult = LockedValue<AudioPacketRingEnqueueResult?>(nil)
+        let stagedFinished = DispatchSemaphore(value: 0)
+        let stagedBytes: [UInt8] = [9, 10, 11, 12]
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = stagedBytes.withUnsafeBytes {
+                (bytes: UnsafeRawBufferPointer) in
+                ring.enqueueStaged(
+                    timestamp: 2,
+                    bytes: bytes,
+                    copyWillBegin: barrier.block
+                ) { commit in
+                    commit()
+                }
+            }
+            stagedResult.store(result)
+            stagedFinished.signal()
+        }
+        #expect(barrier.waitUntilEntered())
+        #expect(ring.diagnostics().queuedBytes == 4)
+
+        ring.reset()
+        let afterReset = ring.diagnostics()
+        #expect(afterReset.resetCount == 1)
+        #expect(afterReset.queuedBytes == 0)
+        #expect(afterReset.queuedSlots == 0)
+        #expect(afterReset.retainedSlots == 0)
+
+        barrier.release()
+        #expect(stagedFinished.wait(timeout: .now() + 10) == .success)
+        #expect(stagedResult.load() == .enqueued(droppedPackets: 0, droppedBytes: 0))
+        #expect(Self.enqueue([13, 14], timestamp: 3, into: ring)
+            == .enqueued(droppedPackets: 0, droppedBytes: 0))
+        #expect(ring.dequeue() == RecordedAudioPacket(
+            timestamp: 2,
+            data: Data(stagedBytes)
+        ))
+        #expect(ring.dequeue() == RecordedAudioPacket(
+            timestamp: 3,
+            data: Data([13, 14])
+        ))
+        #expect(ring.dequeue() == nil)
+        let finished = ring.diagnostics()
+        #expect(finished.queuedBytes == 0)
+        #expect(finished.queuedSlots == 0)
+        #expect(finished.retainedSlots == 0)
+        Self.expectRealtimeCountersRemainZero(finished)
+    }
+
     @Test("dequeue materialization releases the producer mutex and preserves its lease")
     func dequeueMaterializationDoesNotBlockConcurrentEnqueue() {
         let ring = PreallocatedAudioPacketRing(capacityBytes: 12, capacitySlots: 3)
@@ -411,6 +470,24 @@ struct PreallocatedAudioPacketRingTests {
 }
 
 private final class DequeueMaterializationBarrier: @unchecked Sendable {
+    private let entered = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+
+    func block() {
+        entered.signal()
+        released.wait()
+    }
+
+    func waitUntilEntered() -> Bool {
+        entered.wait(timeout: .now() + 10) == .success
+    }
+
+    func release() {
+        released.signal()
+    }
+}
+
+private final class StagedEnqueueBarrier: @unchecked Sendable {
     private let entered = DispatchSemaphore(value: 0)
     private let released = DispatchSemaphore(value: 0)
 

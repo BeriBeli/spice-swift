@@ -14,6 +14,8 @@ struct RecordCaptureBufferTests {
 
         #expect(result == .enqueued(droppedPackets: 0, droppedBytes: 0))
         let queued = buffer.diagnostics()
+        #expect(queued.preallocatedBytes == 16)
+        #expect(queued.preallocatedStagingBytes == 0)
         #expect(queued.queuedBytes == bytes.count)
         #expect(queued.queuedSlots == 1)
         #expect(queued.retainedSlots == 1)
