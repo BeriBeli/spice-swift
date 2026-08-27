@@ -6,9 +6,9 @@
 | Field | Value |
 | --- | --- |
 | Status | Active |
-| Plan version | 1.0 |
+| Plan version | 1.1 |
 | Swift baseline | `v0.2.7` / `2c577d7` |
-| Reference client | spice-gtk/spice-common 0.42 |
+| Reference client | spice-gtk `88ad5f1` (v0.43/master) / spice-common `71e4570` (master), reverified 2026-08-27 |
 | Created | 2026-08-26 |
 
 This plan is the source of truth for active algorithm work. [STATUS.md](STATUS.md)
@@ -53,7 +53,7 @@ Use exactly one of these values in the work table:
 | AIP-12 | done | Move the image cache to Session scope with ordered mutations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, FIFO, cancellation, and capacity tests pass |
 | AIP-20 | done | Introduce a bounded canonical `PixelRegion` | AIP-12 | Random-mask differential tests and pathological 4,096-clip inputs pass |
 | AIP-21 | done | Apply each wire draw command as one Surface transaction and revision | AIP-20 | Failure is atomic and `mutationTransactions == 1` |
-| AIP-22 | pending | Replace staged COPY_BITS with direction-aware O(1)-space copying and add bulk/fill kernels | AIP-21 | Eight-direction differential tests pass and `temporaryCopyBytes == 0` |
+| AIP-22 | in-progress | Replace staged COPY_BITS with direction-aware O(1)-space copying and add bulk/fill kernels | AIP-21 | Eight-direction differential tests pass and `temporaryCopyBytes == 0` |
 | AIP-23 | pending | Remove IOSurface/Data backing ping-pong and resolve damage once per publication | AIP-21 | Full raw followed by a 1x1 CPU mutation records zero CPU materialization bytes |
 | AIP-30 | pending | Replace framer compaction and payload materialization with segments, `OwnedBytes`, `WireSlice`, and production Span parsing | AIP-23 | A contiguous body has zero copies and a fragmented body is coalesced at most once |
 | AIP-31 | pending | Decode LZ into one backing and optimize references and palette expansion | AIP-30 | spice-common fixtures remain bit-exact with one decoded-output allocation |
@@ -186,3 +186,4 @@ acceptance gates.
 | 2026-08-26 | AIP-10, AIP-11 | Keep receive-time serial-barrier behavior unchanged while landing physical-message batches | The batch boundary and ACK ownership are prerequisites for processed-time completion; moving the barrier is separately gated by AIP-11 failure, cancellation, and close semantics |
 | 2026-08-27 | AIP-20 | Match spice-gtk/spice-common pixman region union/intersection semantics, but enforce Swift-side clip and canonical-segment limits | Official spice-gtk `88ad5f1` adds stream clips to `QRegion`; spice-common `71e4570` aliases `QRegion` to `pixman_region32_t`, unions rectangles, and intersects destination, canvas, and clip regions. Explicit bounds keep hostile inputs deterministic in Swift. |
 | 2026-08-27 | AIP-21 | Treat a normalized region as one Surface transaction, while retaining per-segment copy kernels until AIP-22 | Official spice-common `71e4570` passes one normalized `dest_region` into each canvas draw/blit call. Swift additionally validates every translated source and destination before preparing or publishing value-semantic Surface state. |
+| 2026-08-27 | AIP-22 | Reverify current upstream heads and mirror their direction-aware region/row traversal without adding pixman | Current spice-gtk master `88ad5f1` (v0.43 lineage) still delegates COPY_BITS to the canvas. Current spice-common master `71e4570` orders region rectangles by move quadrant, then copies vertical overlap bottom-up, top-down otherwise, and uses per-row `memmove` for horizontal overlap. Swift keeps AIP-20's canonical traversal, applies the same row-direction rule through bounded unsafe-buffer access, adds explicit temporary/bulk-call diagnostics, and preserves AIP-21's one-command transaction. |
