@@ -995,12 +995,27 @@ package actor DisplayFramePublisher {
                 recoveredSurfaceIDs.insert(surfaceID)
                 continue
             }
+            let currentInvalidationGeneration = invalidationGenerations[surfaceID] ?? 0
+            guard currentInvalidationGeneration == request.invalidationGeneration,
+                  let latest = latestSubmittedRevisions[surfaceID],
+                  latest.surfaceID == surfaceID,
+                  latest.lifecycleGeneration
+                    == request.surfaceRevision.lifecycleGeneration,
+                  latest.revision >= request.surfaceRevision.revision
+            else {
+                continue
+            }
+            let recovered = Request(
+                surfaceRevision: latest,
+                invalidationGeneration: currentInvalidationGeneration,
+                queueAge: request.queueAge
+            )
             guard lastEmittedRevisions[surfaceID].map({
-                isNewer(request.surfaceRevision, than: $0)
+                isNewer(recovered.surfaceRevision, than: $0)
             }) ?? true else {
                 continue
             }
-            pending[surfaceID] = request
+            pending[surfaceID] = recovered
             forceFullDamage.insert(surfaceID)
             recoveredSurfaceIDs.insert(surfaceID)
         }
