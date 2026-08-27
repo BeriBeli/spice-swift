@@ -124,10 +124,11 @@ struct PlaybackBufferControllerTests {
             ),
             maximumQueuedMilliseconds: 500
         )
-        #expect(captureDefault == AudioPacketRingCapacity(
+        let expectedCaptureDefault = AudioPacketRingCapacity(
             capacityBytes: 96_000,
-            capacitySlots: 256
-        ))
+            capacitySlots: 24_000
+        )
+        #expect(captureDefault == expectedCaptureDefault)
 
         let playbackConfiguration = SpicePlaybackConfiguration(
             channels: 8,
@@ -151,10 +152,11 @@ struct PlaybackBufferControllerTests {
             capacityBytes: 3_072_000,
             capacitySlots: 192_000
         ))
-        #expect(captureUpper == AudioPacketRingCapacity(
+        let expectedCaptureUpper = AudioPacketRingCapacity(
             capacityBytes: 3_072_000,
-            capacitySlots: 256
-        ))
+            capacitySlots: 192_000
+        )
+        #expect(captureUpper == expectedCaptureUpper)
 
         #expect(throws: SpiceAudioPlaybackSinkError.invalidConfiguration(
             "playback ring allocation exceeds resource limits"
@@ -197,6 +199,41 @@ struct PlaybackBufferControllerTests {
             try SpiceAudioCaptureSource.ringCapacity(
                 configuration: overflowCapture,
                 maximumQueuedMilliseconds: .max
+            )
+        }
+    }
+
+    @Test func captureCapacityReservesOneSlotPerOutputFrameWithinBothResourceLimits() throws {
+        let lowRateOutput = SpiceRecordConfiguration(
+            channels: 1,
+            format: .signed16LittleEndian,
+            sampleRate: 8_000
+        )
+        let reviewerCase = try SpiceAudioCaptureSource.ringCapacity(
+            configuration: lowRateOutput,
+            maximumQueuedMilliseconds: 10_000
+        )
+        let expectedReviewerCase = AudioPacketRingCapacity(
+            capacityBytes: 160_000,
+            capacitySlots: 80_000
+        )
+        #expect(reviewerCase == expectedReviewerCase)
+
+        let exactCapacity = try SpiceAudioCaptureSource.ringCapacity(
+            configuration: lowRateOutput,
+            maximumQueuedMilliseconds: 32_768
+        )
+        let expectedExactCapacity = AudioPacketRingCapacity(
+            capacityBytes: 524_288,
+            capacitySlots: AudioPacketRingAllocationLimits.maximumSlotCount
+        )
+        #expect(exactCapacity == expectedExactCapacity)
+        #expect(throws: SpiceAudioCaptureSourceError.invalidConfiguration(
+            "capture ring allocation exceeds resource limits"
+        )) {
+            try SpiceAudioCaptureSource.ringCapacity(
+                configuration: lowRateOutput,
+                maximumQueuedMilliseconds: 32_769
             )
         }
     }

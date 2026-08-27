@@ -35,16 +35,19 @@ struct RecordCaptureBufferTests {
         buffer.push(RecordedAudioPacket(timestamp: 2, data: Data(repeating: 2, count: 6)))
 
         let drain = buffer.drain()
-        #expect(drain.droppedBytes == 4)
-        #expect(drain.packets == [RecordedAudioPacket(
+        let expectedPackets = [RecordedAudioPacket(
             timestamp: 2,
             data: Data(repeating: 2, count: 6)
-        )])
-        #expect(buffer.drain() == RecordCaptureDrain(
+        )]
+        #expect(drain.droppedBytes == 4)
+        #expect(drain.packets == expectedPackets)
+        let expectedEmptyDrain = RecordCaptureDrain(
             packets: [],
             droppedBytes: 0,
             failure: nil
-        ))
+        )
+        let emptyDrain = buffer.drain()
+        #expect(emptyDrain == expectedEmptyDrain)
         let diagnostics = buffer.diagnostics()
         #expect(diagnostics.preallocatedBytes == 8)
         #expect(diagnostics.queuedBytes == 0)
@@ -58,14 +61,19 @@ struct RecordCaptureBufferTests {
     @Test func dropsOversizedPacketAndTransfersFailureOnce() {
         let buffer = RecordCaptureBuffer(maximumBytes: 4)
         buffer.push(RecordedAudioPacket(timestamp: 1, data: Data(repeating: 1, count: 6)))
-        buffer.fail("conversion")
+        buffer.fail(.converter(code: -50))
 
-        #expect(buffer.drain() == RecordCaptureDrain(
+        let expectedDrain = RecordCaptureDrain(
             packets: [],
             droppedBytes: 6,
-            failure: "conversion"
-        ))
-        #expect(buffer.drain().failure == nil)
+            failure: "audio converter failed with error code -50",
+            failureToken: .converter(code: -50)
+        )
+        let drain = buffer.drain()
+        #expect(drain == expectedDrain)
+        let secondDrain = buffer.drain()
+        #expect(secondDrain.failure == nil)
+        #expect(secondDrain.failureToken == nil)
         let diagnostics = buffer.diagnostics()
         #expect(diagnostics.queuedBytes == 0)
         #expect(diagnostics.retainedSlots == 0)

@@ -6,17 +6,52 @@ package struct RecordedAudioPacket: Sendable, Equatable {
     package let data: Data
 }
 
+package enum AudioCaptureProcessorFailure: Sendable, Equatable {
+    case inputFormatChanged
+    case invalidInputStorage
+    case converter(code: Int?)
+    case invalidOutputStorage
+
+    package func formattedDescription() -> String {
+        switch self {
+        case .inputFormatChanged:
+            "capture input format changed while the tap was active"
+        case .invalidInputStorage:
+            "capture input buffer contains invalid PCM storage"
+        case let .converter(.some(code)):
+            "audio converter failed with error code \(code)"
+        case .converter(.none):
+            "audio converter failed with an unknown error"
+        case .invalidOutputStorage:
+            "converter produced invalid PCM storage"
+        }
+    }
+}
+
 package struct RecordCaptureDrain: Sendable, Equatable {
     package let packets: [RecordedAudioPacket]
     package let droppedBytes: Int
     package let failure: String?
+    package let failureToken: AudioCaptureProcessorFailure?
+
+    package init(
+        packets: [RecordedAudioPacket],
+        droppedBytes: Int,
+        failure: String?,
+        failureToken: AudioCaptureProcessorFailure? = nil
+    ) {
+        self.packets = packets
+        self.droppedBytes = droppedBytes
+        self.failure = failure
+        self.failureToken = failureToken
+    }
 }
 
 /// Thread-safe bounded handoff from the Core Audio tap to the async sender.
 package final class RecordCaptureBuffer: Sendable {
     private struct ReportingState: Sendable {
         var reportedDroppedBytes: UInt64 = 0
-        var failure: String?
+        var failure: AudioCaptureProcessorFailure?
     }
 
     private let ring: PreallocatedAudioPacketRing
@@ -42,10 +77,10 @@ package final class RecordCaptureBuffer: Sendable {
         ring.enqueue(timestamp: timestamp, bytes: bytes)
     }
 
-    package func fail(_ reason: String) {
+    package func fail(_ failure: AudioCaptureProcessorFailure) {
         reporting.withLock { state in
             if state.failure == nil {
-                state.failure = reason
+                state.failure = failure
             }
         }
     }
@@ -58,19 +93,21 @@ package final class RecordCaptureBuffer: Sendable {
             packets.append(packet)
         }
         let currentDroppedBytes = ring.diagnostics().droppedBytes
-        return reporting.withLock { state in
+        let report = reporting.withLock { state in
             let delta = currentDroppedBytes >= state.reportedDroppedBytes
                 ? currentDroppedBytes - state.reportedDroppedBytes
                 : 0
             state.reportedDroppedBytes = currentDroppedBytes
             let failure = state.failure
             state.failure = nil
-            return RecordCaptureDrain(
-                packets: packets,
-                droppedBytes: Int(clamping: delta),
-                failure: failure
-            )
+            return (droppedBytes: Int(clamping: delta), failure: failure)
         }
+        return RecordCaptureDrain(
+            packets: packets,
+            droppedBytes: report.droppedBytes,
+            failure: report.failure?.formattedDescription(),
+            failureToken: report.failure
+        )
     }
 
     package func reset() {

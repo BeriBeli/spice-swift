@@ -108,6 +108,7 @@ struct AudioCaptureProcessorTests {
         #expect(failed.packets.isEmpty)
         #expect(failed.droppedBytes == 0)
         #expect(failed.failure == "capture input format changed while the tap was active")
+        #expect(failed.failureToken == .inputFormatChanged)
         var diagnostics = fixture.processor.diagnostics()
         #expect(diagnostics.inputCallbacks == 1)
         #expect(diagnostics.inputFrames == 1_025)
@@ -125,6 +126,7 @@ struct AudioCaptureProcessorTests {
             data: fixture.expectedBytes
         )]
         #expect(recovered.failure == nil)
+        #expect(recovered.failureToken == nil)
         #expect(recovered.packets == expectedRecoveredPackets)
         diagnostics = fixture.processor.diagnostics()
         #expect(diagnostics.inputCallbacks == 2)
@@ -133,6 +135,44 @@ struct AudioCaptureProcessorTests {
         #expect(diagnostics.convertedFrames == 1_024)
         #expect(diagnostics.callbackDynamicAllocations == 0)
         expectRealtimeRingCountersRemainZero(diagnostics.ring)
+    }
+
+    @Test("callback failures retain typed evidence and format only at drain")
+    func callbackFailureFormattingIsDeferredWithoutDynamicAllocation() throws {
+        let cases: [(AudioCaptureProcessorFailure, String)] = [
+            (.converter(code: -50), "audio converter failed with error code -50"),
+            (.converter(code: nil), "audio converter failed with an unknown error"),
+            (.invalidOutputStorage, "converter produced invalid PCM storage"),
+        ]
+
+        for (failureToken, expectedDescription) in cases {
+            let fixture = try CaptureProcessorFixture(frameCount: 1_024)
+            fixture.processor.capture(
+                fixture.input,
+                timestamp: 1_000,
+                failureForTesting: failureToken
+            )
+
+            let callbackDiagnostics = fixture.processor.diagnostics()
+            #expect(callbackDiagnostics.inputCallbacks == 1)
+            #expect(callbackDiagnostics.conversionPasses == 0)
+            #expect(callbackDiagnostics.conversionFailures == 1)
+            #expect(callbackDiagnostics.convertedFrames == 0)
+            #expect(callbackDiagnostics.callbackDynamicAllocations == 0)
+            #expect(callbackDiagnostics.ring.queuedBytes == 0)
+            #expect(callbackDiagnostics.ring.retainedSlots == 0)
+
+            let drain = fixture.processor.drain()
+            #expect(drain.failureToken == failureToken)
+            #expect(drain.failure == expectedDescription)
+            #expect(drain.packets.isEmpty)
+            #expect(drain.droppedBytes == 0)
+
+            let secondDrain = fixture.processor.drain()
+            #expect(secondDrain.failureToken == nil)
+            #expect(secondDrain.failure == nil)
+            #expect(fixture.processor.diagnostics().callbackDynamicAllocations == 0)
+        }
     }
 
     @Test("non-interleaved device buffers split every AudioBufferList plane bit-exactly")

@@ -266,9 +266,17 @@ public actor SpiceAudioCaptureSource {
             throw .invalidConfiguration("capture ring byte capacity overflow")
         }
         do {
+            // Every nonempty converted packet contains at least one output
+            // frame. Reserving one slot per frame therefore guarantees packet
+            // metadata cannot exhaust before the independent payload-byte
+            // budget, regardless of tap callback or conversion chunk shape.
+            let capacitySlots = try AudioPacketRingCapacity.slotCount(
+                capacityBytes: capacityBytes,
+                minimumPacketBytes: bytesPerFrame
+            )
             return try AudioPacketRingAllocationLimits.validate(
                 capacityBytes: capacityBytes,
-                capacitySlots: 256
+                capacitySlots: capacitySlots
             )
         } catch {
             throw .invalidConfiguration("capture ring allocation exceeds resource limits")
@@ -402,7 +410,11 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
         )
     }
 
-    package func capture(_ input: AVAudioPCMBuffer, timestamp: UInt32) {
+    package func capture(
+        _ input: AVAudioPCMBuffer,
+        timestamp: UInt32,
+        failureForTesting: AudioCaptureProcessorFailure? = nil
+    ) {
         diagnosticState.withLock { state in
             Self.add(&state.inputCallbacks, 1)
             Self.add(&state.inputFrames, Int(input.frameLength))
@@ -410,13 +422,17 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
                 Self.add(&state.splitInputCallbacks, 1)
             }
         }
+        if let failureForTesting {
+            recordFailure(failureForTesting)
+            return
+        }
         guard input.frameLength > 0 else { return }
         guard input.format == inputFormat else {
-            recordFailure("capture input format changed while the tap was active")
+            recordFailure(.inputFormatChanged)
             return
         }
         guard validateInputStorage(input) else {
-            recordFailure("capture input buffer contains invalid PCM storage")
+            recordFailure(.invalidInputStorage)
             return
         }
 
@@ -428,7 +444,7 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
                 frameOffset: frameOffset,
                 frameCount: frameCount
             ) else {
-                recordFailure("capture input buffer contains invalid PCM storage")
+                recordFailure(.invalidInputStorage)
                 return
             }
             guard convertInputChunk(
@@ -453,7 +469,7 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
         )
         inputProvider.clear()
         if status == .error {
-            recordFailure(conversionError.map(String.init(describing:)) ?? "unknown converter error")
+            recordFailure(.converter(code: conversionError?.code))
             return false
         }
         diagnosticState.withLock { state in
@@ -472,7 +488,7 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
               byteCount > 0,
               byteCount <= Int(audioBuffer.mDataByteSize),
               let pointer = audioBuffer.mData else {
-            recordFailure("converter produced invalid PCM storage")
+            recordFailure(.invalidOutputStorage)
             return false
         }
         _ = buffer.push(
@@ -575,11 +591,11 @@ package final class AudioCaptureProcessor: @unchecked Sendable {
         }
     }
 
-    private func recordFailure(_ reason: String) {
+    private func recordFailure(_ failure: AudioCaptureProcessorFailure) {
         diagnosticState.withLock { state in
             Self.add(&state.conversionFailures, 1)
         }
-        buffer.fail(reason)
+        buffer.fail(failure)
     }
 
     private static func add(_ value: inout UInt64, _ amount: Int) {
