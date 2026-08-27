@@ -14,58 +14,82 @@ package struct RecordCaptureDrain: Sendable, Equatable {
 
 /// Thread-safe bounded handoff from the Core Audio tap to the async sender.
 package final class RecordCaptureBuffer: Sendable {
-    private struct State: Sendable {
-        var packets: [RecordedAudioPacket] = []
-        var queuedBytes = 0
-        var droppedBytes = 0
+    private struct ReportingState: Sendable {
+        var reportedDroppedBytes: UInt64 = 0
         var failure: String?
     }
 
-    private let maximumBytes: Int
-    private let state = Mutex(State())
+    private let ring: PreallocatedAudioPacketRing
+    private let reporting = Mutex(ReportingState())
 
-    package init(maximumBytes: Int) {
+    package init(maximumBytes: Int, maximumPackets: Int = 256) {
         precondition(maximumBytes > 0)
-        self.maximumBytes = maximumBytes
+        precondition(maximumPackets > 0)
+        ring = PreallocatedAudioPacketRing(
+            capacityBytes: maximumBytes,
+            capacitySlots: maximumPackets
+        )
     }
 
     package func push(_ packet: RecordedAudioPacket) {
-        state.withLock { state in
-            guard packet.data.count <= maximumBytes else {
-                state.droppedBytes += packet.data.count
-                return
-            }
-            while packet.data.count > maximumBytes - state.queuedBytes,
-                  let oldest = state.packets.first {
-                state.packets.removeFirst()
-                state.queuedBytes -= oldest.data.count
-                state.droppedBytes += oldest.data.count
-            }
-            state.packets.append(packet)
-            state.queuedBytes += packet.data.count
-        }
+        _ = ring.enqueue(packet)
+    }
+
+    package func push(
+        timestamp: UInt32,
+        bytes: UnsafeRawBufferPointer
+    ) -> AudioPacketRingEnqueueResult {
+        ring.enqueue(timestamp: timestamp, bytes: bytes)
     }
 
     package func fail(_ reason: String) {
-        state.withLock { state in
+        reporting.withLock { state in
             if state.failure == nil {
                 state.failure = reason
             }
         }
     }
 
+    /// Packet `Data` is materialized on the async sender, never in the tap
+    /// callback. Queue storage itself remains fixed for the buffer lifetime.
     package func drain() -> RecordCaptureDrain {
-        state.withLock { state in
-            let result = RecordCaptureDrain(
-                packets: state.packets,
-                droppedBytes: state.droppedBytes,
-                failure: state.failure
-            )
-            state.packets.removeAll(keepingCapacity: true)
-            state.queuedBytes = 0
-            state.droppedBytes = 0
-            state.failure = nil
-            return result
+        var packets: [RecordedAudioPacket] = []
+        while let packet = ring.dequeue() {
+            packets.append(packet)
         }
+        let currentDroppedBytes = ring.diagnostics().droppedBytes
+        return reporting.withLock { state in
+            let delta = currentDroppedBytes >= state.reportedDroppedBytes
+                ? currentDroppedBytes - state.reportedDroppedBytes
+                : 0
+            state.reportedDroppedBytes = currentDroppedBytes
+            let failure = state.failure
+            state.failure = nil
+            return RecordCaptureDrain(
+                packets: packets,
+                droppedBytes: Int(clamping: delta),
+                failure: failure
+            )
+        }
+    }
+
+    package func reset() {
+        ring.reset()
+        let droppedBytes = ring.diagnostics().droppedBytes
+        reporting.withLock { state in
+            state.reportedDroppedBytes = droppedBytes
+            state.failure = nil
+        }
+    }
+
+    package func close() {
+        ring.close()
+        reporting.withLock { state in
+            state.failure = nil
+        }
+    }
+
+    package func diagnostics() -> AudioPacketRingDiagnostics {
+        ring.diagnostics()
     }
 }
