@@ -19,6 +19,7 @@ struct SpiceBenchCommand {
                 environment: environment
             )
             let repositoryPreflight = SpiceBenchRepositoryPreflight(
+                executableRevision: .embedded,
                 stateProvider: repositoryState
             )
             let encoded = try await repositoryPreflight.withCleanRepository { commit in

@@ -1,0 +1,6 @@
+#ifndef SPICE_BENCH_BUILD_INFO_H
+#define SPICE_BENCH_BUILD_INFO_H
+
+const char *spice_bench_build_revision(void);
+
+#endif

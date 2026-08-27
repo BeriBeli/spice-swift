@@ -427,7 +427,7 @@ package enum SpiceBenchCatalog {
                 warmUpIterations: warmUpIterations,
                 measuredIterations: measuredIterations,
                 operation: {
-                    try await constructAdvancedVideoSample(
+                    try await advancedVideoObservation(
                         parser: fixtures.videoParser,
                         payload: fixtures.videoPayload
                     )
@@ -607,7 +607,7 @@ package enum SpiceBenchCatalog {
         )
     }
 
-    private static func constructAdvancedVideoSample(
+    package static func advancedVideoObservation(
         parser: SpiceAnnexBParser,
         payload: Data
     ) async throws -> SpiceBenchObservation {

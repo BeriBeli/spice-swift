@@ -1,4 +1,5 @@
 import Foundation
+import SpiceCodecs
 import Synchronization
 import Testing
 import SpiceBenchSupport
@@ -272,10 +273,13 @@ struct SpiceBenchTests {
     func repositoryPreflightRequiresStableCleanRevision() async throws {
         let cleanCalls = Mutex(0)
         let cleanWork = Mutex(0)
-        let clean = SpiceBenchRepositoryPreflight {
-            cleanCalls.withLock { $0 += 1 }
-            return SpiceBenchRepositoryState(commit: "abc123", porcelainStatus: "")
-        }
+        let clean = SpiceBenchRepositoryPreflight(
+            executableRevision: SpiceBenchExecutableRevision(embeddedRevision: "abc123"),
+            stateProvider: {
+                cleanCalls.withLock { $0 += 1 }
+                return SpiceBenchRepositoryState(commit: "abc123", porcelainStatus: "")
+            }
+        )
         let cleanCommit: String = try await clean.withCleanRepository { commit in
             cleanWork.withLock { $0 += 1 }
             return commit
@@ -287,13 +291,16 @@ struct SpiceBenchTests {
         for dirtyStatus in [" M Sources/File.swift", "?? untracked.fixture"] {
             let providerCalls = Mutex(0)
             let work = Mutex(0)
-            let dirty = SpiceBenchRepositoryPreflight {
-                providerCalls.withLock { $0 += 1 }
-                return SpiceBenchRepositoryState(
-                    commit: "abc123",
-                    porcelainStatus: dirtyStatus
-                )
-            }
+            let dirty = SpiceBenchRepositoryPreflight(
+                executableRevision: SpiceBenchExecutableRevision(embeddedRevision: "abc123"),
+                stateProvider: {
+                    providerCalls.withLock { $0 += 1 }
+                    return SpiceBenchRepositoryState(
+                        commit: "abc123",
+                        porcelainStatus: dirtyStatus
+                    )
+                }
+            )
             await #expect(throws: SpiceBenchError.dirtyWorktree) {
                 let _: String = try await dirty.withCleanRepository { commit in
                     work.withLock { $0 += 1 }
@@ -316,7 +323,10 @@ struct SpiceBenchTests {
             guard let state else { throw SpiceBenchError.repositoryStateUnavailable }
             return state
         }
-        let changed = SpiceBenchRepositoryPreflight(stateProvider: changedProvider)
+        let changed = SpiceBenchRepositoryPreflight(
+            executableRevision: SpiceBenchExecutableRevision(embeddedRevision: "abc123"),
+            stateProvider: changedProvider
+        )
         await #expect(throws: SpiceBenchError.repositoryChanged) {
             let _: String = try await changed.withCleanRepository { commit in
                 changedWork.withLock { $0 += 1 }
@@ -324,6 +334,76 @@ struct SpiceBenchTests {
             }
         }
         #expect(changedWork.withLock { $0 } == 1)
+    }
+
+    @Test("executable revision is required and must match before artifact work")
+    func executableRevisionBindsArtifactToTheCleanRepositoryHead() async throws {
+        let head = "0123456789abcdef0123456789abcdef01234567"
+
+        for missingRevision: String? in [nil, "", "unknown", "  UNKNOWN  "] {
+            let providerCalls = Mutex(0)
+            let workCalls = Mutex(0)
+            let preflight = SpiceBenchRepositoryPreflight(
+                executableRevision: SpiceBenchExecutableRevision(
+                    embeddedRevision: missingRevision
+                ),
+                stateProvider: {
+                    providerCalls.withLock { $0 += 1 }
+                    return SpiceBenchRepositoryState(commit: head, porcelainStatus: "")
+                }
+            )
+            await #expect(throws: SpiceBenchError.missingBuildRevision) {
+                let _: Data = try await preflight.withCleanRepository { _ in
+                    workCalls.withLock { $0 += 1 }
+                    return Data("must-not-be-json".utf8)
+                }
+            }
+            #expect(providerCalls.withLock { $0 } == 1)
+            #expect(workCalls.withLock { $0 } == 0)
+        }
+
+        let staleRevision = "fedcba9876543210fedcba9876543210fedcba98"
+        let staleProviderCalls = Mutex(0)
+        let staleWorkCalls = Mutex(0)
+        let stale = SpiceBenchRepositoryPreflight(
+            executableRevision: SpiceBenchExecutableRevision(
+                embeddedRevision: staleRevision
+            ),
+            stateProvider: {
+                staleProviderCalls.withLock { $0 += 1 }
+                return SpiceBenchRepositoryState(commit: head, porcelainStatus: "")
+            }
+        )
+        await #expect(throws: SpiceBenchError.buildRevisionMismatch(
+            expected: staleRevision,
+            actual: head
+        )) {
+            let _: Data = try await stale.withCleanRepository { _ in
+                staleWorkCalls.withLock { $0 += 1 }
+                return Data("must-not-be-json".utf8)
+            }
+        }
+        #expect(staleProviderCalls.withLock { $0 } == 1)
+        #expect(staleWorkCalls.withLock { $0 } == 0)
+
+        let matchingProviderCalls = Mutex(0)
+        let matchingWorkCalls = Mutex(0)
+        let matching = SpiceBenchRepositoryPreflight(
+            executableRevision: SpiceBenchExecutableRevision(
+                embeddedRevision: "  \(head)\n"
+            ),
+            stateProvider: {
+                matchingProviderCalls.withLock { $0 += 1 }
+                return SpiceBenchRepositoryState(commit: "\n\(head) ", porcelainStatus: "")
+            }
+        )
+        let measuredRevision: String = try await matching.withCleanRepository { revision in
+            matchingWorkCalls.withLock { $0 += 1 }
+            return revision
+        }
+        #expect(measuredRevision == head)
+        #expect(matchingProviderCalls.withLock { $0 } == 2)
+        #expect(matchingWorkCalls.withLock { $0 } == 1)
     }
 
     @Test("toolchain evidence comes only from exact injected build metadata")
@@ -620,6 +700,43 @@ struct SpiceBenchTests {
                     )
                 }
             }
+        }
+    }
+
+    @Test("advanced-video benchmark reports observed post-construction copies")
+    func advancedVideoBenchmarkUsesInstrumentedCopyCount() async throws {
+        let payload = Data([0, 0, 0, 1, 0x65, 0x88, 0x84])
+        let direct = try await SpiceBenchCatalog.advancedVideoObservation(
+            parser: SpiceAnnexBParser(sampleConstructionMode: .direct),
+            payload: payload
+        )
+        let materialized = try await SpiceBenchCatalog.advancedVideoObservation(
+            parser: SpiceAnnexBParser(
+                sampleConstructionMode: .materializeAfterConstructionForTesting
+            ),
+            payload: payload
+        )
+
+        #expect(direct.checksum == materialized.checksum)
+        #expect(direct.exactCounters["avccSampleAllocations"] == 1)
+        #expect(materialized.exactCounters["avccSampleAllocations"] == 2)
+        #expect(direct.exactCounters["samplePayloadCopyBytes"] == 0)
+        let copiedBytes = try #require(
+            materialized.exactCounters["samplePayloadCopyBytes"]
+        )
+        #expect(copiedBytes > 0)
+        #expect(copiedBytes == materialized.exactCounters["avccSampleBytes"])
+        #expect(copiedBytes != materialized.exactCounters["avccPayloadWriteBytes"])
+        #expect(throws: SpiceBenchError.counterInvariant(
+            caseID: "advanced_video.sample",
+            counter: "avccSampleAllocations",
+            actual: 2,
+            expected: "1"
+        )) {
+            try SpiceBenchCounterValidator.validate(
+                caseID: "advanced_video.sample",
+                counters: materialized.exactCounters
+            )
         }
     }
 
