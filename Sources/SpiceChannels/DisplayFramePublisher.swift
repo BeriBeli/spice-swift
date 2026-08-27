@@ -364,6 +364,7 @@ package actor DisplayFramePublisher {
     private struct Request: Sendable, Equatable {
         let surfaceRevision: SurfaceRevision
         let invalidationGeneration: UInt64
+        let queueAge: UInt64
     }
 
     private struct SnapshotPreparation: Sendable {
@@ -406,6 +407,7 @@ package actor DisplayFramePublisher {
     private var lastBatchStart: ContinuousClock.Instant?
     private var lastFramedReceiveBatchStart: ContinuousClock.Instant?
     private var generation: UInt64 = 0
+    private var nextQueueAge: UInt64 = 0
     private var submissions: UInt64 = 0
     private var snapshotAttempts: UInt64 = 0
     private var emittedFrames: UInt64 = 0
@@ -501,22 +503,26 @@ package actor DisplayFramePublisher {
             }
         }
 
-        if pending[surfaceID] == nil {
+        let queueAge: UInt64
+        if let existing = pending[surfaceID] {
+            queueAge = existing.queueAge
+            pendingRevisionCoalesces &+= 1
+        } else {
             if pending.count >= maximumPendingSurfaces, let oldest = order.first {
                 pending.removeValue(forKey: oldest)
                 order.removeFirst()
                 pendingEvictions &+= 1
             }
             order.append(surfaceID)
-        } else {
-            pendingRevisionCoalesces &+= 1
+            queueAge = takeNextQueueAge()
         }
         if preparedRevisions[surfaceID] != nil {
             preparedFrameCoalesces &+= 1
         }
         pending[surfaceID] = Request(
             surfaceRevision: surfaceRevision,
-            invalidationGeneration: invalidationGeneration
+            invalidationGeneration: invalidationGeneration,
+            queueAge: queueAge
         )
 
         scheduleFlushIfNeeded()
@@ -577,9 +583,16 @@ package actor DisplayFramePublisher {
             // does not mutate while hidden. Resume must publish one fresh
             // authoritative lease instead of replaying a retained UI frame.
             if let latest = latestSubmittedRevisions[surfaceID] {
+                let queueAge: UInt64
+                if let existing = pending[surfaceID] {
+                    queueAge = existing.queueAge
+                } else {
+                    queueAge = takeNextQueueAge()
+                }
                 let request = Request(
                     surfaceRevision: latest,
-                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0
+                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0,
+                    queueAge: queueAge
                 )
                 if pending[surfaceID] == nil {
                     if pending.count >= maximumPendingSurfaces, let oldest = order.first {
@@ -676,6 +689,8 @@ package actor DisplayFramePublisher {
         lastFlushStart = flushStartedAt
         flushes &+= 1
         let emittedAtFlushStart = emittedFrames
+        let preFlushOrder = order
+        let preFlushRequests = pending
         let eligibleSurfaceIDs = order.filter(canPrepare)
         let requests = eligibleSurfaceIDs.compactMap { pending[$0] }
         for surfaceID in eligibleSurfaceIDs {
@@ -697,7 +712,10 @@ package actor DisplayFramePublisher {
             if generation == flushGeneration, !isCancelled {
                 restoreQueuedRequestsAfterAbortedFlush(
                     requests,
-                    settledRequestCount: snapshotRun.settledRequestCount
+                    settledRequestCount: snapshotRun.settledRequestCount,
+                    preFlushOrder: preFlushOrder,
+                    preFlushRequests: preFlushRequests,
+                    extractedSurfaceIDs: eligibleSet
                 )
                 isFlushing = false
                 scheduleFlushIfNeeded()
@@ -944,10 +962,14 @@ package actor DisplayFramePublisher {
 
     private func restoreQueuedRequestsAfterAbortedFlush(
         _ requests: [Request],
-        settledRequestCount: Int
+        settledRequestCount: Int,
+        preFlushOrder: [UInt32],
+        preFlushRequests: [UInt32: Request],
+        extractedSurfaceIDs: Set<UInt32>
     ) {
-        var restoredSurfaceIDs: [UInt32] = []
-        restoredSurfaceIDs.reserveCapacity(requests.count)
+        let currentOrder = order
+        var recoveredSurfaceIDs: Set<UInt32> = []
+        recoveredSurfaceIDs.reserveCapacity(requests.count)
         for (requestIndex, request) in requests.enumerated() {
             guard requestIndex >= settledRequestCount, isCurrent(request) else {
                 continue
@@ -964,7 +986,13 @@ package actor DisplayFramePublisher {
                 // Preserve the newer pending revision. A snapshot for the
                 // interrupted request may already have consumed the canonical
                 // publication journal, so its replacement must redraw fully.
+                pending[surfaceID] = Request(
+                    surfaceRevision: replacement.surfaceRevision,
+                    invalidationGeneration: replacement.invalidationGeneration,
+                    queueAge: request.queueAge
+                )
                 forceFullDamage.insert(surfaceID)
+                recoveredSurfaceIDs.insert(surfaceID)
                 continue
             }
             guard lastEmittedRevisions[surfaceID].map({
@@ -974,23 +1002,58 @@ package actor DisplayFramePublisher {
             }
             pending[surfaceID] = request
             forceFullDamage.insert(surfaceID)
-            restoredSurfaceIDs.append(surfaceID)
+            recoveredSurfaceIDs.insert(surfaceID)
         }
-        guard !restoredSurfaceIDs.isEmpty else { return }
-        let restored = Set(restoredSurfaceIDs)
-        order.removeAll { restored.contains($0) }
-        order.insert(contentsOf: restoredSurfaceIDs, at: 0)
+
+        // Pre-flush requests that never left the queue keep their age. Of the
+        // extracted requests, only the unsettled suffix recovered above may
+        // return to its old position. A newer pending revision for an already
+        // settled request was submitted during the flush and therefore keeps
+        // its newer position in `currentOrder`.
+        var originalAgeOrder: [UInt32] = []
+        originalAgeOrder.reserveCapacity(preFlushOrder.count)
+        for surfaceID in preFlushOrder {
+            guard let original = preFlushRequests[surfaceID],
+                  let current = pending[surfaceID],
+                  hasSameQueueIdentity(current, original),
+                  current.queueAge == original.queueAge,
+                  !extractedSurfaceIDs.contains(surfaceID)
+                    || recoveredSurfaceIDs.contains(surfaceID)
+            else {
+                continue
+            }
+            originalAgeOrder.append(surfaceID)
+        }
+        let originalAgeSet = Set(originalAgeOrder)
+        let currentAgeOrder = currentOrder.filter { surfaceID in
+            pending[surfaceID] != nil && !originalAgeSet.contains(surfaceID)
+        }
+        order = originalAgeOrder + currentAgeOrder
+
         // Restoration is synchronous actor work, so the temporary merged set
         // is never observable. Apply the same oldest-first capacity eviction
-        // used by normal submissions before yielding again. Full-damage marks
-        // intentionally survive eviction so a later submission still repairs
-        // a publication journal that an interrupted snapshot may have drained.
+        // used by normal submissions before yielding again. Recovered requests
+        // keep their original age and are therefore evicted before newer work
+        // when capacity filled concurrently. Full-damage marks intentionally
+        // survive eviction so a later submission still repairs a publication
+        // journal that an interrupted snapshot may have drained.
         while pending.count > maximumPendingSurfaces, let oldest = order.first {
             order.removeFirst()
             if pending.removeValue(forKey: oldest) != nil {
                 pendingEvictions &+= 1
             }
         }
+    }
+
+    private func hasSameQueueIdentity(_ lhs: Request, _ rhs: Request) -> Bool {
+        lhs.invalidationGeneration == rhs.invalidationGeneration
+            && lhs.surfaceRevision.lifecycleGeneration
+                == rhs.surfaceRevision.lifecycleGeneration
+    }
+
+    private func takeNextQueueAge() -> UInt64 {
+        defer { nextQueueAge &+= 1 }
+        return nextQueueAge
     }
 
     private func isCurrent(_ request: Request) -> Bool {
