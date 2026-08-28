@@ -94,8 +94,5 @@ stop_endpoint_locked() {
         teardown_failed
         return 1
     fi
-    if [[ -f "${PERF_STATE}/log-follower.pid" ]]; then
-        kill "$(<"${PERF_STATE}/log-follower.pid")" 2>/dev/null || true
-    fi
     discard_inactive_state_locked
 }

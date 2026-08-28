@@ -59,8 +59,11 @@ discard inactive state without signalling a persisted follower PID; start does
 so before it arms the new run's failure cleanup. Stop defers an observed
 termination signal until its container and active-state cleanup completes. Run
 directory names include an atomic random suffix, so two attempts in the same
-second cannot collide. Guest builds use temporary rootfs and artifact
-directories, validate the manifest and
+second cannot collide. Lifecycle cleanup never signals the recorded follower
+PID: removing the container lets `podman logs --follow` exit naturally, and its
+PID record is discarded only after Podman confirms the container is absent.
+Guest builds use temporary rootfs and artifact directories, validate the
+manifest and
 hashes, and only then acquire the same lifecycle lock and replace the prior
 build. The build holds that lock through backup cleanup, while start holds it
 through artifact verification, evidence capture, and QEMU detach. Before

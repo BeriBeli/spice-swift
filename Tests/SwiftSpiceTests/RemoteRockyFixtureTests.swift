@@ -139,6 +139,41 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.stateFileExists("log-follower.pid"))
     }
 
+    @Test func failedStartDoesNotSignalAReusedLogFollowerPID() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleeper.arguments = ["60"]
+        try sleeper.run()
+        defer {
+            if sleeper.isRunning {
+                sleeper.terminate()
+            }
+            sleeper.waitUntilExit()
+        }
+
+        let result = try fixture.run(
+            "remote/start.sh",
+            ssMode: "spice-only",
+            additionalEnvironment: [
+                "MOCK_REUSED_FOLLOWER_PID": "\(sleeper.processIdentifier)",
+            ]
+        )
+
+        #expect(result.status != 0)
+        #expect(result.output.contains("active state was removed"))
+        #expect(fixture.stateFileExists("follower-pid-reused"))
+        #expect(sleeper.isRunning)
+        #expect(fixture.didStopContainer)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.containerExists)
+        #expect(!fixture.stateFileExists("ticket"))
+        #expect(!fixture.stateFileExists("current-run"))
+        #expect(!fixture.stateFileExists("log-follower.pid"))
+    }
+
     @Test func failedStartPreservesAuditableStateWhenEndpointTeardownFails() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -342,6 +377,7 @@ struct RemoteRockyFixtureTests {
 
         fixture.releaseMockState("log-follower")
         try fixture.waitForMockState("log-follower-finished")
+        try fixture.waitForMockStateRemoval("log-follower-active")
     }
 
     @Test func terminationDuringStartupAndStopLeavesNoConcurrentStateRace() throws {
@@ -395,6 +431,7 @@ struct RemoteRockyFixtureTests {
 
         let firstStart = try fixture.run("remote/start.sh", ssMode: "both")
         #expect(firstStart.status == 0)
+        try fixture.waitForMockStateRemoval("log-follower-active")
         let firstTicket = try fixture.ticket()
         #expect(firstTicket.range(of: "^[0-9a-f]{48}$", options: .regularExpression) != nil)
         #expect(try fixture.ticketPermissions() == 0o600)
@@ -402,11 +439,13 @@ struct RemoteRockyFixtureTests {
 
         let firstStop = try fixture.run("remote/stop.sh", ssMode: "both")
         #expect(firstStop.status == 0)
+        #expect(!fixture.stateFileExists("log-follower-active"))
         #expect(!fixture.stateFileExists("ticket"))
         #expect(!fixture.evidenceOrArgumentsContain(firstTicket))
 
         let secondStart = try fixture.run("remote/start.sh", ssMode: "both")
         #expect(secondStart.status == 0)
+        try fixture.waitForMockStateRemoval("log-follower-active")
         let secondTicket = try fixture.ticket()
         #expect(secondTicket.range(of: "^[0-9a-f]{48}$", options: .regularExpression) != nil)
         #expect(secondTicket != firstTicket)
@@ -652,6 +691,17 @@ private struct RemoteRockyFixture {
         }
     }
 
+    func waitForMockStateRemoval(_ name: String) throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        let path = mockState.appending(path: name).path
+        while fileManager.fileExists(atPath: path) {
+            guard ContinuousClock().now < deadline else {
+                throw RemoteRockyFixtureError.timedOutWaitingForMockState(name)
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
     func releaseMockState(_ name: String) {
         _ = fileManager.createFile(
             atPath: mockState.appending(path: "release-\(name)").path,
@@ -773,6 +823,8 @@ private struct RemoteRockyFixture {
                         : > "$state/fd9-inherited-log-follower"
                         exit 65
                     fi
+                    : > "$state/log-follower-active"
+                    trap 'rm -f "$state/log-follower-active"' EXIT
                 elif [[ "${1:-}" == --tail ]]; then
                     [[ "${2:-}" == 12 ]]
                     [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
@@ -782,6 +834,16 @@ private struct RemoteRockyFixture {
                     [[ $# == 1 ]]
                 fi
                 printf 'PERF_READY resolution=1280x720\n'
+                if [[ "${1:-}" == --follow && -n "${MOCK_REUSED_FOLLOWER_PID:-}" ]]; then
+                    follower_pid_file="${SWIFTSPICE_PERF_BASE:?}/state/log-follower.pid"
+                    for _ in $(seq 1 100); do
+                        [[ -s "$follower_pid_file" ]] && break
+                        /bin/sleep 0.01
+                    done
+                    [[ -s "$follower_pid_file" ]]
+                    printf '%s\n' "$MOCK_REUSED_FOLLOWER_PID" > "$follower_pid_file"
+                    : > "$state/follower-pid-reused"
+                fi
                 if [[ "${1:-}" == --follow && "${MOCK_HOLD_LOG_FOLLOWER:-}" == 1 ]]; then
                     : > "$state/log-follower-entered"
                     while [[ ! -f "$state/release-log-follower" ]]; do /bin/sleep 0.01; done
