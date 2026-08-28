@@ -23,4 +23,12 @@ void spice_copy_bgra_opaque(
     size_t pixel_count
 );
 
+void spice_fill_bgra32(
+    uint8_t *destination,
+    size_t destination_stride,
+    size_t width,
+    size_t height,
+    uint32_t value
+);
+
 #endif

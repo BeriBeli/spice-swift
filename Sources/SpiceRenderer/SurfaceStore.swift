@@ -119,6 +119,10 @@ package struct SurfaceDescriptor: Sendable, Equatable {
 
 package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let mutationTransactions: UInt64
+    package let temporaryCopyBytes: UInt64
+    package let bulkCopyCalls: UInt64
+    package let rowCopyCalls: UInt64
+    package let fillKernelCalls: UInt64
     package let damageOperations: UInt64
     package let damageBytes: UInt64
     package let snapshots: UInt64
@@ -438,6 +442,10 @@ package actor SurfaceStore {
     )] = [:]
     private var lifecycleGenerations: [UInt32: UInt64] = [:]
     private var mutationTransactions: UInt64 = 0
+    private var temporaryCopyBytes: UInt64 = 0
+    private var bulkCopyCalls: UInt64 = 0
+    private var rowCopyCalls: UInt64 = 0
+    private var fillKernelCalls: UInt64 = 0
     private var damageOperations: UInt64 = 0
     private var damageBytes: UInt64 = 0
     private var snapshots: UInt64 = 0
@@ -619,19 +627,7 @@ package actor SurfaceStore {
         try prepareForMutation(&surface)
         surface.revision = nextRevision
         surface.mutationGeneration &+= 1
-        let destinationBytesPerRow = surface.bytesPerRow
-        surface.pixels.withUnsafeMutableBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else { return }
-            for y in rectangle.y..<(rectangle.y + rectangle.height) {
-                var pixel = baseAddress.advanced(
-                    by: y * destinationBytesPerRow + rectangle.x * 4
-                )
-                for _ in 0..<rectangle.width {
-                    pixel.storeBytes(of: colorBGRA, as: UInt32.self)
-                    pixel = pixel.advanced(by: 4)
-                }
-            }
-        }
+        fillPixels(in: &surface, rectangle: rectangle, colorBGRA: colorBGRA)
         surface.storage.recordDamage(rectangle, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
@@ -673,23 +669,13 @@ package actor SurfaceStore {
         try validate(source, in: surface)
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
-
-        let rowBytes = destination.width * 4
-        var copied = Data(capacity: rowBytes * destination.height)
-        for row in 0..<source.height {
-            let start = (source.y + row) * surface.bytesPerRow + source.x * 4
-            copied.append(surface.pixels[start..<(start + rowBytes)])
-        }
+        copySurfacePixels(
+            in: &surface,
+            destination: destination,
+            source: source
+        )
         surface.revision = nextRevision
         surface.mutationGeneration &+= 1
-        for row in 0..<destination.height {
-            let sourceStart = row * rowBytes
-            let destinationStart = (destination.y + row) * surface.bytesPerRow + destination.x * 4
-            surface.pixels.replaceSubrange(
-                destinationStart..<(destinationStart + rowBytes),
-                with: copied[sourceStart..<(sourceStart + rowBytes)]
-            )
-        }
         surface.storage.recordDamage(destination, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
@@ -857,24 +843,14 @@ package actor SurfaceStore {
             destination: &destinationSurface,
             source: &sourceSurface
         )
-        let rowBytes = destination.width * 4
-        var copied = Data(capacity: rowBytes * destination.height)
-        for row in 0..<sourceRectangle.height {
-            let start = (sourceRectangle.y + row) * sourceSurface.bytesPerRow
-                + sourceRectangle.x * 4
-            copied.append(sourceSurface.pixels[start..<(start + rowBytes)])
-        }
+        copySurfacePixels(
+            from: sourceSurface,
+            to: &destinationSurface,
+            destination: destination,
+            source: sourceRectangle
+        )
         destinationSurface.revision = nextRevision
         destinationSurface.mutationGeneration &+= 1
-        for row in 0..<destination.height {
-            let sourceStart = row * rowBytes
-            let destinationStart = (destination.y + row) * destinationSurface.bytesPerRow
-                + destination.x * 4
-            destinationSurface.pixels.replaceSubrange(
-                destinationStart..<(destinationStart + rowBytes),
-                with: copied[sourceStart..<(sourceStart + rowBytes)]
-            )
-        }
         destinationSurface.storage.recordDamage(
             destination,
             revision: destinationSurface.revision
@@ -915,20 +891,8 @@ package actor SurfaceStore {
             | UInt32(alpha) << 24
 
         try prepareForMutation(&surface)
-        let destinationBytesPerRow = surface.bytesPerRow
-        surface.pixels.withUnsafeMutableBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else { return }
-            for rectangle in region {
-                for y in rectangle.y..<(rectangle.y + rectangle.height) {
-                    var pixel = baseAddress.advanced(
-                        by: y * destinationBytesPerRow + rectangle.x * 4
-                    )
-                    for _ in 0..<rectangle.width {
-                        pixel.storeBytes(of: colorBGRA, as: UInt32.self)
-                        pixel = pixel.advanced(by: 4)
-                    }
-                }
-            }
+        for rectangle in region {
+            fillPixels(in: &surface, rectangle: rectangle, colorBGRA: colorBGRA)
         }
         return commitRegionMutation(
             &surface,
@@ -979,7 +943,7 @@ package actor SurfaceStore {
                 destination: destination,
                 source: source
             )
-            copyBits(
+            copySurfacePixels(
                 in: &surface,
                 destination: rectangle,
                 source: sourceRectangle
@@ -1167,7 +1131,7 @@ package actor SurfaceStore {
                 destination: destination,
                 source: source
             )
-            copyBits(
+            copySurfacePixels(
                 from: sourceSurface,
                 to: &destinationSurface,
                 destination: rectangle,
@@ -1645,6 +1609,10 @@ package actor SurfaceStore {
         let revisionedMetrics = revisionedFramePool?.metrics()
         return SurfaceStoreMetrics(
             mutationTransactions: mutationTransactions,
+            temporaryCopyBytes: temporaryCopyBytes,
+            bulkCopyCalls: bulkCopyCalls,
+            rowCopyCalls: rowCopyCalls,
+            fillKernelCalls: fillKernelCalls,
             damageOperations: damageOperations,
             damageBytes: damageBytes,
             snapshots: snapshots,
@@ -2085,48 +2053,128 @@ package actor SurfaceStore {
         }
     }
 
-    private func copyBits(
+    private func fillPixels(
+        in surface: inout Surface,
+        rectangle: PixelRect,
+        colorBGRA: UInt32
+    ) {
+        let bytesPerRow = surface.bytesPerRow
+        surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            spice_fill_bgra32(
+                baseAddress.advanced(by: rectangle.y * bytesPerRow + rectangle.x * 4)
+                    .assumingMemoryBound(to: UInt8.self),
+                bytesPerRow,
+                rectangle.width,
+                rectangle.height,
+                colorBGRA
+            )
+        }
+        Self.saturatingAdd(1, to: &fillKernelCalls)
+    }
+
+    private func copySurfacePixels(
         in surface: inout Surface,
         destination: PixelRect,
         source: PixelRect
     ) {
+        let bytesPerRow = surface.bytesPerRow
         let rowBytes = destination.width * 4
-        var copied = Data(capacity: rowBytes * destination.height)
-        for row in 0..<source.height {
-            let start = (source.y + row) * surface.bytesPerRow + source.x * 4
-            copied.append(surface.pixels[start..<(start + rowBytes)])
+        let overlaps = source.x < destination.x + destination.width
+            && destination.x < source.x + source.width
+            && source.y < destination.y + destination.height
+            && destination.y < source.y + source.height
+        let usesBulkCopy = !overlaps
+            && (destination.height == 1 || rowBytes == bytesPerRow)
+        surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            if usesBulkCopy {
+                _ = memmove(
+                    baseAddress.advanced(by: destination.y * bytesPerRow + destination.x * 4),
+                    baseAddress.advanced(by: source.y * bytesPerRow + source.x * 4),
+                    rowBytes * destination.height
+                )
+            } else if destination.y > source.y {
+                for row in stride(from: destination.height - 1, through: 0, by: -1) {
+                    _ = memmove(
+                        baseAddress.advanced(
+                            by: (destination.y + row) * bytesPerRow + destination.x * 4
+                        ),
+                        baseAddress.advanced(
+                            by: (source.y + row) * bytesPerRow + source.x * 4
+                        ),
+                        rowBytes
+                    )
+                }
+            } else {
+                for row in 0..<destination.height {
+                    _ = memmove(
+                        baseAddress.advanced(
+                            by: (destination.y + row) * bytesPerRow + destination.x * 4
+                        ),
+                        baseAddress.advanced(
+                            by: (source.y + row) * bytesPerRow + source.x * 4
+                        ),
+                        rowBytes
+                    )
+                }
+            }
         }
-        for row in 0..<destination.height {
-            let sourceStart = row * rowBytes
-            let destinationStart = (destination.y + row) * surface.bytesPerRow
-                + destination.x * 4
-            surface.pixels.replaceSubrange(
-                destinationStart..<(destinationStart + rowBytes),
-                with: copied[sourceStart..<(sourceStart + rowBytes)]
-            )
+        if usesBulkCopy {
+            Self.saturatingAdd(1, to: &bulkCopyCalls)
+        } else {
+            Self.saturatingAdd(UInt64(destination.height), to: &rowCopyCalls)
         }
     }
 
-    private func copyBits(
+    private func copySurfacePixels(
         from sourceSurface: Surface,
         to destinationSurface: inout Surface,
         destination: PixelRect,
         source: PixelRect
     ) {
+        let sourceBytesPerRow = sourceSurface.bytesPerRow
+        let destinationBytesPerRow = destinationSurface.bytesPerRow
         let rowBytes = destination.width * 4
-        var copied = Data(capacity: rowBytes * destination.height)
-        for row in 0..<source.height {
-            let start = (source.y + row) * sourceSurface.bytesPerRow + source.x * 4
-            copied.append(sourceSurface.pixels[start..<(start + rowBytes)])
+        let usesBulkCopy = destination.height == 1
+            || (rowBytes == sourceBytesPerRow && rowBytes == destinationBytesPerRow)
+        sourceSurface.pixels.withUnsafeBytes { sourceBytes in
+            destinationSurface.pixels.withUnsafeMutableBytes { destinationBytes in
+                guard let sourceBase = sourceBytes.baseAddress,
+                      let destinationBase = destinationBytes.baseAddress
+                else {
+                    return
+                }
+                if usesBulkCopy {
+                    _ = memcpy(
+                        destinationBase.advanced(
+                            by: destination.y * destinationBytesPerRow + destination.x * 4
+                        ),
+                        sourceBase.advanced(
+                            by: source.y * sourceBytesPerRow + source.x * 4
+                        ),
+                        rowBytes * destination.height
+                    )
+                } else {
+                    for row in 0..<destination.height {
+                        _ = memcpy(
+                            destinationBase.advanced(
+                                by: (destination.y + row) * destinationBytesPerRow
+                                    + destination.x * 4
+                            ),
+                            sourceBase.advanced(
+                                by: (source.y + row) * sourceBytesPerRow + source.x * 4
+                            ),
+                            rowBytes
+                        )
+                    }
+                }
+            }
         }
-        for row in 0..<destination.height {
-            let sourceStart = row * rowBytes
-            let destinationStart = (destination.y + row) * destinationSurface.bytesPerRow
-                + destination.x * 4
-            destinationSurface.pixels.replaceSubrange(
-                destinationStart..<(destinationStart + rowBytes),
-                with: copied[sourceStart..<(sourceStart + rowBytes)]
-            )
+        if usesBulkCopy {
+            Self.saturatingAdd(1, to: &bulkCopyCalls)
+        } else {
+            Self.saturatingAdd(UInt64(destination.height), to: &rowCopyCalls)
         }
     }
 
@@ -2243,8 +2291,15 @@ package actor SurfaceStore {
     }
 
     private func recordMutationTransaction() {
-        if mutationTransactions < UInt64.max {
-            mutationTransactions += 1
+        Self.saturatingAdd(1, to: &mutationTransactions)
+    }
+
+    private static func saturatingAdd(_ amount: UInt64, to value: inout UInt64) {
+        let (sum, overflow) = value.addingReportingOverflow(amount)
+        if overflow {
+            value = UInt64.max
+        } else {
+            value = sum
         }
     }
 

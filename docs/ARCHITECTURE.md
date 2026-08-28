@@ -169,6 +169,16 @@ and failed validation publish no pixels or damage and advance no Surface
 transaction metrics. Cache entry publication remains ordered after successful
 Surface commit. Cross-Surface locks are acquired in Surface-ID order.
 
+Surface copy kernels do not allocate area-sized staging buffers. Canonical
+same-Surface regions retain command-wide quadrant traversal; each overlapping
+rectangle copies rows bottom-up for downward moves and top-down otherwise, with
+`memmove` handling horizontal overlap. Cross-Surface rectangles copy directly
+from the synchronized source bytes. Only a non-overlapping, tightly contiguous
+rectangle becomes one bulk copy; other rectangles issue one bounded row call
+per row. Surface fill delegates each canonical segment to the arm64 NEON pixel
+kernel. Unsafe byte pointers remain inside synchronous buffer closures and
+never cross an actor suspension point.
+
 The image cache and GLZ dictionary have explicit entry and byte limits. Shared
 Display state uses actors and serial barriers so cross-channel invalidation and
 GLZ dependencies follow protocol order.
