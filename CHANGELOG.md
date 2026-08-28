@@ -23,16 +23,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - Serial barriers now complete after handler and protocol-ACK processing, and
   connection replacement keeps failure, cancellation, Agent sends, and
   migration cleanup bound to the connection that produced the work.
-- Display mutations now validate and commit each wire draw as one transaction;
-  COPY_BITS and fill paths avoid area-sized staging, while eligible CPU updates
-  preserve IOSurface-canonical backing and publication damage.
+- Display mutations now validate and commit each wire draw as one transaction.
+  COPY_BITS avoids area-sized staging, fill uses a bulk C kernel, and eligible
+  CPU updates preserve IOSurface-canonical backing and publication damage.
 - Framing and parsing now use segmented receive storage, checked owned slices,
   and synchronous Swift `Span` views, avoiding repeated compaction and bounding
   retained owners and segment metadata.
-- LZ, GLZ, stateless codecs, and VideoToolbox input preparation now use bounded
-  work admission and explicit immutable ownership. LZ decodes into one output
-  backing, GLZ separates dependency coordination from CPU execution, and
-  Annex-B samples avoid redundant payload materialization.
+- LZ, GLZ, and stateless codecs now use bounded work admission and explicit
+  immutable ownership. LZ decodes into one output backing, while GLZ separates
+  dependency coordination from CPU execution.
+- Annex-B input is scanned once into checked ranges, and VideoToolbox lends
+  CoreMedia one stable owner without redundant payload materialization.
 - Initial and migration child-channel connections now use deterministic bounded
   concurrency with complete rollback of early and late successes.
 

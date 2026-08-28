@@ -121,7 +121,7 @@ them on every build and also checks a release tag:
 
 ```sh
 ./Scripts/check-version.sh
-./Scripts/check-version.sh v0.3.0
+./Scripts/check-version.sh "v$(cat VERSION)"
 ```
 
 To publish a release from a clean, synchronized `main`, run the full local
