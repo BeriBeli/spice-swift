@@ -3,19 +3,17 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-run_dir="$(current_run_dir 2>/dev/null || true)"
-if [[ -n "${run_dir}" ]]; then
-    podman logs "${PERF_CONTAINER}" > "${run_dir}/server-final.log" 2>&1 || true
+acquire_lifecycle_lock
+stop_interrupted=false
+trap 'stop_interrupted=true' HUP INT TERM
+teardown_status=0
+if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
+    stop_endpoint_locked || teardown_status=$?
+else
+    remove_inactive_endpoint_locked || teardown_status=$?
 fi
-podman stop --time 10 "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-if [[ -f "${PERF_STATE}/log-follower.pid" ]]; then
-    kill "$(<"${PERF_STATE}/log-follower.pid")" 2>/dev/null || true
+trap - HUP INT TERM
+if [[ "${stop_interrupted}" == true || "${teardown_status}" != 0 ]]; then
+    exit 1
 fi
-rm -f \
-    "${PERF_STATE}/ticket" \
-    "${PERF_STATE}/current-run" \
-    "${PERF_STATE}/log-follower.pid" \
-    "${PERF_STATE}/round-start" \
-    "${PERF_STATE}/round-id"
 echo "Performance endpoint stopped; the temporary ticket was removed."
