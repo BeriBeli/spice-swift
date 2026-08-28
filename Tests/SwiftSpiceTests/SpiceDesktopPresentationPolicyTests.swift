@@ -52,6 +52,195 @@ struct SpiceDesktopPresentationPolicyTests {
         #expect(selected.pointerMode == .relative)
     }
 
+    @Test func readyLatchMeasuresFromLatestAcceptedSnapshotReadyTime() throws {
+        let first = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 20
+        )
+        let latest = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 21
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let firstReadyAt = ContinuousClock().now
+        let latestReadyAt = firstReadyAt.advanced(by: .milliseconds(10))
+        let selectedAt = firstReadyAt.advanced(by: .milliseconds(15))
+
+        #expect(latch.offer(first, at: firstReadyAt))
+        #expect(!latch.offer(latest, at: latestReadyAt))
+        let ready = try #require(latch.takeReady(at: selectedAt))
+        #expect(ready.snapshot.deliverySequence == 21)
+        #expect(ready.snapshot.pointerMode == .relative)
+        #expect(ready.waitingDuration == .milliseconds(5))
+        #expect(latch.isEmpty)
+    }
+
+    @Test func rejectedOlderOfferDoesNotReplaceSelectedReadyTime() throws {
+        let newest = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 22
+        )
+        let lateOlder = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 21
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let newestReadyAt = ContinuousClock().now
+        let olderArrivedAt = newestReadyAt.advanced(by: .milliseconds(12))
+        let selectedAt = newestReadyAt.advanced(by: .milliseconds(15))
+
+        #expect(latch.offer(newest, at: newestReadyAt))
+        #expect(!latch.offer(lateOlder, at: olderArrivedAt))
+        let ready = try #require(latch.takeReady(at: selectedAt))
+        #expect(ready.snapshot.deliverySequence == 22)
+        #expect(ready.snapshot.pointerMode == .relative)
+        #expect(ready.waitingDuration == .milliseconds(15))
+    }
+
+    @Test func duplicateDeliveryDoesNotReplaceReadyTimeOrReawakenLatch() throws {
+        let snapshot = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 24
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let readyAt = ContinuousClock().now
+
+        #expect(latch.offer(snapshot, at: readyAt))
+        #expect(!latch.offer(
+            snapshot,
+            at: readyAt.advanced(by: .milliseconds(10))
+        ))
+        let selected = try #require(latch.takeReady(
+            at: readyAt.advanced(by: .milliseconds(15))
+        ))
+        #expect(selected.snapshot.deliverySequence == 24)
+        #expect(selected.waitingDuration == .milliseconds(15))
+
+        #expect(!latch.offer(
+            snapshot,
+            at: readyAt.advanced(by: .milliseconds(20))
+        ))
+        #expect(latch.isEmpty)
+        #expect(latch.takeReady(at: readyAt.advanced(by: .milliseconds(25))) == nil)
+    }
+
+    @Test func selectionBeforeReadyTimeReportsZeroWaitingDuration() throws {
+        let snapshot = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 25
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let selectedAt = ContinuousClock().now
+        let futureReadyAt = selectedAt.advanced(by: .milliseconds(5))
+
+        #expect(latch.offer(snapshot, at: futureReadyAt))
+        let selected = try #require(latch.takeReady(at: selectedAt))
+        #expect(selected.snapshot.deliverySequence == 25)
+        #expect(selected.waitingDuration == .zero)
+    }
+
+    @Test func restoreIfEmptyUsesRestoreTimeAndPreservesNewerPendingUpdate() throws {
+        let failed = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 30
+        )
+        let newer = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 31
+        )
+        let firstReadyAt = ContinuousClock().now
+
+        let restoredLatch = SpiceDesktopReadyLatch()
+        #expect(restoredLatch.offer(failed, at: firstReadyAt))
+        let failedReady = try #require(restoredLatch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(1))
+        ))
+        let restoredAt = firstReadyAt.advanced(by: .milliseconds(10))
+        restoredLatch.restoreIfEmpty(failedReady.snapshot, at: restoredAt)
+        let restored = try #require(restoredLatch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(15))
+        ))
+        #expect(restored.snapshot.deliverySequence == 30)
+        #expect(restored.waitingDuration == .milliseconds(5))
+
+        let newerLatch = SpiceDesktopReadyLatch()
+        #expect(newerLatch.offer(failed, at: firstReadyAt))
+        let selectedFailed = try #require(newerLatch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(1))
+        ))
+        let newerReadyAt = firstReadyAt.advanced(by: .milliseconds(10))
+        #expect(newerLatch.offer(newer, at: newerReadyAt))
+        newerLatch.restoreIfEmpty(
+            selectedFailed.snapshot,
+            at: firstReadyAt.advanced(by: .milliseconds(12))
+        )
+        let selectedNewer = try #require(newerLatch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(15))
+        ))
+        #expect(selectedNewer.snapshot.deliverySequence == 31)
+        #expect(selectedNewer.snapshot.pointerMode == .relative)
+        #expect(selectedNewer.waitingDuration == .milliseconds(5))
+    }
+
+    @Test func restoreIfEmptyRejectsStaleSnapshotAfterNewerSelection() throws {
+        let stale = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 40
+        )
+        let newest = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 41
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let staleReadyAt = ContinuousClock().now
+        let newestReadyAt = staleReadyAt.advanced(by: .milliseconds(5))
+
+        #expect(latch.offer(stale, at: staleReadyAt))
+        _ = try #require(latch.takeReady(at: staleReadyAt))
+        #expect(latch.offer(newest, at: newestReadyAt))
+        _ = try #require(latch.takeReady(at: newestReadyAt))
+        #expect(latch.isEmpty)
+
+        latch.restoreIfEmpty(
+            stale,
+            at: newestReadyAt.advanced(by: .milliseconds(5))
+        )
+        #expect(latch.isEmpty)
+        #expect(latch.takeReady(
+            at: newestReadyAt.advanced(by: .milliseconds(10))
+        ) == nil)
+    }
+
     @Test func readyLatchMergesFrameDamageIntoNewerCursorSnapshot() throws {
         let frame = SpiceFrame(
             surfaceID: 0,
@@ -153,9 +342,49 @@ struct SpiceDesktopPresentationPolicyTests {
         #expect(pacing.readyBecameAvailable() == .selectImmediately)
         #expect(pacing.displayLinkFired(hasReadySnapshot: false) == .pauseDisplayLink)
         #expect(pacing.readyBecameAvailable() == .selectImmediately)
+    }
+
+    @Test func activeDisplayLinkSelectsReadyWorkOnFirstEligibleTick() throws {
+        let latch = SpiceDesktopReadyLatch()
+        var pacing = SpiceDesktopPresentationPacingPolicy()
+        let idleReadyAt = ContinuousClock().now
+        let idle = SpiceDesktopSnapshot(
+            generation: 1,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 1
+        )
+        let steady = SpiceDesktopSnapshot(
+            generation: 1,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .relative,
+            deliverySequence: 2
+        )
+
+        #expect(latch.offer(idle, at: idleReadyAt))
+        #expect(pacing.readyBecameAvailable() == .selectImmediately)
+        let idleSelection = try #require(latch.takeReady(at: idleReadyAt))
+        #expect(idleSelection.snapshot.deliverySequence == 1)
+        #expect(idleSelection.waitingDuration == .zero)
+
+        let steadyReadyAt = idleReadyAt.advanced(by: .milliseconds(4))
+        #expect(latch.offer(steady, at: steadyReadyAt))
         #expect(pacing.readyBecameAvailable() == .waitForDisplayLink)
         #expect(
-            pacing.displayLinkFired(hasReadySnapshot: true) == .selectOnDisplayLink
+            pacing.displayLinkFired(hasReadySnapshot: !latch.isEmpty)
+                == .selectOnDisplayLink
+        )
+        let firstEligibleTick = steadyReadyAt.advanced(by: .milliseconds(8))
+        let steadySelection = try #require(latch.takeReady(at: firstEligibleTick))
+        #expect(steadySelection.snapshot.deliverySequence == 2)
+        #expect(steadySelection.snapshot.pointerMode == .relative)
+        #expect(steadySelection.waitingDuration == .milliseconds(8))
+        #expect(latch.isEmpty)
+        #expect(
+            pacing.displayLinkFired(hasReadySnapshot: !latch.isEmpty)
+                == .pauseDisplayLink
         )
     }
 
