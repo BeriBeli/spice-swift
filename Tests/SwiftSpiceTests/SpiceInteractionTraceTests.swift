@@ -70,6 +70,32 @@ struct SpiceInteractionTraceTests {
         #expect(guestOrderViolation.invalidReason == "non_monotonic_timestamps")
     }
 
+    @Test func earlyMotionAcknowledgmentIsBufferedAtSendCompletionLinearization() {
+        let earlyButArmed = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            motionAckNs: 35
+        )
+        #expect(earlyButArmed.valid)
+        #expect(earlyButArmed.invalidReason == nil)
+
+        let beforeSend = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            motionAckNs: 29
+        )
+        #expect(!beforeSend.valid)
+        #expect(beforeSend.invalidReason == "non_monotonic_timestamps")
+
+        let afterPresentation = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            motionAckNs: 121
+        )
+        #expect(!afterPresentation.valid)
+        #expect(afterPresentation.invalidReason == "non_monotonic_timestamps")
+    }
+
     @Test func decodingCannotForgeDerivedValidity() throws {
         let encoded = try JSONEncoder().encode(trace())
         guard var object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
@@ -93,6 +119,7 @@ struct SpiceInteractionTraceTests {
     private func trace(
         sendStartedNs: UInt64? = 30,
         sendCompletedNs: UInt64? = 40,
+        motionAckNs: UInt64? = 45,
         guestReceivedNs: UInt64? = 50,
         guestMarkerDrawnNs: UInt64? = 60,
         markerRevision: UInt64? = 77,
@@ -109,7 +136,7 @@ struct SpiceInteractionTraceTests {
             hostInputNs: 20,
             sendStartedNs: sendStartedNs,
             sendCompletedNs: sendCompletedNs,
-            motionAckNs: 45,
+            motionAckNs: motionAckNs,
             guestReceivedNs: guestReceivedNs,
             guestMarkerDrawnNs: guestMarkerDrawnNs,
             displayReceiveNs: 70,

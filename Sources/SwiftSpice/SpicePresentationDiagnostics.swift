@@ -466,7 +466,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             return "non_monotonic_timestamps"
         }
         if let motionAckNs,
-           !(sendCompletedNs <= motionAckNs && motionAckNs <= presentedNs) {
+           !(sendStartedNs <= motionAckNs && motionAckNs <= presentedNs) {
             return "non_monotonic_timestamps"
         }
         return nil

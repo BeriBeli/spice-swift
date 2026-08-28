@@ -431,6 +431,54 @@ struct RemoteRockyFixtureTests {
         #expect(try fixture.mockEventCount("control-exec") == 1)
     }
 
+    @Test func controlReturnsTheCompleteLatestInputDiagnosisBlock() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+
+        let diagnosisLines = [
+            "PERF_INPUT_DIAGNOSTIC_BEGIN",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-01",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-02",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-03",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-04",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-05",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-06",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-07",
+            "PERF_INPUT_DIAGNOSTIC source=xinput text=device-08",
+            "PERF_INPUT_DIAGNOSTIC source=xorg text=libinput-keyboard",
+            "PERF_INPUT_DIAGNOSTIC source=xorg text=libinput-pointer",
+            "PERF_INPUT_DIAGNOSTIC source=proc_input text=N: Name=QEMU keyboard",
+            "PERF_INPUT_DIAGNOSTIC source=proc_input text=H: Handlers=kbd event0",
+            "PERF_INPUT_DIAGNOSTIC source=proc_input text=N: Name=spice tablet",
+            "PERF_INPUT_DIAGNOSTIC source=proc_input text=H: Handlers=mouse0 event2",
+            "PERF_INPUT_DIAGNOSTIC_END",
+        ]
+        let containerLog = fixture.mockState.appending(path: "container.log")
+        let logLines = ["older unrelated output"] + diagnosisLines
+        try Data((logLines.joined(separator: "\r\n") + "\r\n").utf8).write(to: containerLog)
+
+        let result = try fixture.run(
+            "remote/control.sh",
+            arguments: ["diagnose-input"],
+            ssMode: "both",
+            additionalEnvironment: ["MOCK_CONTAINER_LOG_FILE": containerLog.path]
+        )
+
+        #expect(result.status == 0)
+        #expect(!result.output.contains("\r"))
+        let outputLines = result.output.split(separator: "\n").map(String.init)
+        #expect(outputLines == diagnosisLines)
+        let beginCount = result.output.components(
+            separatedBy: "PERF_INPUT_DIAGNOSTIC_BEGIN"
+        ).count - 1
+        let endCount = result.output.components(
+            separatedBy: "PERF_INPUT_DIAGNOSTIC_END"
+        ).count - 1
+        #expect(beginCount == 1)
+        #expect(endCount == 1)
+    }
+
     @Test func guestInputDiagnosisFramesEveryDeviceLineAndOnlyRelevantXorgLines() throws {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "guest-input-diagnostics-\(UUID().uuidString)",
@@ -1268,9 +1316,10 @@ private struct RemoteRockyFixture {
         #!/bin/bash
         set -euo pipefail
         [[ "${1:-}" == --exclusive ]]
-        [[ "${2:-}" == 9 ]]
+        [[ "${2:-}" == 8 || "${2:-}" == 9 ]]
         [[ $# == 2 ]]
-        exec /usr/bin/python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'
+        exec /usr/bin/python3 -c \
+            'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "${2}"
         """#)
         try writeExecutable(name: "podman", contents: #"""
         #!/bin/bash
@@ -1295,6 +1344,18 @@ private struct RemoteRockyFixture {
                 [[ $# == 4 ]]
                 printf '%s\n' "${4:-}" > "$state/control-command"
                 printf 'control-exec\n' >> "$state/events"
+                if [[ "${4:-}" == *"diagnose-input"* ]]; then
+                    run_id="$(<"${SWIFTSPICE_PERF_BASE:?}/state/current-run")"
+                    server_log="${SWIFTSPICE_PERF_BASE}/logs/${run_id}/server.log"
+                    if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
+                        /bin/cat "${MOCK_CONTAINER_LOG_FILE}" >> "$server_log"
+                    else
+                        printf '%s\n' \
+                            'PERF_INPUT_DIAGNOSTIC_BEGIN' \
+                            'PERF_INPUT_DIAGNOSTIC_END' \
+                            >> "$server_log"
+                    fi
+                fi
                 ;;
             inspect)
                 [[ "${1:-}" == --format ]]
@@ -1381,11 +1442,23 @@ private struct RemoteRockyFixture {
                     [[ "${2:-}" == 12 ]]
                     [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
                     [[ $# == 3 ]]
+                    if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
+                        /usr/bin/tail -n "${2}" "${MOCK_CONTAINER_LOG_FILE}"
+                    else
+                        printf 'PERF_READY resolution=1280x720\n'
+                    fi
                 else
                     [[ "${1:-}" == swiftspice-perf-ab-qemu ]]
                     [[ $# == 1 ]]
+                    if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
+                        /bin/cat "${MOCK_CONTAINER_LOG_FILE}"
+                    else
+                        printf 'PERF_READY resolution=1280x720\n'
+                    fi
                 fi
-                printf 'PERF_READY resolution=1280x720\n'
+                if [[ "${1:-}" == --follow ]]; then
+                    printf 'PERF_READY resolution=1280x720\n'
+                fi
                 if [[ "${1:-}" == --follow && -n "${MOCK_REUSED_FOLLOWER_PID:-}" ]]; then
                     follower_pid_file="${SWIFTSPICE_PERF_BASE:?}/state/log-follower.pid"
                     for _ in $(seq 1 100); do

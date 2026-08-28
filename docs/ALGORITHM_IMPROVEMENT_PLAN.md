@@ -193,6 +193,10 @@ complete or correlate its ACK subsegment until the wire-send completion
 timestamp is recorded. If a same-generation ACK arrives first, buffer it and
 release it only at that post-send linearization point. The next motion probe may
 not start until the current ACK subsegment is resolved or the probe fails. An
+ACK observation may therefore fall between the send-started and send-completed
+timestamps; the guest/ACK subsegment completes at
+`max(sendCompletedNs, motionAckNs)`. This does not change pre-arming, buffered
+early-ACK, clean-epoch, or generation-retirement rules. An
 ACK captured by an old or previous generation, or arriving after close or
 migration retirement, is discarded and can never satisfy the current
 generation. Never attribute concurrent outstanding motions from ACK order; their
