@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-enter_lifecycle_lock "$@"
+acquire_lifecycle_lock
 
 if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
     echo "Performance endpoint is already running."
@@ -137,10 +137,11 @@ container_id="$(podman run --detach \
         -display none \
         -serial stdio \
         -monitor none \
-        -no-reboot)"
+        -no-reboot \
+        9>&-)"
 printf '%s\n' "${container_id}" > "${run_dir}/container-id.txt"
 
-nohup podman logs --follow "${PERF_CONTAINER}" > "${run_dir}/server.log" 2>&1 &
+nohup podman logs --follow "${PERF_CONTAINER}" 9>&- > "${run_dir}/server.log" 2>&1 &
 printf '%s\n' "$!" > "${PERF_STATE}/log-follower.pid"
 
 ready=false

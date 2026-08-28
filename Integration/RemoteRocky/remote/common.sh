@@ -15,12 +15,9 @@ readonly PERF_LIFECYCLE_LOCK="${PERF_STATE}/lifecycle.lock"
 mkdir -p "${PERF_STATE}" "${PERF_LOGS}"
 chmod 0700 "${PERF_BASE}" "${PERF_STATE}" "${PERF_LOGS}"
 
-enter_lifecycle_lock() {
-    if [[ "${SWIFTSPICE_LIFECYCLE_LOCK_HELD:-}" == 1 ]]; then
-        return
-    fi
-    exec env SWIFTSPICE_LIFECYCLE_LOCK_HELD=1 \
-        flock --exclusive --close "${PERF_LIFECYCLE_LOCK}" "$0" "$@"
+acquire_lifecycle_lock() {
+    exec 9>"${PERF_LIFECYCLE_LOCK}"
+    flock --exclusive 9
 }
 
 current_run_dir() {

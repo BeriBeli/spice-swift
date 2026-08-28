@@ -34,7 +34,7 @@ struct RemoteRockyFixtureTests {
         #expect(buildLock.lowerBound < rootfsPublication.lowerBound)
         #expect(buildLock.lowerBound < artifactsPublication.lowerBound)
 
-        let startLock = try #require(startScript.range(of: #"enter_lifecycle_lock "$@""#))
+        let startLock = try #require(startScript.range(of: "acquire_lifecycle_lock"))
         let startHash = try #require(startScript.range(of: "actual_kernel_sha256="))
         let evidenceCopy = try #require(startScript.range(
             of: #"cp "${manifest}" "${run_dir}/guest-build-manifest.env""#
@@ -46,15 +46,33 @@ struct RemoteRockyFixtureTests {
         #expect(startLock.lowerBound < containerDetach.lowerBound)
     }
 
-    @Test func lifecycleLockIsHeldByCloseOnExecCommandWrapper() throws {
+    @Test func lifecycleShellClosesLockFDForDetachedChildrenAndStopTrapsSignals() throws {
         let commonScript = try String(
             contentsOf: repositoryRoot.appending(path: "Integration/RemoteRocky/remote/common.sh"),
             encoding: .utf8
         )
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+        let stopScript = try script("Integration/RemoteRocky/remote/stop.sh")
 
-        #expect(commonScript.contains("flock --exclusive --close"))
-        #expect(!commonScript.contains("exec 9>"))
-        #expect(!commonScript.contains("flock --exclusive 9"))
+        #expect(commonScript.contains(#"exec 9>"${PERF_LIFECYCLE_LOCK}""#))
+        #expect(commonScript.contains("flock --exclusive 9"))
+
+        let detach = try #require(startScript.range(of: "podman run --detach"))
+        let detachEnd = try #require(startScript.range(
+            of: #"9>&-)"#,
+            range: detach.upperBound..<startScript.endIndex
+        ))
+        let logFollower = try #require(startScript.range(of: "nohup podman logs --follow"))
+        let logFollowerClose = try #require(startScript.range(
+            of: "9>&-",
+            range: logFollower.upperBound..<startScript.endIndex
+        ))
+        #expect(detach.lowerBound < detachEnd.lowerBound)
+        #expect(logFollower.lowerBound < logFollowerClose.lowerBound)
+
+        #expect(stopScript.contains("trap 'stop_interrupted=true' HUP INT TERM"))
+        #expect(stopScript.contains("stop_endpoint_locked"))
+        #expect(stopScript.contains("trap - HUP INT TERM"))
     }
 
     @Test func buildManifestIsCompleteAndArtifactHashesAreVerified() throws {
@@ -190,6 +208,76 @@ struct RemoteRockyFixtureTests {
         #expect(fixture.isContainerRunning)
         #expect(fixture.stateFileExists("ticket"))
         #expect(fixture.stateFileExists("current-run"))
+    }
+
+    @Test func successfulStartReleasesLockWhileLogFollowerRemainsActive() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        defer { fixture.releaseMockState("log-follower") }
+
+        let firstStart = try fixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: ["MOCK_HOLD_LOG_FOLLOWER": "1"]
+        )
+        #expect(firstStart.status == 0)
+        try fixture.waitForMockState("log-follower-entered")
+        #expect(!fixture.stateFileExists("fd9-inherited-detach"))
+        #expect(!fixture.stateFileExists("fd9-inherited-log-follower"))
+
+        let secondStart = try fixture.launch("remote/start.sh", ssMode: "both")
+        let secondResult = try secondStart.finish(within: .seconds(3))
+
+        #expect(secondResult.status == 0)
+        #expect(try fixture.mockEventCount("detached") == 1)
+
+        fixture.releaseMockState("log-follower")
+        try fixture.waitForMockState("log-follower-finished")
+    }
+
+    @Test func terminationDuringStartupAndStopLeavesNoConcurrentStateRace() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        defer {
+            fixture.releaseMockState("detach")
+            fixture.releaseMockState("stop")
+        }
+
+        let starting = try fixture.launch(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: ["MOCK_HOLD_DETACH": "1"]
+        )
+        try fixture.waitForMockState("detach-entered")
+        starting.terminate()
+        fixture.releaseMockState("detach")
+        let interruptedStart = try starting.finish(within: .seconds(3))
+
+        #expect(interruptedStart.status != 0)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.stateFileExists("ticket"))
+        #expect(!fixture.stateFileExists("current-run"))
+
+        let recoveredStart = try fixture.run("remote/start.sh", ssMode: "both")
+        #expect(recoveredStart.status == 0)
+
+        let stopping = try fixture.launch(
+            "remote/stop.sh",
+            ssMode: "both",
+            additionalEnvironment: ["MOCK_HOLD_STOP": "1"]
+        )
+        try fixture.waitForMockState("stop-entered")
+        stopping.terminate()
+        fixture.releaseMockState("stop")
+        let interruptedStop = try stopping.finish(within: .seconds(3))
+
+        #expect(interruptedStop.status != 0)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.stateFileExists("ticket"))
+        #expect(!fixture.stateFileExists("current-run"))
+
+        let finalStart = try fixture.run("remote/start.sh", ssMode: "both")
+        #expect(finalStart.status == 0)
     }
 
     @Test func ticketIsPrivateNeverLoggedDeletedAndRotated() throws {
@@ -444,6 +532,13 @@ private struct RemoteRockyFixture {
         }
     }
 
+    func releaseMockState(_ name: String) {
+        _ = fileManager.createFile(
+            atPath: mockState.appending(path: "release-\(name)").path,
+            contents: Data()
+        )
+    }
+
     func mockEventCount(_ event: String) throws -> Int {
         guard fileManager.fileExists(atPath: mockState.appending(path: "events").path) else {
             return 0
@@ -459,22 +554,9 @@ private struct RemoteRockyFixture {
         #!/bin/bash
         set -euo pipefail
         [[ "${1:-}" == --exclusive ]]
-        [[ "${2:-}" == --close ]]
-        [[ $# -ge 4 ]]
-        lock_file="$3"
-        [[ "$lock_file" == */state/lifecycle.lock ]]
-        shift 3
-        lock="$MOCK_PODMAN_STATE/lifecycle-mutex"
-        until mkdir "$lock" 2>/dev/null; do /bin/sleep 0.01; done
-        cleanup() {
-            rmdir "$lock" 2>/dev/null || true
-        }
-        trap cleanup EXIT HUP INT TERM
-        set +e
-        "$@"
-        result=$?
-        set -e
-        exit "$result"
+        [[ "${2:-}" == 9 ]]
+        [[ $# == 2 ]]
+        exec /usr/bin/python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'
         """#)
         try writeExecutable(name: "podman", contents: #"""
         #!/bin/bash
@@ -508,12 +590,20 @@ private struct RemoteRockyFixture {
                 [[ "${2:-}" == 10 ]]
                 [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
                 [[ $# == 3 ]]
+                if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
+                    : > "$state/stop-entered"
+                    while [[ ! -f "$state/release-stop" ]]; do /bin/sleep 0.01; done
+                fi
                 rm -f "$state/running"
                 rmdir "$state/container" 2>/dev/null || true
                 : > "$state/stopped"
                 ;;
             run)
                 if [[ " $* " == *" --detach "* ]]; then
+                    if [[ -e /dev/fd/9 ]]; then
+                        : > "$state/fd9-inherited-detach"
+                        exit 65
+                    fi
                     [[ " $* " == *" --name swiftspice-perf-ab-qemu "* ]]
                     [[ " $* " == *" -object secret,id=spice-password,file=/state/ticket "* ]]
                     [[ " $* " != *"0123456789abcdef"* ]]
@@ -523,6 +613,9 @@ private struct RemoteRockyFixture {
                             [[ -f "$state/$MOCK_WAIT_FOR_INSPECT" ]] && break
                             /bin/sleep 0.01
                         done
+                    fi
+                    if [[ "${MOCK_HOLD_DETACH:-}" == 1 ]]; then
+                        while [[ ! -f "$state/release-detach" ]]; do /bin/sleep 0.01; done
                     fi
                     mkdir "$state/container"
                     : > "$state/running"
@@ -542,6 +635,10 @@ private struct RemoteRockyFixture {
                 if [[ "${1:-}" == --follow ]]; then
                     [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
                     [[ $# == 2 ]]
+                    if [[ -e /dev/fd/9 ]]; then
+                        : > "$state/fd9-inherited-log-follower"
+                        exit 65
+                    fi
                 elif [[ "${1:-}" == --tail ]]; then
                     [[ "${2:-}" == 12 ]]
                     [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
@@ -551,6 +648,11 @@ private struct RemoteRockyFixture {
                     [[ $# == 1 ]]
                 fi
                 printf 'PERF_READY resolution=1280x720\n'
+                if [[ "${1:-}" == --follow && "${MOCK_HOLD_LOG_FOLLOWER:-}" == 1 ]]; then
+                    : > "$state/log-follower-entered"
+                    while [[ ! -f "$state/release-log-follower" ]]; do /bin/sleep 0.01; done
+                    : > "$state/log-follower-finished"
+                fi
                 ;;
             version)
                 [[ $# == 0 ]]
@@ -649,8 +751,26 @@ private struct RunningScript {
             output: String(decoding: data, as: UTF8.self)
         )
     }
+
+    func finish(within timeout: Duration) throws -> ScriptResult {
+        let deadline = ContinuousClock().now.advanced(by: timeout)
+        while process.isRunning, ContinuousClock().now < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard !process.isRunning else {
+            process.terminate()
+            process.waitUntilExit()
+            throw RemoteRockyFixtureError.timedOutWaitingForScript
+        }
+        return finish()
+    }
+
+    func terminate() {
+        process.terminate()
+    }
 }
 
 private enum RemoteRockyFixtureError: Error {
     case timedOutWaitingForMockState(String)
+    case timedOutWaitingForScript
 }
