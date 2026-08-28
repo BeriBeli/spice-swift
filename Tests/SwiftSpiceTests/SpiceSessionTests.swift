@@ -12,6 +12,16 @@ import Testing
 
 @Suite("SpiceSession bootstrap")
 struct SpiceSessionTests {
+    enum ConnectionCancellation: String, Sendable {
+        case task
+        case disconnect
+    }
+
+    enum MigrationPreparationTermination: String, Sendable {
+        case failure
+        case cancellation
+    }
+
     @Test func fullAgentBufferRetainsReconnectLifecycleBoundaries() async {
         let mailbox = SpiceAgentEventMailbox(capacity: 4)
         let stale = SpiceAgentMessage(protocolID: 1, type: 2, opaque: 3, data: Data([4]))
@@ -558,6 +568,331 @@ struct SpiceSessionTests {
         let inputsLink = try decodeLinkRequest(try #require(await inputsTransport.outbound.first))
         #expect(inputsLink.connectionID == 77)
         #expect(inputsLink.channelType == 3)
+    }
+
+    @Test(arguments: [4, 5])
+    func childConnectionsUseWidthFourAndPreserveDescriptorOrder(
+        _ childCount: Int
+    ) async throws {
+        let descriptors = displayChannelIDs(count: childCount)
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let probe = BoundedChildConnectProbe()
+        let children = try gatedChildTransports(count: childCount, probe: probe)
+        let session = SpiceSession(
+            transportFactory: transportFactory(main: main, children: children),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+
+        let connection = Task {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        await probe.waitUntilStarted(count: min(childCount, 4))
+        #expect(await probe.peakActiveCount == min(childCount, 4))
+        #expect(await probe.activeCount == min(childCount, 4))
+        #expect(await probe.startedIDs.count == min(childCount, 4))
+
+        if childCount == 5 {
+            await probe.succeed(id: 3)
+            await probe.waitUntilStarted(count: 5)
+            #expect(await probe.peakActiveCount == 4)
+            #expect(await probe.activeCount == 4)
+            for id in [1, 4, 0, 2] {
+                await probe.succeed(id: id)
+            }
+        } else {
+            for id in [3, 1, 0, 2] {
+                await probe.succeed(id: id)
+            }
+        }
+
+        let info = try await connection.value
+        #expect(info.channels == descriptors.map {
+            SpiceChannelDescriptor(type: $0.type, id: $0.id)
+        })
+        #expect((await session.diagnosticsSnapshot()).displayChannelCount == childCount)
+        var linkedKeys: [ChannelKey] = []
+        for child in children {
+            let request = try decodeLinkRequest(try #require(await child.outbound.first))
+            linkedKeys.append(ChannelKey(type: request.channelType, id: request.channelID))
+        }
+        #expect(Set(linkedKeys) == Set(descriptors.map {
+            ChannelKey(type: $0.type, id: $0.id)
+        }))
+
+        await session.disconnect()
+        for child in children {
+            #expect(await child.isClosed)
+            #expect(!(await child.isConnected))
+        }
+    }
+
+    @Test func duplicateChildDescriptorFailsBeforeAnyChildTransportConnects() async throws {
+        let descriptors = [
+            SpiceChannelID(type: 2, id: 0),
+            SpiceChannelID(type: 3, id: 0),
+            SpiceChannelID(type: 2, id: 0),
+        ]
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let probe = BoundedChildConnectProbe()
+        let children = try gatedChildTransports(count: descriptors.count, probe: probe)
+        let session = SpiceSession(
+            transportFactory: transportFactory(main: main, children: children),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+
+        await #expect(throws: SpiceError.protocolError(
+            "duplicate channel type=2 id=0"
+        )) {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        #expect(await probe.startedIDs.isEmpty)
+        for child in children {
+            #expect(await child.connectCallCount == 0)
+            #expect(!(await child.isConnected))
+        }
+        #expect(!(await main.isConnected))
+    }
+
+    @Test func firstChildFailureDrainsLateSuccessAndClosesEveryStartedTransport() async throws {
+        let descriptors = displayChannelIDs(count: 6)
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let probe = BoundedChildConnectProbe()
+        let children = try gatedChildTransports(
+            count: descriptors.count,
+            probe: probe,
+            ignoresCancellationIDs: [4]
+        )
+        let session = SpiceSession(
+            transportFactory: transportFactory(main: main, children: children),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let connection = Task {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+
+        await probe.waitUntilStarted(count: 4)
+        await probe.succeed(id: 0)
+        await probe.waitUntilStarted(count: 5)
+        await probe.fail(id: 1)
+        await probe.waitUntilActiveCount(1)
+        #expect(await probe.startedIDs.count == 5)
+        #expect(await probe.activeCount == 1)
+        await probe.succeed(id: 4)
+
+        await #expect(throws: SpiceError.connectionFailed(
+            "connectionFailed(\"injected child connect failure\")"
+        )) {
+            try await connection.value
+        }
+        #expect(await probe.activeCount == 0)
+        #expect(!(await main.isConnected))
+        for child in children.prefix(5) {
+            #expect(await child.isClosed)
+            #expect(!(await child.isConnected))
+        }
+        #expect(await children[5].connectCallCount == 0)
+        #expect(!(await children[5].isConnected))
+    }
+
+    @Test(arguments: [ConnectionCancellation.task, .disconnect])
+    func cancellingInitialChildPreparationLeavesNoActiveTransport(
+        _ cancellation: ConnectionCancellation
+    ) async throws {
+        let descriptors = displayChannelIDs(count: 5)
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let probe = BoundedChildConnectProbe()
+        let children = try gatedChildTransports(count: descriptors.count, probe: probe)
+        let session = SpiceSession(
+            transportFactory: transportFactory(main: main, children: children),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        let connection = Task {
+            try await session.connect(
+                endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+                credentials: SpiceCredentials(password: "secret")
+            )
+        }
+        await probe.waitUntilStarted(count: 4)
+
+        let disconnect: Task<Void, Never>?
+        switch cancellation {
+        case .task:
+            connection.cancel()
+            disconnect = nil
+        case .disconnect:
+            disconnect = Task { await session.disconnect() }
+        }
+        await #expect(throws: SpiceError.cancelled) {
+            try await connection.value
+        }
+        await disconnect?.value
+        await probe.waitUntilActiveCount(0)
+
+        #expect(await probe.peakActiveCount == 4)
+        #expect(await probe.startedIDs.count == 4)
+        #expect(await probe.activeCount == 0)
+        #expect(!(await main.isConnected))
+        for child in children.prefix(4) {
+            #expect(await child.isClosed)
+            #expect(!(await child.isConnected))
+        }
+        #expect(await children[4].connectCallCount == 0)
+        #expect(!(await children[4].isConnected))
+    }
+
+    @Test func migrationChildConnectionsUseWidthFourAndStableDescriptorOrder() async throws {
+        let descriptors = displayChannelIDs(count: 5)
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let sourceChildren = try streamingChildTransports(count: descriptors.count)
+        let target = StreamingSessionTransport(initial: try makeLinkResponses())
+        let probe = BoundedChildConnectProbe()
+        let targetChildren = try gatedChildTransports(
+            count: descriptors.count,
+            probe: probe
+        )
+        var transports: [any SpiceTransport] = [source]
+        transports.append(contentsOf: sourceChildren)
+        transports.append(target)
+        transports.append(contentsOf: targetChildren)
+        let session = SpiceSession(
+            transportFactory: transportFactory(transports),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
+            host: "bounded-target.example"
+        )))
+        let offer = try #require(preparingOffer(await events.next()))
+        await probe.waitUntilStarted(count: 4)
+        #expect(await probe.peakActiveCount == 4)
+        #expect(await probe.startedIDs.count == 4)
+        await probe.succeed(id: 2)
+        await probe.waitUntilStarted(count: 5)
+        for id in [4, 1, 3, 0] {
+            await probe.succeed(id: id)
+        }
+
+        #expect(await events.next() == .migration(.ready(offer, seamless: false)))
+        #expect(await probe.peakActiveCount == 4)
+        #expect(await probe.activeCount == 0)
+        var linkedKeys: [ChannelKey] = []
+        for child in targetChildren {
+            let request = try decodeLinkRequest(try #require(await child.outbound.first))
+            linkedKeys.append(ChannelKey(type: request.channelType, id: request.channelID))
+        }
+        #expect(Set(linkedKeys) == Set(descriptors.map {
+            ChannelKey(type: $0.type, id: $0.id)
+        }))
+        #expect(await source.isConnected)
+
+        await source.enqueue(encodeMini(id: 102, body: Data()))
+        #expect(await events.next() == .migration(.cancelled(offer)))
+        await target.waitUntilClosed()
+        #expect(!(await target.isConnected))
+        for child in targetChildren {
+            await child.waitUntilClosed()
+            #expect(await child.isClosed)
+            #expect(!(await child.isConnected))
+        }
+        await session.disconnect()
+    }
+
+    @Test(arguments: [
+        MigrationPreparationTermination.failure,
+        .cancellation,
+    ])
+    func migrationChildFailureOrCancellationLeavesSourceAndNoTargetLeak(
+        _ termination: MigrationPreparationTermination
+    ) async throws {
+        let descriptors = displayChannelIDs(count: 5)
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: descriptors
+        ))
+        let sourceChildren = try streamingChildTransports(count: descriptors.count)
+        let target = StreamingSessionTransport(initial: try makeLinkResponses())
+        let probe = BoundedChildConnectProbe()
+        let targetChildren = try gatedChildTransports(
+            count: descriptors.count,
+            probe: probe,
+            ignoresCancellationIDs: termination == .failure ? [3] : []
+        )
+        var transports: [any SpiceTransport] = [source]
+        transports.append(contentsOf: sourceChildren)
+        transports.append(target)
+        transports.append(contentsOf: targetChildren)
+        let session = SpiceSession(
+            transportFactory: transportFactory(transports),
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        var events = session.events.makeAsyncIterator()
+
+        await source.enqueue(encodeMini(id: 101, body: migrationDestinationBody(
+            host: "terminating-target.example"
+        )))
+        let offer = try #require(preparingOffer(await events.next()))
+        await probe.waitUntilStarted(count: 4)
+        switch termination {
+        case .failure:
+            await probe.fail(id: 0, reason: "migration child failed")
+            await probe.waitUntilActiveCount(1)
+            await probe.succeed(id: 3)
+            guard case let .migration(.failed(failedOffer, reason)) = await events.next()
+            else {
+                Issue.record("expected migration preparation failure")
+                return
+            }
+            #expect(failedOffer == offer)
+            #expect(reason.contains("migration child failed"))
+        case .cancellation:
+            await source.enqueue(encodeMini(id: 102, body: Data()))
+            #expect(await events.next() == .migration(.cancelled(offer)))
+        }
+        await probe.waitUntilActiveCount(0)
+        await target.waitUntilClosed()
+
+        #expect(await probe.peakActiveCount == 4)
+        #expect(await probe.startedIDs.count == 4)
+        #expect(await probe.activeCount == 0)
+        #expect(await targetChildren[4].connectCallCount == 0)
+        #expect(!(await target.isConnected))
+        for child in targetChildren.prefix(4) {
+            await child.waitUntilClosed()
+            #expect(await child.isClosed)
+            #expect(!(await child.isConnected))
+        }
+        #expect(await source.isConnected)
+        for child in sourceChildren {
+            #expect(await child.isConnected)
+        }
+        await session.disconnect()
     }
 
     @Test func publishesAgentEventsOnDedicatedStream() async throws {
@@ -2345,7 +2680,10 @@ struct SpiceSessionTests {
 
     @Test func cancellationWhileAttachingChannelsClosesEveryTransport() async throws {
         let mainTransport = FakeTransport(
-            inbound: try makeServerTranscript().map(Result.success)
+            inbound: try makeServerTranscript(channels: [
+                SpiceChannelID(type: 2, id: 0),
+                SpiceChannelID(type: 3, id: 0),
+            ]).map(Result.success)
         )
         let displayTransport = FakeTransport(
             inbound: try makeLinkResponses().map(Result.success)
@@ -3245,6 +3583,49 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    private func displayChannelIDs(count: Int) -> [SpiceChannelID] {
+        (0..<count).map { SpiceChannelID(type: 2, id: UInt8($0)) }
+    }
+
+    private func gatedChildTransports(
+        count: Int,
+        probe: BoundedChildConnectProbe,
+        ignoresCancellationIDs: Set<Int> = []
+    ) throws -> [GatedChildTransport] {
+        try (0..<count).map { id in
+            GatedChildTransport(
+                id: id,
+                probe: probe,
+                inbound: try makeLinkResponses(),
+                ignoresTaskCancellation: ignoresCancellationIDs.contains(id)
+            )
+        }
+    }
+
+    private func streamingChildTransports(
+        count: Int
+    ) throws -> [StreamingSessionTransport] {
+        try (0..<count).map { _ in
+            StreamingSessionTransport(initial: try makeLinkResponses())
+        }
+    }
+
+    private func transportFactory(
+        main: any SpiceTransport,
+        children: [GatedChildTransport]
+    ) -> @Sendable (SpiceEndpoint) -> any SpiceTransport {
+        var transports: [any SpiceTransport] = [main]
+        transports.append(contentsOf: children)
+        return transportFactory(transports)
+    }
+
+    private func transportFactory(
+        _ transports: [any SpiceTransport]
+    ) -> @Sendable (SpiceEndpoint) -> any SpiceTransport {
+        let pool = TransportPool(transports)
+        return { _ in pool.take() }
+    }
+
     private func makeServerTranscript(
         channels channelOverride: [SpiceChannelID]? = nil,
         agentConnected: UInt32 = 0,
@@ -3487,6 +3868,183 @@ private final class TransportPool: Sendable {
     }
 }
 
+private actor BoundedChildConnectProbe {
+    private typealias Outcome = Result<Void, TransportError>
+
+    private var activeIDs: Set<Int> = []
+    private var continuations: [Int: CheckedContinuation<Outcome, Never>] = [:]
+    private var earlyOutcomes: [Int: Outcome] = [:]
+    private var ignoresCancellation: Set<Int> = []
+    private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var activeCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private(set) var startedIDs: [Int] = []
+    private(set) var peakActiveCount = 0
+
+    var activeCount: Int { activeIDs.count }
+
+    func connect(id: Int, ignoresTaskCancellation: Bool) async throws(TransportError) {
+        if ignoresTaskCancellation {
+            ignoresCancellation.insert(id)
+        }
+        activeIDs.insert(id)
+        startedIDs.append(id)
+        peakActiveCount = max(peakActiveCount, activeIDs.count)
+        let ready = startWaiters.filter { startedIDs.count >= $0.0 }
+        startWaiters.removeAll { startedIDs.count >= $0.0 }
+        for (_, waiter) in ready {
+            waiter.resume()
+        }
+        resumeActiveCountWaiters()
+
+        let outcome = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if let early = earlyOutcomes.removeValue(forKey: id) {
+                    continuation.resume(returning: early)
+                } else {
+                    continuations[id] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+        try outcome.get()
+    }
+
+    func waitUntilStarted(count: Int) async {
+        guard startedIDs.count < count else {
+            return
+        }
+        await withCheckedContinuation { startWaiters.append((count, $0)) }
+    }
+
+    func waitUntilActiveCount(_ count: Int) async {
+        guard activeIDs.count != count else {
+            return
+        }
+        await withCheckedContinuation { activeCountWaiters.append((count, $0)) }
+    }
+
+    func succeed(id: Int) {
+        finish(id: id, outcome: .success(()))
+    }
+
+    func fail(id: Int, reason: String = "injected child connect failure") {
+        finish(id: id, outcome: .failure(.connectionFailed(reason)))
+    }
+
+    func transportClosed(id: Int) {
+        finish(id: id, outcome: .failure(.connectionClosed))
+    }
+
+    private func cancel(id: Int) {
+        guard !ignoresCancellation.contains(id) else {
+            return
+        }
+        finish(id: id, outcome: .failure(.cancelled))
+    }
+
+    private func finish(id: Int, outcome: Outcome) {
+        guard activeIDs.remove(id) != nil else {
+            return
+        }
+        resumeActiveCountWaiters()
+        ignoresCancellation.remove(id)
+        if let continuation = continuations.removeValue(forKey: id) {
+            continuation.resume(returning: outcome)
+        } else {
+            earlyOutcomes[id] = outcome
+        }
+    }
+
+    private func resumeActiveCountWaiters() {
+        let ready = activeCountWaiters.filter { activeIDs.count == $0.0 }
+        activeCountWaiters.removeAll { activeIDs.count == $0.0 }
+        for (_, waiter) in ready {
+            waiter.resume()
+        }
+    }
+}
+
+private actor GatedChildTransport: SpiceTransport {
+    private let id: Int
+    private let probe: BoundedChildConnectProbe
+    private let ignoresTaskCancellation: Bool
+    private let inbound: AsyncStream<Data>
+    private let inboundContinuation: AsyncStream<Data>.Continuation
+    private(set) var outbound: [Data] = []
+    private(set) var connectCallCount = 0
+    private(set) var isConnected = false
+    private(set) var isClosed = false
+    private var closedWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        id: Int,
+        probe: BoundedChildConnectProbe,
+        inbound: [Data],
+        ignoresTaskCancellation: Bool = false
+    ) {
+        self.id = id
+        self.probe = probe
+        self.ignoresTaskCancellation = ignoresTaskCancellation
+        let pipe = AsyncStream.makeStream(of: Data.self)
+        self.inbound = pipe.stream
+        inboundContinuation = pipe.continuation
+        for packet in inbound {
+            pipe.continuation.yield(packet)
+        }
+    }
+
+    func connect() async throws(TransportError) {
+        connectCallCount += 1
+        try await probe.connect(
+            id: id,
+            ignoresTaskCancellation: ignoresTaskCancellation
+        )
+        guard !isClosed else {
+            throw .connectionClosed
+        }
+        isConnected = true
+    }
+
+    func read(minimum: Int, maximum: Int) async throws(TransportError) -> Data {
+        guard isConnected, !isClosed else {
+            throw .connectionClosed
+        }
+        for await packet in inbound {
+            guard packet.count >= minimum, packet.count <= maximum else {
+                throw .connectionFailed("gated fixture returned an invalid read size")
+            }
+            return packet
+        }
+        throw Task.isCancelled ? .cancelled : .connectionClosed
+    }
+
+    func write(_ data: sending Data) async throws(TransportError) {
+        guard isConnected, !isClosed else {
+            throw .connectionClosed
+        }
+        outbound.append(data)
+    }
+
+    func waitUntilClosed() async {
+        guard !isClosed, isConnected || connectCallCount > 0 else {
+            return
+        }
+        await withCheckedContinuation { closedWaiters.append($0) }
+    }
+
+    func close() async {
+        isClosed = true
+        isConnected = false
+        inboundContinuation.finish()
+        for waiter in closedWaiters {
+            waiter.resume()
+        }
+        closedWaiters.removeAll()
+        await probe.transportClosed(id: id)
+    }
+}
+
 private actor BlockingTransport: SpiceTransport {
     private let inbound: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
@@ -3551,6 +4109,7 @@ private actor StreamingSessionTransport: SpiceTransport {
     private var writeIsBlocked = false
     private var blockedWriteWaiters: [CheckedContinuation<Void, Never>] = []
     private var blockedWriteRelease: CheckedContinuation<Void, Never>?
+    private var closedWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(initial: [Data]) {
         let inboundPipe = AsyncStream.makeStream(of: Data.self)
@@ -3635,9 +4194,10 @@ private actor StreamingSessionTransport: SpiceTransport {
     }
 
     func waitUntilClosed() async {
-        while isConnected {
-            await Task.yield()
+        guard isConnected else {
+            return
         }
+        await withCheckedContinuation { closedWaiters.append($0) }
     }
 
     func close() async {
@@ -3645,6 +4205,10 @@ private actor StreamingSessionTransport: SpiceTransport {
         shouldBlockNextWrite = false
         blockedWriteRelease?.resume()
         blockedWriteRelease = nil
+        for waiter in closedWaiters {
+            waiter.resume()
+        }
+        closedWaiters.removeAll()
         inboundContinuation.finish()
         writeContinuation.finish()
     }

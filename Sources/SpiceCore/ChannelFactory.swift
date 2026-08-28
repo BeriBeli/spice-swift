@@ -30,7 +30,24 @@ package struct ChannelFactory: Sendable {
         connectionID: UInt32,
         password: consuming Data
     ) async throws(ChannelError) -> ChannelConnection {
-        let transport = transportFactory(key)
+        try await connect(
+            transport: makeTransport(for: key),
+            key: key,
+            connectionID: connectionID,
+            password: password
+        )
+    }
+
+    package func makeTransport(for key: ChannelKey) -> any SpiceTransport {
+        transportFactory(key)
+    }
+
+    package func connect(
+        transport: any SpiceTransport,
+        key: ChannelKey,
+        connectionID: UInt32,
+        password: consuming Data
+    ) async throws(ChannelError) -> ChannelConnection {
         do {
             try await transport.connect()
             let handshake = try await LinkHandshake().perform(
