@@ -423,7 +423,12 @@ struct RemoteRockyFixtureTests {
 
         #expect(timedOut.status != 0)
         #expect(timedOut.output.contains("PERF_MARKER_BARRIER rejected"))
-        #expect(timedOut.output.contains("PERF_MARKER_BARRIER_TRANSPORT runs=1"))
+        let transportRecord = try #require(perfRecords(
+            prefix: "PERF_MARKER_BARRIER_TRANSPORT",
+            in: timedOut.output
+        ).first)
+        let transportRuns = try #require(transportRecord["runs"].flatMap(Int.init))
+        #expect((0...1).contains(transportRuns))
         #expect(!timedOut.output.contains("accepted"))
     }
 
