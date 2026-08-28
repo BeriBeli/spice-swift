@@ -6,7 +6,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active |
-| Plan version | 1.1 |
+| Plan version | 1.2 |
 | Swift baseline | `v0.2.7` / `2c577d7` |
 | Reference client | spice-gtk `88ad5f1` (v0.43/master) / spice-common `71e4570` (master), reverified 2026-08-27 |
 | Created | 2026-08-26 |
@@ -20,8 +20,10 @@ performance of `v0.2.7`.
 ## Goals and invariants
 
 The work is ordered as protocol correctness, rendering transactions, ownership
-and copy reduction, then measured concurrency improvements. Preserve these
-invariants throughout:
+and copy reduction, then measured concurrency improvements. Within measured
+work, perceived interaction latency is the highest priority, followed by visual
+clarity; CPU and RSS are guardrails rather than primary optimization targets.
+Preserve these invariants throughout:
 
 1. Do not change the public `SwiftSpice` API.
 2. Do not add pixman or another rendering runtime dependency.
@@ -31,6 +33,12 @@ invariants throughout:
 5. Preserve spice-common PLT4 modulo semantics and the current MJPEG
    one-in-flight/one-latest policy.
 6. Do not claim a performance change without a fresh, versioned measurement.
+7. Keep desktop delivery latest-only and outside per-frame SwiftUI observation;
+   an idle view with no new revision must not acquire a drawable or commit Metal
+   work.
+8. Keep at most two Metal commands in flight. A low-latency path may bypass a
+   frame-clock wait only when command admission and drawable acquisition are
+   both known not to block.
 
 ## Status model
 
@@ -47,7 +55,7 @@ Use exactly one of these values in the work table:
 
 | ID | Status | Work item | Depends on | Completion gate |
 | --- | --- | --- | --- | --- |
-| AIP-00 | pending | Establish fresh `v0.2.7` metrics and a Release `spice-bench` JSON harness | — | Microbench and live artifacts identify commit, toolchain, hardware, thermal state, workload, and date |
+| AIP-00 | pending | Establish fresh adjacent `v0.2.7`/`v0.3.0` interaction-pipeline metrics and a Release `spice-bench` JSON harness | — | Versioned artifacts identify commit, toolchain, hardware, thermal state, workload, and date; live traces separate input-to-guest and receive-to-present stages |
 | AIP-10 | done | Add an owned physical-message model and strict full-header submessage lists | — | List-only and main-plus-list ordering, bounds, ACK, fragmentation, and mutation tests pass |
 | AIP-11 | done | Advance the serial barrier after processing and propagate channel failure | AIP-10 | Waiters remain blocked through handler work and terminate on success, failure, cancellation, or close |
 | AIP-12 | done | Move the image cache to Session scope with ordered mutations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, FIFO, cancellation, and capacity tests pass |
@@ -63,6 +71,7 @@ Use exactly one of these values in the work table:
 | AIP-41 | pending | Prepare independent Surface snapshots with bounded concurrency | AIP-32 | A blocked Surface does not prevent another from starting and emit order stays stable |
 | AIP-42 | pending | Replace realtime audio queues with preallocated rings | AIP-00 | Realtime callbacks perform no linear queue movement or per-packet allocation |
 | AIP-43 | pending | Move blocking WebDAV filesystem work to a bounded executor | AIP-00 | Slow I/O does not block an unrelated client while per-client order is preserved |
+| AIP-44 | pending | Correlate input and display stages, then add interaction-aware low-latency frame selection | AIP-00 | Same-action paired traces reduce click/key/motion-to-visible p50 and p95 without weakening latest-only delivery, idle no-commit, drawable nonblocking, or the two-command GPU bound |
 | AIP-90 | pending | Run final regression, interoperability, and documentation closure | All applicable items | Full tests and fresh live gates pass and final evidence is recorded in `STATUS.md` |
 
 ## Required designs
@@ -158,6 +167,89 @@ Use exactly one of these values in the work table:
 
 ## Measurement and acceptance
 
+Perceived interaction latency takes precedence over aggregate throughput. Use
+this optimization and acceptance order:
+
+1. End-to-end input: host click, key, or motion receipt to wire-send completion,
+   guest/protocol ACK where one exists, and the corresponding visible response.
+2. Display pipeline: frame receive to Surface ready, latest-revision selection,
+   Metal commit, and drawable presentation.
+3. Visual quality: clarity and scaling at the same guest workload.
+4. Resource guardrails: CPU and RSS must not regress materially, but neither is
+   a proxy for interaction latency.
+
+Every live comparison must replay the same timestamped interaction and carry a
+correlation token through the fixture. Mouse motion may use the SPICE motion ACK;
+keyboard and button messages have no general guest ACK, so their causal endpoint
+must be a unique guest-rendered marker and its matching presented revision. Do
+not infer causality by adding unrelated aggregate histograms or pairing an input
+with whichever frame happened to arrive next.
+
+An end-to-end request-to-presented measurement may summarize user experience,
+but it does not identify which path caused a change. In particular, a capture
+with no input events cannot support a conclusion about the input queue. After
+latency, compare visual clarity at the same guest workload and scaling; treat
+CPU and RSS only as regression guardrails.
+
+The 2026-08-28 Maspice adjacent-run observation against the same guest provides
+directional evidence, not the paired artifact required to complete AIP-00:
+
+| Observed interval | `v0.2.7` | `v0.3.0` | Direction |
+| --- | ---: | ---: | --- |
+| Surface ready to frame selection p95 | 0.2 ms | 12 ms | Regression; highest-priority display-path target |
+| Surface ready to frame selection max | 70.8 ms | 22.2 ms | Tail maximum improved while the p95 distribution shifted later |
+| Snapshot preparation p95 | 4.0 ms | 0.2 ms | Improvement |
+| Selection request to presented p95 | 100 ms | 33 ms | Presentation improvement; this interval does not start at input |
+| Warm CPU | 12.51% | 12.37% / 12.23% | Approximately unchanged; guardrail only |
+
+The local samples are
+`/private/tmp/maspice-swiftspice-027-controlled.sample.txt` and
+`/private/tmp/maspice-swiftspice-030.sample.txt`. They are host-local supporting
+evidence and must not be committed or treated as a reproducible release
+artifact. The `v0.3.0` diagnostic interval used for the reported timings
+contained no input event or correlation token, so neither the 12 ms p95 nor the
+request-to-presented change can be attributed to an input queue. RSS also
+remains a guardrail for the final controlled paired runs rather than a target
+inferred from these samples.
+
+Code and sample review narrow the hypotheses without proving one:
+
+- `SpiceDesktopPresentationPacingPolicy.readyBecameAvailable()` selects an idle
+  update immediately, but an update arriving while the one-shot display link is
+  active waits for the next tick. A 12 ms histogram result means the p95 landed
+  in the `(8, 12]` ms bucket; without refresh-rate and arrival-phase data it does
+  not prove that a response always waited a complete frame or missed two ticks.
+- `SpiceDesktopReadyLatch.pendingSince` records the first empty-to-ready
+  transition. A newer coalesced revision inherits that timestamp, so add both
+  first-ready and selected-revision-ready times before calling the current
+  aggregate an interaction-frame delay.
+- `SpiceMetalFrameView.canPresentWithoutBlocking` currently checks only the
+  two-command GPU slot. The `v0.3.0` sample contains 31 one-millisecond samples
+  in `currentDrawable → nextDrawable → semaphore_timedwait`, versus about nine
+  drawable-acquisition samples and no sampled semaphore wait in the controlled
+  `v0.2.7` capture. Sampling counts are not event counts or per-stall durations,
+  but they require a separate nonblocking drawable-capacity gate.
+
+The next display-latency study must compare a low-latency selection path for
+correlated interactive updates with an adaptive display-link policy. Sweep
+arrival phase across manual 60 Hz and 120 Hz ticks; prove a steady-state update
+is selected on the first eligible tick, never the second, and record the
+selected revision rather than only the oldest coalesced-ready time. When a
+correlated interactive revision becomes ready and both a command slot and a
+drawable are demonstrably available without blocking, evaluate immediate
+selection even while the pacing link is active. Otherwise retain tick pacing
+and retry only the latest revision. Do not restore per-frame SwiftUI updates or
+unconditional Metal commits.
+
+Package-only deterministic seams may inject the monotonic clock, manual display
+ticks, input/revision trace tokens, drawable availability, command completion,
+and presented callbacks. Required tests cover idle immediate selection,
+steady-state tick-phase sweeps, first-ready versus selected-revision-ready
+timing, mouse-motion ACK and key/button visible-marker correlation, GPU-busy and
+drawable-unavailable latest-only retry, zero drawable access/commit on empty
+ticks, and strict distinction between command completion and compositor-visible
+presentation.
+
 `spice-bench` must run in Release mode, warm up inputs, retain a checksum to
 prevent dead-code elimination, and emit JSON. It covers wire split patterns,
 regions, COPY_BITS, LZ/GLZ, IOSurface backing transitions, and advanced-video
@@ -175,11 +267,15 @@ confidence-interval upper bound for unrelated cases must not regress beyond
 - `cpuMaterializationBytes == 0` for full-raw then 1x1 mutation on a supported
   revisioned IOSurface path.
 
-The final live decision uses ten paired 30-second runs and the existing gates:
-fps lower bound 0.95; ready-frame, p95, and CPU-per-frame upper bound 1.10; RSS
-upper bound 1.15; and zero stale publications, pool exhaustion, or GPU errors.
-Real-window 1080p/4K at 60/120 Hz and audio-device behavior remain separate
-acceptance gates.
+The final live decision uses ten paired 30-second runs. It first reports the
+same-action click/key/motion-to-visible p50 and p95 with the input, guest/ACK,
+display, commit, and presented segments above; then it checks clarity and
+scaling; only then does it apply resource guardrails. Average FPS or CPU cannot
+substitute for the interaction-latency result. Existing guardrails remain: fps
+lower bound 0.95; CPU-per-frame upper bound 1.10; RSS upper bound 1.15; and zero
+stale publications, pool exhaustion, GPU errors, idle commits, or violations of
+the two-command in-flight limit. Real-window 1080p/4K at 60/120 Hz and
+audio-device behavior remain separate acceptance gates.
 
 ## Execution protocol
 
@@ -198,6 +294,7 @@ acceptance gates.
 
 | ID | Date | Commit/PR | Evidence | Notes |
 | --- | --- | --- | --- | --- |
+| AIP-00 | 2026-08-28 | Local Maspice adjacent run | `/private/tmp/maspice-swiftspice-027-controlled.sample.txt`; `/private/tmp/maspice-swiftspice-030.sample.txt`; same guest; ready-to-selection p95 0.2 ms to 12 ms (max 70.8 ms to 22.2 ms), snapshot p95 4.0 ms to 0.2 ms, selection-request-to-presented p95 100 ms to 33 ms, and warm CPU 12.51% to 12.37% / 12.23% | Directional host-local evidence only. The reported `v0.3.0` diagnostic interval contained no input event or correlation token, so it cannot measure or explain input-queue latency. The samples are not committed artifacts and do not complete AIP-00. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
@@ -228,3 +325,4 @@ acceptance gates.
 | 2026-08-27 | AIP-32 | Share one GCD-backed Swift `TaskExecutor` of width two per Session, cap FIFO admission at 64 pending jobs and 256 MiB of retained input, and keep GLZ dependency waits outside worker permits | Current spice-gtk master `88ad5f1` owns one GLZ window per Session, explicitly accepts out-of-order image arrival across display sockets, and separates window coordination from per-surface decoders; its GLZ template also records a TODO to split distance/length parsing from copying. Swift 6 task-executor preference moves blocking codec work off the default cooperative pool instead of merely counting it with an actor semaphore. Swift parses a bounded GLZ program, resolves immutable dictionary snapshots in the actor, then acquires Session admission only for cancellation-aware CPU decode. The actor reserves image IDs, commits out-of-order completions with existing contiguous-tail eviction semantics, and rejects commits from an older clear generation. Stateless JPEG/LZ/QUIC and ZLIB work share the executor; stateful MJPEG keeps its per-stream serial executor and existing width-two limiter. FIFO admission, cancellation removal, conservative parsed-program/dependency and complete physical-wire-owner accounting, checked retention arithmetic, prefix-doubling overlap copies, and immutable diagnostics make overload deterministic without occupying worker slots while waiting on dictionary order. All four P1 review findings are resolved and promoted these accounting and copy-complexity constraints to durable requirements. |
 | 2026-08-27 | AIP-33 | Represent Annex-B NAL units as checked ranges into one immutable payload owner, allocate AVCC exactly once, and lend CoreMedia a stable retained owner through a custom block source | The prior path copied the full Annex-B payload into an array, materialized each NAL, grew AVCC through appends, and then copied AVCC again with `CMBlockBufferReplaceDataBytes`. Swift 6 requires unsafe byte access to remain synchronous and scoped, so range metadata crosses isolation while raw pointers do not. A retained `NSData` provides stable storage for CoreMedia; its `refCon` and once-only free callback make ownership explicit and testable across synchronous creation failure, decode-submission failure, cancellation, teardown, and close. Package-only diagnostics and failure seams preserve the public API while making scan count, allocations, copies, parameter-set materialization, and owner balance deterministic acceptance criteria. |
 | 2026-08-27 | AIP-40 | Keep SPICE's independent per-channel links, but prepare child channels through one deterministic Swift task group with manual width four and explicit ownership transfer | spice-gtk's channel model keeps each advertised child on its own link; connecting those independent links serially is not a protocol-ordering requirement. Swift 6 structured concurrency can overlap the network and handshake latency, but a throwing group alone does not prove that already completed or late successful connections remain observable after a sibling fails. A nonthrowing `TaskGroup<Result>` therefore admits at most four descriptor-ordered transports, stops admission on first failure/cancellation, drains every result, closes all successes before propagating failure, and transfers ownership only after complete success. Initial bootstrap and migration preparation share this helper so cancellation and rollback cannot drift. |
+| 2026-08-28 | AIP-00, AIP-44 | Prioritize perceived interaction latency, decompose it before optimization, then evaluate clarity; keep CPU and RSS as guardrails | The adjacent Maspice observation improved snapshot and selection-request-to-presented time while ready-to-selection p95 regressed sharply. Because the reported diagnostic interval contained no correlated input event, the observation cannot identify input scheduling as a cause. Immediate or adaptive frame selection therefore requires same-action input/revision tokens, first-ready and selected-ready timestamps, tick-phase and drawable-capacity evidence, and must retain latest-only, idle no-commit, and bounded GPU in-flight invariants. |
