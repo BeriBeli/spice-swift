@@ -970,32 +970,53 @@ struct SurfaceStoreTests {
             )
         )
 
-        var metrics = await store.metrics()
-        #expect(metrics.directIOSurfaceWriteBytes == 16)
-        #expect(metrics.fullFrameCopyBytes == 0)
-        #expect(metrics.partialFrameCopyBytes == 0)
-        #expect(metrics.cpuMaterializations == 0)
+        let descriptorBefore = try await store.descriptor(surfaceID: 44)
+        let metricsBefore = await store.metrics()
+        #expect(metricsBefore.directIOSurfaceWriteBytes == 16)
+        #expect(metricsBefore.fullFrameCopyBytes == 0)
+        #expect(metricsBefore.partialFrameCopyBytes == 0)
+        #expect(metricsBefore.cpuMaterializations == 0)
 
-        var snapshot: FrameSnapshot? = try await store.snapshot(surfaceID: 44)
-        let ioSurfaceFrame = try #require(snapshot?.ioSurfaceFrame)
-        #expect(ioSurfaceFrame.copyPixels() == Data([
-            9, 10, 11, 0xff, 13, 14, 15, 0xff,
-            1, 2, 3, 0xff, 5, 6, 7, 0xff,
-        ]))
-        metrics = await store.metrics()
-        #expect(metrics.fullFrameCopyBytes == 0)
-        #expect(metrics.cpuMaterializations == 0)
-
-        snapshot = nil
         try await store.fill(
             surfaceID: 44,
             rectangle: PixelRect(x: 1, y: 1, width: 1, height: 1),
             colorARGB: 0x0011_2233
         )
-        #expect(await store.metrics().cpuMaterializations == 1)
+        let descriptorAfter = try await store.descriptor(surfaceID: 44)
+        let metricsAfterMutation = await store.metrics()
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializations
+                == metricsBefore.cpuMaterializations
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
+        #expect(metricsAfterMutation.fullFrameCopyBytes == metricsBefore.fullFrameCopyBytes)
+        #expect(
+            metricsAfterMutation.partialFrameCopyBytes
+                == metricsBefore.partialFrameCopyBytes
+        )
+
         let resumed = try await store.snapshot(surfaceID: 44)
-        #expect(pixel(resumed, x: 0, y: 0) == [9, 10, 11, 0xff])
-        #expect(pixel(resumed, x: 1, y: 1) == [0x33, 0x22, 0x11, 0xff])
+        let ioSurfaceFrame = try #require(resumed.ioSurfaceFrame)
+        #expect(ioSurfaceFrame.copyPixels() == Data([
+            9, 10, 11, 0xff, 13, 14, 15, 0xff,
+            1, 2, 3, 0xff, 0x33, 0x22, 0x11, 0xff,
+        ]))
+        let metricsAfterSnapshot = await store.metrics()
+        #expect(metricsAfterSnapshot.fullFrameCopyBytes == metricsBefore.fullFrameCopyBytes)
+        #expect(metricsAfterSnapshot.partialFrameCopyBytes == metricsBefore.partialFrameCopyBytes)
+        #expect(metricsAfterSnapshot.cpuMaterializations == metricsBefore.cpuMaterializations)
+        #expect(
+            metricsAfterSnapshot.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
     }
 
     @Test func fullSurfaceRawCopyKeepsLeasedRevisionImmutable() async throws {
@@ -1031,6 +1052,343 @@ struct SurfaceStoreTests {
         let metrics = await store.metrics()
         #expect(metrics.directIOSurfaceWriteBytes == 4)
         #expect(metrics.revisionedAllocatedFrames == 2)
+    }
+
+    @Test func canonicalCPUMutationKeepsLeasedRevisionImmutable() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let fullSurface = PixelRect(x: 0, y: 0, width: 4, height: 2)
+        try await store.create(id: 46, width: 4, height: 2, format: 32)
+        try await store.drawCopy(
+            surfaceID: 46,
+            destination: fullSurface,
+            bitmap: seededBitmap(width: 4, height: 2, seed: 17)
+        )
+        let oldSnapshot = try await store.snapshot(surfaceID: 46)
+        let oldFrame = try #require(oldSnapshot.ioSurfaceFrame)
+        let oldPixels = try #require(oldFrame.copyPixels())
+        let oldRevision = oldSnapshot.surfaceRevision
+        let descriptorBefore = try await store.descriptor(surfaceID: 46)
+        let metricsBefore = await store.metrics()
+        let destination = PixelRect(x: 2, y: 1, width: 1, height: 1)
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: fullSurface,
+            clips: nil
+        )
+
+        _ = try #require(await store.fill(
+            surfaceID: 46,
+            region: region,
+            colorARGB: 0x0011_2233
+        ))
+
+        let descriptorAfter = try await store.descriptor(surfaceID: 46)
+        let metricsAfterMutation = await store.metrics()
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            metricsAfterMutation.mutationTransactions
+                == metricsBefore.mutationTransactions + 1
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializations
+                == metricsBefore.cpuMaterializations
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
+        #expect(metricsAfterMutation.fullFrameCopyBytes == metricsBefore.fullFrameCopyBytes)
+        #expect(
+            metricsAfterMutation.partialFrameCopyBytes
+                == metricsBefore.partialFrameCopyBytes
+        )
+
+        let newSnapshot = try await store.snapshot(surfaceID: 46)
+        let newFrame = try #require(newSnapshot.ioSurfaceFrame)
+        var expected = oldPixels
+        replacePixel(
+            in: &expected,
+            bytesPerRow: oldSnapshot.bytesPerRow,
+            x: destination.x,
+            y: destination.y,
+            with: [0x33, 0x22, 0x11, 0xff]
+        )
+        #expect(oldSnapshot.surfaceRevision == oldRevision)
+        #expect(oldFrame.copyPixels() == oldPixels)
+        #expect(newSnapshot.surfaceRevision == descriptorAfter.surfaceRevision)
+        #expect(newFrame.copyPixels() == expected)
+        #expect(pool.metrics().allocatedFrames == 2)
+        let metricsAfterSnapshot = await store.metrics()
+        #expect(metricsAfterSnapshot.cpuMaterializations == metricsBefore.cpuMaterializations)
+        #expect(
+            metricsAfterSnapshot.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
+    }
+
+    @Test(arguments: CanonicalCPUMutation.allCases)
+    func canonicalIOSurfaceContinuesDirectlyAcrossCPUMutations(
+        mutation: CanonicalCPUMutation
+    ) async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let fullSurface = PixelRect(x: 0, y: 0, width: 4, height: 3)
+        let bitmap = seededBitmap(width: 4, height: 3, seed: 31)
+        var expected = bitmap.pixels
+        try await store.create(id: 47, width: 4, height: 3, format: 32)
+        try await store.drawCopy(
+            surfaceID: 47,
+            destination: fullSurface,
+            bitmap: bitmap
+        )
+        let crossSurfaceBitmap: RawBitmap?
+        if case .crossSurfaceDrawCopy = mutation {
+            let sourceBitmap = seededBitmap(width: 4, height: 3, seed: 109)
+            try await store.create(id: 49, width: 4, height: 3, format: 32)
+            try await store.drawCopy(
+                surfaceID: 49,
+                destination: fullSurface,
+                bitmap: sourceBitmap
+            )
+            crossSurfaceBitmap = sourceBitmap
+        } else {
+            crossSurfaceBitmap = nil
+        }
+        let descriptorBefore = try await store.descriptor(surfaceID: 47)
+        let metricsBefore = await store.metrics()
+
+        switch mutation {
+        case .fill:
+            let destination = PixelRect(x: 1, y: 1, width: 1, height: 1)
+            let region = try PixelRegion(
+                destination: destination,
+                surfaceBounds: fullSurface,
+                clips: nil
+            )
+            _ = try #require(await store.fill(
+                surfaceID: 47,
+                region: region,
+                colorARGB: 0x00aa_bbcc
+            ))
+            replacePixel(
+                in: &expected,
+                bytesPerRow: 16,
+                x: 1,
+                y: 1,
+                with: [0xcc, 0xbb, 0xaa, 0xff]
+            )
+        case .sameSurfaceCopyBits:
+            let destination = PixelRect(x: 1, y: 1, width: 2, height: 1)
+            let source = PixelRect(x: 0, y: 0, width: 2, height: 1)
+            let region = try PixelRegion(
+                destination: destination,
+                surfaceBounds: fullSurface,
+                clips: nil
+            )
+            _ = try #require(await store.copyBits(
+                surfaceID: 47,
+                region: region,
+                destination: destination,
+                sourceX: source.x,
+                sourceY: source.y
+            ))
+            copyPixels(
+                in: &expected,
+                bytesPerRow: 16,
+                source: source,
+                destination: destination
+            )
+        case .partialBitmapDrawCopy:
+            let destination = PixelRect(x: 2, y: 1, width: 1, height: 2)
+            let source = PixelRect(x: 0, y: 0, width: 1, height: 2)
+            let region = try PixelRegion(
+                destination: destination,
+                surfaceBounds: fullSurface,
+                clips: nil
+            )
+            let partial = RawBitmap(
+                format: .xRGB8888,
+                width: 1,
+                height: 2,
+                stride: 4,
+                topDown: true,
+                pixels: Data([
+                    0x10, 0x20, 0x30, 0,
+                    0x40, 0x50, 0x60, 0,
+                ])
+            )
+            _ = try #require(await store.drawCopy(
+                surfaceID: 47,
+                region: region,
+                destination: destination,
+                bitmap: partial,
+                source: source
+            ))
+            replacePixel(
+                in: &expected,
+                bytesPerRow: 16,
+                x: 2,
+                y: 1,
+                with: [0x10, 0x20, 0x30, 0xff]
+            )
+            replacePixel(
+                in: &expected,
+                bytesPerRow: 16,
+                x: 2,
+                y: 2,
+                with: [0x40, 0x50, 0x60, 0xff]
+            )
+        case .crossSurfaceDrawCopy:
+            let sourceBitmap = try #require(crossSurfaceBitmap)
+            let destination = PixelRect(x: 1, y: 1, width: 2, height: 1)
+            let source = PixelRect(x: 0, y: 0, width: 2, height: 1)
+            let region = try PixelRegion(
+                destination: destination,
+                surfaceBounds: fullSurface,
+                clips: nil
+            )
+            _ = try #require(await store.drawCopy(
+                surfaceID: 47,
+                region: region,
+                destination: destination,
+                sourceSurfaceID: 49,
+                source: source
+            ))
+            copyPixels(
+                from: sourceBitmap.pixels,
+                sourceBytesPerRow: sourceBitmap.stride,
+                in: &expected,
+                destinationBytesPerRow: 16,
+                source: source,
+                destination: destination
+            )
+        }
+
+        let descriptorAfter = try await store.descriptor(surfaceID: 47)
+        let metricsAfterMutation = await store.metrics()
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            metricsAfterMutation.mutationTransactions
+                == metricsBefore.mutationTransactions + 1
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializations
+                == metricsBefore.cpuMaterializations
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
+        #expect(metricsAfterMutation.fullFrameCopyBytes == metricsBefore.fullFrameCopyBytes)
+        #expect(
+            metricsAfterMutation.partialFrameCopyBytes
+                == metricsBefore.partialFrameCopyBytes
+        )
+
+        let snapshot = try await store.snapshot(surfaceID: 47)
+        let frame = try #require(snapshot.ioSurfaceFrame)
+        #expect(frame.copyPixels() == expected)
+        if let crossSurfaceBitmap {
+            let sourceSnapshot = try await store.snapshot(surfaceID: 49)
+            let sourceFrame = try #require(sourceSnapshot.ioSurfaceFrame)
+            #expect(sourceFrame.copyPixels() == crossSurfaceBitmap.pixels)
+        }
+        let metricsAfterSnapshot = await store.metrics()
+        #expect(metricsAfterSnapshot.cpuMaterializations == metricsBefore.cpuMaterializations)
+        #expect(
+            metricsAfterSnapshot.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes
+        )
+        #expect(metricsAfterSnapshot.fullFrameCopyBytes == metricsBefore.fullFrameCopyBytes)
+        #expect(metricsAfterSnapshot.partialFrameCopyBytes == metricsBefore.partialFrameCopyBytes)
+    }
+
+    @Test func canonicalMutationFallsBackAtomicallyWhenOnlySlotIsLeased() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 1, maximumBytes: 1_024 * 1_024)
+        ) else {
+            return
+        }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        let fullSurface = PixelRect(x: 0, y: 0, width: 3, height: 2)
+        let bitmap = seededBitmap(width: 3, height: 2, seed: 71)
+        try await store.create(id: 48, width: 3, height: 2, format: 32)
+        try await store.drawCopy(
+            surfaceID: 48,
+            destination: fullSurface,
+            bitmap: bitmap
+        )
+        let oldSnapshot = try await store.snapshot(surfaceID: 48)
+        let oldFrame = try #require(oldSnapshot.ioSurfaceFrame)
+        let oldPixels = try #require(oldFrame.copyPixels())
+        let descriptorBefore = try await store.descriptor(surfaceID: 48)
+        let metricsBefore = await store.metrics()
+        let destination = PixelRect(x: 1, y: 1, width: 1, height: 1)
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: fullSurface,
+            clips: nil
+        )
+
+        _ = try #require(await store.fill(
+            surfaceID: 48,
+            region: region,
+            colorARGB: 0x0011_2233
+        ))
+
+        let descriptorAfter = try await store.descriptor(surfaceID: 48)
+        let metricsAfterMutation = await store.metrics()
+        #expect(descriptorAfter.revision == descriptorBefore.revision + 1)
+        #expect(
+            descriptorAfter.mutationGeneration
+                == descriptorBefore.mutationGeneration + 1
+        )
+        #expect(
+            metricsAfterMutation.mutationTransactions
+                == metricsBefore.mutationTransactions + 1
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializations
+                == metricsBefore.cpuMaterializations + 1
+        )
+        #expect(
+            metricsAfterMutation.cpuMaterializationBytes
+                == metricsBefore.cpuMaterializationBytes + UInt64(bitmap.pixels.count)
+        )
+        #expect(metricsAfterMutation.damageOperations == metricsBefore.damageOperations + 1)
+        #expect(metricsAfterMutation.damageBytes == metricsBefore.damageBytes + 4)
+        #expect(oldFrame.copyPixels() == oldPixels)
+
+        let newSnapshot = try await store.snapshot(surfaceID: 48)
+        #expect(newSnapshot.ioSurfaceFrame == nil)
+        var expected = oldPixels
+        replacePixel(
+            in: &expected,
+            bytesPerRow: oldSnapshot.bytesPerRow,
+            x: destination.x,
+            y: destination.y,
+            with: [0x33, 0x22, 0x11, 0xff]
+        )
+        #expect(newSnapshot.pixels == expected)
+        #expect(oldSnapshot.surfaceRevision == descriptorBefore.surfaceRevision)
+        #expect(oldFrame.copyPixels() == oldPixels)
     }
 
     @Test func repeatedSmallDamageDoesNotRegressToFullGPUBlits() async throws {
@@ -1632,14 +1990,19 @@ struct SurfaceStoreTests {
         let white = pixel(gpuSnapshot, x: 1, y: 1)
         #expect(white.allSatisfy { $0 >= 254 })
 
-        // A later CPU command lazily reads the GPU-canonical revision once,
-        // then preserves untouched video pixels while applying its own damage.
+        // A later CPU command mutates a synchronized IOSurface candidate
+        // without another CPU materialization, then preserves untouched video
+        // pixels while applying its own damage.
+        let materializationsBeforeCPUFill = await store.metrics().cpuMaterializations
         try await store.fill(
             surfaceID: 22,
             rectangle: PixelRect(x: 0, y: 0, width: 1, height: 1),
             colorARGB: 0x00aa_bbcc
         )
-        #expect(await store.metrics().cpuMaterializations == 2)
+        #expect(
+            await store.metrics().cpuMaterializations
+                == materializationsBeforeCPUFill
+        )
         let resumed = try await store.snapshot(surfaceID: 22)
         #expect(!resumed.isAdvancedVideoFrame)
         #expect(pixel(resumed, x: 0, y: 0) == [0xcc, 0xbb, 0xaa, 0xff])
@@ -1789,6 +2152,56 @@ struct SurfaceStoreTests {
             }
         }
         return expected
+    }
+
+    private func replacePixel(
+        in pixels: inout Data,
+        bytesPerRow: Int,
+        x: Int,
+        y: Int,
+        with replacement: [UInt8]
+    ) {
+        let offset = y * bytesPerRow + x * 4
+        pixels.replaceSubrange(offset..<(offset + 4), with: replacement)
+    }
+
+    private func copyPixels(
+        in pixels: inout Data,
+        bytesPerRow: Int,
+        source: PixelRect,
+        destination: PixelRect
+    ) {
+        let before = pixels
+        copyPixels(
+            from: before,
+            sourceBytesPerRow: bytesPerRow,
+            in: &pixels,
+            destinationBytesPerRow: bytesPerRow,
+            source: source,
+            destination: destination
+        )
+    }
+
+    private func copyPixels(
+        from sourcePixels: Data,
+        sourceBytesPerRow: Int,
+        in destinationPixels: inout Data,
+        destinationBytesPerRow: Int,
+        source: PixelRect,
+        destination: PixelRect
+    ) {
+        for row in 0..<destination.height {
+            for column in 0..<destination.width {
+                let sourceOffset = (source.y + row) * sourceBytesPerRow
+                    + (source.x + column) * 4
+                let destinationOffset = (destination.y + row) * destinationBytesPerRow
+                    + (destination.x + column) * 4
+                destinationPixels.replaceSubrange(
+                    destinationOffset..<(destinationOffset + 4),
+                    with: sourcePixels[sourceOffset..<(sourceOffset + 4)]
+                )
+            }
+        }
     }
 
     private func pixel(_ snapshot: FrameSnapshot, x: Int, y: Int) -> [UInt8] {
@@ -1980,6 +2393,13 @@ struct FillKernelCase: Sendable, CustomTestStringConvertible {
         Self(name: "ARGB8888 preserves alpha", format: 96, expectedAlpha: 0x7f),
         Self(name: "xRGB8888 forces opaque alpha", format: 32, expectedAlpha: 0xff),
     ]
+}
+
+enum CanonicalCPUMutation: CaseIterable, Sendable {
+    case fill
+    case sameSurfaceCopyBits
+    case partialBitmapDrawCopy
+    case crossSurfaceDrawCopy
 }
 
 private enum TestError: Error {

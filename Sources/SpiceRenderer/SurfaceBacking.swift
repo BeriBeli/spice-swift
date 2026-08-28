@@ -314,12 +314,12 @@ package struct UnifiedIOSurfaceBacking: @unchecked Sendable {
     }
 }
 
-/// CPU drawing retains its byte-exact Data reference representation. On a
-/// supported Apple GPU the same storage also tracks immutable IOSurface
-/// revisions; publication uploads only bounded damage needed by the selected
-/// candidate revision.
-/// This dual representation lets native video make IOSurface canonical without
-/// exposing CoreVideo or mutable IOSurface handles publicly.
+/// Tracks byte-exact Data and immutable IOSurface representations. Either may
+/// be canonical: eligible CPU kernels continue directly from an IOSurface
+/// revision while leaving `dataRevision` stale, and Data-canonical mutations
+/// retain bounded damage for the next IOSurface publication.
+/// This dual representation keeps native video and CPU drawing on one revision
+/// chain without exposing CoreVideo or mutable IOSurface handles publicly.
 package struct SurfaceStorage: @unchecked Sendable {
     package var dataBacking: DataSurfaceBacking
     package var unifiedBacking: UnifiedIOSurfaceBacking?
@@ -378,8 +378,8 @@ package struct SurfaceStorage: @unchecked Sendable {
         publicationDamageJournal.markFull()
     }
 
-    /// Native video composition commits the IOSurface directly, so only the
-    /// publication journal needs the clipped destination damage.
+    /// Direct IOSurface mutations already contain the complete next revision,
+    /// so only the publication journal needs their destination damage.
     package mutating func recordPublicationDamage(_ rectangle: PixelRect) {
         publicationDamageJournal.append(rectangle)
     }

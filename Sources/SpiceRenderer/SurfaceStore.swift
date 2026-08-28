@@ -397,6 +397,44 @@ extension SurfaceVideoCompositionError: CustomStringConvertible {
 }
 
 package actor SurfaceStore {
+    private enum CanonicalCPUMutation: Sendable {
+        case fill(region: PixelRegion, colorBGRA: UInt32)
+        case sameSurfaceCopy(
+            region: PixelRegion,
+            destination: PixelRect,
+            source: PixelRect
+        )
+        case bitmapCopy(
+            region: PixelRegion,
+            destination: PixelRect,
+            bitmap: RawBitmap,
+            source: PixelRect,
+            preservesAlpha: Bool
+        )
+
+        var region: PixelRegion {
+            switch self {
+            case let .fill(region, _),
+                 let .sameSurfaceCopy(region, _, _),
+                 let .bitmapCopy(region, _, _, _, _):
+                region
+            }
+        }
+    }
+
+    private struct PixelKernelMetrics {
+        var bulkCopyCalls: UInt64 = 0
+        var rowCopyCalls: UInt64 = 0
+        var fillKernelCalls: UInt64 = 0
+        var writtenBytes: UInt64 = 0
+    }
+
+    private enum CanonicalMutationAttempt {
+        case notEligible
+        case fallback
+        case committed(SurfaceRevision)
+    }
+
     private struct Surface: Sendable {
         let id: UInt32
         let width: Int
@@ -624,9 +662,31 @@ package actor SurfaceStore {
             | UInt32(red) << 16
             | UInt32(alpha) << 24
         let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
+        let region = try PixelRegion(
+            destination: rectangle,
+            surfaceBounds: PixelRect(
+                x: 0,
+                y: 0,
+                width: surface.width,
+                height: surface.height
+            ),
+            clips: nil
+        )
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .fill(region: region, colorBGRA: colorBGRA)
+        ) {
+        case let .committed(revision):
+            return revision
+        case .fallback, .notEligible:
+            surface = try self.surface(id: surfaceID)
+        }
         try prepareForMutation(&surface)
         surface.revision = nextRevision
-        surface.mutationGeneration &+= 1
+        surface.mutationGeneration = nextMutationGeneration
         fillPixels(in: &surface, rectangle: rectangle, colorBGRA: colorBGRA)
         surface.storage.recordDamage(rectangle, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
@@ -644,7 +704,7 @@ package actor SurfaceStore {
     ) async throws(RenderError) -> SurfaceRevision {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
-        return try copyBitsUnlocked(
+        return try await copyBitsUnlocked(
             surfaceID: surfaceID,
             destination: destination,
             sourceX: sourceX,
@@ -657,7 +717,7 @@ package actor SurfaceStore {
         destination: PixelRect,
         sourceX: Int,
         sourceY: Int
-    ) throws(RenderError) -> SurfaceRevision {
+    ) async throws(RenderError) -> SurfaceRevision {
         var surface = try surface(id: surfaceID)
         try validate(destination, in: surface)
         let source = PixelRect(
@@ -668,6 +728,32 @@ package actor SurfaceStore {
         )
         try validate(source, in: surface)
         let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: PixelRect(
+                x: 0,
+                y: 0,
+                width: surface.width,
+                height: surface.height
+            ),
+            clips: nil
+        )
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .sameSurfaceCopy(
+                region: region,
+                destination: destination,
+                source: source
+            )
+        ) {
+        case let .committed(revision):
+            return revision
+        case .fallback, .notEligible:
+            surface = try self.surface(id: surfaceID)
+        }
         try prepareForMutation(&surface)
         copySurfacePixels(
             in: &surface,
@@ -675,7 +761,7 @@ package actor SurfaceStore {
             source: source
         )
         surface.revision = nextRevision
-        surface.mutationGeneration &+= 1
+        surface.mutationGeneration = nextMutationGeneration
         surface.storage.recordDamage(destination, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
@@ -725,6 +811,7 @@ package actor SurfaceStore {
         }
 
         let nextRevision = try advancedRevision(surface.revision)
+        let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
         let fullSurface = PixelRect(
@@ -733,7 +820,35 @@ package actor SurfaceStore {
             width: surface.width,
             height: surface.height
         )
-        if destination == fullSurface,
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: fullSurface,
+            clips: nil
+        )
+        let allowsBootstrapDirectWrite: Bool
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .bitmapCopy(
+                region: region,
+                destination: destination,
+                bitmap: bitmap,
+                source: source,
+                preservesAlpha: preservesAlpha
+            )
+        ) {
+        case let .committed(revision):
+            return revision
+        case .notEligible:
+            allowsBootstrapDirectWrite = true
+            surface = try self.surface(id: surfaceID)
+        case .fallback:
+            allowsBootstrapDirectWrite = false
+            surface = try self.surface(id: surfaceID)
+        }
+        if allowsBootstrapDirectWrite,
+           destination == fullSurface,
            var unified = surface.storage.unifiedBacking,
            let writable = unified.pool.checkoutWritable(
                namespace: unified.namespace,
@@ -755,7 +870,7 @@ package actor SurfaceStore {
            let committed = writable.finish(revision: nextRevision)
         {
             surface.revision = nextRevision
-            surface.mutationGeneration &+= 1
+            surface.mutationGeneration = nextMutationGeneration
             unified.current = committed
             unified.damageJournal.clear()
             unified.damageHistory.reset(at: nextRevision)
@@ -770,7 +885,7 @@ package actor SurfaceStore {
 
         try prepareForMutation(&surface)
         surface.revision = nextRevision
-        surface.mutationGeneration &+= 1
+        surface.mutationGeneration = nextMutationGeneration
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
             guard let destinationBase = destinationBytes.baseAddress else { return }
             copyRawBitmap(
@@ -804,7 +919,7 @@ package actor SurfaceStore {
             else {
                 throw .invalidRectangle
             }
-            return try copyBitsUnlocked(
+            return try await copyBitsUnlocked(
                 surfaceID: surfaceID,
                 destination: destination,
                 sourceX: sourceRectangle.x,
@@ -839,6 +954,34 @@ package actor SurfaceStore {
             throw .invalidRectangle
         }
         let nextRevision = try advancedRevision(destinationSurface.revision)
+        let nextMutationGeneration = try advancedRevision(
+            destinationSurface.mutationGeneration
+        )
+        let region = try PixelRegion(
+            destination: destination,
+            surfaceBounds: PixelRect(
+                x: 0,
+                y: 0,
+                width: destinationSurface.width,
+                height: destinationSurface.height
+            ),
+            clips: nil
+        )
+        switch try await applyCanonicalCrossSurfaceCopy(
+            destinationSurface: destinationSurface,
+            sourceSurface: sourceSurface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            region: region,
+            destination: destination,
+            source: sourceRectangle
+        ) {
+        case let .committed(revision):
+            return revision
+        case .fallback, .notEligible:
+            destinationSurface = try self.surface(id: surfaceID)
+            sourceSurface = try self.surface(id: sourceSurfaceID)
+        }
         try prepareForCrossSurfaceCopy(
             destination: &destinationSurface,
             source: &sourceSurface
@@ -850,7 +993,7 @@ package actor SurfaceStore {
             source: sourceRectangle
         )
         destinationSurface.revision = nextRevision
-        destinationSurface.mutationGeneration &+= 1
+        destinationSurface.mutationGeneration = nextMutationGeneration
         destinationSurface.storage.recordDamage(
             destination,
             revision: destinationSurface.revision
@@ -890,6 +1033,18 @@ package actor SurfaceStore {
             | UInt32(red) << 16
             | UInt32(alpha) << 24
 
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .fill(region: region, colorBGRA: colorBGRA)
+        ) {
+        case let .committed(revision):
+            recordMutationTransaction()
+            return revision
+        case .fallback, .notEligible:
+            surface = try self.surface(id: surfaceID)
+        }
         try prepareForMutation(&surface)
         for rectangle in region {
             fillPixels(in: &surface, rectangle: rectangle, colorBGRA: colorBGRA)
@@ -936,6 +1091,22 @@ package actor SurfaceStore {
         let nextRevision = try advancedRevision(surface.revision)
         let nextMutationGeneration = try advancedRevision(surface.mutationGeneration)
 
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .sameSurfaceCopy(
+                region: region,
+                destination: destination,
+                source: source
+            )
+        ) {
+        case let .committed(revision):
+            recordMutationTransaction()
+            return revision
+        case .fallback, .notEligible:
+            surface = try self.surface(id: surfaceID)
+        }
         try prepareForMutation(&surface)
         for rectangle in region.copyTraversal(source: source, destination: destination) {
             let sourceRectangle = translatedSourceAfterValidation(
@@ -990,7 +1161,30 @@ package actor SurfaceStore {
             width: surface.width,
             height: surface.height
         )
-        if region.singleRectangle == fullSurface {
+        let allowsBootstrapDirectWrite: Bool
+        switch try await applyCanonicalMutation(
+            to: surface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            mutation: .bitmapCopy(
+                region: region,
+                destination: destination,
+                bitmap: bitmap,
+                source: source,
+                preservesAlpha: preservesAlpha
+            )
+        ) {
+        case let .committed(revision):
+            recordMutationTransaction()
+            return revision
+        case .notEligible:
+            allowsBootstrapDirectWrite = true
+            surface = try self.surface(id: surfaceID)
+        case .fallback:
+            allowsBootstrapDirectWrite = false
+            surface = try self.surface(id: surfaceID)
+        }
+        if allowsBootstrapDirectWrite, region.singleRectangle == fullSurface {
             let fullSource = translatedSourceAfterValidation(
                 for: fullSurface,
                 destination: destination,
@@ -1121,6 +1315,22 @@ package actor SurfaceStore {
         let nextMutationGeneration = try advancedRevision(
             destinationSurface.mutationGeneration
         )
+        switch try await applyCanonicalCrossSurfaceCopy(
+            destinationSurface: destinationSurface,
+            sourceSurface: sourceSurface,
+            revision: nextRevision,
+            mutationGeneration: nextMutationGeneration,
+            region: region,
+            destination: destination,
+            source: source
+        ) {
+        case let .committed(revision):
+            recordMutationTransaction()
+            return revision
+        case .fallback, .notEligible:
+            destinationSurface = try self.surface(id: surfaceID)
+            sourceSurface = try self.surface(id: sourceSurfaceID)
+        }
         try prepareForCrossSurfaceCopy(
             destination: &destinationSurface,
             source: &sourceSurface
@@ -1959,6 +2169,272 @@ package actor SurfaceStore {
         return surface
     }
 
+    private func applyCanonicalMutation(
+        to surface: Surface,
+        revision nextRevision: UInt64,
+        mutationGeneration nextMutationGeneration: UInt64,
+        mutation: CanonicalCPUMutation
+    ) async throws(RenderError) -> CanonicalMutationAttempt {
+        guard surface.storage.dataRevision != surface.revision,
+              let unified = surface.storage.unifiedBacking,
+              let sourceRevision = unified.current,
+              sourceRevision.revision == surface.revision
+        else {
+            return .notEligible
+        }
+        guard let writable = unified.pool.checkoutWritable(
+            namespace: unified.namespace,
+            surfaceID: surface.id,
+            width: surface.width,
+            height: surface.height,
+            source: sourceRevision,
+            allowsInPlaceSource: true
+        ) else {
+            return .fallback
+        }
+        let copiesCanonicalSource = writable.requiresSourceSynchronization
+
+        guard await writable.synchronizeFromSource() else {
+            revisionedGPUErrors &+= 1
+            return .fallback
+        }
+        guard var liveSurface = surfaces[surface.id],
+              liveSurface.lifecycleGeneration == surface.lifecycleGeneration,
+              liveSurface.revision == surface.revision,
+              var liveUnified = liveSurface.storage.unifiedBacking,
+              liveUnified.current === sourceRevision
+        else {
+            throw .backingMaterializationFailed
+        }
+
+        guard let kernelMetrics = writable.withLockedMutableBytes({ baseAddress, bytesPerRow in
+            applyCanonicalMutation(
+                mutation,
+                baseAddress: baseAddress,
+                bytesPerRow: bytesPerRow
+            )
+        }) else {
+            // An in-place candidate has not changed when the lock body never
+            // ran. Restore its committed metadata instead of aborting the live
+            // canonical slot and forcing every later publication to recover.
+            if !copiesCanonicalSource {
+                guard writable.finish(revision: sourceRevision.revision) != nil else {
+                    preconditionFailure("unmodified IOSurface source could not be released")
+                }
+            }
+            return .fallback
+        }
+        guard let committed = writable.finish(revision: nextRevision) else {
+            preconditionFailure("validated IOSurface CPU mutation could not be committed")
+        }
+
+        liveSurface.revision = nextRevision
+        liveSurface.mutationGeneration = nextMutationGeneration
+        liveUnified.current = committed
+        liveUnified.damageJournal.clear()
+        liveUnified.damageHistory.reset(at: nextRevision)
+        liveSurface.storage.unifiedBacking = liveUnified
+        let region = mutation.region
+        for rectangle in region {
+            liveSurface.storage.recordPublicationDamage(rectangle)
+        }
+        currentFramePixelStorage[liveSurface.id] = nil
+        surfaces[liveSurface.id] = liveSurface
+        recordPixelKernelMetrics(kernelMetrics)
+        Self.saturatingAdd(kernelMetrics.writtenBytes, to: &directIOSurfaceWriteBytes)
+        if copiesCanonicalSource {
+            Self.saturatingAdd(
+                UInt64(liveSurface.width * liveSurface.height * 4),
+                to: &gpuCopyBytes
+            )
+        }
+        for rectangle in region {
+            recordDamage(rectangle)
+        }
+        return .committed(surfaceRevision(of: liveSurface))
+    }
+
+    private func applyCanonicalCrossSurfaceCopy(
+        destinationSurface: Surface,
+        sourceSurface: Surface,
+        revision nextRevision: UInt64,
+        mutationGeneration nextMutationGeneration: UInt64,
+        region: PixelRegion,
+        destination: PixelRect,
+        source: PixelRect
+    ) async throws(RenderError) -> CanonicalMutationAttempt {
+        guard destinationSurface.storage.dataRevision != destinationSurface.revision,
+              sourceSurface.storage.dataRevision != sourceSurface.revision,
+              let destinationUnified = destinationSurface.storage.unifiedBacking,
+              let sourceUnified = sourceSurface.storage.unifiedBacking,
+              let destinationRevision = destinationUnified.current,
+              let sourceRevision = sourceUnified.current,
+              destinationRevision.revision == destinationSurface.revision,
+              sourceRevision.revision == sourceSurface.revision
+        else {
+            return .notEligible
+        }
+        guard let writable = destinationUnified.pool.checkoutWritable(
+            namespace: destinationUnified.namespace,
+            surfaceID: destinationSurface.id,
+            width: destinationSurface.width,
+            height: destinationSurface.height,
+            source: destinationRevision,
+            allowsInPlaceSource: true
+        ) else {
+            return .fallback
+        }
+        let copiesCanonicalDestination = writable.requiresSourceSynchronization
+        guard await writable.synchronizeFromSource() else {
+            revisionedGPUErrors &+= 1
+            return .fallback
+        }
+        guard var liveDestination = surfaces[destinationSurface.id],
+              liveDestination.lifecycleGeneration == destinationSurface.lifecycleGeneration,
+              liveDestination.revision == destinationSurface.revision,
+              var liveDestinationUnified = liveDestination.storage.unifiedBacking,
+              liveDestinationUnified.current === destinationRevision,
+              let liveSource = surfaces[sourceSurface.id],
+              liveSource.lifecycleGeneration == sourceSurface.lifecycleGeneration,
+              liveSource.revision == sourceSurface.revision,
+              liveSource.storage.unifiedBacking?.current === sourceRevision
+        else {
+            throw .backingMaterializationFailed
+        }
+
+        let lockedMetrics = sourceRevision.withLockedBytes { sourceBase, sourceBytesPerRow in
+            writable.withLockedMutableBytes { destinationBase, destinationBytesPerRow in
+                var metrics = PixelKernelMetrics()
+                for rectangle in region {
+                    let sourceRectangle = translatedSourceAfterValidation(
+                        for: rectangle,
+                        destination: destination,
+                        source: source
+                    )
+                    Self.accumulate(
+                        Self.copySurfacePixels(
+                            sourceBase: sourceBase,
+                            sourceBytesPerRow: sourceBytesPerRow,
+                            destinationBase: destinationBase,
+                            destinationBytesPerRow: destinationBytesPerRow,
+                            destination: rectangle,
+                            source: sourceRectangle
+                        ),
+                        into: &metrics
+                    )
+                }
+                return metrics
+            }
+        }
+        guard let destinationLockResult = lockedMetrics,
+              let kernelMetrics = destinationLockResult
+        else {
+            if !copiesCanonicalDestination {
+                guard writable.finish(revision: destinationRevision.revision) != nil else {
+                    preconditionFailure("unmodified IOSurface destination could not be released")
+                }
+            }
+            return .fallback
+        }
+        guard let committed = writable.finish(revision: nextRevision) else {
+            preconditionFailure("validated cross-Surface IOSurface copy could not be committed")
+        }
+
+        liveDestination.revision = nextRevision
+        liveDestination.mutationGeneration = nextMutationGeneration
+        liveDestinationUnified.current = committed
+        liveDestinationUnified.damageJournal.clear()
+        liveDestinationUnified.damageHistory.reset(at: nextRevision)
+        liveDestination.storage.unifiedBacking = liveDestinationUnified
+        for rectangle in region {
+            liveDestination.storage.recordPublicationDamage(rectangle)
+        }
+        currentFramePixelStorage[liveDestination.id] = nil
+        surfaces[liveDestination.id] = liveDestination
+        recordPixelKernelMetrics(kernelMetrics)
+        Self.saturatingAdd(kernelMetrics.writtenBytes, to: &directIOSurfaceWriteBytes)
+        if copiesCanonicalDestination {
+            Self.saturatingAdd(
+                UInt64(liveDestination.width * liveDestination.height * 4),
+                to: &gpuCopyBytes
+            )
+        }
+        for rectangle in region {
+            recordDamage(rectangle)
+        }
+        return .committed(surfaceRevision(of: liveDestination))
+    }
+
+    private func applyCanonicalMutation(
+        _ mutation: CanonicalCPUMutation,
+        baseAddress: UnsafeMutableRawPointer,
+        bytesPerRow: Int
+    ) -> PixelKernelMetrics {
+        var metrics = PixelKernelMetrics()
+        switch mutation {
+        case let .fill(region, colorBGRA):
+            for rectangle in region {
+                Self.accumulate(
+                    Self.fillPixels(
+                        baseAddress: baseAddress,
+                        bytesPerRow: bytesPerRow,
+                        rectangle: rectangle,
+                        colorBGRA: colorBGRA
+                    ),
+                    into: &metrics
+                )
+            }
+        case let .sameSurfaceCopy(region, destination, source):
+            for rectangle in region.copyTraversal(source: source, destination: destination) {
+                let sourceRectangle = translatedSourceAfterValidation(
+                    for: rectangle,
+                    destination: destination,
+                    source: source
+                )
+                Self.accumulate(
+                    Self.copySurfacePixels(
+                        baseAddress: baseAddress,
+                        bytesPerRow: bytesPerRow,
+                        destination: rectangle,
+                        source: sourceRectangle
+                    ),
+                    into: &metrics
+                )
+            }
+        case let .bitmapCopy(region, destination, bitmap, source, preservesAlpha):
+            for rectangle in region {
+                let sourceRectangle = translatedSourceAfterValidation(
+                    for: rectangle,
+                    destination: destination,
+                    source: source
+                )
+                copyRawBitmap(
+                    bitmap,
+                    source: sourceRectangle,
+                    to: baseAddress.advanced(
+                        by: rectangle.y * bytesPerRow + rectangle.x * 4
+                    ),
+                    destinationBytesPerRow: bytesPerRow,
+                    preservesAlpha: preservesAlpha
+                )
+                metrics.writtenBytes += UInt64(
+                    rectangle.width * rectangle.height * 4
+                )
+            }
+        }
+        return metrics
+    }
+
+    private static func accumulate(
+        _ addition: PixelKernelMetrics,
+        into metrics: inout PixelKernelMetrics
+    ) {
+        saturatingAdd(addition.bulkCopyCalls, to: &metrics.bulkCopyCalls)
+        saturatingAdd(addition.rowCopyCalls, to: &metrics.rowCopyCalls)
+        saturatingAdd(addition.fillKernelCalls, to: &metrics.fillKernelCalls)
+        saturatingAdd(addition.writtenBytes, to: &metrics.writtenBytes)
+    }
+
     /// Removes the dictionary's value-semantic reference before mutation. Every
     /// fallible GPU readback is staged first, so failure restores the exact
     /// original surface rather than a partially updated CPU cache.
@@ -2059,18 +2535,16 @@ package actor SurfaceStore {
         colorBGRA: UInt32
     ) {
         let bytesPerRow = surface.bytesPerRow
-        surface.pixels.withUnsafeMutableBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else { return }
-            spice_fill_bgra32(
-                baseAddress.advanced(by: rectangle.y * bytesPerRow + rectangle.x * 4)
-                    .assumingMemoryBound(to: UInt8.self),
-                bytesPerRow,
-                rectangle.width,
-                rectangle.height,
-                colorBGRA
+        let metrics = surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return PixelKernelMetrics() }
+            return Self.fillPixels(
+                baseAddress: baseAddress,
+                bytesPerRow: bytesPerRow,
+                rectangle: rectangle,
+                colorBGRA: colorBGRA
             )
         }
-        Self.saturatingAdd(1, to: &fillKernelCalls)
+        recordPixelKernelMetrics(metrics)
     }
 
     private func copySurfacePixels(
@@ -2079,52 +2553,16 @@ package actor SurfaceStore {
         source: PixelRect
     ) {
         let bytesPerRow = surface.bytesPerRow
-        let rowBytes = destination.width * 4
-        let overlaps = source.x < destination.x + destination.width
-            && destination.x < source.x + source.width
-            && source.y < destination.y + destination.height
-            && destination.y < source.y + source.height
-        let usesBulkCopy = !overlaps
-            && (destination.height == 1 || rowBytes == bytesPerRow)
-        surface.pixels.withUnsafeMutableBytes { bytes in
-            guard let baseAddress = bytes.baseAddress else { return }
-            if usesBulkCopy {
-                _ = memmove(
-                    baseAddress.advanced(by: destination.y * bytesPerRow + destination.x * 4),
-                    baseAddress.advanced(by: source.y * bytesPerRow + source.x * 4),
-                    rowBytes * destination.height
-                )
-            } else if destination.y > source.y {
-                for row in stride(from: destination.height - 1, through: 0, by: -1) {
-                    _ = memmove(
-                        baseAddress.advanced(
-                            by: (destination.y + row) * bytesPerRow + destination.x * 4
-                        ),
-                        baseAddress.advanced(
-                            by: (source.y + row) * bytesPerRow + source.x * 4
-                        ),
-                        rowBytes
-                    )
-                }
-            } else {
-                for row in 0..<destination.height {
-                    _ = memmove(
-                        baseAddress.advanced(
-                            by: (destination.y + row) * bytesPerRow + destination.x * 4
-                        ),
-                        baseAddress.advanced(
-                            by: (source.y + row) * bytesPerRow + source.x * 4
-                        ),
-                        rowBytes
-                    )
-                }
-            }
+        let metrics = surface.pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return PixelKernelMetrics() }
+            return Self.copySurfacePixels(
+                baseAddress: baseAddress,
+                bytesPerRow: bytesPerRow,
+                destination: destination,
+                source: source
+            )
         }
-        if usesBulkCopy {
-            Self.saturatingAdd(1, to: &bulkCopyCalls)
-        } else {
-            Self.saturatingAdd(UInt64(destination.height), to: &rowCopyCalls)
-        }
+        recordPixelKernelMetrics(metrics)
     }
 
     private func copySurfacePixels(
@@ -2135,47 +2573,141 @@ package actor SurfaceStore {
     ) {
         let sourceBytesPerRow = sourceSurface.bytesPerRow
         let destinationBytesPerRow = destinationSurface.bytesPerRow
-        let rowBytes = destination.width * 4
-        let usesBulkCopy = destination.height == 1
-            || (rowBytes == sourceBytesPerRow && rowBytes == destinationBytesPerRow)
-        sourceSurface.pixels.withUnsafeBytes { sourceBytes in
+        let metrics = sourceSurface.pixels.withUnsafeBytes { sourceBytes in
             destinationSurface.pixels.withUnsafeMutableBytes { destinationBytes in
                 guard let sourceBase = sourceBytes.baseAddress,
                       let destinationBase = destinationBytes.baseAddress
                 else {
-                    return
+                    return PixelKernelMetrics()
                 }
-                if usesBulkCopy {
-                    _ = memcpy(
-                        destinationBase.advanced(
-                            by: destination.y * destinationBytesPerRow + destination.x * 4
-                        ),
-                        sourceBase.advanced(
-                            by: source.y * sourceBytesPerRow + source.x * 4
-                        ),
-                        rowBytes * destination.height
-                    )
-                } else {
-                    for row in 0..<destination.height {
-                        _ = memcpy(
-                            destinationBase.advanced(
-                                by: (destination.y + row) * destinationBytesPerRow
-                                    + destination.x * 4
-                            ),
-                            sourceBase.advanced(
-                                by: (source.y + row) * sourceBytesPerRow + source.x * 4
-                            ),
-                            rowBytes
-                        )
-                    }
-                }
+                return Self.copySurfacePixels(
+                    sourceBase: sourceBase,
+                    sourceBytesPerRow: sourceBytesPerRow,
+                    destinationBase: destinationBase,
+                    destinationBytesPerRow: destinationBytesPerRow,
+                    destination: destination,
+                    source: source
+                )
             }
         }
+        recordPixelKernelMetrics(metrics)
+    }
+
+    private static func fillPixels(
+        baseAddress: UnsafeMutableRawPointer,
+        bytesPerRow: Int,
+        rectangle: PixelRect,
+        colorBGRA: UInt32
+    ) -> PixelKernelMetrics {
+        spice_fill_bgra32(
+            baseAddress.advanced(by: rectangle.y * bytesPerRow + rectangle.x * 4)
+                .assumingMemoryBound(to: UInt8.self),
+            bytesPerRow,
+            rectangle.width,
+            rectangle.height,
+            colorBGRA
+        )
+        return PixelKernelMetrics(
+            fillKernelCalls: 1,
+            writtenBytes: UInt64(rectangle.width * rectangle.height * 4)
+        )
+    }
+
+    private static func copySurfacePixels(
+        baseAddress: UnsafeMutableRawPointer,
+        bytesPerRow: Int,
+        destination: PixelRect,
+        source: PixelRect
+    ) -> PixelKernelMetrics {
+        let rowBytes = destination.width * 4
+        let overlaps = source.x < destination.x + destination.width
+            && destination.x < source.x + source.width
+            && source.y < destination.y + destination.height
+            && destination.y < source.y + source.height
+        let usesBulkCopy = !overlaps
+            && (destination.height == 1 || rowBytes == bytesPerRow)
         if usesBulkCopy {
-            Self.saturatingAdd(1, to: &bulkCopyCalls)
+            _ = memmove(
+                baseAddress.advanced(by: destination.y * bytesPerRow + destination.x * 4),
+                baseAddress.advanced(by: source.y * bytesPerRow + source.x * 4),
+                rowBytes * destination.height
+            )
+        } else if destination.y > source.y {
+            for row in stride(from: destination.height - 1, through: 0, by: -1) {
+                _ = memmove(
+                    baseAddress.advanced(
+                        by: (destination.y + row) * bytesPerRow + destination.x * 4
+                    ),
+                    baseAddress.advanced(
+                        by: (source.y + row) * bytesPerRow + source.x * 4
+                    ),
+                    rowBytes
+                )
+            }
         } else {
-            Self.saturatingAdd(UInt64(destination.height), to: &rowCopyCalls)
+            for row in 0..<destination.height {
+                _ = memmove(
+                    baseAddress.advanced(
+                        by: (destination.y + row) * bytesPerRow + destination.x * 4
+                    ),
+                    baseAddress.advanced(
+                        by: (source.y + row) * bytesPerRow + source.x * 4
+                    ),
+                    rowBytes
+                )
+            }
         }
+        return PixelKernelMetrics(
+            bulkCopyCalls: usesBulkCopy ? 1 : 0,
+            rowCopyCalls: usesBulkCopy ? 0 : UInt64(destination.height),
+            writtenBytes: UInt64(rowBytes * destination.height)
+        )
+    }
+
+    private static func copySurfacePixels(
+        sourceBase: UnsafeRawPointer,
+        sourceBytesPerRow: Int,
+        destinationBase: UnsafeMutableRawPointer,
+        destinationBytesPerRow: Int,
+        destination: PixelRect,
+        source: PixelRect
+    ) -> PixelKernelMetrics {
+        let rowBytes = destination.width * 4
+        let usesBulkCopy = destination.height == 1
+            || (rowBytes == sourceBytesPerRow && rowBytes == destinationBytesPerRow)
+        if usesBulkCopy {
+            _ = memcpy(
+                destinationBase.advanced(
+                    by: destination.y * destinationBytesPerRow + destination.x * 4
+                ),
+                sourceBase.advanced(by: source.y * sourceBytesPerRow + source.x * 4),
+                rowBytes * destination.height
+            )
+        } else {
+            for row in 0..<destination.height {
+                _ = memcpy(
+                    destinationBase.advanced(
+                        by: (destination.y + row) * destinationBytesPerRow
+                            + destination.x * 4
+                    ),
+                    sourceBase.advanced(
+                        by: (source.y + row) * sourceBytesPerRow + source.x * 4
+                    ),
+                    rowBytes
+                )
+            }
+        }
+        return PixelKernelMetrics(
+            bulkCopyCalls: usesBulkCopy ? 1 : 0,
+            rowCopyCalls: usesBulkCopy ? 0 : UInt64(destination.height),
+            writtenBytes: UInt64(rowBytes * destination.height)
+        )
+    }
+
+    private func recordPixelKernelMetrics(_ metrics: PixelKernelMetrics) {
+        Self.saturatingAdd(metrics.bulkCopyCalls, to: &bulkCopyCalls)
+        Self.saturatingAdd(metrics.rowCopyCalls, to: &rowCopyCalls)
+        Self.saturatingAdd(metrics.fillKernelCalls, to: &fillKernelCalls)
     }
 
     private func translatedSource(
