@@ -14,6 +14,11 @@ fail() {
     exit 1
 }
 
+reject_arm() {
+    echo "PERF_ARM_REJECTED action_class=$1 token=$2 reason=$3" >&2
+    exit 1
+}
+
 valid_action_class() {
     case "$1" in
         click|key|motion) return 0 ;;
@@ -68,6 +73,7 @@ if test "${1:-}" = --self-test-jsonl; then
                     printf '%s\n' "${output}"
                 else
                     case "${output}" in
+                        PERF_ARM_REJECTED\ action_class=*) printf '%s\n' "${output}" ;;
                         PERF_ERROR\ input_marker=*) printf '%s\n' "${output}" ;;
                         *) printf '%s\n' "${output}" >&2; exit 1 ;;
                     esac
@@ -137,11 +143,11 @@ case "${command}" in
         token="$3"
         valid_token "${token}" || fail invalid_token
         if test -f "${state_dir}/armed"; then
-            fail arm_outstanding
+            reject_arm "${action_class}" "${token}" arm_outstanding
         fi
         if test -f "${state_dir}/used-tokens" \
             && grep -Fqx "${token}" "${state_dir}/used-tokens"; then
-            fail duplicate_token
+            reject_arm "${action_class}" "${token}" duplicate_token
         fi
         arm_tmp="${state_dir}/armed.$$"
         printf '%s %s\n' "${action_class}" "${token}" > "${arm_tmp}"

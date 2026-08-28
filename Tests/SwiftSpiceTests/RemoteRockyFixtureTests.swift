@@ -399,6 +399,95 @@ struct RemoteRockyFixtureTests {
         #expect(try fixture.mockEventCount("control-exec") == cases.count)
     }
 
+    @Test func controlArmWaitsForExactGuestAcceptanceOrRejection() throws {
+        let cases = [
+            (
+                result: "accepted",
+                succeeds: true,
+                expectedLine: "PERF_ARMED action_class=click token=0000000000000010"
+            ),
+            (
+                result: "arm_outstanding",
+                succeeds: false,
+                expectedLine: "PERF_ARM_REJECTED action_class=click token=0000000000000010 reason=arm_outstanding"
+            ),
+            (
+                result: "duplicate_token",
+                succeeds: false,
+                expectedLine: "PERF_ARM_REJECTED action_class=click token=0000000000000010 reason=duplicate_token"
+            ),
+        ]
+
+        for testCase in cases {
+            let fixture = try RemoteRockyFixture()
+            defer { fixture.remove() }
+            try fixture.prepareRunningState()
+
+            let result = try fixture.run(
+                "remote/control.sh",
+                arguments: ["arm", "click", "0000000000000010"],
+                ssMode: "both",
+                additionalEnvironment: [
+                    "MOCK_ARM_RESULT": testCase.result,
+                    "MOCK_ARM_CRLF_NOISE": "1",
+                ]
+            )
+
+            #expect((result.status == 0) == testCase.succeeds)
+            #expect(result.output.contains(testCase.expectedLine))
+            #expect(!result.output.contains("\r"))
+            #expect(try fixture.mockEventCount("control-exec") == 1)
+        }
+
+        let timeoutFixture = try RemoteRockyFixture()
+        defer { timeoutFixture.remove() }
+        try timeoutFixture.prepareRunningState()
+        let timeout = try timeoutFixture.run(
+            "remote/control.sh",
+            arguments: ["arm", "click", "0000000000000011"],
+            ssMode: "both",
+            additionalEnvironment: ["MOCK_ARM_RESULT": "timeout"]
+        )
+        #expect(timeout.status != 0)
+        #expect(!timeout.output.contains("PERF_ARMED"))
+        #expect(!timeout.output.contains("PERF_ARM_REJECTED"))
+    }
+
+    @Test func concurrentHostArmsSerializeAroundOneGuestPendingSlot() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+        let environment = [
+            "MOCK_ARM_STATEFUL": "1",
+            "MOCK_ARM_CRLF_NOISE": "1",
+        ]
+
+        let first = try fixture.launch(
+            "remote/control.sh",
+            arguments: ["arm", "click", "0000000000000020"],
+            ssMode: "both",
+            additionalEnvironment: environment
+        )
+        let second = try fixture.launch(
+            "remote/control.sh",
+            arguments: ["arm", "click", "0000000000000021"],
+            ssMode: "both",
+            additionalEnvironment: environment
+        )
+        let results = [first.finish(), second.finish()]
+
+        #expect(results.filter { $0.status == 0 }.count == 1)
+        #expect(results.filter { $0.status != 0 }.count == 1)
+        let combinedOutput = results.map(\.output).joined(separator: "\n")
+        #expect(combinedOutput.contains("PERF_ARMED action_class=click"))
+        #expect(combinedOutput.contains(
+            "PERF_ARM_REJECTED action_class=click"
+        ))
+        #expect(combinedOutput.contains("reason=arm_outstanding"))
+        #expect(!combinedOutput.contains("\r"))
+        #expect(try fixture.mockEventCount("control-exec") == 2)
+    }
+
     @Test func controlDiagnosesGuestInputWithNoAdditionalArguments() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -676,11 +765,16 @@ struct RemoteRockyFixtureTests {
         let errors = result.output.split(separator: "\n").filter {
             $0.hasPrefix("PERF_ERROR")
         }
-        #expect(errors.count == 4)
-        #expect(errors.contains("PERF_ERROR input_marker=arm_outstanding"))
-        #expect(errors.contains("PERF_ERROR input_marker=duplicate_token"))
+        #expect(errors.count == 2)
         #expect(errors.contains("PERF_ERROR input_marker=invalid_action_class"))
         #expect(errors.contains("PERF_ERROR input_marker=invalid_token"))
+        let rejected = result.output.split(separator: "\n").filter {
+            $0.hasPrefix("PERF_ARM_REJECTED")
+        }
+        #expect(rejected == [
+            "PERF_ARM_REJECTED action_class=key token=0000000000000002 reason=arm_outstanding",
+            "PERF_ARM_REJECTED action_class=motion token=0000000000000001 reason=duplicate_token",
+        ])
 
         let renders = perfRecords(prefix: "PERF_MARKER_RENDER", in: result.output)
         #expect(renders.map { $0["checksum"] } == ["665e9948", "000f6f4a"])
@@ -1316,7 +1410,7 @@ private struct RemoteRockyFixture {
         #!/bin/bash
         set -euo pipefail
         [[ "${1:-}" == --exclusive ]]
-        [[ "${2:-}" == 8 || "${2:-}" == 9 ]]
+        [[ "${2:-}" =~ ^[3-9]$ ]]
         [[ $# == 2 ]]
         exec /usr/bin/python3 -c \
             'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' "${2}"
@@ -1354,6 +1448,43 @@ private struct RemoteRockyFixture {
                             'PERF_INPUT_DIAGNOSTIC_BEGIN' \
                             'PERF_INPUT_DIAGNOSTIC_END' \
                             >> "$server_log"
+                    fi
+                fi
+                if [[ "${4:-}" =~ arm\ action_class=([a-z]+)\ token=([0-9a-f]{16}) ]]; then
+                    action_class="${BASH_REMATCH[1]}"
+                    token="${BASH_REMATCH[2]}"
+                    run_id="$(<"${SWIFTSPICE_PERF_BASE:?}/state/current-run")"
+                    server_log="${SWIFTSPICE_PERF_BASE}/logs/${run_id}/server.log"
+                    arm_result="${MOCK_ARM_RESULT:-accepted}"
+                    if [[ "${MOCK_ARM_STATEFUL:-}" == 1 ]]; then
+                        arm_lock="$state/guest-arm.lock"
+                        until mkdir "$arm_lock" 2>/dev/null; do /bin/sleep 0.01; done
+                        if [[ -f "$state/guest-arm-pending" ]]; then
+                            arm_result=arm_outstanding
+                        else
+                            : > "$state/guest-arm-pending"
+                            arm_result=accepted
+                        fi
+                    fi
+                    if [[ "${MOCK_ARM_CRLF_NOISE:-}" == 1 ]]; then
+                        for index in $(seq 1 14); do
+                            printf 'PERF_ARM_NOISE index=%s\r\n' "$index" >> "$server_log"
+                        done
+                    fi
+                    case "$arm_result" in
+                        accepted)
+                            printf 'PERF_ARMED action_class=%s token=%s\r\n' \
+                                "$action_class" "$token" >> "$server_log"
+                            ;;
+                        arm_outstanding|duplicate_token)
+                            printf 'PERF_ARM_REJECTED action_class=%s token=%s reason=%s\r\n' \
+                                "$action_class" "$token" "$arm_result" >> "$server_log"
+                            ;;
+                        timeout) ;;
+                        *) exit 64 ;;
+                    esac
+                    if [[ "${MOCK_ARM_STATEFUL:-}" == 1 ]]; then
+                        rmdir "$arm_lock"
                     fi
                 fi
                 ;;

@@ -20,6 +20,8 @@ case "${action}" in
             echo "TOKEN must be exactly 16 lowercase hexadecimal characters." >&2
             exit 2
         fi
+        arm_action_class="${2}"
+        arm_token="${3}"
         wire_command="arm action_class=${2} token=${3}"
         ;;
     *)
@@ -31,18 +33,23 @@ esac
 require_running
 run_dir="$(current_run_dir)"
 
-diagnostic_log_offset=
-if [[ "${action}" == diagnose-input ]]; then
-    # Serialize diagnostics so the first complete block after this byte
-    # boundary belongs to this invocation, even when server.log is appended by
-    # the persistent Podman log follower.
-    exec 8>"${PERF_STATE}/input-diagnostic.lock"
-    flock --exclusive 8
+control_log_offset=
+if [[ "${action}" == diagnose-input || "${action}" == arm ]]; then
+    if [[ "${action}" == diagnose-input ]]; then
+        # A diagnostic invocation owns its complete BEGIN/END response.
+        exec 8>"${PERF_STATE}/input-diagnostic.lock"
+        flock --exclusive 8
+    else
+        # Only one host arm may be outstanding while its exact guest result is
+        # correlated. Guest input processing remains independent of this lock.
+        exec 7>"${PERF_STATE}/input-marker-arm.lock"
+        flock --exclusive 7
+    fi
     server_log="${run_dir}/server.log"
     if [[ -f "${server_log}" ]]; then
-        diagnostic_log_offset="$(wc -c < "${server_log}")"
+        control_log_offset="$(wc -c < "${server_log}")"
     else
-        diagnostic_log_offset=0
+        control_log_offset=0
     fi
 fi
 
@@ -53,7 +60,7 @@ podman exec "${PERF_CONTAINER}" \
 if [[ "${action}" == diagnose-input ]]; then
     for _ in {1..100}; do
         diagnostic_block="$(
-            tail -c "+$((diagnostic_log_offset + 1))" "${server_log}" 2>/dev/null |
+            tail -c "+$((control_log_offset + 1))" "${server_log}" 2>/dev/null |
                 awk '
                     {
                         line = $0
@@ -88,6 +95,48 @@ if [[ "${action}" == diagnose-input ]]; then
         sleep 0.1
     done
     echo "PERF_INPUT_DIAGNOSTIC_ERROR reason=timeout" >&2
+    exit 1
+fi
+
+if [[ "${action}" == arm ]]; then
+    for _ in {1..100}; do
+        arm_result="$(
+            tail -c "+$((control_log_offset + 1))" "${server_log}" 2>/dev/null |
+                awk -v action_class="${arm_action_class}" -v token="${arm_token}" '
+                    BEGIN {
+                        armed = "PERF_ARMED action_class=" action_class " token=" token
+                        rejected = "PERF_ARM_REJECTED action_class=" action_class " token=" token " reason="
+                    }
+                    {
+                        line = $0
+                        sub(/\r$/, "", line)
+                    }
+                    line == armed {
+                        print line
+                        found = 1
+                        exit
+                    }
+                    line == rejected "arm_outstanding" || line == rejected "duplicate_token" {
+                        print line
+                        found = 1
+                        exit
+                    }
+                    END { exit(found ? 0 : 1) }
+                '
+        )" || true
+        case "${arm_result}" in
+            "PERF_ARMED action_class=${arm_action_class} token=${arm_token}")
+                printf '%s\n' "${arm_result}"
+                exit 0
+                ;;
+            "PERF_ARM_REJECTED action_class=${arm_action_class} token=${arm_token} reason="*)
+                printf '%s\n' "${arm_result}" >&2
+                exit 1
+                ;;
+        esac
+        sleep 0.1
+    done
+    echo "PERF_ARM_ERROR action_class=${arm_action_class} token=${arm_token} reason=timeout" >&2
     exit 1
 fi
 
