@@ -8,10 +8,8 @@ ack_fifo="${PERF_MARKER_ACK_FIFO:-/run/perf-marker-ack}"
 ack_timeout_seconds="${PERF_MARKER_ACK_TIMEOUT_SECONDS:-2}"
 MARKER_FOREGROUND=000000
 MARKER_BACKGROUND=ffffff
-ack_reader_pid=
-ack_timer_pid=
-ack_status_file=
-ack_done_file=
+ack_fd_open=false
+request_fd_open=false
 mkdir -p "${state_dir}"
 
 fail() {
@@ -43,6 +41,48 @@ monotonic_nanoseconds() {
     awk '{ printf "%.0f\n", $1 * 1000000000 }' /proc/uptime
 }
 
+event_clock_nanoseconds() {
+    if test -r /proc/uptime; then
+        monotonic_nanoseconds
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(time.monotonic_ns())'
+    else
+        return 1
+    fi
+}
+
+read_ack_record() {
+    timeout_ns="$1"
+    if test -r /proc/uptime; then
+        timeout_seconds="$(awk -v nanoseconds="${timeout_ns}" \
+            'BEGIN { printf "%.6f", nanoseconds / 1000000000 }')"
+        IFS= read -r -t "${timeout_seconds}" acknowledged_revision <&3
+        return
+    fi
+
+    # macOS's system Bash (used by the host-run fixture tests) accepts only an
+    # integer `read -t`. Keep the same nanosecond deadline with select(2)
+    # instead of rounding it and changing the production timing contract.
+    acknowledged_revision="$(python3 -c '
+import os
+import select
+import sys
+
+timeout = int(sys.argv[1]) / 1_000_000_000
+if not select.select([3], [], [], timeout)[0]:
+    raise SystemExit(1)
+record = bytearray()
+while True:
+    byte = os.read(3, 1)
+    if not byte:
+        raise SystemExit(2)
+    if byte == b"\n":
+        break
+    record.extend(byte)
+sys.stdout.buffer.write(record)
+' "${timeout_ns}" 3<&3)"
+}
+
 render_marker() {
     token="$1"
     marker_revision="$2"
@@ -56,63 +96,54 @@ render_marker() {
     valid_uint64_text "${ack_timeout_seconds}" || fail invalid_ack_timeout
     test "${ack_timeout_seconds}" -gt 0 || fail invalid_ack_timeout
     test "${ack_timeout_seconds}" -le 60 || fail invalid_ack_timeout
-    # Opening a FIFO for reading can itself wait forever for a writer. O_RDWR
-    # establishes both ends before the request is visible. A watchdog bounds
-    # the reader across all records; stale revisions are drained while waiting
-    # for this request's revision, so a late ACK cannot poison the next event.
+    ack_started_ns="$(event_clock_nanoseconds)" || fail marker_clock_unavailable
+    ack_deadline_ns=$((ack_started_ns + ack_timeout_seconds * 1000000000))
+    # Opening either FIFO in only one direction can wait forever for its peer.
+    # O_RDWR establishes both ends without waiting. There is one outstanding
+    # event and one fixed record far below PIPE_BUF, so publication cannot fill
+    # this freshly owned request pipe; closing FD 5 also discards an unconsumed
+    # request before any future renderer can open it.
     exec 3<> "${ack_fifo}"
-    printf '%s\n' "${payload}" > "${request_fifo}"
-    ack_status_file="${state_dir}/ack-status.$$"
-    ack_done_file="${state_dir}/ack-done.$$"
-    (
-        trap - EXIT HUP INT TERM
-        saw_mismatch=false
-        while IFS= read -r acknowledged_revision <&3; do
-            if test "${acknowledged_revision}" = "${marker_revision}"; then
-                printf '%s\n' accepted > "${ack_status_file}"
-                exit 0
-            fi
-            saw_mismatch=true
-            printf '%s\n' mismatch > "${ack_status_file}"
-        done
-        if test "${saw_mismatch}" = false; then
-            printf '%s\n' eof > "${ack_status_file}"
-        fi
-        exit 1
-    ) &
-    ack_reader_pid=$!
-    (
-        trap - EXIT HUP INT TERM
-        remaining_ticks=$((ack_timeout_seconds * 20))
-        while test "${remaining_ticks}" -gt 0; do
-            test -f "${ack_done_file}" && exit 0
-            sleep 0.05
-            remaining_ticks=$((remaining_ticks - 1))
-        done
-        kill -TERM "${ack_reader_pid}" 2>/dev/null || true
-    ) &
-    ack_timer_pid=$!
+    ack_fd_open=true
+    exec 5<> "${request_fifo}"
+    request_fd_open=true
 
-    if wait "${ack_reader_pid}"; then
-        :
+    # The same absolute deadline is already running when publication becomes
+    # visible.
+    # FD 5 cannot block on open, and this single bounded write cannot exhaust
+    # the empty FIFO capacity under the one-outstanding-event invariant.
+    if ! printf '%s\n' "${payload}" >&5; then
+        exec 5>&-
+        request_fd_open=false
+        fail marker_request_failed
     fi
-    ack_reader_pid=
-    : > "${ack_done_file}"
-    wait "${ack_timer_pid}" 2>/dev/null || true
-    ack_timer_pid=
-    rm -f "${ack_done_file}"
-    ack_done_file=
-    exec 3>&-
+    exec 5>&-
+    request_fd_open=false
+
     ack_status=timeout
-    if test -f "${ack_status_file}"; then
-        ack_status="$(cat "${ack_status_file}")"
+    saw_mismatch=false
+    while true; do
+        ack_now_ns="$(event_clock_nanoseconds)" || fail marker_clock_unavailable
+        remaining_ns=$((ack_deadline_ns - ack_now_ns))
+        test "${remaining_ns}" -gt 0 || break
+        acknowledged_revision=
+        if ! read_ack_record "${remaining_ns}"; then
+            break
+        fi
+        if test "${acknowledged_revision}" = "${marker_revision}"; then
+            ack_status=accepted
+            break
+        fi
+        saw_mismatch=true
+    done
+    exec 3>&-
+    ack_fd_open=false
+    if test "${ack_status}" != accepted && test "${saw_mismatch}" = true; then
+        ack_status=mismatch
     fi
-    rm -f "${ack_status_file}"
-    ack_status_file=
     case "${ack_status}" in
         accepted) return 0 ;;
         mismatch) fail marker_ack_mismatch ;;
-        eof) fail marker_ack_eof ;;
         *) fail marker_ack_timeout ;;
     esac
 }
@@ -180,23 +211,13 @@ if ! mkdir "${lock_dir}" 2>/dev/null; then
     fail state_busy
 fi
 release_lock() {
-    if test -n "${ack_reader_pid}"; then
-        kill -TERM "${ack_reader_pid}" 2>/dev/null || true
-        wait "${ack_reader_pid}" 2>/dev/null || true
-        ack_reader_pid=
+    if test "${request_fd_open}" = true; then
+        exec 5>&-
+        request_fd_open=false
     fi
-    if test -n "${ack_timer_pid}"; then
-        kill -TERM "${ack_timer_pid}" 2>/dev/null || true
-        wait "${ack_timer_pid}" 2>/dev/null || true
-        ack_timer_pid=
-    fi
-    if test -n "${ack_status_file}"; then
-        rm -f "${ack_status_file}"
-        ack_status_file=
-    fi
-    if test -n "${ack_done_file}"; then
-        rm -f "${ack_done_file}"
-        ack_done_file=
+    if test "${ack_fd_open}" = true; then
+        exec 3>&-
+        ack_fd_open=false
     fi
     rmdir "${lock_dir}" 2>/dev/null || true
 }

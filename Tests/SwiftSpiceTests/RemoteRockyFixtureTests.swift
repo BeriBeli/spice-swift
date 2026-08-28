@@ -849,11 +849,54 @@ struct RemoteRockyFixtureTests {
         #expect(mismatched.rearm.status == 0)
     }
 
+    @Test func guestMarkerRequestPublicationIsBoundedWithoutARenderer() throws {
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-no-renderer-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+
+        let requestFIFO = state.appending(path: "request")
+        let acknowledgmentFIFO = state.appending(path: "ack")
+        try makeFIFOs(requestFIFO, acknowledgmentFIFO)
+        let arm = try runGuestMarkerCommand(
+            ["arm", "click", "0000000000000001"],
+            state: state
+        )
+        try #require(arm.status == 0)
+
+        let input = try launchGuestMarkerCommand(
+            ["input", "click", "100", "101"],
+            state: state,
+            additionalEnvironment: [
+                "PERF_MARKER_TEST_MODE": "0",
+                "PERF_MARKER_REQUEST_FIFO": requestFIFO.path,
+                "PERF_MARKER_ACK_FIFO": acknowledgmentFIFO.path,
+                "PERF_MARKER_ACK_TIMEOUT_SECONDS": "1",
+            ]
+        ).finish(within: .seconds(3))
+
+        #expect(input.status != 0)
+        #expect(input.output.contains("PERF_ERROR input_marker=marker_ack_timeout"))
+        #expect(!input.output.contains("event=marker_drawn"))
+        #expect(!FileManager.default.fileExists(atPath: state.appending(path: "lock").path))
+
+        let rearm = try runGuestMarkerCommand(
+            ["arm", "key", "0000000000000002"],
+            state: state
+        )
+        #expect(rearm.status == 0)
+        #expect(rearm.output.contains(
+            "PERF_ARMED action_class=key token=0000000000000002"
+        ))
+    }
+
     @Test func lateMarkerAcknowledgmentCannotValidateANewerRevision() throws {
         let agent = try script("Integration/RemoteRocky/guest/input-marker-agent.sh")
         let renderer = try script("Integration/RemoteRocky/guest/input-marker-renderer.sh")
         #expect(agent.contains(#"ack_timeout_seconds="${PERF_MARKER_ACK_TIMEOUT_SECONDS:-2}""#))
-        #expect(renderer.contains("read -r -d n -t 1 response"))
+        #expect(renderer.contains("read -r -d n -t 0.5 response"))
 
         let state = FileManager.default.temporaryDirectory.appending(
             path: "guest-marker-stale-ack-\(UUID().uuidString)",
@@ -864,11 +907,13 @@ struct RemoteRockyFixtureTests {
 
         let requestFIFO = state.appending(path: "request")
         let acknowledgmentFIFO = state.appending(path: "ack")
+        let releaseStale = state.appending(path: "release-stale")
         let staleWritten = state.appending(path: "stale-written")
         try makeFIFOs(requestFIFO, acknowledgmentFIFO)
         let responder = try launchStaleMarkerAcknowledgmentStub(
             requestFIFO: requestFIFO,
             acknowledgmentFIFO: acknowledgmentFIFO,
+            releaseStale: releaseStale,
             staleWritten: staleWritten
         )
         defer {
@@ -899,6 +944,7 @@ struct RemoteRockyFixtureTests {
         #expect(timedOut.output.contains("PERF_ERROR input_marker=marker_ack_timeout"))
         #expect(!timedOut.output.contains("event=marker_drawn"))
 
+        try Data().write(to: releaseStale)
         try waitForPath(staleWritten)
         let secondArm = try runGuestMarkerCommand(
             ["arm", "key", "0000000000000002"],
@@ -1359,6 +1405,7 @@ struct RemoteRockyFixtureTests {
     private func launchStaleMarkerAcknowledgmentStub(
         requestFIFO: URL,
         acknowledgmentFIFO: URL,
+        releaseStale: URL,
         staleWritten: URL
     ) throws -> RunningScript {
         let process = Process()
@@ -1369,9 +1416,11 @@ struct RemoteRockyFixtureTests {
             """
             exec 4<> "$2"
             IFS= read -r first < "$1"
-            sleep 2
+            while ! test -e "$3"; do
+                sleep 0.01
+            done
             printf '1\\n' >&4
-            : > "$3"
+            : > "$4"
             IFS= read -r second < "$1"
             printf '2\\n' >&4
             printf '%s\\n%s\\n' "$first" "$second"
@@ -1379,6 +1428,7 @@ struct RemoteRockyFixtureTests {
             "marker-stale-ack-stub",
             requestFIFO.path,
             acknowledgmentFIFO.path,
+            releaseStale.path,
             staleWritten.path,
         ]
         process.standardOutput = output

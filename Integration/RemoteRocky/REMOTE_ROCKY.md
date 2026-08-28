@@ -93,15 +93,18 @@ their terminal entry point. Rows 1-4 are reserved for the marker while both
 workloads render from row 6 onward. For the animated workload, marker output
 briefly stops the generator; an xterm terminal-status response confirms the
 ROI write was consumed before the renderer acknowledges the marker and resumes
-animation. The terminal-response barrier has one aggregate one-second bound;
+animation. The terminal-response barrier has one aggregate half-second bound;
 unrelated or malformed input fails it without an acknowledgement. Thus a
 fullscreen workload cannot stack above or repaint the ROI after the
 acknowledgement. The guest agent waits at most two seconds for this renderer
 acknowledgement and drains any nonmatching stale revision within that same
 overall bound; a late revision may enter the FIFO, but it cannot satisfy or
-poison the current event. A
-missing acknowledgement or unexpected marker
-revision fails the event without emitting `marker_drawn`, releases the marker
+poison the current event. A monotonic nanosecond deadline is recorded before request
+publication. The agent opens the request FIFO read/write, publishes one small
+fixed record, and closes it immediately; with no renderer, open cannot block
+and closing the final endpoint discards the unconsumed record rather than
+delivering it to a future workload. A missing acknowledgement or unexpected
+marker revision fails the event without emitting `marker_drawn`, releases the marker
 state lock, and lets the supervised input monitor restart instead of hanging.
 The guest image pins `xf86-input-libinput`; without that Xorg input driver,
 SPICE input can reach the guest device while producing no XI2 event for the

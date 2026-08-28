@@ -60,8 +60,8 @@ terminal_visibility_barrier() {
     fi
 
     # Xterm answers CSI 5 n only after consuming all preceding terminal input.
-    # One delimiter read gives the entire barrier a one-second bound, strictly
-    # below the agent's two-second ACK bound. An unrelated `n`, malformed
+    # One delimiter read gives the entire barrier a half-second bound, strictly
+    # below even an injected one-second agent ACK bound. An unrelated `n`, malformed
     # response, or timeout fails this event without ACK. The agent additionally
     # filters revisions in case an external or delayed writer leaves stale data.
     saved_terminal_state="$(stty -g < /dev/tty)"
@@ -69,7 +69,7 @@ terminal_visibility_barrier() {
     printf '\033[5n' > /dev/tty
     response=
     escape="$(printf '\033')"
-    if ! IFS= read -r -d n -t 1 response < /dev/tty; then
+    if ! IFS= read -r -d n -t 0.5 response < /dev/tty; then
         restore_terminal_state
         return 1
     fi
