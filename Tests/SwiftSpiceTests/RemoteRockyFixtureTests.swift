@@ -363,15 +363,20 @@ struct RemoteRockyFixtureTests {
 
     @Test func markerVisibilityBarrierAcceptsOnlyTheExactTerminalResponse() throws {
         let escape = "\u{1B}"
+        let unrelatedPrefix = String(repeating: "ordinary-n:X;", count: 128)
+            + "\(escape)[1n"
         let accepted = try runGuestScript(
             "input-marker-renderer.sh",
             arguments: ["--self-test-barrier"],
-            standardInput: "nX\(escape)[0n"
+            standardInput: "\(unrelatedPrefix)\(escape)[0n",
+            environment: ["PERF_MARKER_SELF_TEST_BARRIER_DIAGNOSTICS": "1"]
         )
         #expect(accepted.status == 0)
-        #expect(accepted.output.split(separator: "\n").map(String.init) == [
-            "PERF_MARKER_BARRIER accepted",
-        ])
+        let acceptedLines = accepted.output.split(separator: "\n").map(String.init)
+        #expect(acceptedLines.contains("PERF_MARKER_BARRIER accepted"))
+        // The host fallback may perform several bounded os.read calls, but it
+        // must keep one transport process for the complete absolute deadline.
+        #expect(acceptedLines.contains("PERF_MARKER_BARRIER_TRANSPORT runs=1"))
 
         for malformed in [
             "ordinary n bytes\n",
@@ -407,9 +412,10 @@ struct RemoteRockyFixtureTests {
         process.standardError = output
         var environment = ProcessInfo.processInfo.environment
         environment["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS"] = "50000000"
+        environment["PERF_MARKER_SELF_TEST_BARRIER_DIAGNOSTICS"] = "1"
         process.environment = environment
         try process.run()
-        input.fileHandleForWriting.write(Data("ordinary n noise".utf8))
+        input.fileHandleForWriting.write(Data(unrelatedPrefix.utf8))
         let timedOut = try RunningScript(process: process, output: output).finish(
             within: .seconds(2)
         )
@@ -417,6 +423,7 @@ struct RemoteRockyFixtureTests {
 
         #expect(timedOut.status != 0)
         #expect(timedOut.output.contains("PERF_MARKER_BARRIER rejected"))
+        #expect(timedOut.output.contains("PERF_MARKER_BARRIER_TRANSPORT runs=1"))
         #expect(!timedOut.output.contains("accepted"))
     }
 

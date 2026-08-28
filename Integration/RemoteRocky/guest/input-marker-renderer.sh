@@ -10,6 +10,7 @@ saved_terminal_state=
 request_fd_open=false
 barrier_input_fd_open=false
 barrier_timeout_ns=500000000
+host_barrier_transport_runs=0
 
 restore_terminal_state() {
     if test -n "${saved_terminal_state}"; then
@@ -56,26 +57,68 @@ monotonic_nanoseconds() {
 read_barrier_byte() {
     remaining_ns="$1"
     barrier_byte=
-    if test -x /usr/local/bin/monotonic-nanoseconds; then
-        timeout_seconds="$(awk -v nanoseconds="${remaining_ns}" \
-            'BEGIN { printf "%.6f", nanoseconds / 1000000000 }')"
-        IFS= read -r -n 1 -t "${timeout_seconds}" barrier_byte <&6
-        return
-    fi
+    timeout_seconds="$(awk -v nanoseconds="${remaining_ns}" \
+        'BEGIN { printf "%.6f", nanoseconds / 1000000000 }')"
+    IFS= read -r -n 1 -t "${timeout_seconds}" barrier_byte <&6
+}
 
-    barrier_byte="$(python3 -c '
+await_host_terminal_status() {
+    remaining_ns="$1"
+    host_barrier_transport_runs=1
+    barrier_hex=
+    if barrier_hex="$(python3 -c '
+from collections import deque
 import os
 import select
 import sys
+import time
 
-timeout = int(sys.argv[1]) / 1_000_000_000
-if not select.select([6], [], [], timeout)[0]:
-    raise SystemExit(1)
-value = os.read(6, 1)
-if not value:
-    raise SystemExit(2)
-sys.stdout.buffer.write(value)
-' "${remaining_ns}" 6<&6)"
+deadline = time.monotonic_ns() + int(sys.argv[1])
+window = deque(maxlen=4096)
+state = 0
+while True:
+    remaining = deadline - time.monotonic_ns()
+    if remaining <= 0 or not select.select([6], [], [], remaining / 1_000_000_000)[0]:
+        raise SystemExit(1)
+    chunk = os.read(6, 4096)
+    if not chunk:
+        raise SystemExit(2)
+    for value in chunk:
+        window.append(value)
+        if state == 0:
+            state = 1 if value == 0x1B else 0
+        elif state == 1:
+            state = 2 if value == 0x5B else (1 if value == 0x1B else 0)
+        elif state == 2:
+            state = 3 if value == 0x30 else (1 if value == 0x1B else 0)
+        else:
+            if value == 0x6E:
+                sys.stdout.write(bytes(window).hex())
+                raise SystemExit(0)
+            state = 1 if value == 0x1B else 0
+' "${remaining_ns}" 6<&6)"; then
+        :
+    else
+        return 1
+    fi
+
+    # Python is only the host-test transport: one bounded process may perform
+    # multiple select/read calls and returns a capped hex cache. Reconfirm the
+    # exact response with the same transitions used by the guest shell path.
+    barrier_state=ground
+    while test -n "${barrier_hex}"; do
+        byte_hex="${barrier_hex%"${barrier_hex#??}"}"
+        barrier_hex="${barrier_hex#??}"
+        case "${barrier_state}:${byte_hex}" in
+            ground:1b) barrier_state=escape ;;
+            escape:5b) barrier_state=bracket ;;
+            bracket:30) barrier_state=zero ;;
+            zero:6e) return 0 ;;
+            *:1b) barrier_state=escape ;;
+            *) barrier_state=ground ;;
+        esac
+    done
+    return 1
 }
 
 await_terminal_status() {
@@ -84,6 +127,14 @@ await_terminal_status() {
     barrier_deadline_ns=$((barrier_started_ns + barrier_timeout_ns))
     barrier_state=ground
     escape="$(printf '\033')"
+    if ! test -x /usr/local/bin/monotonic-nanoseconds; then
+        barrier_now_ns="$(monotonic_nanoseconds)" || return 1
+        valid_uint64_text "${barrier_now_ns}" || return 1
+        remaining_ns=$((barrier_deadline_ns - barrier_now_ns))
+        test "${remaining_ns}" -gt 0 || return 1
+        await_host_terminal_status "${remaining_ns}"
+        return
+    fi
     while true; do
         barrier_now_ns="$(monotonic_nanoseconds)" || return 1
         valid_uint64_text "${barrier_now_ns}" || return 1
@@ -203,8 +254,14 @@ case "${1:-}" in
         exec 6<&0
         barrier_input_fd_open=true
         if await_terminal_status; then
+            if test "${PERF_MARKER_SELF_TEST_BARRIER_DIAGNOSTICS:-0}" = 1; then
+                echo "PERF_MARKER_BARRIER_TRANSPORT runs=${host_barrier_transport_runs}"
+            fi
             echo "PERF_MARKER_BARRIER accepted"
             exit 0
+        fi
+        if test "${PERF_MARKER_SELF_TEST_BARRIER_DIAGNOSTICS:-0}" = 1; then
+            echo "PERF_MARKER_BARRIER_TRANSPORT runs=${host_barrier_transport_runs}"
         fi
         echo "PERF_MARKER_BARRIER rejected" >&2
         exit 1
