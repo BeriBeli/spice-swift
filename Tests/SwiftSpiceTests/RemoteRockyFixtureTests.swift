@@ -23,7 +23,9 @@ struct RemoteRockyFixtureTests {
         #expect(buildGuest.contains("\ncc -std=c11 -Os -Wall -Wextra -Werror -static"))
         #expect(!buildGuest.contains("musl-gcc"))
 
-        for forbiddenPackage in ["gcc", "musl-tools", "musl-dev", "build-base"] {
+        for forbiddenPackage in [
+            "gcc", "musl-tools", "musl-dev", "build-base", "libxi-dev", "libx11-dev",
+        ] {
             #expect(!runtime.contains(forbiddenPackage))
         }
 
@@ -185,21 +187,95 @@ struct RemoteRockyFixtureTests {
         }
     }
 
-    @Test func guestInputMonitorUsesThePinnedLineBufferingProvider() throws {
+    @Test func guestXI2EventMonitorPublishesReadyOnlyAfterApplyingItsSubscription() throws {
+        let builder = try script("Integration/RemoteRocky/GuestBuilder.Containerfile")
         let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
         let startScript = try script("Integration/RemoteRocky/remote/start.sh")
         let monitorScript = try script("Integration/RemoteRocky/guest/input-marker-monitor.sh")
+        let eventMonitor = try script("Integration/RemoteRocky/guest/xi2-event-monitor.c")
 
-        #expect(buildScript.contains("coreutils="))
-        #expect(buildScript.contains("record_package coreutils guest_coreutils"))
+        #expect(builder.contains("libxi-dev=1.8.2-r0"))
+        #expect(buildScript.contains("libxi=1.8.2-r0"))
+        #expect(buildScript.contains("libx11=1.8.11-r0"))
+        #expect(buildScript.contains("record_package libxi guest_libxi"))
+        #expect(buildScript.contains("record_package libx11 guest_libx11"))
+        #expect(buildScript.contains("guest_xi2_monitor=native-xi2-select-sync-v1"))
+        #expect(buildScript.contains(
+            #"-o "${rootfs}/usr/local/bin/xi2-event-monitor""#
+        ))
+        #expect(buildScript.contains(#""${source}/xi2-event-monitor.c""#))
+        #expect(buildScript.contains("-lXi -lX11"))
         #expect(buildScript.contains("xf86-input-libinput=1.5.0-r0"))
         #expect(buildScript.contains(
             "record_package xf86-input-libinput guest_xf86_input_libinput"
         ))
-        #expect(startScript.contains("guest_coreutils"))
+        #expect(startScript.contains("guest_libxi"))
+        #expect(startScript.contains("guest_libx11"))
+        #expect(startScript.contains("guest_xi2_monitor"))
         #expect(startScript.contains("guest_xf86_input_libinput"))
-        #expect(monitorScript.contains("stdbuf -oL -eL xinput test-xi2 --root"))
-        #expect(!monitorScript.contains("\nxinput test-xi2 --root |"))
+
+        #expect(monitorScript.contains(
+            #"exec /usr/local/bin/xi2-event-monitor "${source_ready}""#
+        ))
+        #expect(!monitorScript.contains("xinput test-xi2 --root"))
+        #expect(!monitorScript.contains(#"/proc/${source_child}/exe"#))
+
+        let publishReadyDefinition = try #require(eventMonitor.range(of: "publish_ready("))
+        let main = try #require(eventMonitor.range(
+            of: "int main(",
+            range: publishReadyDefinition.upperBound..<eventMonitor.endIndex
+        ))
+        let temporaryReady = try #require(eventMonitor.range(
+            of: "open(",
+            range: publishReadyDefinition.upperBound..<main.lowerBound
+        ))
+        let closeTemporaryReady = try #require(eventMonitor.range(
+            of: "close(",
+            range: temporaryReady.upperBound..<main.lowerBound
+        ))
+        let renameReady = try #require(eventMonitor.range(
+            of: "rename(",
+            range: closeTemporaryReady.upperBound..<main.lowerBound
+        ))
+        #expect(temporaryReady.lowerBound < closeTemporaryReady.lowerBound)
+        #expect(closeTemporaryReady.lowerBound < renameReady.lowerBound)
+
+        let openDisplay = try #require(eventMonitor.range(
+            of: "XOpenDisplay",
+            range: main.upperBound..<eventMonitor.endIndex
+        ))
+        let negotiateXI2 = try #require(eventMonitor.range(
+            of: "XIQueryVersion",
+            range: openDisplay.upperBound..<eventMonitor.endIndex
+        ))
+        let selectEvents = try #require(eventMonitor.range(
+            of: "XISelectEvents",
+            range: negotiateXI2.upperBound..<eventMonitor.endIndex
+        ))
+        let synchronize = try #require(eventMonitor.range(
+            of: "XSync",
+            range: selectEvents.upperBound..<eventMonitor.endIndex
+        ))
+        let publishReady = try #require(eventMonitor.range(
+            of: "publish_ready(argv[1])",
+            range: synchronize.upperBound..<eventMonitor.endIndex
+        ))
+        let eventLoop = try #require(eventMonitor.range(
+            of: "XNextEvent",
+            range: publishReady.upperBound..<eventMonitor.endIndex
+        ))
+        #expect(openDisplay.lowerBound < negotiateXI2.lowerBound)
+        #expect(negotiateXI2.lowerBound < selectEvents.lowerBound)
+        #expect(selectEvents.lowerBound < synchronize.lowerBound)
+        #expect(synchronize.lowerBound < publishReady.lowerBound)
+        #expect(publishReady.lowerBound < eventLoop.lowerBound)
+
+        #expect(eventMonitor.contains("XI_RawKeyPress"))
+        #expect(eventMonitor.contains("XI_RawButtonPress"))
+        #expect(eventMonitor.contains("XI_RawMotion"))
+        #expect(eventMonitor.contains("0600"))
+        #expect(eventMonitor.contains("fflush(stdout)"))
+        #expect(eventMonitor.contains("ferror(stdout)"))
     }
 
     @Test func markerDrawsInsideBothFullscreenWorkloadsBeforeAcknowledgment() throws {
@@ -2272,6 +2348,8 @@ private struct RemoteRockyFixture {
         "guest_dbus",
         "guest_eudev",
         "guest_font_dejavu",
+        "guest_libx11",
+        "guest_libxi",
         "guest_linux_virt",
         "guest_marker_clock",
         "guest_openbox",
@@ -2284,6 +2362,7 @@ private struct RemoteRockyFixture {
         "guest_xrandr",
         "guest_xsetroot",
         "guest_xterm",
+        "guest_xi2_monitor",
         "guest_kernel_sha256",
         "guest_initramfs_sha256",
     ]
@@ -2348,6 +2427,8 @@ private struct RemoteRockyFixture {
             "guest_dbus": "1.16.2-r1",
             "guest_eudev": "3.2.14-r5",
             "guest_font_dejavu": "2.37-r6",
+            "guest_libx11": "1.8.11-r0",
+            "guest_libxi": "1.8.2-r0",
             "guest_linux_virt": "6.12.107-r0",
             "guest_marker_clock": "clock_gettime-monotonic-v1",
             "guest_openbox": "3.6.1-r8",
@@ -2360,6 +2441,7 @@ private struct RemoteRockyFixture {
             "guest_xrandr": "1.5.2-r0",
             "guest_xsetroot": "1.1.1-r2",
             "guest_xterm": "399-r0",
+            "guest_xi2_monitor": "native-xi2-select-sync-v1",
             "guest_kernel_sha256": kernelHash ?? Self.kernelHash,
             "guest_initramfs_sha256": initramfsHash ?? Self.initramfsHash,
         ]

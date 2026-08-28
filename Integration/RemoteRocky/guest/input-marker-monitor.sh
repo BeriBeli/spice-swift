@@ -265,12 +265,12 @@ if test "${1:-}" = --self-test-motion-burst; then
 fi
 
 test "$#" -eq 0 || exit 2
-# xinput uses block buffering when stdout is a pipe. Force each event record to
-# reach the reader immediately. A checkpoint rotates the XI2 client itself:
-# terminate the old source, drain all bytes it already published through EOF,
-# and only then enqueue the checkpoint behind the old epoch's agent work. Any
-# event still unread in the old X connection is discarded when that connection
-# closes and therefore cannot consume the next arm.
+# The native helper selects exactly the three accepted raw XI2 events and
+# publishes readiness only after XISelectEvents plus an XSync round trip on the
+# same connection. It flushes each event record itself. A checkpoint terminates
+# that connection, drains its stdout through EOF, and only then enqueues the
+# checkpoint behind the old epoch's agent work. Any event still unread in the
+# old X connection is discarded and cannot consume the next arm.
 mkfifo "${event_fifo}"
 event_source_generation=0
 start_event_source() {
@@ -279,42 +279,16 @@ start_event_source() {
     rm -f "${source_ready}"
     process_events < "${event_fifo}" &
     event_reader_pid=$!
-    (
-        if test -n "${PERF_MARKER_EVENT_SOURCE_COMMAND:-}"; then
+    if test -n "${PERF_MARKER_EVENT_SOURCE_COMMAND:-}"; then
+        (
             exec "${PERF_MARKER_EVENT_SOURCE_COMMAND}" \
                 "${event_source_generation}" "${source_ready}"
-        fi
-        source_child=
-        forward_source_signal() {
-            trap - TERM
-            if test -n "${source_child}"; then
-                kill -TERM "${source_child}" 2>/dev/null || true
-                wait "${source_child}" 2>/dev/null || true
-            fi
-            exit 0
-        }
-        trap forward_source_signal TERM
-        stdbuf -oL -eL xinput test-xi2 --root &
-        source_child=$!
-        exec_attempt=0
-        while true; do
-            test "${exec_attempt}" -lt 500 || exit 1
-            if ! kill -0 "${source_child}" 2>/dev/null; then
-                wait "${source_child}"
-                exit $?
-            fi
-            source_executable="$(readlink "/proc/${source_child}/exe" 2>/dev/null || true)"
-            case "${source_executable}" in
-                */xinput)
-                    : > "${source_ready}"
-                    break
-                    ;;
-            esac
-            exec_attempt=$((exec_attempt + 1))
-            sleep 0.01
-        done
-        wait "${source_child}"
-    ) > "${event_fifo}" &
+        ) > "${event_fifo}" &
+    else
+        (
+            exec /usr/local/bin/xi2-event-monitor "${source_ready}"
+        ) > "${event_fifo}" &
+    fi
     event_source_pid=$!
     ready_attempt=0
     while ! test -f "${source_ready}"; do

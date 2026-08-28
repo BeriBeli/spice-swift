@@ -74,6 +74,8 @@ apk \
         dbus=1.16.2-r1 \
         eudev=3.2.14-r5 \
         font-dejavu=2.37-r6 \
+        libx11=1.8.11-r0 \
+        libxi=1.8.2-r0 \
         linux-virt=6.12.107-r0 \
         openbox=3.6.1-r8 \
         spice-vdagent=0.22.1-r2 \
@@ -99,6 +101,10 @@ install -m 0755 "${source}/input-marker-renderer.sh" "${rootfs}/usr/local/bin/in
 cc -std=c11 -Os -Wall -Wextra -Werror -static \
     -o "${rootfs}/usr/local/bin/monotonic-nanoseconds" \
     "${source}/monotonic-nanoseconds.c"
+cc -std=c11 -Os -Wall -Wextra -Werror \
+    -o "${rootfs}/usr/local/bin/xi2-event-monitor" \
+    "${source}/xi2-event-monitor.c" \
+    -lXi -lX11
 
 cp "${rootfs}/boot/vmlinuz-virt" "${artifacts}/vmlinuz-virt"
 (
@@ -135,12 +141,15 @@ fi
 {
     echo 'manifest_version=1'
     echo 'guest_marker_clock=clock_gettime-monotonic-v1'
+    echo 'guest_xi2_monitor=native-xi2-select-sync-v1'
     printf 'guest_kernel=linux-virt-%s\n' "${kernel_version}"
     record_package alpine-base guest_alpine_base
     record_package coreutils guest_coreutils
     record_package dbus guest_dbus
     record_package eudev guest_eudev
     record_package font-dejavu guest_font_dejavu
+    record_package libx11 guest_libx11
+    record_package libxi guest_libxi
     record_package linux-virt guest_linux_virt
     record_package openbox guest_openbox
     record_package spice-vdagent guest_spice_vdagent
@@ -158,6 +167,7 @@ fi
 
 if [ "$(grep -c '^manifest_version=1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" -ne 1 ] \
+    || [ "$(grep -c '^guest_xi2_monitor=native-xi2-select-sync-v1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ]; then
     echo "Generated guest build manifest is incomplete." >&2

@@ -59,11 +59,13 @@ podman run --rm \
   /work/build-guest.sh
 ```
 
-The builder is based on Alpine 3.22 and pins `build-base`,
+The builder is based on Alpine 3.22 and pins `build-base`, `libxi-dev`,
 `fortify-headers`, and the util-linux `flock` subpackage. The build script
-requires Alpine's `cc` and produces the marker clock helper as a static musl
-binary; it rejects an incomplete builder before creating any staged rootfs or
-artifacts. Do not add `--userns=keep-id`: `apk --root` must run as root inside
+requires Alpine's `cc`, produces the marker clock helper as a static musl
+binary, and builds the native XI2 event monitor against libXi/libX11. The guest
+runtime pins those two libraries but contains no compiler or headers. An
+incomplete builder is rejected before any staged rootfs or artifacts are
+created. Do not add `--userns=keep-id`: `apk --root` must run as root inside
 the container to create and populate the guest chroot. Podman itself remains a
 rootless process owned by the invoking Rocky user; container root is mapped
 through the rootless user namespace and does not grant host root privileges.
@@ -149,12 +151,15 @@ ignores each delivered counterpart so one physical input cannot consume a
 second arm. It dispatches through a serialized worker so the XI2 reader keeps
 draining during marker processing. Key and click events stay FIFO; an atomic
 motion ownership token coalesces every later RawMotion delivered while one
-motion epoch is open. Before the next arm, the invocation sync rotates the XI2
-source: it terminates the old `xinput` subscription, drains all stdout already
-published by that source through EOF, and closes the old X connection so
-unread upstream events cannot cross generations. The monitor establishes the
-new subscription endpoint before placing the checkpoint behind the old epoch's
-agent work. Only after that worker checkpoint clears motion ownership does it
+motion epoch is open. The native source owns one X connection, selects only
+RawKeyPress, RawButtonPress, and RawMotion on the root window, completes an
+`XSync` round trip, and only then atomically publishes its private ready file.
+Before the next arm, the invocation sync rotates that XI2 source: it terminates
+the old helper, drains all stdout already published through EOF, and closes the
+old X connection so unread upstream events cannot cross generations. The
+monitor observes the new helper's application-level ready publication before
+placing the checkpoint behind the old epoch's agent work. Only after that
+worker checkpoint clears motion ownership does it
 permit the sync echo. This is an explicit XI2-source/FIFO/worker epoch boundary,
 not a sleep-based burst heuristic. The checkpoint's single bounded wait budget
 covers monitor/source startup and the subsequent worker acknowledgement. Guest
@@ -162,7 +167,9 @@ timestamps come from a statically linked
 `clock_gettime(CLOCK_MONOTONIC)` helper rather than `/proc/uptime`'s coarse
 text representation. Startup requires the manifest capability
 `guest_marker_clock=clock_gettime-monotonic-v1`, and a missing or malformed
-clock sample fails the event explicitly.
+clock sample fails the event explicitly. Startup also requires
+`guest_xi2_monitor=native-xi2-select-sync-v1` plus the pinned libXi/libX11
+runtime versions; `xinput` remains installed only for input diagnostics.
 Each host `arm` invocation is serialized and first sends a random 128-bit
 control barrier. The guest strictly accepts 32 lowercase hexadecimal digits
 and echoes `PERF_CONTROL_SYNC invocation=<id>` to the serial log. The host waits

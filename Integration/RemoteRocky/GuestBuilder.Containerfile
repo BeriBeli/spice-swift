@@ -9,7 +9,8 @@ RUN apk add --no-cache \
         cpio \
         flock=2.41-r9 \
         fortify-headers=1.1-r5 \
-        gzip
+        gzip \
+        libxi-dev=1.8.2-r0
 
 WORKDIR /work
 
