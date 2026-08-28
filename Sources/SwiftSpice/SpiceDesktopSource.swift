@@ -674,6 +674,7 @@ public final class SpiceDesktopSource: Sendable {
             else {
                 return nil
             }
+            state.deliverySequence &+= 1
             return delivery(
                 for: subscriber,
                 snapshot: authoritativeSnapshot(
