@@ -36,6 +36,30 @@ if grep -Evq '^[a-z0-9_]+=[A-Za-z0-9._:+-]+$' "${manifest}"; then
     echo "Guest build manifest is malformed." >&2
     exit 1
 fi
+required_manifest_keys=(
+    manifest_version
+    guest_kernel
+    guest_alpine_base
+    guest_dbus
+    guest_font_dejavu
+    guest_linux_virt
+    guest_openbox
+    guest_spice_vdagent
+    guest_spice_webdavd
+    guest_xclip
+    guest_xorg_server
+    guest_xrandr
+    guest_xsetroot
+    guest_xterm
+    guest_kernel_sha256
+    guest_initramfs_sha256
+)
+for key in "${required_manifest_keys[@]}"; do
+    if [[ "$(grep -c "^${key}=" "${manifest}")" != 1 ]]; then
+        echo "Guest build manifest must contain ${key} exactly once." >&2
+        exit 1
+    fi
+done
 if [[ "$(grep -c '^manifest_version=1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel=linux-virt-[0-9][A-Za-z0-9._+-]*$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 \

@@ -78,6 +78,13 @@ struct RemoteRockyFixtureTests {
             #expect(!fixture.didDetachContainer)
         }
 
+        let duplicateFixture = try RemoteRockyFixture()
+        defer { duplicateFixture.remove() }
+        try duplicateFixture.writeManifest(duplicating: "guest_spice_vdagent")
+        let duplicateResult = try duplicateFixture.run("remote/start.sh", ssMode: "both")
+        #expect(duplicateResult.status != 0)
+        #expect(!duplicateFixture.didDetachContainer)
+
         for corruptedArtifact in ["kernel", "initramfs"] {
             let fixture = try RemoteRockyFixture()
             defer { fixture.remove() }
@@ -229,6 +236,18 @@ private struct RemoteRockyFixture {
     static let requiredManifestKeys = [
         "manifest_version",
         "guest_kernel",
+        "guest_alpine_base",
+        "guest_dbus",
+        "guest_font_dejavu",
+        "guest_linux_virt",
+        "guest_openbox",
+        "guest_spice_vdagent",
+        "guest_spice_webdavd",
+        "guest_xclip",
+        "guest_xorg_server",
+        "guest_xrandr",
+        "guest_xsetroot",
+        "guest_xterm",
         "guest_kernel_sha256",
         "guest_initramfs_sha256",
     ]
@@ -277,6 +296,7 @@ private struct RemoteRockyFixture {
 
     func writeManifest(
         omitting omittedKey: String? = nil,
+        duplicating duplicatedKey: String? = nil,
         kernelHash: String? = nil,
         initramfsHash: String? = nil
     ) throws {
@@ -298,10 +318,14 @@ private struct RemoteRockyFixture {
             "guest_kernel_sha256": kernelHash ?? Self.kernelHash,
             "guest_initramfs_sha256": initramfsHash ?? Self.initramfsHash,
         ]
-        let contents = Self.requiredManifestKeys.compactMap { key -> String? in
+        var lines = Self.requiredManifestKeys.compactMap { key -> String? in
             guard key != omittedKey, let value = values[key] else { return nil }
             return "\(key)=\(value)"
-        }.joined(separator: "\n") + "\n"
+        }
+        if let duplicatedKey, let value = values[duplicatedKey] {
+            lines.append("\(duplicatedKey)=\(value)")
+        }
+        let contents = lines.joined(separator: "\n") + "\n"
         try Data(contents.utf8).write(to: base.appending(path: "artifacts/build-manifest.env"))
     }
 
