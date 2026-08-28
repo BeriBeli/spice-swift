@@ -568,35 +568,32 @@ struct SpiceSessionTests {
             data: Data("agent".utf8)
         )
         let encoded = try #require(VDAgentWireEncoder.fragments(for: agentMessage).first)
-        var transcript = try makeServerTranscript(channels: [])
-        transcript.append(encodeMini(id: 115, body: uint32(2)))
-        transcript.append(encodeMini(id: 109, body: encoded))
-        transcript.append(encodeMini(id: 108, body: uint32(9)))
-        let transport = FakeTransport(inbound: transcript.map(Result.success))
+        let transport = StreamingSessionTransport(
+            initial: try makeServerTranscript(channels: [])
+        )
         let session = SpiceSession(
             transportFactory: { _ in transport },
             ticketEncryptor: SessionTicketEncryptor()
         )
-        let eventTask = Task {
-            var iterator = session.agentEvents.makeAsyncIterator()
-            return [await iterator.next(), await iterator.next(), await iterator.next()]
-        }
+        var iterator = session.agentEvents.makeAsyncIterator()
 
         let info = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
             credentials: SpiceCredentials(password: "secret")
         )
         #expect(!info.agentConnected)
-        #expect(await eventTask.value == [
-            .connected,
-            .message(SpiceAgentMessage(
-                protocolID: 1,
-                type: 6,
-                opaque: 11,
-                data: Data("agent".utf8)
-            )),
-            .disconnected(errorCode: 9),
-        ])
+        await transport.enqueue(encodeMini(id: 115, body: uint32(2)))
+        #expect(await iterator.next() == .connected)
+        await transport.enqueue(encodeMini(id: 109, body: encoded))
+        #expect(await iterator.next() == .message(SpiceAgentMessage(
+            protocolID: 1,
+            type: 6,
+            opaque: 11,
+            data: Data("agent".utf8)
+        )))
+        await transport.enqueue(encodeMini(id: 108, body: uint32(9)))
+        #expect(await iterator.next() == .disconnected(errorCode: 9))
+        await session.disconnect()
     }
 
     @Test func publishesAgentConnectedStateFromMainInit() async throws {
@@ -2646,6 +2643,223 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func seamlessMigrationDrainsInFlightAgentMessageBeforeClosingSource() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 16
+        ))
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let transports = TransportPool([source, target])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
+        var events = session.events.makeAsyncIterator()
+        let sourceAgentMessage = SpiceAgentMessage(
+            protocolID: VDAgentMessage.protocolVersion,
+            type: VDAgentMessageType.clipboard.rawValue,
+            opaque: 0x55,
+            data: Data(repeating: 0xa5, count: 6_000)
+        )
+        let expectedSourceFragments = try VDAgentWireEncoder.fragments(for: VDAgentMessage(
+            protocolID: sourceAgentMessage.protocolID,
+            type: sourceAgentMessage.type,
+            opaque: sourceAgentMessage.opaque,
+            data: sourceAgentMessage.data
+        ))
+        #expect(expectedSourceFragments.count > 1)
+
+        await source.blockNextWrite()
+        let sourceSend = Task {
+            try await session.sendAgentMessage(sourceAgentMessage)
+        }
+        await source.waitUntilWriteIsBlocked()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+        await source.enqueue(encodeMini(id: 1, body: uint32(3)))
+        await source.enqueue(encodeMini(id: 2, body: Data("main-state".utf8)))
+        #expect(await events.next() == .migration(.committing(offer)))
+
+        // Target supervision starts after the connections are atomically
+        // rebound, but before adoption is allowed to close the retired Main.
+        // Observing this runtime update therefore proves adoption has reached
+        // its old-Main retirement fence.
+        await target.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
+        ))
+        var targetPointerMode: SpicePointerMode?
+        for _ in 0..<4 {
+            guard let snapshot = await desktopUpdates.next() else { break }
+            targetPointerMode = snapshot.pointerMode
+            if targetPointerMode == .relative { break }
+        }
+        #expect(targetPointerMode == .relative)
+        #expect(await source.isConnected)
+
+        await source.releaseBlockedWrite()
+        try await sourceSend.value
+        #expect(await events.next() == .migration(.completed(offer)))
+        await source.waitUntilClosed()
+
+        let sourceOutbound = await source.outbound
+        let sourceAgentIndices = try sourceOutbound.indices.filter {
+            try decodeMiniMessageID(sourceOutbound[$0]) == 107
+        }
+        #expect(sourceAgentIndices.count == expectedSourceFragments.count)
+        if let first = sourceAgentIndices.first, let last = sourceAgentIndices.last {
+            #expect(sourceAgentIndices == Array(first...last))
+        }
+        let sourceFragments = try sourceAgentIndices.map {
+            try decodeMiniBody(sourceOutbound[$0])
+        }
+        #expect(sourceFragments == expectedSourceFragments)
+        #expect(!(await source.isConnected))
+        #expect(await target.isConnected)
+
+        let targetAgentMessage = SpiceAgentMessage(
+            protocolID: VDAgentMessage.protocolVersion,
+            type: VDAgentMessageType.monitorsConfig.rawValue,
+            opaque: 0x77,
+            data: Data("target-agent".utf8)
+        )
+        let targetCount = await target.outbound.count
+        try await session.sendAgentMessage(targetAgentMessage)
+        await target.waitForOutboundCount(targetCount + 1)
+        let targetPacket = try #require((await target.outbound).last)
+        #expect(try decodeMiniMessageID(targetPacket) == 107)
+        var decoder = VDAgentStreamDecoder()
+        let decoded = try decoder.append(packet: decodeMiniBody(targetPacket))
+        #expect(decoded == [VDAgentMessage(
+            protocolID: targetAgentMessage.protocolID,
+            type: targetAgentMessage.type,
+            opaque: targetAgentMessage.opaque,
+            data: targetAgentMessage.data
+        )])
+
+        desktop.cancel()
+        await session.disconnect()
+    }
+
+    @Test func disconnectCancelsSeamlessAdoptionWaitingForRetiredAgentSend() async throws {
+        let source = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: [],
+            agentConnected: 1,
+            agentTokens: 16
+        ))
+        let target = StreamingSessionTransport(
+            initial: try makeLinkResponses(mainCapabilities: [0x8])
+                + [encodeMini(id: 117, body: Data())]
+        )
+        let transports = TransportPool([source, target])
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor()
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        let desktop = session.desktop.subscribe()
+        desktop.setDemand(.visible)
+        var desktopUpdates = desktop.updates.makeAsyncIterator()
+        var events = session.events.makeAsyncIterator()
+        let sourceAgentMessage = SpiceAgentMessage(
+            protocolID: VDAgentMessage.protocolVersion,
+            type: VDAgentMessageType.clipboard.rawValue,
+            opaque: 0x99,
+            data: Data(repeating: 0x5a, count: 6_000)
+        )
+
+        await source.blockNextWrite()
+        let sourceSend = Task {
+            try await session.sendAgentMessage(sourceAgentMessage)
+        }
+        await source.waitUntilWriteIsBlocked()
+
+        await source.enqueue(encodeMini(
+            id: 116,
+            body: migrationDestinationBody(host: "target.example") + uint32(9)
+        ))
+        let offer = try #require(preparingOffer(await events.next()))
+        #expect(await events.next() == .migration(.ready(offer, seamless: true)))
+        await source.enqueue(encodeMini(id: 1, body: uint32(3)))
+        await source.enqueue(encodeMini(id: 2, body: Data("main-state".utf8)))
+        #expect(await events.next() == .migration(.committing(offer)))
+
+        await target.enqueue(try encodeMini(
+            SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 1)
+        ))
+        var targetPointerMode: SpicePointerMode?
+        for _ in 0..<4 {
+            guard let snapshot = await desktopUpdates.next() else { break }
+            targetPointerMode = snapshot.pointerMode
+            if targetPointerMode == .relative { break }
+        }
+        #expect(targetPointerMode == .relative)
+        #expect(await source.isConnected)
+        #expect(await target.isConnected)
+
+        let disconnectFinished = Mutex(false)
+        let disconnectTask = Task {
+            await session.disconnect()
+            disconnectFinished.withLock { $0 = true }
+        }
+        for _ in 0..<100 {
+            if disconnectFinished.withLock({ $0 }) { break }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let completedWithoutManualGateRelease = disconnectFinished.withLock { $0 }
+        #expect(completedWithoutManualGateRelease)
+        var manuallyReleasedGate = false
+        if !completedWithoutManualGateRelease {
+            // Keep failure-first runs finite: old adoption leaves the retired
+            // continuation unreachable, so release it only after recording
+            // the timeout that distinguishes the bug.
+            await source.releaseBlockedWrite()
+            manuallyReleasedGate = true
+        }
+        await disconnectTask.value
+
+        for _ in 0..<100 where await source.isConnected {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let sourceClosedWithoutManualGateRelease = !(await source.isConnected)
+        #expect(sourceClosedWithoutManualGateRelease)
+        if !sourceClosedWithoutManualGateRelease && !manuallyReleasedGate {
+            // A second old failure mode lets disconnect return after losing
+            // ownership of the retired Main. Unblock its caller so this
+            // failure-first regression can still finish deterministically.
+            await source.releaseBlockedWrite()
+            manuallyReleasedGate = true
+        }
+        await #expect(throws: SpiceError.connectionFailed("connectionClosed")) {
+            try await sourceSend.value
+        }
+        if await source.isConnected {
+            await source.close()
+        }
+        #expect(!(await source.isConnected))
+        #expect(!(await target.isConnected))
+        #expect(!(await session.currentAgentConnectionState()))
+        desktop.cancel()
+    }
+
     @Test func migrationEndpointPolicyPreservesTLSAndRejectsUnsafeTargets() throws {
         #expect(try SpiceSession.selectMigrationEndpoint(
             destination: .init(
@@ -3122,6 +3336,10 @@ private actor StreamingSessionTransport: SpiceTransport {
     private let writeContinuation: AsyncStream<Void>.Continuation
     private(set) var outbound: [Data] = []
     private(set) var isConnected = false
+    private var shouldBlockNextWrite = false
+    private var writeIsBlocked = false
+    private var blockedWriteWaiters: [CheckedContinuation<Void, Never>] = []
+    private var blockedWriteRelease: CheckedContinuation<Void, Never>?
 
     init(initial: [Data]) {
         let inboundPipe = AsyncStream.makeStream(of: Data.self)
@@ -3156,8 +3374,38 @@ private actor StreamingSessionTransport: SpiceTransport {
         guard isConnected else {
             throw .connectionClosed
         }
+        if shouldBlockNextWrite {
+            shouldBlockNextWrite = false
+            writeIsBlocked = true
+            let waiters = blockedWriteWaiters
+            blockedWriteWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { continuation in
+                blockedWriteRelease = continuation
+            }
+            writeIsBlocked = false
+            guard isConnected else {
+                throw .connectionClosed
+            }
+        }
         outbound.append(data)
         writeContinuation.yield(())
+    }
+
+    func blockNextWrite() {
+        shouldBlockNextWrite = true
+    }
+
+    func waitUntilWriteIsBlocked() async {
+        guard !writeIsBlocked else { return }
+        await withCheckedContinuation { continuation in
+            blockedWriteWaiters.append(continuation)
+        }
+    }
+
+    func releaseBlockedWrite() {
+        blockedWriteRelease?.resume()
+        blockedWriteRelease = nil
     }
 
     func enqueue(_ data: Data) {
@@ -3175,8 +3423,17 @@ private actor StreamingSessionTransport: SpiceTransport {
         }
     }
 
+    func waitUntilClosed() async {
+        while isConnected {
+            await Task.yield()
+        }
+    }
+
     func close() async {
         isConnected = false
+        shouldBlockNextWrite = false
+        blockedWriteRelease?.resume()
+        blockedWriteRelease = nil
         inboundContinuation.finish()
         writeContinuation.finish()
     }

@@ -1190,7 +1190,7 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1) == before)
     }
 
-    @Test func boundsMJPEGStreamsAndKeepsFailedFramesTransactional() async throws {
+    @Test func failedMJPEGFrameIsTransactionalAndTerminatesTheChannel() async throws {
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
                 surfaceID: 1,
@@ -1218,6 +1218,51 @@ struct DisplayChannelTests {
                 multimediaTime: 2,
                 data: Data([1])
             )),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: PatternJPEGDecoder(),
+            maximumStreams: 1
+        )
+
+        _ = try await channel.processNext()
+        _ = try await channel.processNext()
+        let before = try await channel.snapshot(surfaceID: 1)
+        await #expect(throws: ChannelError.self) {
+            try await channel.processNext()
+        }
+        #expect(try await channel.snapshot(surfaceID: 1) == before)
+
+        await #expect(throws: ChannelError.self) {
+            try await channel.processNext()
+        }
+        #expect(try await channel.snapshot(surfaceID: 1) == before)
+    }
+
+    @Test func exceedingMJPEGStreamLimitFailsWithoutSurfaceMutation() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 1,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
             encodeMini(id: 122, body: streamCreateBody(
                 streamID: 2,
                 streamWidth: 2,
@@ -1226,6 +1271,51 @@ struct DisplayChannelTests {
                 sourceHeight: 2,
                 destination: (top: 0, left: 0, bottom: 2, right: 2),
                 clipRectangles: nil
+            )),
+        ]
+        let transport = FakeTransport(inbound: inbound.map(Result.success))
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0),
+                transport: transport,
+                headerMode: .mini
+            ),
+            jpegDecoder: PatternJPEGDecoder(),
+            maximumStreams: 1
+        )
+
+        _ = try await channel.processNext()
+        _ = try await channel.processNext()
+        let before = try await channel.snapshot(surfaceID: 1)
+        await #expect(throws: ChannelError.self) {
+            try await channel.processNext()
+        }
+        #expect(try await channel.snapshot(surfaceID: 1) == before)
+    }
+
+    @Test func destroysAllMJPEGStreamsThenRecreatesWithinTheLimit() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1,
+                width: 2,
+                height: 2,
+                format: 32,
+                flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 1,
+                streamWidth: 2,
+                streamHeight: 2,
+                sourceWidth: 2,
+                sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2),
+                clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 1,
+                multimediaTime: 2,
+                data: Data([1])
             )),
             encodeMini(id: 126, body: Data()),
             encodeMini(id: 122, body: streamCreateBody(
@@ -1257,17 +1347,7 @@ struct DisplayChannelTests {
 
         _ = try await channel.processNext()
         _ = try await channel.processNext()
-        let before = try await channel.snapshot(surfaceID: 1)
-        await #expect(throws: ChannelError.self) {
-            try await channel.processNext()
-        }
-        #expect(try await channel.snapshot(surfaceID: 1) == before)
         #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
-        let committed = try await channel.snapshot(surfaceID: 1)
-        await #expect(throws: ChannelError.self) {
-            try await channel.processNext()
-        }
-        #expect(try await channel.snapshot(surfaceID: 1) == committed)
         #expect(try await channel.processNext() == .ignored(126))
         #expect(try await channel.processNext() == .ignored(122))
         #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 2))

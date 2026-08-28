@@ -23,7 +23,7 @@ package protocol SpiceManagedChannel: Actor {
     ) async throws(ChannelError)
     func replaceConnection(
         with connection: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection
+    ) async throws(ChannelError) -> ChannelConnection
     func close() async
 }
 
@@ -38,8 +38,13 @@ package actor PassiveChannel: SpiceManagedChannel {
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
         _ = emit
+        let runConnection = connection
         while !Task.isCancelled {
-            _ = try await connection.receive()
+            _ = try await runConnection.receive()
+            try await runConnection.completeLastDelivered()
+        }
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
         }
     }
 
@@ -49,11 +54,15 @@ package actor PassiveChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match passive channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         return previous
     }

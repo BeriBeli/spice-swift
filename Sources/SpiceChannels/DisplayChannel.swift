@@ -187,6 +187,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         let runGeneration = beginAsynchronousMJPEGScheduling()
         defer { stopAsynchronousMJPEGScheduling(runGeneration: runGeneration) }
         try await connection.send(SpiceMsgcDisplayInit(
@@ -262,6 +263,9 @@ package actor DisplayChannel: SpiceManagedChannel {
             await retireFramePublisher(framePublisher)
             throw error
         }
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
+        }
         await retireFramePublisher(framePublisher)
     }
 
@@ -270,6 +274,20 @@ package actor DisplayChannel: SpiceManagedChannel {
     }
 
     private func processNext(
+        runGeneration: UInt64?
+    ) async throws(ChannelError) -> DisplayEvent {
+        let activeConnection = connection
+        do {
+            return try await processNextImpl(runGeneration: runGeneration)
+        } catch let error {
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
+            throw error
+        }
+    }
+
+    private func processNextImpl(
         runGeneration: UInt64?
     ) async throws(ChannelError) -> DisplayEvent {
         if let asynchronousFailure {
@@ -336,7 +354,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .displayInvalidateAllImages(waits):
-            try await connection.waitUntilReceived(waits.map {
+            try await connection.waitUntilProcessed(waits.map {
                 ChannelSerialBarrier.Requirement(
                     key: ChannelKey(type: $0.channelType, id: $0.channelID),
                     serial: $0.messageSerial
@@ -456,6 +474,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case let .ping(ping):
             try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))
@@ -715,11 +734,15 @@ package actor DisplayChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Display Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         return previous
     }

@@ -48,6 +48,22 @@ package actor MainChannel: SpiceManagedChannel {
         let continuation: CheckedContinuation<AgentSendTurn, Never>
     }
 
+    private struct ActiveAgentSend {
+        let ticket: AgentSendTicket
+        let connection: ChannelConnection
+    }
+
+    private enum AgentSendRetirementResult: Sendable {
+        case drained
+        case cancelled
+    }
+
+    private struct AgentSendRetirementWaiter {
+        let id: UInt64
+        let connection: ChannelConnection
+        let continuation: CheckedContinuation<AgentSendRetirementResult, Never>
+    }
+
     private var connection: ChannelConnection
     private let multimediaClock: (any MultimediaClockScheduling)?
     private let agentLimits: VDAgentWireLimits
@@ -60,6 +76,9 @@ package actor MainChannel: SpiceManagedChannel {
     private var nextAgentSendSequence: UInt64 = 0
     private var activeAgentSendTicket: AgentSendTicket?
     private var pendingAgentSendWaiters: [AgentSendWaiter] = []
+    private var activeAgentSends: [ActiveAgentSend] = []
+    private var nextAgentSendRetirementWaiterID: UInt64 = 0
+    private var agentSendRetirementWaiters: [AgentSendRetirementWaiter] = []
     private var pendingEvents: [MainEvent] = []
     private var pendingAgentBytes = 0
     private var lastClientMouseModeRequest: MouseModeState?
@@ -78,6 +97,18 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     package func bootstrap() async throws(ChannelError) -> MainBootstrap {
+        let activeConnection = connection
+        do {
+            return try await bootstrapImpl()
+        } catch let error {
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
+            throw error
+        }
+    }
+
+    private func bootstrapImpl() async throws(ChannelError) -> MainBootstrap {
         let first = try await receiveDecoded()
         guard case let .mainInit(mainInit) = first else {
             throw .protocolViolation("Main Init must be the first Main Channel message")
@@ -96,6 +127,7 @@ package actor MainChannel: SpiceManagedChannel {
             try await startAgent(clientTokens: mainInit.agentTokens)
         }
         try await connection.send(SpiceMsgcMainAttachChannels())
+        try await acknowledgeIfNeeded()
 
         while true {
             let message = try await receiveDecoded()
@@ -129,6 +161,7 @@ package actor MainChannel: SpiceManagedChannel {
                     window: setAck.window
                 )
                 try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+                try await acknowledgeIfNeeded()
             case let .ping(ping):
                 try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))
                 try await acknowledgeIfNeeded()
@@ -151,10 +184,14 @@ package actor MainChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         while !Task.isCancelled {
             if let event = try await processNext() {
                 await emit(.main(event))
             }
+        }
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
         }
     }
 
@@ -165,14 +202,61 @@ package actor MainChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match Main Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         lastClientMouseModeRequest = nil
         return previous
+    }
+
+    package func waitForActiveAgentSends(
+        on retiredConnection: ChannelConnection
+    ) async throws(ChannelError) {
+        guard !Task.isCancelled else {
+            throw .transport(.cancelled)
+        }
+        let waiterID = nextAgentSendRetirementWaiterID
+        let (nextWaiterID, overflow) = waiterID.addingReportingOverflow(1)
+        guard !overflow else {
+            throw .protocolViolation("Agent send retirement waiter ID overflow")
+        }
+        nextAgentSendRetirementWaiterID = nextWaiterID
+
+        let result = await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                (continuation: CheckedContinuation<AgentSendRetirementResult, Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
+                guard activeAgentSends.contains(where: {
+                    $0.connection === retiredConnection
+                }) else {
+                    continuation.resume(returning: .drained)
+                    return
+                }
+                agentSendRetirementWaiters.append(AgentSendRetirementWaiter(
+                    id: waiterID,
+                    connection: retiredConnection,
+                    continuation: continuation
+                ))
+            }
+        } onCancel: {
+            Task { await self.cancelAgentSendRetirementWait(id: waiterID) }
+        }
+        switch result {
+        case .drained:
+            return
+        case .cancelled:
+            throw .transport(.cancelled)
+        }
     }
 
     package func sendAgentMessage(_ message: VDAgentMessage) async throws(ChannelError) {
@@ -213,11 +297,17 @@ package actor MainChannel: SpiceManagedChannel {
         clientAgentTokens -= requiredTokens
         var unsentReservedTokens = requiredTokens
         var sentFragmentCount: UInt64 = 0
+        var messageConnection: ChannelConnection?
         let ticket = AgentSendTicket(
             sequence: nextAgentSendSequence,
             generation: messageAgentGeneration
         )
         nextAgentSendSequence &+= 1
+        defer {
+            if let messageConnection {
+                finishActiveAgentSend(ticket: ticket, on: messageConnection)
+            }
+        }
         do {
             switch await acquireAgentSendTurn(for: ticket) {
             case .acquired:
@@ -242,16 +332,23 @@ package actor MainChannel: SpiceManagedChannel {
             // A seamless rebind may happen while this message is queued. Capture
             // the connection only after obtaining the turn, then keep every
             // fragment of this message on that same connection.
-            let messageConnection = connection
+            let capturedConnection = connection
+            messageConnection = capturedConnection
+            beginActiveAgentSend(ticket: ticket, on: capturedConnection)
             for fragment in fragments {
                 guard agentGeneration == messageAgentGeneration else {
                     throw ChannelError.protocolViolation(
                         "agent lifecycle changed during message send"
                     )
                 }
-                try await messageConnection.send(
+                try await capturedConnection.send(
                     messageType: SpiceMainAgentWire.clientData,
-                    body: fragment
+                    body: fragment,
+                    // The complete message reserved its tokens and captured
+                    // this connection before it began retiring. Its suffix
+                    // must remain on the same byte stream during migration or
+                    // after rebind; new sends retain the default rejection.
+                    allowRetiringSend: true
                 )
                 unsentReservedTokens -= 1
                 sentFragmentCount += 1
@@ -272,9 +369,10 @@ package actor MainChannel: SpiceManagedChannel {
                 // decoder. Invalidate this Agent epoch before suspending so a
                 // resumed FIFO waiter cannot write, then make the Main
                 // connection fail closed and let session supervision recover.
-                let connectionToClose = connection
                 resetAgent()
-                await connectionToClose.close()
+                if let messageConnection {
+                    await messageConnection.close()
+                }
             } else if sentFragmentCount == 0,
                       agentGeneration == messageAgentGeneration {
                 let (restoredTokens, overflow) = clientAgentTokens.addingReportingOverflow(
@@ -304,12 +402,28 @@ package actor MainChannel: SpiceManagedChannel {
     package func negotiateDestinationSeamless(
         sourceVersion: UInt32
     ) async throws(ChannelError) -> Bool {
+        let activeConnection = connection
+        do {
+            return try await negotiateDestinationSeamlessImpl(sourceVersion: sourceVersion)
+        } catch let error {
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
+            throw error
+        }
+    }
+
+    private func negotiateDestinationSeamlessImpl(
+        sourceVersion: UInt32
+    ) async throws(ChannelError) -> Bool {
         try await sendMigrationReply(.destinationDoSeamless(sourceVersion: sourceVersion))
         let reply = try await receiveDecoded()
         switch reply {
         case .mainMigration(.destinationSeamlessAccepted):
+            try await acknowledgeIfNeeded()
             return true
         case .mainMigration(.destinationSeamlessRejected):
+            try await acknowledgeIfNeeded()
             return false
         default:
             throw .protocolViolation(
@@ -319,6 +433,18 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func processNext() async throws(ChannelError) -> MainEvent? {
+        let activeConnection = connection
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> MainEvent? {
         if !pendingEvents.isEmpty {
             return removeFirstPendingEvent()
         }
@@ -351,6 +477,7 @@ package actor MainChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return nil
         case let .ping(ping):
             try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))
@@ -513,6 +640,49 @@ package actor MainChannel: SpiceManagedChannel {
         pendingAgentSendWaiters.remove(at: index).continuation.resume(
             returning: .cancelled
         )
+    }
+
+    private func beginActiveAgentSend(
+        ticket: AgentSendTicket,
+        on connection: ChannelConnection
+    ) {
+        activeAgentSends.append(ActiveAgentSend(ticket: ticket, connection: connection))
+    }
+
+    private func cancelAgentSendRetirementWait(id: UInt64) {
+        guard let waiterIndex = agentSendRetirementWaiters.firstIndex(where: {
+            $0.id == id
+        }) else {
+            return
+        }
+        agentSendRetirementWaiters.remove(at: waiterIndex).continuation.resume(
+            returning: .cancelled
+        )
+    }
+
+    private func finishActiveAgentSend(
+        ticket: AgentSendTicket,
+        on connection: ChannelConnection
+    ) {
+        guard let activeIndex = activeAgentSends.firstIndex(where: {
+            $0.ticket == ticket && $0.connection === connection
+        }) else {
+            return
+        }
+        activeAgentSends.remove(at: activeIndex)
+        guard !activeAgentSends.contains(where: { $0.connection === connection }) else {
+            return
+        }
+
+        let waiters = agentSendRetirementWaiters
+        agentSendRetirementWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            if waiter.connection === connection {
+                waiter.continuation.resume(returning: .drained)
+            } else {
+                agentSendRetirementWaiters.append(waiter)
+            }
+        }
     }
 
     private func releaseAgentSendTurn(for ticket: AgentSendTicket) {

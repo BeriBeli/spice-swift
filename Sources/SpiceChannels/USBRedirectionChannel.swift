@@ -23,14 +23,30 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
     package func run(
         emit: @escaping @Sendable (SpiceChannelEvent) async -> Void
     ) async throws(ChannelError) {
+        let runConnection = connection
         while !Task.isCancelled {
             let event = try await processNext()
             if case .ignored = event { continue }
             await emit(.usbRedirection(event))
         }
+        if connection === runConnection {
+            await runConnection.fail(.transport(.cancelled))
+        }
     }
 
     package func processNext() async throws(ChannelError) -> USBRedirectionEvent {
+        let activeConnection = connection
+        do {
+            return try await processNextImpl()
+        } catch let error {
+            if connection === activeConnection {
+                await activeConnection.fail(error)
+            }
+            throw error
+        }
+    }
+
+    private func processNextImpl() async throws(ChannelError) -> USBRedirectionEvent {
         let framed = try await connection.receive()
         switch framed.type {
         case SpiceVMCWire.serverData, SpiceVMCWire.serverCompressedData:
@@ -56,6 +72,7 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
                 window: setAck.window
             )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
+            try await acknowledgeIfNeeded()
             return .ignored(framed.type)
         case 4:
             let ping: SpiceMsgPing
@@ -87,11 +104,15 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
 
     package func replaceConnection(
         with replacement: ChannelConnection
-    ) throws(ChannelError) -> ChannelConnection {
+    ) async throws(ChannelError) -> ChannelConnection {
         guard replacement.key == connection.key else {
             throw .protocolViolation("replacement connection key does not match USB redirection Channel")
         }
         let previous = connection
+        try await replacement.activate()
+        await previous.supersede(
+            preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
+        )
         connection = replacement
         return previous
     }

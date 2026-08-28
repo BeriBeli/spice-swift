@@ -203,6 +203,8 @@ public actor SpiceSession {
     private var webDAVServers: [UInt8: SpiceWebDAVServer] = [:]
     private var migrationCoordinator = MigrationHandoffCoordinator()
     private var migrationTask: Task<Void, Never>?
+    private var nextRetiringMainDrainID: UInt64 = 0
+    private var retiringMainDrain: RetiringMainDrain?
     private var preparedMigrations: [UInt64: PreparedSession] = [:]
     private struct ChannelMigrationPayload: Sendable {
         let data: Data?
@@ -233,6 +235,12 @@ public actor SpiceSession {
                 }
             )
         }
+    }
+
+    private struct RetiringMainDrain: Sendable {
+        let id: UInt64
+        let connection: ChannelConnection
+        let task: Task<Result<Void, ChannelError>, Never>
     }
 
     public init() {
@@ -527,6 +535,7 @@ public actor SpiceSession {
             await disconnectProcessingHook()
         }
         await cancelMigrationHandoff()
+        await cancelAndCloseRetiringMainDrain()
         await stopUSBRedirectionHosts()
         await stopWebDAVServers()
         let tasks = receiveTasks
@@ -1270,7 +1279,13 @@ public actor SpiceSession {
                     "seamless migration lost active credentials"
                 )
             }
-            try await adoptMigrationTarget(prepared, credentials: credentials)
+            let adoptedGeneration = try await adoptMigrationTarget(
+                prepared,
+                credentials: credentials
+            )
+            guard adoptedGeneration == supervisionGeneration, !isDisconnecting else {
+                return
+            }
             await migrationHandoffCompleted(offerID: offer.id)
         } catch {
             seamlessMigrationPayloads.removeValue(forKey: offer.id)
@@ -1642,6 +1657,14 @@ public actor SpiceSession {
         }
     }
 
+    private func cancelAndCloseRetiringMainDrain() async {
+        guard let drain = retiringMainDrain else { return }
+        retiringMainDrain = nil
+        drain.task.cancel()
+        await drain.connection.close()
+        _ = await drain.task.value
+    }
+
     private func prepareMigrationTarget(_ offer: SpiceMigrationOffer) async throws -> Bool {
         guard let credentials = credentialStorage,
               let sourceBootstrap = currentBootstrap else {
@@ -1801,7 +1824,7 @@ public actor SpiceSession {
                 throw CancellationError()
             }
             removedForAdoption = true
-            try await adoptMigrationTarget(prepared, credentials: credentials)
+            _ = try await adoptMigrationTarget(prepared, credentials: credentials)
         } catch {
             if removedForAdoption {
                 await Self.closePrepared(prepared)
@@ -1833,8 +1856,17 @@ public actor SpiceSession {
     private func adoptMigrationTarget(
         _ prepared: PreparedSession,
         credentials: SpiceCredentialStorage
-    ) async throws {
+    ) async throws -> UInt64 {
         try Task.checkCancellation()
+        guard retiringMainDrain == nil else {
+            throw SpiceError.protocolError("migration already has a retiring Main connection")
+        }
+        let drainID = nextRetiringMainDrainID
+        let (nextDrainID, drainIDOverflow) = drainID.addingReportingOverflow(1)
+        guard !drainIDOverflow else {
+            throw SpiceError.protocolError("retiring Main drain ID overflow")
+        }
+        nextRetiringMainDrainID = nextDrainID
 
         let mainKey = ChannelKey(type: 1, id: 0)
         let activeKeys = Set(connections.keys)
@@ -1893,10 +1925,45 @@ public actor SpiceSession {
         desktop.beginSeamlessMigration(
             pointerMode: SpicePointerMode(spiceMouseMode: prepared.bootstrap.currentMouseMode)
         )
-        for connection in previousConnections.values {
-            await connection.close()
+        for key in previousConnections.keys.sorted(by: Self.channelKeySort)
+        where key != mainKey {
+            await previousConnections[key]?.close()
         }
         startSupervision(mainChannel: mainChannel)
+        let adoptedGeneration = supervisionGeneration
+        if let previousMainConnection = previousConnections[mainKey] {
+            let drainTask = Task.detached {
+                () -> Result<Void, ChannelError> in
+                do {
+                    try await mainChannel.waitForActiveAgentSends(
+                        on: previousMainConnection
+                    )
+                    return .success(())
+                } catch let error as ChannelError {
+                    return .failure(error)
+                } catch {
+                    return .failure(.invalidState)
+                }
+            }
+            retiringMainDrain = RetiringMainDrain(
+                id: drainID,
+                connection: previousMainConnection,
+                task: drainTask
+            )
+            let drainResult = await drainTask.value
+            let stillOwnsDrain = retiringMainDrain?.id == drainID
+            if stillOwnsDrain {
+                retiringMainDrain = nil
+            }
+            await previousMainConnection.close()
+            guard stillOwnsDrain else {
+                throw ChannelError.transport(.cancelled)
+            }
+            if case let .failure(error) = drainResult {
+                throw error
+            }
+        }
+        return adoptedGeneration
     }
 
     private func replaceSessionWithTarget(
@@ -2025,6 +2092,7 @@ public actor SpiceSession {
         supervisionGeneration &+= 1
         agentConnectionGeneration &+= 1
         await cancelMigrationHandoff()
+        await cancelAndCloseRetiringMainDrain()
         await stopUSBRedirectionHosts()
         await stopWebDAVServers()
         let tasks = receiveTasks
