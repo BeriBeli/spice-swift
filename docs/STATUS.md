@@ -169,8 +169,13 @@ Agent behavior, including system-trusted TLS.
   rectangles, Brush, QMask, Image descriptors, RAW Bitmap, and Surface images.
 - Strict decoding for COPY_BITS (104), DRAW_FILL (302), and DRAW_COPY (304),
   including relative image offsets and bounded pointer payload validation.
-- DisplayChannel dispatch into SurfaceStore with clip intersection, solid PUT
-  fills, one-to-one RAW/surface DRAW_COPY, COPY_BITS, Ping/Pong, and ACK handling.
+- DisplayChannel dispatch into SurfaceStore with bounded canonical clip regions,
+  solid PUT fills, one-to-one RAW/surface DRAW_COPY, COPY_BITS, Ping/Pong, and
+  ACK handling. `PixelRegion` computes `destination ∩ surfaceBounds ∩
+  union(clips)` as ordered y bands with sorted disjoint x intervals. Nil/single
+  clips stay inline; multi-clip normalization uses compressed x coordinates, a
+  y sweep, and a lazy range-add coverage tree. Input is capped at 4,096 clips
+  and output at 65,536 segments before Surface mutation.
 - A complete Mini-header transcript test from Surface Create through real draw
   wire bodies to the expected framebuffer and Surface Destroy.
 - An external JSON golden-frame fixture that replays Surface Create, DRAW_FILL,
