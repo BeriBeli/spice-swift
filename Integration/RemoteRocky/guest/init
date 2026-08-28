@@ -110,11 +110,9 @@ monitor_marker_inputs() {
     done
 }
 
-start_static
 rm -f /run/perf-marker-request /run/perf-marker-ack
 mkfifo /run/perf-marker-request /run/perf-marker-ack
-/usr/local/bin/input-marker-renderer.sh &
-echo "$!" > /run/perf-marker-renderer.pid
+start_static
 monitor_marker_inputs &
 echo "$!" > /run/perf-marker-monitor.pid
 echo "PERF_READY resolution=1280x720"

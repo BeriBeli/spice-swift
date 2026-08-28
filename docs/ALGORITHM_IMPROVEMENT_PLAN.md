@@ -236,6 +236,16 @@ guest X server and caused the marker draw call. It does not prove that the
 marker pixels entered one exact SwiftSpice frame revision or that AppKit
 presented that delivery.
 
+That run used a separate ordinary marker xterm which a fullscreen static or
+animated workload could stack above even after the renderer acknowledged its
+write. It is therefore draw-call evidence, not proof that marker pixels were
+visible. The fixture now renders the reserved marker ROI inside the active
+fullscreen workload xterm itself, keeps subsequent animation frames outside
+that ROI, and acknowledges only after an xterm terminal-response barrier. A
+fresh live run must still bind those pixels to the exact host frame and
+presentation identities below; the stacking repair does not upgrade the older
+run into input-to-visible evidence.
+
 This is an executable fixture/schema seam, not completion evidence. The live
 collector still must bind the rendered ROI to one exact presented revision and
 populate the per-event JSONL record. Until that Rocky gate succeeds, missing or

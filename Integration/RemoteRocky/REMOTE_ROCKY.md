@@ -88,6 +88,13 @@ different class do not consume the arm. The first matching X input emits
 token, monotonically increasing guest marker revision, and the first eight
 hexadecimal digits of `SHA-256(token)`, then emits `marker_drawn`. Autonomous
 animation never consumes an arm and is not a causal interaction endpoint.
+The static and animated fullscreen xterms use the same marker renderer as
+their terminal entry point. Rows 1-4 are reserved for the marker while both
+workloads render from row 6 onward. For the animated workload, marker output
+briefly stops the generator; an xterm terminal-status response confirms the
+ROI write was consumed before the renderer acknowledges the marker and resumes
+animation. Thus a fullscreen workload cannot stack above or repaint the ROI
+after the acknowledgement.
 The guest image pins `xf86-input-libinput`; without that Xorg input driver,
 SPICE input can reach the guest device while producing no XI2 event for the
 marker monitor. The build manifest records the exact driver package version,

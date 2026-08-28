@@ -7,4 +7,4 @@ exec xterm \
     -fa 'DejaVu Sans Mono' \
     -fs 12 \
     -title 'SwiftSpice deterministic animation' \
-    -e /usr/local/bin/animation-generator.sh
+    -e /usr/local/bin/input-marker-renderer.sh workload animation

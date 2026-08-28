@@ -142,6 +142,87 @@ struct RemoteRockyFixtureTests {
         #expect(!monitorScript.contains("\nxinput test-xi2 --root |"))
     }
 
+    @Test func markerDrawsInsideBothFullscreenWorkloadsBeforeAcknowledgment() throws {
+        let guestInit = try script("Integration/RemoteRocky/guest/init")
+        let renderer = try script(
+            "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+        )
+        let animationGenerator = try script(
+            "Integration/RemoteRocky/guest/animation-generator.sh"
+        )
+        let workloads = [
+            try script("Integration/RemoteRocky/guest/static-desktop.sh"),
+            try script("Integration/RemoteRocky/guest/animation-load.sh"),
+        ]
+
+        for workload in workloads {
+            let fullscreen = try #require(workload.range(of: "-fullscreen"))
+            let terminalCommand = try #require(workload.range(
+                of: "input-marker-renderer.sh",
+                range: fullscreen.upperBound..<workload.endIndex
+            ))
+            #expect(fullscreen.lowerBound < terminalCommand.lowerBound)
+        }
+
+        #expect(!renderer.contains("exec xterm"))
+        #expect(!guestInit.contains("/usr/local/bin/input-marker-renderer.sh &"))
+        #expect(renderer.contains(#"printf '\033[1;1H"#))
+        #expect(renderer.contains("Rows 1-4 are reserved"))
+        #expect(renderer.contains("printf '\\033[2J\\033[6;1H'"))
+        #expect(animationGenerator.contains("printf '\\033[6;1H"))
+        #expect(!animationGenerator.contains("printf '\\033[1;1H"))
+        let visibleDraw = try #require(renderer.range(of: "CAUSAL INPUT MARKER"))
+        let visibilityBarrier = try #require(renderer.range(
+            of: "terminal_visibility_barrier",
+            range: visibleDraw.upperBound..<renderer.endIndex
+        ))
+        let acknowledgment = try #require(renderer.range(
+            of: #"> "${ack_fifo}""#,
+            range: visibilityBarrier.upperBound..<renderer.endIndex
+        ))
+        #expect(visibleDraw.lowerBound < visibilityBarrier.lowerBound)
+        #expect(visibilityBarrier.lowerBound < acknowledgment.lowerBound)
+    }
+
+    @Test func markerWorkloadsDrawAndCrossTheVisibilityBarrierBeforeAcknowledgment() throws {
+        let marker = "SWIFTSPICE_MARKER token=0123456789abcdef "
+            + "marker_revision=17 checksum=9f9f5111\n"
+
+        for workload in ["static", "animation"] {
+            let result = try runGuestScript(
+                "input-marker-renderer.sh",
+                arguments: ["--self-test-workload", workload],
+                standardInput: marker
+            )
+            let lines = result.output.split(separator: "\n").map(String.init)
+            let common = "workload=\(workload) token=0123456789abcdef marker_revision=17"
+
+            #expect(result.status == 0)
+            #expect(lines == [
+                "PERF_MARKER_WORKLOAD action=draw \(common)",
+                "PERF_MARKER_WORKLOAD action=barrier \(common)",
+                "PERF_MARKER_WORKLOAD action=ack \(common)",
+            ])
+        }
+
+        let invalidWorkload = try runGuestScript(
+            "input-marker-renderer.sh",
+            arguments: ["--self-test-workload", "unknown"],
+            standardInput: marker
+        )
+        #expect(invalidWorkload.status != 0)
+        #expect(!invalidWorkload.output.contains("action=ack"))
+
+        let malformedMarker = try runGuestScript(
+            "input-marker-renderer.sh",
+            arguments: ["--self-test-workload", "static"],
+            standardInput: "NOT_A_MARKER token=0123456789abcdef "
+                + "marker_revision=17 checksum=9f9f5111\n"
+        )
+        #expect(malformedMarker.status != 0)
+        #expect(!malformedMarker.output.contains("action=ack"))
+    }
+
     @Test func guestStartsPinnedEudevDiscoveryBeforeXorg() throws {
         let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
         let startScript = try script("Integration/RemoteRocky/remote/start.sh")

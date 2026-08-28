@@ -5,7 +5,8 @@ set -eu
 frame=0
 printf '\033[2J'
 while true; do
-    printf '\033[HSwiftSpice deterministic animation | 1280x720 | frame=%06d\n' "${frame}"
+    # Rows 1-4 are the causal marker ROI; row 5 separates it from workload.
+    printf '\033[6;1HSwiftSpice deterministic animation | 1280x720 | frame=%06d\n' "${frame}"
     row=0
     while test "${row}" -lt 32; do
         phase=$(((frame + row * 3) % 64))
