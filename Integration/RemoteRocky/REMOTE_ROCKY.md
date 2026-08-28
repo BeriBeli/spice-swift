@@ -52,10 +52,13 @@ the run directory for diagnosis. Start and stop hold one cross-process lifecycle
 lock, so concurrent starts serialize and a failed start finishes its cleanup
 before another start can publish an endpoint. The lifecycle shell itself owns
 the lock; QEMU detach and the persistent log follower explicitly close the lock
-descriptor before launch. Stop defers an observed termination signal until its
-container and active-state cleanup completes. Run-directory names include an
-atomic random suffix, so two attempts in the same second cannot collide. Guest
-builds use temporary rootfs and artifact directories, validate the manifest and
+descriptor before launch. If no fixed container is running, start and stop
+discard inactive state without signalling a persisted follower PID; start does
+so before it arms the new run's failure cleanup. Stop defers an observed
+termination signal until its container and active-state cleanup completes. Run
+directory names include an atomic random suffix, so two attempts in the same
+second cannot collide. Guest builds use temporary rootfs and artifact
+directories, validate the manifest and
 hashes, and only then acquire the same lifecycle lock and replace the prior
 build. The build holds that lock through backup cleanup, while start holds it
 through artifact verification, evidence capture, and QEMU detach. Before

@@ -139,6 +139,70 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.stateFileExists("log-follower.pid"))
     }
 
+    @Test func preflightFailureDiscardsStaleFollowerPIDWithoutKillingItsProcess() throws {
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+        let staleStateDiscard = try #require(startScript.range(of: "discard_inactive_state_locked"))
+        let cleanupTrap = try #require(startScript.range(of: "trap cleanup_failed_start EXIT"))
+        #expect(staleStateDiscard.lowerBound < cleanupTrap.lowerBound)
+
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleeper.arguments = ["60"]
+        try sleeper.run()
+        defer {
+            if sleeper.isRunning {
+                sleeper.terminate()
+            }
+            sleeper.waitUntilExit()
+        }
+
+        try fixture.prepareStaleActiveState(logFollowerPID: sleeper.processIdentifier)
+        try FileManager.default.removeItem(
+            at: fixture.base.appending(path: "artifacts/build-manifest.env")
+        )
+
+        let result = try fixture.run("remote/start.sh", ssMode: "both")
+
+        #expect(result.status != 0)
+        #expect(sleeper.isRunning)
+        #expect(!fixture.didDetachContainer)
+        #expect(!fixture.stateFileExists("ticket"))
+        #expect(!fixture.stateFileExists("current-run"))
+        #expect(!fixture.stateFileExists("log-follower.pid"))
+    }
+
+    @Test func stopDiscardsStaleFollowerPIDWithoutKillingItsProcess() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleeper.arguments = ["60"]
+        try sleeper.run()
+        defer {
+            if sleeper.isRunning {
+                sleeper.terminate()
+            }
+            sleeper.waitUntilExit()
+        }
+
+        try fixture.prepareStaleActiveState(logFollowerPID: sleeper.processIdentifier)
+        #expect(!fixture.isContainerRunning)
+
+        let result = try fixture.run("remote/stop.sh", ssMode: "both")
+
+        #expect(result.status == 0)
+        #expect(sleeper.isRunning)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.didDetachContainer)
+        #expect(!fixture.stateFileExists("ticket"))
+        #expect(!fixture.stateFileExists("current-run"))
+        #expect(!fixture.stateFileExists("log-follower.pid"))
+    }
+
     @Test(arguments: ["spice-only", "control-only"])
     func statusCannotPassWithOnlyOneListener(ssMode: String) throws {
         let fixture = try RemoteRockyFixture()
@@ -425,6 +489,13 @@ private struct RemoteRockyFixture {
         )
         try Data("\(runID)\n".utf8).write(to: base.appending(path: "state/current-run"))
         try Data().write(to: mockState.appending(path: "running"))
+    }
+
+    func prepareStaleActiveState(logFollowerPID: Int32) throws {
+        let state = base.appending(path: "state")
+        try Data("stale-ticket".utf8).write(to: state.appending(path: "ticket"))
+        try Data("stale-run\n".utf8).write(to: state.appending(path: "current-run"))
+        try Data("\(logFollowerPID)\n".utf8).write(to: state.appending(path: "log-follower.pid"))
     }
 
     func run(

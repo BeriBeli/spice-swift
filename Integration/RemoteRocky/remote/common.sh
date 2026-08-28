@@ -45,6 +45,18 @@ loopback_port_is_listening() {
     '
 }
 
+# The caller must hold PERF_LIFECYCLE_LOCK and must already have established
+# that the fixed container is not running. A persisted PID may have been reused
+# by the OS, so inactive-state discard never signals it.
+discard_inactive_state_locked() {
+    rm -f \
+        "${PERF_STATE}/ticket" \
+        "${PERF_STATE}/current-run" \
+        "${PERF_STATE}/log-follower.pid" \
+        "${PERF_STATE}/round-start" \
+        "${PERF_STATE}/round-id"
+}
+
 # The caller must hold PERF_LIFECYCLE_LOCK. Keeping cleanup in-process lets a
 # failed start retain the lock until its container and active state are gone.
 stop_endpoint_locked() {
@@ -58,10 +70,5 @@ stop_endpoint_locked() {
     if [[ -f "${PERF_STATE}/log-follower.pid" ]]; then
         kill "$(<"${PERF_STATE}/log-follower.pid")" 2>/dev/null || true
     fi
-    rm -f \
-        "${PERF_STATE}/ticket" \
-        "${PERF_STATE}/current-run" \
-        "${PERF_STATE}/log-follower.pid" \
-        "${PERF_STATE}/round-start" \
-        "${PERF_STATE}/round-id"
+    discard_inactive_state_locked
 }

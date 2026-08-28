@@ -10,6 +10,9 @@ if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev
     exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
 fi
 
+podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
+discard_inactive_state_locked
+
 startup_complete=false
 cleanup_failed_start() {
     result=$?
@@ -22,8 +25,6 @@ cleanup_failed_start() {
 }
 trap cleanup_failed_start EXIT
 trap 'exit 1' HUP INT TERM
-
-podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
 
 manifest="${PERF_ARTIFACTS}/build-manifest.env"
 if [[ ! -r "${PERF_ARTIFACTS}/vmlinuz-virt" \
