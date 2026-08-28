@@ -166,9 +166,10 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         viewUpdateToMetalCommitHistogram.summary
     }
 
-    /// Time from the first coalesced desktop update becoming ready until the
-    /// AppKit presentation scheduler selects the latest revision. The property
-    /// name remains source-compatible with SwiftSpice 0.2.5.
+    /// Time from the ready timestamp of the latest accepted desktop revision
+    /// that is actually selected until the AppKit presentation scheduler makes
+    /// that selection. This is not the first update in its coalescing window;
+    /// the property name remains source-compatible with SwiftSpice 0.2.5.
     public var desktopReadyToDisplayLink: SpiceTimingSummary {
         desktopReadyToDisplayLinkHistogram.summary
     }

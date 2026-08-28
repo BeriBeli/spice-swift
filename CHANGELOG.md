@@ -9,9 +9,6 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added package-only selected-revision timing diagnostics that measure the
-  accepted latest desktop revision from surface readiness to display-link
-  selection without changing latest-only pacing or committing while idle.
 - Added versioned guest manifests, verified artifact hashes, and private
   per-run evidence to the existing Rocky 9 rootless Podman/KVM fixture.
 - Added a per-event causal input trace schema and private JSONL artifact, plus
@@ -19,6 +16,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `SpicePresentationMetrics.desktopReadyToDisplayLink` and the corresponding
+  session diagnostic now measure from the ready timestamp of the latest
+  accepted revision that is actually selected, rather than the first update in
+  its coalescing window. This differs from the 0.3.0 metric semantics, so the
+  values should not be treated as directly equivalent; latest-only pacing and
+  idle no-commit behavior are unchanged.
 - Reframed performance work around paired interaction latency first: separate
   input-to-guest and receive-to-presented segments before clarity, with CPU and
   RSS retained as guardrails rather than substitutes for latency acceptance.
