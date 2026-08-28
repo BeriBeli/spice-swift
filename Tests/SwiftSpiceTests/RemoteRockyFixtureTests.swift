@@ -594,6 +594,43 @@ struct RemoteRockyFixtureTests {
         #expect(!timeout.output.contains("PERF_ARM_REJECTED"))
     }
 
+    @Test func controlArmRetryCannotReuseADelayedPriorAcceptance() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+        let environment = [
+            "MOCK_ARM_RETRY_RACE": "1",
+            "PERF_CONTROL_WAIT_ATTEMPTS": "1",
+        ]
+        let arguments = ["arm", "click", "0000000000000012"]
+
+        let timedOut = try fixture.run(
+            "remote/control.sh",
+            arguments: arguments,
+            ssMode: "both",
+            additionalEnvironment: environment
+        )
+        #expect(timedOut.status != 0)
+        #expect(timedOut.output.contains(
+            "PERF_ARM_ERROR action_class=click token=0000000000000012 reason=timeout"
+        ))
+        #expect(!timedOut.output.contains("PERF_ARMED"))
+
+        let retry = try fixture.run(
+            "remote/control.sh",
+            arguments: arguments,
+            ssMode: "both",
+            additionalEnvironment: environment
+        )
+        #expect(retry.status != 0)
+        #expect(retry.output.contains(
+            "PERF_ARM_REJECTED action_class=click token=0000000000000012 reason=duplicate_token"
+        ))
+        #expect(!retry.output.contains("PERF_ARMED"))
+        #expect(try fixture.mockEventCount("control-sync") == 2)
+        #expect(try fixture.mockEventCount("control-exec") == 2)
+    }
+
     @Test func concurrentHostArmsSerializeAroundOneGuestPendingSlot() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -1920,6 +1957,19 @@ private struct RemoteRockyFixture {
                 [[ "${3:-}" == -c ]]
                 [[ $# == 4 ]]
                 printf '%s\n' "${4:-}" > "$state/control-command"
+                if [[ "${4:-}" =~ sync\ invocation=([0-9a-f]{32}) ]]; then
+                    invocation="${BASH_REMATCH[1]}"
+                    run_id="$(<"${SWIFTSPICE_PERF_BASE:?}/state/current-run")"
+                    server_log="${SWIFTSPICE_PERF_BASE}/logs/${run_id}/server.log"
+                    if [[ "${MOCK_ARM_RETRY_RACE:-}" == 1 \
+                        && -f "$state/delayed-arm-result" ]]; then
+                        /bin/cat "$state/delayed-arm-result" >> "$server_log"
+                        rm -f "$state/delayed-arm-result"
+                    fi
+                    printf 'PERF_CONTROL_SYNC invocation=%s\r\n' "$invocation" >> "$server_log"
+                    printf 'control-sync\n' >> "$state/events"
+                    exit 0
+                fi
                 printf 'control-exec\n' >> "$state/events"
                 if [[ "${4:-}" == *"diagnose-input"* ]]; then
                     run_id="$(<"${SWIFTSPICE_PERF_BASE:?}/state/current-run")"
@@ -1939,6 +1989,26 @@ private struct RemoteRockyFixture {
                     run_id="$(<"${SWIFTSPICE_PERF_BASE:?}/state/current-run")"
                     server_log="${SWIFTSPICE_PERF_BASE}/logs/${run_id}/server.log"
                     arm_result="${MOCK_ARM_RESULT:-accepted}"
+                    if [[ "${MOCK_ARM_RETRY_RACE:-}" == 1 ]]; then
+                        attempt_file="$state/arm-attempts"
+                        attempt=0
+                        if [[ -f "$attempt_file" ]]; then
+                            attempt="$(<"$attempt_file")"
+                        fi
+                        attempt=$((attempt + 1))
+                        printf '%s\n' "$attempt" > "$attempt_file"
+                        if [[ "$attempt" == 1 ]]; then
+                            printf 'PERF_ARMED action_class=%s token=%s\r\n' \
+                                "$action_class" "$token" > "$state/delayed-arm-result"
+                            arm_result=timeout
+                        else
+                            if [[ -f "$state/delayed-arm-result" ]]; then
+                                /bin/cat "$state/delayed-arm-result" >> "$server_log"
+                                rm -f "$state/delayed-arm-result"
+                            fi
+                            arm_result=duplicate_token
+                        fi
+                    fi
                     if [[ "${MOCK_ARM_STATEFUL:-}" == 1 ]]; then
                         arm_lock="$state/guest-arm.lock"
                         until mkdir "$arm_lock" 2>/dev/null; do /bin/sleep 0.01; done

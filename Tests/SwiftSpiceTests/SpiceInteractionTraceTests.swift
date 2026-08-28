@@ -96,6 +96,35 @@ struct SpiceInteractionTraceTests {
         #expect(afterPresentation.invalidReason == "non_monotonic_timestamps")
     }
 
+    @Test func displayReceiveMayPrecedeSendCompletionRecording() {
+        let receiveDuringSendContinuation = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            motionAckNs: 35,
+            displayReceiveNs: 35
+        )
+
+        #expect(receiveDuringSendContinuation.valid)
+        #expect(receiveDuringSendContinuation.invalidReason == nil)
+        #expect(receiveDuringSendContinuation.sendToDisplayNanoseconds == 0)
+
+        let receiveAfterSendCompletion = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            displayReceiveNs: 70
+        )
+        #expect(receiveAfterSendCompletion.valid)
+        #expect(receiveAfterSendCompletion.sendToDisplayNanoseconds == 30)
+
+        let receiveBeforeSendStarted = trace(
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            displayReceiveNs: 29
+        )
+        #expect(!receiveBeforeSendStarted.valid)
+        #expect(receiveBeforeSendStarted.invalidReason == "non_monotonic_timestamps")
+    }
+
     @Test func decodingCannotForgeDerivedValidity() throws {
         let encoded = try JSONEncoder().encode(trace())
         guard var object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
@@ -122,6 +151,7 @@ struct SpiceInteractionTraceTests {
         motionAckNs: UInt64? = 45,
         guestReceivedNs: UInt64? = 50,
         guestMarkerDrawnNs: UInt64? = 60,
+        displayReceiveNs: UInt64? = 70,
         markerRevision: UInt64? = 77,
         invalidReason: String? = nil
     ) -> SpiceInteractionTraceRecord {
@@ -139,7 +169,7 @@ struct SpiceInteractionTraceTests {
             motionAckNs: motionAckNs,
             guestReceivedNs: guestReceivedNs,
             guestMarkerDrawnNs: guestMarkerDrawnNs,
-            displayReceiveNs: 70,
+            displayReceiveNs: displayReceiveNs,
             surfaceReadyNs: 80,
             selectedRevisionReadyNs: 90,
             selectionNs: 100,

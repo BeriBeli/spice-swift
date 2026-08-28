@@ -254,6 +254,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
     package let valid: Bool
     package let invalidReason: String?
 
+    /// Send completion is recorded after the sending continuation resumes, so
+    /// display receive may legitimately be observed first. That overlap has no
+    /// post-send-to-display duration.
+    package var sendToDisplayNanoseconds: UInt64? {
+        guard let sendCompletedNs, let displayReceiveNs else { return nil }
+        return displayReceiveNs - min(sendCompletedNs, displayReceiveNs)
+    }
+
     package init(
         pairId: String,
         version: String,
@@ -456,7 +464,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         guard scheduledNs <= hostInputNs,
               hostInputNs <= sendStartedNs,
               sendStartedNs <= sendCompletedNs,
-              sendCompletedNs <= displayReceiveNs,
+              sendStartedNs <= displayReceiveNs,
               displayReceiveNs <= surfaceReadyNs,
               surfaceReadyNs <= selectedRevisionReadyNs,
               selectedRevisionReadyNs <= selectionNs,

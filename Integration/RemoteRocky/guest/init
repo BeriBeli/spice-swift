@@ -136,6 +136,15 @@ while true; do
             diagnose-input)
                 /usr/local/bin/input-diagnostics.sh
                 ;;
+            sync\ invocation=*)
+                invocation="${command#sync invocation=}"
+                if test "${#invocation}" -eq 32 \
+                    && ! printf '%s' "${invocation}" | grep -q '[^0-9a-f]'; then
+                    echo "PERF_CONTROL_SYNC invocation=${invocation}"
+                else
+                    echo "PERF_ERROR control_sync=invalid_invocation"
+                fi
+                ;;
             arm\ action_class=*\ token=*)
                 action_class="${command#arm action_class=}"
                 action_class="${action_class%% token=*}"

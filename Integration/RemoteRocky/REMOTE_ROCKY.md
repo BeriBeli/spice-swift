@@ -140,6 +140,13 @@ second arm. Guest timestamps come from a statically linked
 text representation. Startup requires the manifest capability
 `guest_marker_clock=clock_gettime-monotonic-v1`, and a missing or malformed
 clock sample fails the event explicitly.
+Each host `arm` invocation is serialized and first sends a random 128-bit
+control barrier. The guest strictly accepts 32 lowercase hexadecimal digits
+and echoes `PERF_CONTROL_SYNC invocation=<id>` to the serial log. The host waits
+for that exact barrier, then records a fresh byte boundary before sending the
+real arm; delayed responses from an earlier invocation therefore cannot satisfy
+a retry. A missing barrier fails with a bounded, structured sync error and no
+arm is sent. Neither the barrier nor its log record contains the SPICE ticket.
 The guest image pins `xf86-input-libinput`; without that Xorg input driver,
 SPICE input can reach the guest device while producing no XI2 event for the
 marker monitor. The build manifest records the exact driver package version,
