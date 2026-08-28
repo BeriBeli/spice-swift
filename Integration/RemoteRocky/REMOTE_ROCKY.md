@@ -47,10 +47,12 @@ Remote lifecycle commands:
 desktop. `remote/stop.sh` stops QEMU. Start/reset always begins the same
 30-frame-per-second animation at frame zero. A successful start requires both
 the SPICE and guest-control loopback listeners. Startup failure removes the
-container, log follower, temporary ticket, and active-run state while retaining
-the run directory for diagnosis. Start and stop hold one cross-process lifecycle
-lock, so concurrent starts serialize and a failed start finishes its cleanup
-before another start can publish an endpoint. The lifecycle shell itself owns
+container, log follower, temporary ticket, and active-run state only after
+Podman confirms that the fixed container no longer exists. If teardown cannot
+be confirmed, the command fails and preserves the ticket, follower PID, and run
+evidence for audit. Start and stop hold one cross-process lifecycle lock, so
+concurrent starts serialize and a failed start finishes its cleanup before
+another start can publish an endpoint. The lifecycle shell itself owns
 the lock; QEMU detach and the persistent log follower explicitly close the lock
 descriptor before launch. If no fixed container is running, start and stop
 discard inactive state without signalling a persisted follower PID; start does

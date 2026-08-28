@@ -57,6 +57,29 @@ discard_inactive_state_locked() {
         "${PERF_STATE}/round-id"
 }
 
+fixed_container_absence_is_confirmed() {
+    local status=0
+    podman container exists "${PERF_CONTAINER}" >/dev/null 2>&1 || status=$?
+    [[ "${status}" == 1 ]]
+}
+
+teardown_failed() {
+    echo "Performance endpoint teardown failed; active state was preserved." >&2
+    return 1
+}
+
+# The caller must hold PERF_LIFECYCLE_LOCK and must have observed that the
+# fixed container is not running. Removal is still confirmed before stale
+# active state is discarded.
+remove_inactive_endpoint_locked() {
+    podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
+    if ! fixed_container_absence_is_confirmed; then
+        teardown_failed
+        return 1
+    fi
+    discard_inactive_state_locked
+}
+
 # The caller must hold PERF_LIFECYCLE_LOCK. Keeping cleanup in-process lets a
 # failed start retain the lock until its container and active state are gone.
 stop_endpoint_locked() {
@@ -67,6 +90,10 @@ stop_endpoint_locked() {
     fi
     podman stop --time 10 "${PERF_CONTAINER}" >/dev/null 2>&1 || true
     podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
+    if ! fixed_container_absence_is_confirmed; then
+        teardown_failed
+        return 1
+    fi
     if [[ -f "${PERF_STATE}/log-follower.pid" ]]; then
         kill "$(<"${PERF_STATE}/log-follower.pid")" 2>/dev/null || true
     fi

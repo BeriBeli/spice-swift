@@ -10,16 +10,18 @@ if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev
     exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
 fi
 
-podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-discard_inactive_state_locked
+remove_inactive_endpoint_locked
 
 startup_complete=false
 cleanup_failed_start() {
     result=$?
     trap - EXIT HUP INT TERM
     if [[ "${startup_complete}" != true ]]; then
-        stop_endpoint_locked >/dev/null 2>&1 || true
-        echo "Performance endpoint startup failed; active state was removed." >&2
+        if stop_endpoint_locked; then
+            echo "Performance endpoint startup failed; active state was removed." >&2
+        else
+            exit 1
+        fi
     fi
     exit "${result}"
 }

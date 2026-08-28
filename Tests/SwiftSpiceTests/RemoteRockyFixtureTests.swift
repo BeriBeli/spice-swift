@@ -139,9 +139,54 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.stateFileExists("log-follower.pid"))
     }
 
+    @Test func failedStartPreservesAuditableStateWhenEndpointTeardownFails() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let result = try fixture.run(
+            "remote/start.sh",
+            ssMode: "spice-only",
+            additionalEnvironment: [
+                "MOCK_FAIL_STOP": "1",
+                "MOCK_FAIL_RM": "1",
+            ]
+        )
+
+        #expect(result.status != 0)
+        #expect(result.output.contains(
+            "Performance endpoint teardown failed; active state was preserved."
+        ))
+        #expect(fixture.isContainerRunning)
+        #expect(fixture.containerExists)
+        #expect(fixture.stateFileExists("ticket"))
+        #expect(fixture.stateFileExists("current-run"))
+        #expect(fixture.stateFileExists("log-follower.pid"))
+        #expect(fixture.stateFileExists("stop-failed"))
+        #expect(fixture.stateFileExists("rm-failed"))
+
+        let stopResult = try fixture.run(
+            "remote/stop.sh",
+            ssMode: "both",
+            additionalEnvironment: [
+                "MOCK_FAIL_STOP": "1",
+                "MOCK_FAIL_RM": "1",
+            ]
+        )
+
+        #expect(stopResult.status != 0)
+        #expect(stopResult.output.contains(
+            "Performance endpoint teardown failed; active state was preserved."
+        ))
+        #expect(fixture.isContainerRunning)
+        #expect(fixture.containerExists)
+        #expect(fixture.stateFileExists("ticket"))
+        #expect(fixture.stateFileExists("current-run"))
+        #expect(fixture.stateFileExists("log-follower.pid"))
+    }
+
     @Test func preflightFailureDiscardsStaleFollowerPIDWithoutKillingItsProcess() throws {
         let startScript = try script("Integration/RemoteRocky/remote/start.sh")
-        let staleStateDiscard = try #require(startScript.range(of: "discard_inactive_state_locked"))
+        let staleStateDiscard = try #require(startScript.range(of: "remove_inactive_endpoint_locked"))
         let cleanupTrap = try #require(startScript.range(of: "trap cleanup_failed_start EXIT"))
         #expect(staleStateDiscard.lowerBound < cleanupTrap.lowerBound)
 
@@ -442,6 +487,10 @@ private struct RemoteRockyFixture {
         fileManager.fileExists(atPath: mockState.appending(path: "running").path)
     }
 
+    var containerExists: Bool {
+        fileManager.fileExists(atPath: mockState.appending(path: "container").path)
+    }
+
     func remove() {
         try? fileManager.removeItem(at: root)
     }
@@ -639,6 +688,12 @@ private struct RemoteRockyFixture {
         printf ' %s' "$@" >> "$state/commands"
         printf '\n' >> "$state/commands"
         case "$command" in
+            container)
+                [[ "${1:-}" == exists ]]
+                [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
+                [[ $# == 2 ]]
+                [[ -d "$state/container" ]]
+                ;;
             inspect)
                 [[ "${1:-}" == --format ]]
                 [[ "${2:-}" == '{{.State.Running}}' ]]
@@ -653,6 +708,10 @@ private struct RemoteRockyFixture {
                 [[ "${1:-}" == --force ]]
                 [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
                 [[ $# == 2 ]]
+                if [[ "${MOCK_FAIL_RM:-}" == 1 && -d "$state/container" ]]; then
+                    : > "$state/rm-failed"
+                    exit 71
+                fi
                 rm -f "$state/running"
                 rmdir "$state/container" 2>/dev/null || true
                 ;;
@@ -664,6 +723,10 @@ private struct RemoteRockyFixture {
                 if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
                     : > "$state/stop-entered"
                     while [[ ! -f "$state/release-stop" ]]; do /bin/sleep 0.01; done
+                fi
+                if [[ "${MOCK_FAIL_STOP:-}" == 1 ]]; then
+                    : > "$state/stop-failed"
+                    exit 70
                 fi
                 rm -f "$state/running"
                 rmdir "$state/container" 2>/dev/null || true
