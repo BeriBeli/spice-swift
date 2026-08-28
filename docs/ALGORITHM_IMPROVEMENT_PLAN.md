@@ -193,6 +193,10 @@ complete or correlate its ACK subsegment until the wire-send completion
 timestamp is recorded. If a same-generation ACK arrives first, buffer it and
 release it only at that post-send linearization point. The next motion probe may
 not start until the current ACK subsegment is resolved or the probe fails. An
+ACK observation may therefore fall between the send-started and send-completed
+timestamps; the guest/ACK subsegment completes at
+`max(sendCompletedNs, motionAckNs)`. This does not change pre-arming, buffered
+early-ACK, clean-epoch, or generation-retirement rules. An
 ACK captured by an old or previous generation, or arriving after close or
 migration retirement, is discarded and can never satisfy the current
 generation. Never attribute concurrent outstanding motions from ACK order; their
@@ -200,6 +204,126 @@ visible markers remain the only causal endpoints. Keyboard and button messages
 have no general guest ACK and likewise always use a unique visible marker. Do
 not infer causality by adding unrelated aggregate histograms or pairing an input
 with whichever frame happened to arrive next.
+
+Host display receive may be observed after `sendStartedNs` but before the send
+task records `sendCompletedNs`. This overlap remains causal: validation requires
+both observations to be no earlier than send start, while the derived
+post-send-to-display segment is clamped to zero. A display observation earlier
+than send start remains invalid.
+
+The Rocky fixture now provides the first causal-trace slice without changing
+display scheduling. `control.sh arm <click|key|motion> <token>` pre-arms one
+strictly unique 16-lowercase-hex token. Only the next matching real guest input
+consumes it, records guest-received time, and draws a fixed high-contrast ROI
+whose payload includes the token, guest marker revision, and SHA-256 checksum.
+The guest state machine rejects an illegal/reused token and a concurrent arm;
+autonomous animation cannot consume the arm. Every run reserves a normalized
+`input-events.jsonl` path, and the package-only Codable schema derives validity
+from the complete host-input/send, guest-marker, display, selection, commit,
+presented, and frame-identity evidence. Guest and host monotonic clocks are
+validated only within their own domains. The guest marker revision is not the
+host frame revision and must be correlated by captured marker pixels and the
+matching presented delivery, not by numeric equality.
+
+Before each real arm, the host sends a unique random 128-bit lowercase-hex
+control barrier and waits for its exact serial-log echo. It records the arm
+response boundary only after that echo, so delayed output from a prior
+invocation cannot be mistaken for the current accepted or rejected result. A
+barrier timeout fails without sending the arm and never exposes the SPICE
+ticket.
+
+The live Rocky marker also requires the pinned guest Xorg input driver
+`xf86-input-libinput=1.5.0-r0`. A guest image without that driver may accept
+SPICE keyboard or pointer traffic without emitting the XI2 event consumed by
+the marker monitor. The driver version is therefore part of the guest build
+manifest and a required startup key, not an unrecorded host assumption.
+
+The Rocky run
+`/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`
+validated this guest-side repair. eudev discovery allowed Xorg/libinput to
+register the Virtio keyboard and mouse and the later hotplug SPICE tablet. A
+Release mode-aware probe then produced both `guest_received` and `marker_drawn`
+for key token `4444`, motion token `5555`, and click token `6666`; the motion
+exercise also observed two protocol ACKs. This proves client input reached the
+guest X server and caused the marker draw call. It does not prove that the
+marker pixels entered one exact SwiftSpice frame revision or that AppKit
+presented that delivery.
+
+That run used a separate ordinary marker xterm which a fullscreen static or
+animated workload could stack above even after the renderer acknowledged its
+write. It is therefore draw-call evidence, not proof that marker pixels were
+visible. The fixture now renders the reserved marker ROI inside the active
+fullscreen workload xterm itself, keeps subsequent animation frames outside
+that ROI, and acknowledges only after an xterm terminal-response barrier. A
+byte-state parser uses one absolute monotonic half-second deadline, ignores
+unrelated input including printable `n`, and accepts only exact `ESC [ 0 n`.
+EOF, malformed-only input, or timeout produces no ACK. The
+agent's longer two-second bounded FIFO wait therefore expires only after the
+renderer has either acknowledged or definitively declined the event; a late
+revision from another writer may still enter the FIFO, but the bounded reader
+drains nonmatching revisions and never lets one satisfy or poison the current
+request. A monotonic nanosecond deadline is recorded before request publication; every
+stale-record read uses only the remaining total time and never resets the
+timeout. A timed-out terminal-status query taints that renderer until a later
+marker, before drawing, sends the distinct cursor-position query `ESC [ 6 n`
+and receives an exact `ESC [ <row> ; <column> R`. Terminal output ordering makes
+that response a resynchronization fence past the old DSR; a late old
+`ESC [ 0 n` is drained as unrelated input and cannot satisfy the fence. A
+failed fence leaves the renderer tainted and emits no draw or ACK. The renderer
+holds one request FIFO read/write descriptor for its
+entire main loop, including while drawing and waiting on the terminal barrier,
+so a next request published during processing remains queued for its next read.
+The agent also opens the request FIFO read/write, writes one small fixed record,
+and closes it immediately. Without a renderer, open cannot block and closing
+the final endpoint discards the unconsumed request before a future workload can
+observe it. The wait treats a missing acknowledgement or wrong
+marker revision as a failed event and releases the guest marker lock; it never emits
+`marker_drawn` from an unacknowledged write. A
+fresh live run must still bind those pixels to the exact host frame and
+presentation identities below; the stacking repair does not upgrade the older
+run into input-to-visible evidence.
+
+The guest XI2 monitor admits only RawKeyPress, RawButtonPress, and RawMotion;
+the delivered counterpart for the same physical input is ignored and cannot
+consume a subsequently armed token. A dedicated serialized agent worker keeps
+the XI2 reader draining while a marker is rendered. Key and click observations
+remain FIFO; a motion ownership token is created before the first RawMotion is
+queued and remains set after that call returns. Before the next arm, its unique
+invocation sync requests XI2 source rotation. The native source first opens one
+X connection, selects only RawKeyPress, RawButtonPress, and RawMotion on the
+root window, completes an `XSync` round trip, and atomically publishes readiness.
+The monitor terminates the old helper, drains all stdout already published
+through EOF, and closes that X connection so unread upstream events are
+discarded with the generation. It waits for the replacement helper's same
+application-level readiness before publishing a checkpoint behind every old
+agent call; the worker clears motion ownership
+and acknowledges only after reaching it. Only then may the host send the arm.
+Thus neither an upstream X backlog nor reader scheduling can move an old queued
+record into the next arm epoch, and no arbitrary quiet-period sleep defines the
+boundary. One total bounded checkpoint budget covers monitor/source startup and
+worker acknowledgement; the phases cannot each consume a fresh timeout. Guest event
+timestamps use a statically
+linked `clock_gettime(CLOCK_MONOTONIC)` helper recorded as
+`guest_marker_clock=clock_gettime-monotonic-v1` in the build manifest. Coarse
+`/proc/uptime` text must not be scaled and represented as nanosecond evidence;
+an unavailable or malformed monotonic sample invalidates the event. The
+manifest must also record `guest_xi2_monitor=native-xi2-select-sync-v1` and the
+pinned libXi/libX11 runtime versions. The evidence log below records the native
+helper's exact-source Rocky live closure; it still does not bind marker pixels
+to an exact SwiftSpice frame/delivery and AppKit presented callback.
+
+This is an executable fixture/schema seam, not completion evidence. The live
+collector still must bind the rendered ROI to one exact presented revision and
+populate the per-event JSONL record. Until that Rocky gate succeeds, missing or
+ambiguous marker/presented evidence is invalid, and no input-to-visible latency
+or improvement claim may use these records.
+
+The next slice remains the `input-events.jsonl` collector plus exact marker
+pixel-to-frame-generation/revision/delivery and AppKit-presented binding,
+followed by paired `v0.2.7`/`v0.3.x` traces. Only those paired results may decide
+whether ready-to-selection should use an interaction-aware immediate path or an
+adaptive display-link policy. Either choice must retain latest-only delivery,
+zero idle commits, at most two GPU commands in flight, and CPU/RSS guardrails.
 
 An end-to-end request-to-presented measurement may summarize user experience,
 but it does not identify which path caused a change. In particular, a capture
@@ -366,6 +490,12 @@ behavior remain separate acceptance gates.
 | ID | Date | Commit/PR | Evidence | Notes |
 | --- | --- | --- | --- | --- |
 | AIP-00 | 2026-08-28 | Local Maspice adjacent run | `/private/tmp/maspice-swiftspice-027-controlled.sample.txt`; `/private/tmp/maspice-swiftspice-030.sample.txt`; same guest; ready-to-selection p95 0.2 ms to 12 ms (max 70.8 ms to 22.2 ms), snapshot p95 4.0 ms to 0.2 ms, selection-request-to-presented p95 100 ms to 33 ms, and warm CPU 12.51% to 12.37% / 12.23% | Directional host-local evidence only. The reported `v0.3.0` diagnostic interval contained no input event or correlation token, so it cannot measure or explain input-queue latency. The samples are not committed artifacts and do not complete AIP-00. |
+| AIP-00 | 2026-08-29 | Rocky 9 live marker run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`; eudev/Xorg/libinput registered Virtio keyboard/mouse and hotplug SPICE tablet; Release mode-aware key `4444`, motion `5555`, and click `6666` probes each emitted `guest_received` plus `marker_drawn`; motion ACK count 2 | Guest-causal subpath evidence only: client input reached guest X and invoked the marker renderer. The run does not bind marker pixels to an exact SwiftSpice generation/revision/delivery or AppKit presented callback, so it does not complete AIP-00 or justify a scheduling change. |
+| AIP-00 | 2026-08-29 | Rocky 9 rebuilt guest marker run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T194358Z.TQ3mft`; build manifest records `guest_marker_clock=clock_gettime-monotonic-v1` and `guest_linux_virt=6.12.107-r0`; Release probe exited 0 after 42 frames and two motion ACKs; token `eeeeeeeeeeeeeeee` recorded `guest_received=53621746290 ns` and `marker_drawn=53628063503 ns`, a 6.317213 ms guest-clock delta, with no marker error | Confirms only the guest-causal draw/ACK subpath. Marker pixels are not yet bound to an exact SwiftSpice frame revision and AppKit presented callback, so this evidence neither completes AIP-00 nor supports an AIP-44 scheduling change. |
+| AIP-00 | 2026-08-29 | Rocky 9 arm-barrier retry run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T201148Z.r0vGwi`; sync `b90af807995470a1595ec1a140120859` preceded `PERF_ARMED` for click token `abababababababab`, followed by `guest_received=24953841014 ns` and `marker_drawn=24959354130 ns`; Release probe exited 0 after 42 frames and two motion ACKs with no marker error; retrying the same token used distinct sync `c61a9dcca1e180bdf44d9a76af72a34f` and returned `duplicate_token`, with no stale `PERF_ARMED` accepted | Live evidence for the per-invocation log barrier, retry rejection, and guest-causal marker subpath only. It still does not bind marker pixels to an exact SwiftSpice frame revision and AppKit presented callback, so it does not complete AIP-00 or support an AIP-44 scheduling change. |
+| AIP-00 | 2026-08-29 | Rocky 9 motion-epoch drain run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T204616Z.Q0jo6t`; rebuilt Alpine guest and restarted endpoint; first Release probe exited 0 with 42 frames and two motion ACKs, and token `1111111111111111` recorded `guest_received=29908152175 ns` then `marker_drawn=29918028916 ns`; the next sync/checkpoint armed token `2222222222222222`, which remained only `PERF_ARMED` after one second with no new input and no marker/control error; a second Release probe then exited 0 with 15 frames and two motion ACKs and only its new burst produced `guest_received=77938920509 ns` then `marker_drawn=77960725095 ns`. After the host-test transport fix, the exact-source rebuild at `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T210655Z.rXLQJS` again produced 42 frames, two motion ACKs, and token `3333333333333333` at `guest_received=23044223211 ns` then `marker_drawn=23053993151 ns`, with no marker/control error. | Live evidence that RawMotion queued by the first exercise burst did not cross the explicit event-FIFO/worker checkpoint and consume the next arm. The run also exercises the persistent renderer request FIFO and exact terminal barrier through successful marker revisions. It remains guest-causal evidence only: marker pixels are not bound to an exact SwiftSpice delivery and AppKit presented callback, so AIP-00 and AIP-44 remain open. |
+| AIP-00 | 2026-08-29 | Rocky 9 exact-source rotation/resync run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T215310Z.2MwTiI`; local and remote monitor SHA-256 both `69790792ad1df7c6d792055098a2a3f1c1e54276fbe8a90078782060a4b7719b`, and renderer SHA-256 both `0dabd04339fb7d5cc27debe49cbee9a2eeae3f2fa14903851633e544cd05fb11`; the manifest records kernel hash prefix `5d1248...`, initramfs hash prefix `2253b8...`, and pinned `xf86-input-libinput=1.5.0-r0`, `xinput=1.6.4-r2`, and `xterm=399-r0`. Probe 1 exited 0 after 42 frames and two motion ACKs; token `4444444444444444` recorded `guest_received=90816603923 ns` then `marker_drawn=90826034950 ns` (9.431027 ms). After the adjacent sync, token `5555555555555555` remained only `PERF_ARMED` for about nine seconds; probe 2 then exited 0 after 15 frames and two motion ACKs and recorded `guest_received=143585443088 ns` then `marker_drawn=143607414779 ns` (21.971691 ms). The log contains no `PERF_ERROR`. | Exact-source live evidence for source-generation rotation, the adjacent idle arm boundary, and the guest marker draw/ACK subpath. It still does not bind marker pixels to an exact SwiftSpice frame revision/delivery and AppKit presented callback; it therefore does not complete AIP-00 or justify an AIP-44 scheduling change. |
+| AIP-00 | 2026-08-29 | Rocky 9 native XI2 application-ready run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T221334Z.L7UYBw`; local and remote source hashes match: `xi2-event-monitor.c` SHA-256 `219277b6af523c2600a0aea8d80eb9e45998907b90891d329b34cfab487f1070` and `input-marker-monitor.sh` SHA-256 `aee0d9ae049bfb155b378b44462030aee728a4f6fbb86e46efd128de9f00d96c`. The manifest records `guest_xi2_monitor=native-xi2-select-sync-v1`, `guest_libx11=1.8.11-r0`, `guest_libxi=1.8.2-r0`, kernel SHA-256 `5d124820329f4c664cdb61635ada850e89a6ac1aea171a7079daa25add349289`, and initramfs SHA-256 `ba424f6b8084e436876a1f5c60312f3f0ce29c321ebf8a940262a5070d9ff344`. Probe 1 exited 0 after 42 frames and two motion ACKs; token `6666666666666666` recorded `guest_received=35525744079 ns` then `marker_drawn=35535631312 ns` (9.887233 ms). After the adjacent sync, token `7777777777777777` remained only `PERF_ARMED` for about 14 seconds without new input; the subsequent probe exited 0 after 11 frames and two motion ACKs and recorded `guest_received=85115646987 ns` then `marker_drawn=85136868964 ns` (21.222977 ms). Neither probe logged `PERF_ERROR`. | Live closure that the native helper reaches application readiness only after `XISelectEvents` and its `XSync` round trip, while source rotation preserves the adjacent idle arm boundary. This remains guest-causal marker draw/ACK evidence: marker pixels are not bound to an exact SwiftSpice frame revision/delivery and AppKit presented callback, so it is not a completed input-to-visible latency measurement and does not complete AIP-00. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
@@ -399,3 +529,5 @@ behavior remain separate acceptance gates.
 | 2026-08-28 | AIP-00, AIP-44 | Prioritize perceived interaction latency, decompose it before optimization, then evaluate clarity; keep CPU and RSS as guardrails | The adjacent Maspice observation improved snapshot and selection-request-to-presented time while ready-to-selection p95 regressed sharply. Because the reported diagnostic interval contained no correlated input event, the observation cannot identify input scheduling as a cause. Immediate or adaptive frame selection therefore requires same-action input/revision tokens, first-ready and selected-ready timestamps, tick-phase and drawable-capacity evidence, and must retain latest-only, idle no-commit, and bounded GPU in-flight invariants. |
 | 2026-08-28 | AIP-00, AIP-44 | Land revision-accurate selected-ready diagnostics before any AIP-44 scheduling change | A pacing experiment is interpretable only after coalesced revisions carry their own ready timestamp and unsolicited exact duplicate identities cannot move or re-wake that timestamp. Explicit authoritative `requestLatest()` redraws receive a fresh delivery identity even when frame revision and generation are unchanged, preserving retry and resize behavior; live paired external artifacts remain the completion gate. |
 | 2026-08-28 | AIP-00 | Use the Rocky 9 rootless Podman/KVM fixture first for real connectivity and receive-to-present baselines; do not treat its autonomous animation as paired interaction evidence | The current animation has no causal input token. Before the fixture can admit click/key/motion-to-visible observations, the guest must emit a unique rendered marker and the harness must retain a per-event trace that correlates that marker through the matching presented revision. Until then, the fixture can validate transport and the receive-to-surface-ready-to-selection-to-Metal-commit-to-presented pipeline only. |
+| 2026-08-28 | AIP-00, AIP-44 | Land a unique guest input-marker state machine and normalized per-event trace schema before scheduling experiments | The fixture can now pre-arm one click/key/motion token, consume it only on a matching real guest input, draw a deterministic high-contrast ROI, and record guest marker evidence. Autonomous animation remains ineligible. This slice does not yet bind captured marker pixels to an exact AppKit presented delivery; that live Rocky correlation remains mandatory before any paired latency artifact or AIP-44 scheduling claim. |
+| 2026-08-29 | AIP-00, AIP-44 | Treat the successful Rocky eudev/Xorg marker run as guest-causal subpath evidence, not an input-to-visible result | Key, motion, and click now reach the guest marker and relative motion produces protocol ACKs, but no collector yet binds those marker pixels to an exact SwiftSpice delivery and AppKit presented callback. Complete that binding and paired `v0.2.7`/`v0.3.x` traces before selecting an immediate or adaptive ready-to-selection policy. |

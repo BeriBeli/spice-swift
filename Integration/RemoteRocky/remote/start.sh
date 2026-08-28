@@ -41,15 +41,23 @@ if grep -Evq '^[a-z0-9_]+=[A-Za-z0-9._:+-]+$' "${manifest}"; then
 fi
 required_manifest_keys=(
     manifest_version
+    guest_marker_clock
+    guest_xi2_monitor
     guest_kernel
     guest_alpine_base
+    guest_coreutils
     guest_dbus
+    guest_eudev
     guest_font_dejavu
+    guest_libx11
+    guest_libxi
     guest_linux_virt
     guest_openbox
     guest_spice_vdagent
     guest_spice_webdavd
     guest_xclip
+    guest_xf86_input_libinput
+    guest_xinput
     guest_xorg_server
     guest_xrandr
     guest_xsetroot
@@ -64,6 +72,8 @@ for key in "${required_manifest_keys[@]}"; do
     fi
 done
 if [[ "$(grep -c '^manifest_version=1$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_xi2_monitor=native-xi2-select-sync-v1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel=linux-virt-[0-9][A-Za-z0-9._+-]*$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 ]]; then
@@ -85,6 +95,8 @@ run_dir="$(mktemp -d "${PERF_LOGS}/${run_prefix}.XXXXXX")"
 run_id="${run_dir##*/}"
 mkdir -p "${run_dir}/rounds"
 chmod 0700 "${run_dir}" "${run_dir}/rounds"
+: > "${run_dir}/input-events.jsonl"
+chmod 0600 "${run_dir}/input-events.jsonl"
 
 ticket="$(openssl rand -hex 24)"
 umask 077
@@ -101,6 +113,8 @@ jpeg_wan_compression=auto
 zlib_glz_wan_compression=auto
 streaming_video=filter
 playback_compression=on
+interaction_trace_schema=1
+interaction_trace_path=${run_dir}/input-events.jsonl
 EOF
 cat "${manifest}" >> "${run_dir}/configuration.txt"
 cp "${manifest}" "${run_dir}/guest-build-manifest.env"
