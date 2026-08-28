@@ -3,21 +3,59 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+enter_lifecycle_lock "$@"
+
 if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
     echo "Performance endpoint is already running."
     exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
 fi
 
+startup_complete=false
+cleanup_failed_start() {
+    result=$?
+    trap - EXIT HUP INT TERM
+    if [[ "${startup_complete}" != true ]]; then
+        stop_endpoint_locked >/dev/null 2>&1 || true
+        echo "Performance endpoint startup failed; active state was removed." >&2
+    fi
+    exit "${result}"
+}
+trap cleanup_failed_start EXIT
+trap 'exit 1' HUP INT TERM
+
 podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
 
+manifest="${PERF_ARTIFACTS}/build-manifest.env"
 if [[ ! -r "${PERF_ARTIFACTS}/vmlinuz-virt" \
-    || ! -r "${PERF_ARTIFACTS}/perf-initramfs.cpio.gz" ]]; then
+    || ! -r "${PERF_ARTIFACTS}/perf-initramfs.cpio.gz" \
+    || ! -r "${manifest}" ]]; then
     echo "Guest artifacts are missing; run the guest build first." >&2
     exit 1
 fi
+if grep -Evq '^[a-z0-9_]+=[A-Za-z0-9._:+-]+$' "${manifest}"; then
+    echo "Guest build manifest is malformed." >&2
+    exit 1
+fi
+if [[ "$(grep -c '^manifest_version=1$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_kernel=linux-virt-[0-9][A-Za-z0-9._+-]*$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 ]]; then
+    echo "Guest build manifest is incomplete." >&2
+    exit 1
+fi
+expected_kernel_sha256="$(sed -n 's/^guest_kernel_sha256=//p' "${manifest}")"
+expected_initramfs_sha256="$(sed -n 's/^guest_initramfs_sha256=//p' "${manifest}")"
+actual_kernel_sha256="$(sha256sum "${PERF_ARTIFACTS}/vmlinuz-virt" | awk '{print $1}')"
+actual_initramfs_sha256="$(sha256sum "${PERF_ARTIFACTS}/perf-initramfs.cpio.gz" | awk '{print $1}')"
+if [[ "${actual_kernel_sha256}" != "${expected_kernel_sha256}" \
+    || "${actual_initramfs_sha256}" != "${expected_initramfs_sha256}" ]]; then
+    echo "Guest artifacts do not match the build manifest." >&2
+    exit 1
+fi
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)"
-run_dir="${PERF_LOGS}/${run_id}"
+run_prefix="$(date -u +%Y%m%dT%H%M%SZ)"
+run_dir="$(mktemp -d "${PERF_LOGS}/${run_prefix}.XXXXXX")"
+run_id="${run_dir##*/}"
 mkdir -p "${run_dir}/rounds"
 chmod 0700 "${run_dir}" "${run_dir}/rounds"
 
@@ -36,10 +74,9 @@ jpeg_wan_compression=auto
 zlib_glz_wan_compression=auto
 streaming_video=filter
 playback_compression=on
-guest_kernel=linux-virt-6.12.98-r0
-guest_spice_vdagent=0.22.1-r2
-guest_spice_webdavd=3.0-r4
 EOF
+cat "${manifest}" >> "${run_dir}/configuration.txt"
+cp "${manifest}" "${run_dir}/guest-build-manifest.env"
 
 podman run --rm "${PERF_IMAGE}" qemu-system-x86_64 --version > "${run_dir}/versions.txt"
 podman run --rm "${PERF_IMAGE}" dpkg-query -W libspice-server1 qemu-system-x86 qemu-system-modules-spice \
@@ -84,7 +121,8 @@ printf '%s\n' "$!" > "${PERF_STATE}/log-follower.pid"
 
 ready=false
 for _ in $(seq 1 60); do
-    if ss -ltn | grep -q "127.0.0.1:${PERF_SPICE_PORT}" \
+    if loopback_port_is_listening "${PERF_SPICE_PORT}" \
+        && loopback_port_is_listening "${PERF_CONTROL_PORT}" \
         && grep -q 'PERF_READY resolution=1280x720' "${run_dir}/server.log" 2>/dev/null; then
         ready=true
         break
@@ -98,7 +136,9 @@ if [[ "${ready}" != true ]]; then
     exit 1
 fi
 
+startup_complete=true
+trap - EXIT HUP INT TERM
 echo "Performance endpoint ready."
-echo "SPICE: 127.0.0.1:${PERF_SPICE_PORT} on rocky8"
+echo "SPICE: 127.0.0.1:${PERF_SPICE_PORT} on $(hostname)"
 echo "Read the temporary ticket with remote/ticket.sh and keep it out of logs."
 echo "Run evidence: ${run_dir}"
