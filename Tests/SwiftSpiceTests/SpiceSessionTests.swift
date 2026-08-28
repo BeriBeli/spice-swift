@@ -596,6 +596,96 @@ struct SpiceSessionTests {
         await session.disconnect()
     }
 
+    @Test func disconnectClosesSessionImageCacheAndWakesPendingDisplayResolve() async throws {
+        let displayChannel = [SpiceChannelID(type: 2, id: 0)]
+        let main = StreamingSessionTransport(initial: try makeServerTranscript(
+            channels: displayChannel
+        ))
+        let display = StreamingSessionTransport(initial: try makeLinkResponses())
+        let transports = TransportPool([main, display])
+        let imageCache = DisplayImageCache()
+        let session = SpiceSession(
+            transportFactory: { _ in transports.take() },
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCache }
+        )
+        _ = try await session.connect(
+            endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
+            credentials: SpiceCredentials(password: "secret")
+        )
+        await display.waitForOutboundCount(4)
+        await display.enqueue(try encodeMini(SpiceMsgDisplaySurfaceCreate(
+            surfaceID: 1,
+            width: 2,
+            height: 1,
+            format: 32,
+            flags: 1
+        )))
+        await display.enqueue(encodeMini(id: 304, body: sessionCachedCopyBody(
+            descriptorID: 0xc001
+        )))
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
+
+        let activeMutation = try await imageCache.begin(
+            id: 0xc002,
+            lossy: false,
+            mode: .cache,
+            retainedByteCount: 3
+        )
+        let queuedMutation = Task { () -> Result<Void, ChannelError> in
+            do {
+                let mutation = try await imageCache.begin(
+                    id: 0xc002,
+                    lossy: false,
+                    mode: .cache,
+                    retainedByteCount: 5
+                )
+                await imageCache.abort(mutation)
+                return .success(())
+            } catch let error as ChannelError {
+                return .failure(error)
+            } catch {
+                return .failure(.invalidState)
+            }
+        }
+        for _ in 0..<1_000 {
+            if await imageCache.diagnosticsSnapshot().queuedMutationCount == 1 { break }
+            await Task.yield()
+        }
+        var diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.pendingMutationCount == 2)
+        #expect(diagnostics.pendingReservationCount == 1)
+        #expect(diagnostics.queuedMutationCount == 1)
+        #expect(diagnostics.mutationRetainedBytes == 8)
+
+        await session.disconnect()
+
+        switch await queuedMutation.value {
+        case .success:
+            Issue.record("queued cache mutation unexpectedly survived Session disconnect")
+        case let .failure(error):
+            #expect(error == .transport(.connectionClosed))
+        }
+        #expect(await imageCache.commit(activeMutation) == .discarded)
+        diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.pendingReservationCount == 0)
+        #expect(diagnostics.pendingMutationCount == 0)
+        #expect(diagnostics.queuedMutationCount == 0)
+        #expect(diagnostics.mutationRetainedBytes == 0)
+        #expect(diagnostics.pendingWaiterCount == 0)
+        #expect(diagnostics.retainedBytes == 0)
+        await #expect(throws: ChannelError.transport(.connectionClosed)) {
+            _ = try await imageCache.resolve(id: 0xc001, requirement: .any)
+        }
+        #expect(!(await main.isConnected))
+        #expect(!(await display.isConnected))
+    }
+
     @Test func publishesAgentConnectedStateFromMainInit() async throws {
         let transport = StreamingSessionTransport(initial: try makeServerTranscript(
             channels: [],
@@ -1817,9 +1907,13 @@ struct SpiceSessionTests {
             target,
             targetPlayback,
         ])
+        let sourceCache = DisplayImageCache()
+        let targetCache = DisplayImageCache()
+        let imageCaches = ImageCachePool([sourceCache, targetCache])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
-            ticketEncryptor: SessionTicketEncryptor()
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCaches.take() }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -1843,8 +1937,11 @@ struct SpiceSessionTests {
         #expect(!(await sourcePlayback.isConnected))
         #expect(await target.isConnected)
         #expect(await targetPlayback.isConnected)
+        await expectImageCacheClosed(sourceCache, id: 0xd400)
+        try await expectImageCacheOpen(targetCache, id: 0xd401)
 
         await session.disconnect()
+        await expectImageCacheClosed(targetCache, id: 0xd402)
     }
 
     @Test func agentManagerClassifiesClipboardWireFailuresWithoutContent() async throws {
@@ -2438,9 +2535,13 @@ struct SpiceSessionTests {
         )
         let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
         let transports = TransportPool([source, sourceInputs, target, targetInputs])
+        let sourceCache = DisplayImageCache()
+        let targetCache = DisplayImageCache()
+        let imageCaches = ImageCachePool([sourceCache, targetCache])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
-            ticketEncryptor: SessionTicketEncryptor()
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCaches.take() }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -2486,6 +2587,8 @@ struct SpiceSessionTests {
         #expect(await target.isConnected)
         #expect(!(await sourceInputs.isConnected))
         #expect(await targetInputs.isConnected)
+        try await expectImageCacheOpen(sourceCache, id: 0xd100)
+        await expectImageCacheClosed(targetCache, id: 0xd101)
         desktop.cancel()
         let targetInputLink = try decodeLinkRequest(
             try #require((await targetInputs.outbound).first)
@@ -2497,6 +2600,7 @@ struct SpiceSessionTests {
         #expect(await sourceInputs.outbound.count == sourceInputCount)
         #expect(await targetInputs.outbound.count == targetInputCount + 1)
         await session.disconnect()
+        await expectImageCacheClosed(sourceCache, id: 0xd102)
         #expect(!(await target.isConnected))
         #expect(!(await targetInputs.isConnected))
     }
@@ -2513,9 +2617,13 @@ struct SpiceSessionTests {
         )
         let targetInputs = StreamingSessionTransport(initial: try makeLinkResponses())
         let transports = TransportPool([source, sourceInputs, target, targetInputs])
+        let sourceCache = DisplayImageCache()
+        let preparedTargetCache = DisplayImageCache()
+        let imageCaches = ImageCachePool([sourceCache, preparedTargetCache])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
-            ticketEncryptor: SessionTicketEncryptor()
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCaches.take() }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -2569,6 +2677,8 @@ struct SpiceSessionTests {
         #expect(!(await sourceInputs.isConnected))
         #expect(await target.isConnected)
         #expect(await targetInputs.isConnected)
+        try await expectImageCacheOpen(sourceCache, id: 0xd200)
+        await expectImageCacheClosed(preparedTargetCache, id: 0xd201)
 
         let targetInputCount = await targetInputs.outbound.count
         try await session.send(.mousePosition(x: 40, y: 50, displayID: 0))
@@ -2578,6 +2688,7 @@ struct SpiceSessionTests {
         var reboundBody = try ByteReader(try decodeMiniBody(reboundInput), offset: 8)
         #expect(try reboundBody.readUInt16LE() == 1)
         await session.disconnect()
+        await expectImageCacheClosed(sourceCache, id: 0xd202)
     }
 
     @Test func agentManagerRemainsUsableAfterSeamlessMigration() async throws {
@@ -3002,9 +3113,13 @@ struct SpiceSessionTests {
             .failure(.connectionFailed("target fixture rejected handshake")),
         ])
         let transports = TransportPool([source, target])
+        let sourceCache = DisplayImageCache()
+        let targetCache = DisplayImageCache()
+        let imageCaches = ImageCachePool([sourceCache, targetCache])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
-            ticketEncryptor: SessionTicketEncryptor()
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCaches.take() }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -3032,6 +3147,8 @@ struct SpiceSessionTests {
         #expect(try decodeMiniMessageID(outbound.last ?? Data()) == 103)
         #expect(await target.isClosed)
         #expect(await source.isConnected)
+        await expectImageCacheClosed(targetCache, id: 0xd500)
+        try await expectImageCacheOpen(sourceCache, id: 0xd501)
 
         await source.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 3, currentMode: 2)
@@ -3040,15 +3157,20 @@ struct SpiceSessionTests {
         #expect(await session.currentAgentConnectionState() == false)
         desktop.cancel()
         await session.disconnect()
+        await expectImageCacheClosed(sourceCache, id: 0xd502)
     }
 
     @Test func cancellingMigrationPreparationClosesOnlyTargetTransport() async throws {
         let source = StreamingSessionTransport(initial: try makeServerTranscript(channels: []))
         let target = BlockingTransport()
         let transports = TransportPool([source, target])
+        let sourceCache = DisplayImageCache()
+        let targetCache = DisplayImageCache()
+        let imageCaches = ImageCachePool([sourceCache, targetCache])
         let session = SpiceSession(
             transportFactory: { _ in transports.take() },
-            ticketEncryptor: SessionTicketEncryptor()
+            ticketEncryptor: SessionTicketEncryptor(),
+            imageCacheFactory: { imageCaches.take() }
         )
         _ = try await session.connect(
             endpoint: SpiceEndpoint(host: "fixture.invalid", port: 5_900),
@@ -3069,6 +3191,8 @@ struct SpiceSessionTests {
         await target.waitUntilClosed()
         #expect(await target.isClosed)
         #expect(await source.isConnected)
+        await expectImageCacheClosed(targetCache, id: 0xd300)
+        try await expectImageCacheOpen(sourceCache, id: 0xd301)
 
         await source.enqueue(try encodeMini(
             SpiceMsgMainMouseMode(supportedModes: 1, currentMode: 1)
@@ -3082,6 +3206,7 @@ struct SpiceSessionTests {
         #expect(resumedPointerMode == .relative)
         desktop.cancel()
         await session.disconnect()
+        await expectImageCacheClosed(sourceCache, id: 0xd302)
     }
 
     @Test func newerMigrationCancelsInFlightPreparationAndCommitsOnlyAfterEnd() async throws {
@@ -3235,6 +3360,32 @@ struct SpiceSessionTests {
         return writer.data
     }
 
+    private func sessionCachedCopyBody(descriptorID: UInt64) -> Data {
+        var writer = ByteWriter()
+        writer.writeUInt32LE(1)
+        for value: Int32 in [0, 0, 1, 2] {
+            writer.writeInt32LE(value)
+        }
+        writer.writeUInt8(0)
+        let imageOffset = UInt32(writer.data.count + 36)
+        writer.writeUInt32LE(imageOffset)
+        for value: Int32 in [0, 0, 1, 2] {
+            writer.writeInt32LE(value)
+        }
+        writer.writeUInt16LE(0x08)
+        writer.writeUInt8(0)
+        writer.writeUInt8(0)
+        writer.writeInt32LE(0)
+        writer.writeInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt64LE(descriptorID)
+        writer.writeUInt8(103)
+        writer.writeUInt8(0)
+        writer.writeUInt32LE(2)
+        writer.writeUInt32LE(1)
+        return writer.data
+    }
+
     private func uint32(_ value: UInt32) -> Data {
         var writer = ByteWriter()
         writer.writeUInt32LE(value)
@@ -3260,6 +3411,66 @@ struct SpiceSessionTests {
 
 private func requireSendable<T: Sendable>(_ value: T) {
     _ = value
+}
+
+private func expectImageCacheOpen(
+    _ cache: DisplayImageCache,
+    id: UInt64
+) async throws {
+    let bitmap = RawBitmap(
+        format: .xRGB8888,
+        width: 1,
+        height: 1,
+        stride: 4,
+        topDown: true,
+        pixels: Data([1, 2, 3, 0])
+    )
+    let reservation = try await cache.reserve(
+        id: id,
+        bitmap: bitmap,
+        lossy: false,
+        mode: .cache
+    )
+    #expect(await cache.commit(reservation) == .committed)
+    #expect(try await cache.resolve(id: id, requirement: .any) == bitmap)
+}
+
+private func expectImageCacheClosed(
+    _ cache: DisplayImageCache,
+    id: UInt64
+) async {
+    await #expect(throws: ChannelError.transport(.connectionClosed)) {
+        _ = try await cache.reserve(
+            id: id,
+            bitmap: RawBitmap(
+                format: .xRGB8888,
+                width: 1,
+                height: 1,
+                stride: 4,
+                topDown: true,
+                pixels: Data([1, 2, 3, 0])
+            ),
+            lossy: false,
+            mode: .cache
+        )
+    }
+    await #expect(throws: ChannelError.transport(.connectionClosed)) {
+        _ = try await cache.resolve(id: id, requirement: .any)
+    }
+}
+
+private final class ImageCachePool: Sendable {
+    private let caches: Mutex<[DisplayImageCache]>
+
+    init(_ caches: [DisplayImageCache]) {
+        self.caches = Mutex(caches)
+    }
+
+    func take() -> DisplayImageCache {
+        caches.withLock { caches in
+            caches.removeFirst()
+        }
+    }
 }
 
 private final class TransportPool: Sendable {
