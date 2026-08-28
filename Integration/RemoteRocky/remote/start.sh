@@ -41,6 +41,7 @@ if grep -Evq '^[a-z0-9_]+=[A-Za-z0-9._:+-]+$' "${manifest}"; then
 fi
 required_manifest_keys=(
     manifest_version
+    guest_marker_clock
     guest_kernel
     guest_alpine_base
     guest_coreutils
@@ -68,6 +69,7 @@ for key in "${required_manifest_keys[@]}"; do
     fi
 done
 if [[ "$(grep -c '^manifest_version=1$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel=linux-virt-[0-9][A-Za-z0-9._+-]*$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 ]]; then

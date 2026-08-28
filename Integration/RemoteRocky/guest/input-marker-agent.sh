@@ -38,14 +38,39 @@ valid_uint64_text() {
 }
 
 monotonic_nanoseconds() {
-    awk '{ printf "%.0f\n", $1 * 1000000000 }' /proc/uptime
+    if test -n "${PERF_MARKER_CLOCK_COMMAND:-}"; then
+        "${PERF_MARKER_CLOCK_COMMAND}"
+    elif test -x /usr/local/bin/monotonic-nanoseconds; then
+        /usr/local/bin/monotonic-nanoseconds
+    elif command -v python3 >/dev/null 2>&1; then
+        # Host-run shell tests do not boot the Alpine initramfs. Production
+        # always installs the static clock_gettime helper above.
+        python3 -c 'import time; print(time.monotonic_ns())'
+    else
+        return 1
+    fi
 }
 
 event_clock_nanoseconds() {
-    if test -r /proc/uptime; then
-        monotonic_nanoseconds
+    value="$(monotonic_nanoseconds)" || return 1
+    valid_uint64_text "${value}" || return 1
+    printf '%s\n' "${value}"
+}
+
+clock_samples() {
+    count="$1"
+    if test -n "${PERF_MARKER_CLOCK_COMMAND:-}"; then
+        "${PERF_MARKER_CLOCK_COMMAND}" "${count}"
+    elif test -x /usr/local/bin/monotonic-nanoseconds; then
+        /usr/local/bin/monotonic-nanoseconds "${count}"
     elif command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import time; print(time.monotonic_ns())'
+        python3 -c '
+import sys
+import time
+
+for _ in range(int(sys.argv[1])):
+    print(time.monotonic_ns())
+' "${count}"
     else
         return 1
     fi
@@ -53,7 +78,9 @@ event_clock_nanoseconds() {
 
 read_ack_record() {
     timeout_ns="$1"
-    if test -r /proc/uptime; then
+    if test -x /usr/local/bin/monotonic-nanoseconds; then
+        # The Alpine initramfs pairs the static clock helper with BusyBox ash,
+        # whose `read -t` accepts fractional seconds.
         timeout_seconds="$(awk -v nanoseconds="${timeout_ns}" \
             'BEGIN { printf "%.6f", nanoseconds / 1000000000 }')"
         IFS= read -r -t "${timeout_seconds}" acknowledged_revision <&3
@@ -206,6 +233,25 @@ if test "${1:-}" = --self-test-jsonl; then
     exit 0
 fi
 
+if test "${1:-}" = --self-test-clock; then
+    test "$#" -eq 2 || fail invalid_clock_sample_count
+    valid_uint64_text "$2" || fail invalid_clock_sample_count
+    test "$2" -gt 0 && test "$2" -le 100 || fail invalid_clock_sample_count
+    samples="$(clock_samples "$2")" || fail marker_clock_unavailable
+    if ! printf '%s\n' "${samples}" | awk -v expected="$2" '
+        /^[0-9]+$/ {
+            print "PERF_MARKER_CLOCK monotonic_ns=" $0
+            count += 1
+            next
+        }
+        { invalid = 1 }
+        END { exit(invalid || count != expected) }
+    '; then
+        fail marker_clock_unavailable
+    fi
+    exit 0
+fi
+
 lock_dir="${state_dir}/lock"
 if ! mkdir "${lock_dir}" 2>/dev/null; then
     fail state_busy
@@ -268,7 +314,11 @@ case "${command}" in
         if test "${action_class}" != "${armed_class}"; then
             exit 0
         fi
-        guest_received_ns="${3:-$(monotonic_nanoseconds)}"
+        if test "$#" -ge 3; then
+            guest_received_ns="$3"
+        else
+            guest_received_ns="$(event_clock_nanoseconds)" || fail marker_clock_unavailable
+        fi
         valid_uint64_text "${guest_received_ns}" || fail invalid_guest_timestamp
         rm -f "${state_dir}/armed"
 
@@ -279,7 +329,11 @@ case "${command}" in
         printf '%s\n' "${marker_revision}" > "${state_dir}/marker-revision"
         echo "PERF_TRACE event=guest_received action_class=${action_class} token=${token} guest_ns=${guest_received_ns} marker_revision=${marker_revision}"
         render_marker "${token}" "${marker_revision}"
-        marker_drawn_ns="${4:-$(monotonic_nanoseconds)}"
+        if test "$#" -eq 4; then
+            marker_drawn_ns="$4"
+        else
+            marker_drawn_ns="$(event_clock_nanoseconds)" || fail marker_clock_unavailable
+        fi
         valid_uint64_text "${marker_drawn_ns}" || fail invalid_marker_timestamp
         test "${marker_drawn_ns}" -ge "${guest_received_ns}" || fail marker_time_regressed
         echo "PERF_TRACE event=marker_drawn action_class=${action_class} token=${token} guest_ns=${marker_drawn_ns} marker_revision=${marker_revision}"

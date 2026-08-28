@@ -44,6 +44,33 @@ Remote lifecycle commands:
 ~/swiftspice-remote-closure/perf-ab/remote/stop.sh
 ```
 
+Build the Alpine guest with its dedicated builder image from the repository
+root. The QEMU runtime image intentionally contains neither a C compiler nor
+the guest build toolchain:
+
+```sh
+podman build \
+  --file Integration/RemoteRocky/GuestBuilder.Containerfile \
+  --tag localhost/swiftspice-guest-builder:alpine-3.22 \
+  Integration/RemoteRocky
+podman run --rm \
+  --volume "$PWD/Integration/RemoteRocky:/work:Z" \
+  localhost/swiftspice-guest-builder:alpine-3.22 \
+  /work/build-guest.sh
+```
+
+The builder is based on Alpine 3.22 and pins `build-base`,
+`fortify-headers`, and the util-linux `flock` subpackage. The build script
+requires Alpine's `cc` and produces the marker clock helper as a static musl
+binary; it rejects an incomplete builder before creating any staged rootfs or
+artifacts. Do not add `--userns=keep-id`: `apk --root` must run as root inside
+the container to create and populate the guest chroot. Podman itself remains a
+rootless process owned by the invoking Rocky user; container root is mapped
+through the rootless user namespace and does not grant host root privileges.
+It publishes verified output under `Integration/RemoteRocky/rootfs` and
+`Integration/RemoteRocky/artifacts`, serialized with the same lifecycle lock
+used by start and stop.
+
 `control.sh stop` stops only the animated workload and returns to the static
 desktop. `remote/stop.sh` stops QEMU. Start/reset always begins the same
 30-frame-per-second animation at frame zero. A successful start requires both
@@ -106,6 +133,13 @@ and closing the final endpoint discards the unconsumed record rather than
 delivering it to a future workload. A missing acknowledgement or unexpected
 marker revision fails the event without emitting `marker_drawn`, releases the marker
 state lock, and lets the supervised input monitor restart instead of hanging.
+The XI2 monitor consumes only RawKeyPress, RawButtonPress, and RawMotion; it
+ignores each delivered counterpart so one physical input cannot consume a
+second arm. Guest timestamps come from a statically linked
+`clock_gettime(CLOCK_MONOTONIC)` helper rather than `/proc/uptime`'s coarse
+text representation. Startup requires the manifest capability
+`guest_marker_clock=clock_gettime-monotonic-v1`, and a missing or malformed
+clock sample fails the event explicitly.
 The guest image pins `xf86-input-libinput`; without that Xorg input driver,
 SPICE input can reach the guest device while producing no XI2 event for the
 marker monitor. The build manifest records the exact driver package version,

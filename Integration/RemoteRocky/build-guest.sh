@@ -8,8 +8,12 @@ readonly source=/work/guest
 readonly state=/work/state
 readonly lifecycle_lock="${state}/lifecycle.lock"
 
+if ! command -v cc >/dev/null 2>&1; then
+    echo "The Alpine guest builder must provide cc." >&2
+    exit 1
+fi
 if ! command -v flock >/dev/null 2>&1; then
-    echo "The Alpine builder must provide flock." >&2
+    echo "The Alpine guest builder must provide flock." >&2
     exit 1
 fi
 
@@ -70,7 +74,7 @@ apk \
         dbus=1.16.2-r1 \
         eudev=3.2.14-r5 \
         font-dejavu=2.37-r6 \
-        linux-virt=6.12.103-r0 \
+        linux-virt=6.12.107-r0 \
         openbox=3.6.1-r8 \
         spice-vdagent=0.22.1-r2 \
         spice-webdavd=3.0-r4 \
@@ -92,6 +96,9 @@ install -m 0755 "${source}/input-diagnostics.sh" "${rootfs}/usr/local/bin/input-
 install -m 0755 "${source}/input-marker-agent.sh" "${rootfs}/usr/local/bin/input-marker-agent.sh"
 install -m 0755 "${source}/input-marker-monitor.sh" "${rootfs}/usr/local/bin/input-marker-monitor.sh"
 install -m 0755 "${source}/input-marker-renderer.sh" "${rootfs}/usr/local/bin/input-marker-renderer.sh"
+cc -std=c11 -Os -Wall -Wextra -Werror -static \
+    -o "${rootfs}/usr/local/bin/monotonic-nanoseconds" \
+    "${source}/monotonic-nanoseconds.c"
 
 cp "${rootfs}/boot/vmlinuz-virt" "${artifacts}/vmlinuz-virt"
 (
@@ -127,6 +134,7 @@ if [ -z "${kernel_version}" ]; then
 fi
 {
     echo 'manifest_version=1'
+    echo 'guest_marker_clock=clock_gettime-monotonic-v1'
     printf 'guest_kernel=linux-virt-%s\n' "${kernel_version}"
     record_package alpine-base guest_alpine_base
     record_package coreutils guest_coreutils
@@ -149,6 +157,7 @@ fi
 } > "${manifest}"
 
 if [ "$(grep -c '^manifest_version=1$' "${manifest}")" -ne 1 ] \
+    || [ "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ]; then
     echo "Generated guest build manifest is incomplete." >&2

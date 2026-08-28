@@ -4,6 +4,64 @@ import Testing
 
 @Suite("Remote Rocky fixture scripts")
 struct RemoteRockyFixtureTests {
+    @Test func guestBuilderOwnsBuildToolsAndRuntimeRemainsMinimal() throws {
+        let builder = try script("Integration/RemoteRocky/GuestBuilder.Containerfile")
+        let runtime = try script("Integration/RemoteRocky/Containerfile")
+        let readme = try script("Integration/RemoteRocky/REMOTE_ROCKY.md")
+        let buildGuest = try script("Integration/RemoteRocky/build-guest.sh")
+
+        #expect(builder.contains("FROM docker.io/library/alpine:3.22"))
+        #expect(builder.contains("build-base=0.5-r3"))
+        #expect(builder.contains("fortify-headers=1.1-r5"))
+        #expect(builder.contains("flock=2.41-r9"))
+
+        let compilerCheck = try #require(buildGuest.range(of: "command -v cc"))
+        let lockCheck = try #require(buildGuest.range(of: "command -v flock"))
+        let firstStagingDirectory = try #require(buildGuest.range(of: "mktemp -d /work/.rootfs"))
+        #expect(compilerCheck.lowerBound < firstStagingDirectory.lowerBound)
+        #expect(lockCheck.lowerBound < firstStagingDirectory.lowerBound)
+        #expect(buildGuest.contains("\ncc -std=c11 -Os -Wall -Wextra -Werror -static"))
+        #expect(!buildGuest.contains("musl-gcc"))
+
+        for forbiddenPackage in ["gcc", "musl-tools", "musl-dev", "build-base"] {
+            #expect(!runtime.contains(forbiddenPackage))
+        }
+
+        let buildCommand = try #require(readme.range(of: "podman build \\"))
+        let recipe = try #require(readme.range(
+            of: "--file Integration/RemoteRocky/GuestBuilder.Containerfile",
+            range: buildCommand.lowerBound..<readme.endIndex
+        ))
+        let builderImage = try #require(readme.range(
+            of: "localhost/swiftspice-guest-builder:alpine-3.22",
+            range: recipe.lowerBound..<readme.endIndex
+        ))
+        let runCommand = try #require(readme.range(
+            of: "podman run --rm \\",
+            range: builderImage.lowerBound..<readme.endIndex
+        ))
+        let mount = try #require(readme.range(
+            of: #"--volume "$PWD/Integration/RemoteRocky:/work:Z""#,
+            range: runCommand.lowerBound..<readme.endIndex
+        ))
+        let runImage = try #require(readme.range(
+            of: "localhost/swiftspice-guest-builder:alpine-3.22",
+            range: mount.lowerBound..<readme.endIndex
+        ))
+        let guestBuild = try #require(readme.range(
+            of: "/work/build-guest.sh",
+            range: runImage.lowerBound..<readme.endIndex
+        ))
+        #expect(buildCommand.lowerBound < recipe.lowerBound)
+        #expect(recipe.lowerBound < builderImage.lowerBound)
+        #expect(builderImage.lowerBound < runCommand.lowerBound)
+        #expect(runCommand.lowerBound < mount.lowerBound)
+        #expect(mount.lowerBound < runImage.lowerBound)
+        #expect(runImage.lowerBound < guestBuild.lowerBound)
+        let runInvocation = readme[runCommand.lowerBound..<guestBuild.upperBound]
+        #expect(!runInvocation.contains("--userns=keep-id"))
+    }
+
     @Test func buildPublicationAndEndpointStartupShareOneLifecycleLock() throws {
         let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
         let commonScript = try script("Integration/RemoteRocky/remote/common.sh")
@@ -83,6 +141,8 @@ struct RemoteRockyFixtureTests {
         )
         let requiredKeys = RemoteRockyFixture.requiredManifestKeys
 
+        #expect(buildScript.contains("linux-virt=6.12.107-r0"))
+        #expect(!buildScript.contains("linux-virt=6.12.103-r0"))
         for key in requiredKeys {
             #expect(buildScript.contains(key), "build manifest must record \(key)")
         }
@@ -763,14 +823,30 @@ struct RemoteRockyFixtureTests {
         }
     }
 
-    @Test func guestInputMonitorMatchesCommonRawAndDeliveredXI2Events() throws {
+    @Test func guestInputMonitorCoalescesRawAndDeliveredXI2Counterparts() throws {
         let events = [
             "EVENT type 13 (RawKeyPress)",
+            "    detail: 38",
+            "    time: 1000",
             "EVENT type 2 (KeyPress)",
+            "    detail: 38",
+            "    time: 1000",
+            "EVENT type 13 (RawKeyPress)",
+            "    detail: 39",
+            "    time: 1001",
+            "EVENT type 2 (KeyPress)",
+            "    detail: 39",
+            "    time: 1001",
             "EVENT type 15 (RawButtonPress)",
+            "    detail: 1",
+            "    time: 1002",
             "EVENT type 4 (ButtonPress)",
+            "    detail: 1",
+            "    time: 1002",
             "EVENT type 17 (RawMotion)",
+            "    time: 1003",
             "EVENT type 6 (Motion)",
+            "    time: 1003",
             "EVENT type 14 (RawKeyRelease)",
             "EVENT type 11 (HierarchyChanged)",
             "    device: 2 (Virtual core pointer)",
@@ -788,10 +864,61 @@ struct RemoteRockyFixtureTests {
             "PERF_INPUT_MATCH action_class=key",
             "PERF_INPUT_MATCH action_class=key",
             "PERF_INPUT_MATCH action_class=click",
-            "PERF_INPUT_MATCH action_class=click",
-            "PERF_INPUT_MATCH action_class=motion",
             "PERF_INPUT_MATCH action_class=motion",
         ])
+    }
+
+    @Test func guestMarkerClockUsesAHighResolutionMonotonicSource() throws {
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-clock-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+        let clockSourceURL = repositoryRoot.appending(
+            path: "Integration/RemoteRocky/guest/monotonic-nanoseconds.c"
+        )
+        let clockExecutable = state.appending(path: "monotonic-nanoseconds")
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/clang")
+        compiler.arguments = [
+            "-std=c11", "-Wall", "-Wextra", "-Werror",
+            clockSourceURL.path, "-o", clockExecutable.path,
+        ]
+        try compiler.run()
+        compiler.waitUntilExit()
+        try #require(compiler.terminationStatus == 0)
+
+        let result = try runGuestScript(
+            "input-marker-agent.sh",
+            arguments: ["--self-test-clock", "64"],
+            environment: [
+                "PERF_MARKER_STATE_DIR": state.path,
+                "PERF_MARKER_CLOCK_COMMAND": clockExecutable.path,
+            ]
+        )
+        #expect(result.status == 0)
+
+        let samples = perfRecords(prefix: "PERF_MARKER_CLOCK", in: result.output)
+            .compactMap { record in
+                record["monotonic_ns"].flatMap(UInt64.init)
+            }
+        #expect(samples.count == 64)
+        let deltas: [UInt64] = zip(samples, samples.dropFirst()).compactMap { earlier, later in
+            guard later >= earlier else { return nil }
+            return later - earlier
+        }
+        #expect(deltas.count == 63)
+        #expect(deltas.contains { $0 > 0 && $0 < 10_000_000 })
+        #expect(Set(samples.map { $0 % 10_000_000 }).count > 1)
+
+        let clockSource = try String(contentsOf: clockSourceURL, encoding: .utf8)
+        let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+        #expect(clockSource.contains("clock_gettime(CLOCK_MONOTONIC"))
+        #expect(buildScript.contains("monotonic-nanoseconds.c"))
+        #expect(buildScript.contains("guest_marker_clock=clock_gettime-monotonic-v1"))
+        #expect(startScript.contains("guest_marker_clock"))
     }
 
     @Test func guestMarkerConsumesOnlyTheNextMatchingInputAndRendersItsToken() throws {
@@ -1503,6 +1630,7 @@ private struct RemoteRockyFixture {
         "guest_eudev",
         "guest_font_dejavu",
         "guest_linux_virt",
+        "guest_marker_clock",
         "guest_openbox",
         "guest_spice_vdagent",
         "guest_spice_webdavd",
@@ -1571,13 +1699,14 @@ private struct RemoteRockyFixture {
     ) throws {
         let values = [
             "manifest_version": "1",
-            "guest_kernel": "linux-virt-6.12.103-r0",
+            "guest_kernel": "linux-virt-6.12.107-r0",
             "guest_alpine_base": "3.22.5-r0",
             "guest_coreutils": "9.7-r1",
             "guest_dbus": "1.16.2-r1",
             "guest_eudev": "3.2.14-r5",
             "guest_font_dejavu": "2.37-r6",
-            "guest_linux_virt": "6.12.103-r0",
+            "guest_linux_virt": "6.12.107-r0",
+            "guest_marker_clock": "clock_gettime-monotonic-v1",
             "guest_openbox": "3.6.1-r8",
             "guest_spice_vdagent": "0.22.1-r2",
             "guest_spice_webdavd": "3.0-r4",

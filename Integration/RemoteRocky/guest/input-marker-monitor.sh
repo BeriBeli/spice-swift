@@ -6,9 +6,12 @@ export LC_ALL=C
 
 match_action_class() {
     case "$1" in
-        *'(RawKeyPress)'*|*'(KeyPress)'*) echo key ;;
-        *'(RawButtonPress)'*|*'(ButtonPress)'*) echo click ;;
-        *'(RawMotion)'*|*'(Motion)'*) echo motion ;;
+        # XI2 emits a Raw event and a delivered counterpart for the same
+        # physical input. Consume only Raw events so the counterpart cannot
+        # satisfy an arm installed immediately after the first event.
+        *'(RawKeyPress)'*) echo key ;;
+        *'(RawButtonPress)'*) echo click ;;
+        *'(RawMotion)'*) echo motion ;;
         *) return 1 ;;
     esac
 }
