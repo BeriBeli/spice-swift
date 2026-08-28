@@ -140,7 +140,11 @@ while true; do
                 invocation="${command#sync invocation=}"
                 if test "${#invocation}" -eq 32 \
                     && ! printf '%s' "${invocation}" | grep -q '[^0-9a-f]'; then
-                    echo "PERF_CONTROL_SYNC invocation=${invocation}"
+                    if /usr/local/bin/input-marker-monitor.sh checkpoint "${invocation}"; then
+                        echo "PERF_CONTROL_SYNC invocation=${invocation}"
+                    else
+                        echo "PERF_ERROR control_sync=monitor_checkpoint_failed"
+                    fi
                 else
                     echo "PERF_ERROR control_sync=invalid_invocation"
                 fi

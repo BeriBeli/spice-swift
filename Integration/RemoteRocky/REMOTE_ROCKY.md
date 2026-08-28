@@ -121,21 +121,36 @@ workloads render from row 6 onward. For the animated workload, marker output
 briefly stops the generator; an xterm terminal-status response confirms the
 ROI write was consumed before the renderer acknowledges the marker and resumes
 animation. The terminal-response barrier has one aggregate half-second bound;
-unrelated or malformed input fails it without an acknowledgement. Thus a
+its byte-state parser ignores unrelated input, including printable `n`, and
+accepts only exact `ESC [ 0 n` before one absolute monotonic deadline. EOF,
+malformed-only input, or timeout produces no acknowledgement. Thus a
 fullscreen workload cannot stack above or repaint the ROI after the
 acknowledgement. The guest agent waits at most two seconds for this renderer
 acknowledgement and drains any nonmatching stale revision within that same
 overall bound; a late revision may enter the FIFO, but it cannot satisfy or
 poison the current event. A monotonic nanosecond deadline is recorded before request
 publication. The agent opens the request FIFO read/write, publishes one small
-fixed record, and closes it immediately; with no renderer, open cannot block
-and closing the final endpoint discards the unconsumed record rather than
-delivering it to a future workload. A missing acknowledgement or unexpected
+fixed record, and closes it immediately. The renderer keeps its request FIFO
+read/write descriptor open for its entire main loop, including marker
+processing, so a second request cannot lose its reader between publication and
+the next read. With no renderer, the agent's open cannot block and closing its
+final endpoint discards the unconsumed record rather than delivering it to a
+future workload. A missing acknowledgement or unexpected
 marker revision fails the event without emitting `marker_drawn`, releases the marker
 state lock, and lets the supervised input monitor restart instead of hanging.
 The XI2 monitor consumes only RawKeyPress, RawButtonPress, and RawMotion; it
 ignores each delivered counterpart so one physical input cannot consume a
-second arm. Guest timestamps come from a statically linked
+second arm. It dispatches through a serialized worker so the XI2 reader keeps
+draining during marker processing. Key and click events stay FIFO; an atomic
+motion ownership token coalesces every later RawMotion delivered while one
+motion epoch is open. Before the next arm, the invocation sync places a
+checkpoint through the same XI2 event FIFO and serialized worker; only after
+all earlier records and agent calls drain does that checkpoint clear motion
+ownership and permit the sync echo. This is an explicit FIFO/worker epoch
+boundary, not a sleep-based burst heuristic. The checkpoint's single bounded
+wait budget covers both a monitor still creating its event FIFO at startup and
+the subsequent worker acknowledgement. Guest
+timestamps come from a statically linked
 `clock_gettime(CLOCK_MONOTONIC)` helper rather than `/proc/uptime`'s coarse
 text representation. Startup requires the manifest capability
 `guest_marker_clock=clock_gettime-monotonic-v1`, and a missing or malformed

@@ -7,6 +7,9 @@ ack_fifo="${PERF_MARKER_ACK_FIFO:-/run/perf-marker-ack}"
 test_mode=false
 workload_pid=
 saved_terminal_state=
+request_fd_open=false
+barrier_input_fd_open=false
+barrier_timeout_ns=500000000
 
 restore_terminal_state() {
     if test -n "${saved_terminal_state}"; then
@@ -18,12 +21,84 @@ restore_terminal_state() {
 cleanup() {
     trap - EXIT HUP INT TERM
     restore_terminal_state
+    if test "${request_fd_open}" = true; then
+        exec 5>&-
+        request_fd_open=false
+    fi
+    if test "${barrier_input_fd_open}" = true; then
+        exec 6<&-
+        barrier_input_fd_open=false
+    fi
     if test -n "${workload_pid}"; then
         kill "${workload_pid}" 2>/dev/null || true
         # SIGTERM remains pending while a process is job-control stopped.
         kill -CONT "${workload_pid}" 2>/dev/null || true
         wait "${workload_pid}" 2>/dev/null || true
     fi
+}
+
+valid_uint64_text() {
+    test -n "$1" && ! printf '%s' "$1" | grep -q '[^0-9]'
+}
+
+monotonic_nanoseconds() {
+    if test -n "${PERF_MARKER_CLOCK_COMMAND:-}"; then
+        "${PERF_MARKER_CLOCK_COMMAND}"
+    elif test -x /usr/local/bin/monotonic-nanoseconds; then
+        /usr/local/bin/monotonic-nanoseconds
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(time.monotonic_ns())'
+    else
+        return 1
+    fi
+}
+
+read_barrier_byte() {
+    remaining_ns="$1"
+    barrier_byte=
+    if test -x /usr/local/bin/monotonic-nanoseconds; then
+        timeout_seconds="$(awk -v nanoseconds="${remaining_ns}" \
+            'BEGIN { printf "%.6f", nanoseconds / 1000000000 }')"
+        IFS= read -r -n 1 -t "${timeout_seconds}" barrier_byte <&6
+        return
+    fi
+
+    barrier_byte="$(python3 -c '
+import os
+import select
+import sys
+
+timeout = int(sys.argv[1]) / 1_000_000_000
+if not select.select([6], [], [], timeout)[0]:
+    raise SystemExit(1)
+value = os.read(6, 1)
+if not value:
+    raise SystemExit(2)
+sys.stdout.buffer.write(value)
+' "${remaining_ns}" 6<&6)"
+}
+
+await_terminal_status() {
+    barrier_started_ns="$(monotonic_nanoseconds)" || return 1
+    valid_uint64_text "${barrier_started_ns}" || return 1
+    barrier_deadline_ns=$((barrier_started_ns + barrier_timeout_ns))
+    barrier_state=ground
+    escape="$(printf '\033')"
+    while true; do
+        barrier_now_ns="$(monotonic_nanoseconds)" || return 1
+        valid_uint64_text "${barrier_now_ns}" || return 1
+        remaining_ns=$((barrier_deadline_ns - barrier_now_ns))
+        test "${remaining_ns}" -gt 0 || return 1
+        read_barrier_byte "${remaining_ns}" || return 1
+        case "${barrier_state}:${barrier_byte}" in
+            "ground:${escape}") barrier_state=escape ;;
+            "escape:[") barrier_state=bracket ;;
+            "bracket:0") barrier_state=zero ;;
+            "zero:n") return 0 ;;
+            *:"${escape}") barrier_state=escape ;;
+            *) barrier_state=ground ;;
+        esac
+    done
 }
 
 terminate_after_signal() {
@@ -60,24 +135,21 @@ terminal_visibility_barrier() {
     fi
 
     # Xterm answers CSI 5 n only after consuming all preceding terminal input.
-    # One delimiter read gives the entire barrier a half-second bound, strictly
-    # below even an injected one-second agent ACK bound. An unrelated `n`, malformed
-    # response, or timeout fails this event without ACK. The agent additionally
-    # filters revisions in case an external or delayed writer leaves stale data.
+    # One absolute monotonic deadline bounds the complete parser to half a
+    # second. The state machine ignores unrelated bytes (including printable
+    # `n`) and accepts only the exact ESC [ 0 n response. Timeout or EOF fails
+    # this event without ACK.
     saved_terminal_state="$(stty -g < /dev/tty)"
     stty -echo -icanon min 1 time 0 < /dev/tty
+    exec 6< /dev/tty
+    barrier_input_fd_open=true
     printf '\033[5n' > /dev/tty
-    response=
-    escape="$(printf '\033')"
-    if ! IFS= read -r -d n -t 0.5 response < /dev/tty; then
-        restore_terminal_state
-        return 1
-    fi
+    result=0
+    await_terminal_status || result=$?
+    exec 6<&-
+    barrier_input_fd_open=false
     restore_terminal_state
-    case "${response}" in
-        *"${escape}[0") return 0 ;;
-        *) return 1 ;;
-    esac
+    return "${result}"
 }
 
 acknowledge_marker() {
@@ -120,6 +192,23 @@ process_marker() {
 }
 
 case "${1:-}" in
+    --self-test-barrier)
+        test "$#" -eq 1 || exit 2
+        if test -n "${PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS:-}"; then
+            barrier_timeout_ns="${PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS}"
+            valid_uint64_text "${barrier_timeout_ns}" || exit 2
+            test "${barrier_timeout_ns}" -gt 0 \
+                && test "${barrier_timeout_ns}" -le 500000000 || exit 2
+        fi
+        exec 6<&0
+        barrier_input_fd_open=true
+        if await_terminal_status; then
+            echo "PERF_MARKER_BARRIER accepted"
+            exit 0
+        fi
+        echo "PERF_MARKER_BARRIER rejected" >&2
+        exit 1
+        ;;
     --self-test-workload)
         test "$#" -eq 2 || exit 2
         workload="$2"
@@ -135,6 +224,15 @@ case "${1:-}" in
             "${revision_field}" "${checksum_field}"
         exit
         ;;
+    --self-test-fifo)
+        test "$#" -eq 1 || exit 2
+        self_test_request_count="${PERF_MARKER_SELF_TEST_REQUEST_COUNT:-}"
+        valid_uint64_text "${self_test_request_count}" || exit 2
+        test "${self_test_request_count}" -gt 0 \
+            && test "${self_test_request_count}" -le 100 || exit 2
+        workload=static
+        test_mode=true
+        ;;
     workload)
         test "$#" -eq 2 || exit 2
         workload="$2"
@@ -146,12 +244,16 @@ esac
 
 case "${workload}" in
     static)
-        printf '\033[2J\033[6;1H'
-        printf 'SwiftSpice remote performance fixture\n\n'
-        printf 'Resolution: 1280x720\n'
-        printf 'State: static baseline\n'
-        printf 'Animation: stopped\n\n'
-        printf 'Use the remote control script to start or reset the load.\n'
+        if test "${test_mode}" = true; then
+            echo "PERF_MARKER_WORKLOAD action=ready"
+        else
+            printf '\033[2J\033[6;1H'
+            printf 'SwiftSpice remote performance fixture\n\n'
+            printf 'Resolution: 1280x720\n'
+            printf 'State: static baseline\n'
+            printf 'Animation: stopped\n\n'
+            printf 'Use the remote control script to start or reset the load.\n'
+        fi
         ;;
     animation)
         /usr/local/bin/animation-generator.sh &
@@ -166,12 +268,28 @@ esac
 # while this renderer is leaving the visibility barrier, its closed reader must
 # not strand the active fullscreen workload in a FIFO open.
 exec 4<> "${ack_fifo}"
+exec 5<> "${request_fifo}"
+request_fd_open=true
 
+processed_requests=0
 while true; do
-    if read -r marker token_field revision_field checksum_field < "${request_fifo}"; then
+    if read -r marker token_field revision_field checksum_field <&5; then
         if ! process_marker "${workload}" "${marker}" "${token_field}" \
             "${revision_field}" "${checksum_field}"; then
             echo "PERF_ERROR input_marker_renderer=visibility_barrier" >&2
+        fi
+        if test "${test_mode}" = true; then
+            processed_requests=$((processed_requests + 1))
+            if test -n "${PERF_MARKER_SELF_TEST_AFTER_PROCESS_FILE:-}"; then
+                gate="${PERF_MARKER_SELF_TEST_AFTER_PROCESS_FILE}"
+                : > "${gate}.entered.${processed_requests}"
+                while ! test -e "${gate}.release.${processed_requests}"; do
+                    sleep 0.01
+                done
+            fi
+            if test "${processed_requests}" -eq "${self_test_request_count}"; then
+                exit 0
+            fi
         fi
     fi
 done

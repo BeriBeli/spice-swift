@@ -283,6 +283,143 @@ struct RemoteRockyFixtureTests {
         #expect(!malformedMarker.output.contains("action=ack"))
     }
 
+    @Test func markerRendererKeepsTheRequestFIFOReadableBetweenMarkers() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-renderer-fifo-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let requestFIFO = directory.appending(path: "request")
+        let acknowledgmentFIFO = directory.appending(path: "ack")
+        let afterProcess = directory.appending(path: "after-process")
+        let outputURL = directory.appending(path: "renderer-output.log")
+        try makeFIFOs(requestFIFO, acknowledgmentFIFO)
+        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
+        let output = try FileHandle(forWritingTo: outputURL)
+
+        let renderer = Process()
+        renderer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        renderer.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+            ).path,
+            "--self-test-fifo",
+        ]
+        renderer.standardOutput = output
+        renderer.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_REQUEST_FIFO"] = requestFIFO.path
+        environment["PERF_MARKER_ACK_FIFO"] = acknowledgmentFIFO.path
+        environment["PERF_MARKER_SELF_TEST_REQUEST_COUNT"] = "2"
+        environment["PERF_MARKER_SELF_TEST_AFTER_PROCESS_FILE"] = afterProcess.path
+        renderer.environment = environment
+        try renderer.run()
+        try output.close()
+        try waitForText("PERF_MARKER_WORKLOAD action=ready", count: 1, in: outputURL)
+
+        let firstWriterFinished = directory.appending(path: "first-writer-finished")
+        let firstWriter = try launchFIFORecordWriter(
+            "SWIFTSPICE_MARKER token=0000000000000001 "
+                + "marker_revision=1 checksum=665e9948",
+            FIFO: requestFIFO,
+            completion: firstWriterFinished
+        )
+        try waitForPath(firstWriterFinished)
+        #expect(try firstWriter.finish(within: .seconds(2)).status == 0)
+        try waitForPath(afterProcess.appendingPathExtension("entered.1"))
+
+        // The renderer is deliberately between process_marker and its next read.
+        // A persistent reader lets this publication complete without waiting for
+        // the first iteration's gate to be released.
+        let secondWriterFinished = directory.appending(path: "second-writer-finished")
+        let secondWriter = try launchFIFORecordWriter(
+            "SWIFTSPICE_MARKER token=0000000000000002 "
+                + "marker_revision=2 checksum=cd04a475",
+            FIFO: requestFIFO,
+            completion: secondWriterFinished
+        )
+        try waitForPath(secondWriterFinished)
+        #expect(try secondWriter.finish(within: .seconds(2)).status == 0)
+
+        try Data().write(to: afterProcess.appendingPathExtension("release.1"))
+        try waitForPath(afterProcess.appendingPathExtension("entered.2"))
+        try Data().write(to: afterProcess.appendingPathExtension("release.2"))
+        try waitForExit(renderer, within: .seconds(3))
+
+        let records = perfRecords(
+            prefix: "PERF_MARKER_WORKLOAD",
+            in: try String(contentsOf: outputURL, encoding: .utf8)
+        )
+        #expect(renderer.terminationStatus == 0)
+        #expect(records.compactMap { $0["action"] } == [
+            "ready", "draw", "barrier", "ack", "draw", "barrier", "ack",
+        ])
+        #expect(records.compactMap { $0["marker_revision"] } == [
+            "1", "1", "1", "2", "2", "2",
+        ])
+    }
+
+    @Test func markerVisibilityBarrierAcceptsOnlyTheExactTerminalResponse() throws {
+        let escape = "\u{1B}"
+        let accepted = try runGuestScript(
+            "input-marker-renderer.sh",
+            arguments: ["--self-test-barrier"],
+            standardInput: "nX\(escape)[0n"
+        )
+        #expect(accepted.status == 0)
+        #expect(accepted.output.split(separator: "\n").map(String.init) == [
+            "PERF_MARKER_BARRIER accepted",
+        ])
+
+        for malformed in [
+            "ordinary n bytes\n",
+            "\(escape)[0m",
+            "\(escape)[00n",
+            "noise\(escape)[1n",
+        ] {
+            let rejected = try runGuestScript(
+                "input-marker-renderer.sh",
+                arguments: ["--self-test-barrier"],
+                standardInput: malformed,
+                environment: ["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS": "50000000"]
+            )
+            #expect(rejected.status != 0)
+            #expect(rejected.output.contains("PERF_MARKER_BARRIER rejected"))
+            #expect(!rejected.output.contains("accepted"))
+        }
+
+        // Keep stdin open: rejection must come from the one aggregate deadline,
+        // not EOF and not a deadline restarted by unrelated bytes.
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+            ).path,
+            "--self-test-barrier",
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS"] = "50000000"
+        process.environment = environment
+        try process.run()
+        input.fileHandleForWriting.write(Data("ordinary n noise".utf8))
+        let timedOut = try RunningScript(process: process, output: output).finish(
+            within: .seconds(2)
+        )
+        try input.fileHandleForWriting.close()
+
+        #expect(timedOut.status != 0)
+        #expect(timedOut.output.contains("PERF_MARKER_BARRIER rejected"))
+        #expect(!timedOut.output.contains("accepted"))
+    }
+
     @Test func guestStartsPinnedEudevDiscoveryBeforeXorg() throws {
         let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
         let startScript = try script("Integration/RemoteRocky/remote/start.sh")
@@ -905,6 +1042,118 @@ struct RemoteRockyFixtureTests {
         ])
     }
 
+    @Test func guestInputMonitorDrainsMotionWhileTheMarkerAgentIsBlocked() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-input-motion-burst-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let agent = directory.appending(path: "agent-stub.sh")
+        try writeExecutable(agent, contents: #"""
+        #!/bin/sh
+        set -eu
+        state="${PERF_MARKER_MONITOR_STATE_DIR:?}"
+        printf '%s\n' "$*" >> "${state}/agent-calls"
+        calls="$(wc -l < "${state}/agent-calls" | tr -d ' ')"
+        if test "${calls}" = 1; then
+            : > "${state}/first-agent-entered"
+            while ! test -e "${state}/release-first-agent"; do
+                sleep 0.01
+            done
+            : > "${state}/first-agent-finished"
+        else
+            : > "${state}/second-agent-entered"
+        fi
+        """#)
+
+        let outputURL = directory.appending(path: "monitor-output.log")
+        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
+        let output = try FileHandle(forWritingTo: outputURL)
+        let input = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-monitor.sh"
+            ).path,
+            "--self-test-motion-burst",
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_AGENT_COMMAND"] = agent.path
+        environment["PERF_MARKER_MONITOR_STATE_DIR"] = directory.path
+        let beforeRead = directory.appending(path: "before-read")
+        environment["PERF_MARKER_MONITOR_BEFORE_READ_FILE"] = beforeRead.path
+        process.environment = environment
+
+        try process.run()
+        try output.close()
+        let writer = input.fileHandleForWriting
+        writer.write(Data("EVENT type 17 (RawMotion)\n".utf8))
+        try waitForPath(beforeRead.appendingPathExtension("entered.1"))
+        try Data().write(to: beforeRead.appendingPathExtension("release.1"))
+        try waitForPath(directory.appending(path: "first-agent-entered"))
+
+        let burstCount = 32
+        let burst = Array(repeating: "EVENT type 17 (RawMotion)", count: burstCount)
+            .joined(separator: "\n") + "\n"
+        let checkpoint = "00000000000000000000000000000001"
+        writer.write(Data((burst + "__checkpoint__ invocation=\(checkpoint)\n").utf8))
+
+        // The first stale RawMotion is already in the event pipe, but its reader
+        // is held. Complete the worker first to exercise the race where a naive
+        // active flag would clear before the old pipe backlog is drained.
+        try waitForPath(beforeRead.appendingPathExtension("entered.2"))
+        try Data().write(to: directory.appending(path: "release-first-agent"))
+        try waitForPath(directory.appending(path: "first-agent-finished"))
+
+        for index in 2...(burstCount + 2) {
+            try waitForPath(beforeRead.appendingPathExtension("entered.\(index)"))
+            try Data().write(to: beforeRead.appendingPathExtension("release.\(index)"))
+        }
+        try waitForText(
+            "PERF_INPUT_CHECKPOINT invocation=\(checkpoint)",
+            count: 1,
+            in: outputURL
+        )
+        let callsBeforeNextArm = try String(
+            contentsOf: directory.appending(path: "agent-calls"),
+            encoding: .utf8
+        ).split(separator: "\n")
+        #expect(callsBeforeNextArm.count == 1)
+
+        // The checkpoint is the arm-ready linearization: only a genuinely new
+        // RawMotion after it may invoke the agent a second time.
+        writer.write(Data("EVENT type 17 (RawMotion)\n".utf8))
+        let newMotionIndex = burstCount + 3
+        try waitForPath(beforeRead.appendingPathExtension("entered.\(newMotionIndex)"))
+        try Data().write(to: beforeRead.appendingPathExtension("release.\(newMotionIndex)"))
+        try writer.close()
+
+        try waitForExit(process, within: .seconds(3))
+        let calls = try String(
+            contentsOf: directory.appending(path: "agent-calls"),
+            encoding: .utf8
+        ).split(separator: "\n").map(String.init)
+        let monitorOutput = try String(contentsOf: outputURL, encoding: .utf8)
+
+        #expect(process.terminationStatus == 0)
+        #expect(calls == ["input motion", "input motion"])
+        #expect(monitorOutput.components(
+            separatedBy: "PERF_INPUT_COALESCED action_class=motion"
+        ).count - 1 == burstCount)
+        #expect(FileManager.default.fileExists(
+            atPath: directory.appending(path: "second-agent-entered").path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: directory.appending(path: "motion-active").path
+        ))
+    }
+
     @Test func guestMarkerClockUsesAHighResolutionMonotonicSource() throws {
         let state = FileManager.default.temporaryDirectory.appending(
             path: "guest-marker-clock-\(UUID().uuidString)",
@@ -1060,7 +1309,7 @@ struct RemoteRockyFixtureTests {
         let agent = try script("Integration/RemoteRocky/guest/input-marker-agent.sh")
         let renderer = try script("Integration/RemoteRocky/guest/input-marker-renderer.sh")
         #expect(agent.contains(#"ack_timeout_seconds="${PERF_MARKER_ACK_TIMEOUT_SECONDS:-2}""#))
-        #expect(renderer.contains("read -r -d n -t 0.5 response"))
+        #expect(renderer.contains("barrier_timeout_ns=500000000"))
 
         let state = FileManager.default.temporaryDirectory.appending(
             path: "guest-marker-stale-ack-\(UUID().uuidString)",
@@ -1610,6 +1859,28 @@ struct RemoteRockyFixtureTests {
         try #require(process.terminationStatus == 0)
     }
 
+    private func launchFIFORecordWriter(
+        _ record: String,
+        FIFO: URL,
+        completion: URL
+    ) throws -> RunningScript {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "printf '%s\\n' \"$1\" > \"$2\"; : > \"$3\"",
+            "marker-request-writer",
+            record,
+            FIFO.path,
+            completion.path,
+        ]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        return RunningScript(process: process, output: output)
+    }
+
     private func launchGuestMarkerCommand(
         _ arguments: [String],
         state: URL,
@@ -1642,6 +1913,49 @@ struct RemoteRockyFixtureTests {
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
+    }
+
+    private func waitForPathRemoval(_ path: URL) throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while FileManager.default.fileExists(atPath: path.path) {
+            guard ContinuousClock().now < deadline else {
+                throw RemoteRockyFixtureError.timedOutWaitingForMockState(path.lastPathComponent)
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    private func waitForExit(_ process: Process, within timeout: Duration) throws {
+        let deadline = ContinuousClock().now.advanced(by: timeout)
+        while process.isRunning, ContinuousClock().now < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard !process.isRunning else {
+            process.terminate()
+            process.waitUntilExit()
+            throw RemoteRockyFixtureError.timedOutWaitingForScript
+        }
+        process.waitUntilExit()
+    }
+
+    private func waitForText(_ text: String, count: Int, in file: URL) throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline {
+            let contents = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+            if contents.components(separatedBy: text).count - 1 >= count {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        throw RemoteRockyFixtureError.timedOutWaitingForMockState(text)
+    }
+
+    private func writeExecutable(_ URL: URL, contents: String) throws {
+        try Data(contents.utf8).write(to: URL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: URL.path
+        )
     }
 
     private func perfRecords(prefix: String, in output: String) -> [[String: String]] {

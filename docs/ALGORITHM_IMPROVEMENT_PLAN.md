@@ -255,18 +255,22 @@ write. It is therefore draw-call evidence, not proof that marker pixels were
 visible. The fixture now renders the reserved marker ROI inside the active
 fullscreen workload xterm itself, keeps subsequent animation frames outside
 that ROI, and acknowledges only after an xterm terminal-response barrier. A
-single delimiter read bounds the whole renderer barrier to half a second and
-rejects unrelated or malformed terminal input without writing an ACK. The
+byte-state parser uses one absolute monotonic half-second deadline, ignores
+unrelated input including printable `n`, and accepts only exact `ESC [ 0 n`.
+EOF, malformed-only input, or timeout produces no ACK. The
 agent's longer two-second bounded FIFO wait therefore expires only after the
 renderer has either acknowledged or definitively declined the event; a late
 revision from another writer may still enter the FIFO, but the bounded reader
 drains nonmatching revisions and never lets one satisfy or poison the current
 request. A monotonic nanosecond deadline is recorded before request publication; every
 stale-record read uses only the remaining total time and never resets the
-timeout. The agent opens the request FIFO read/write, writes one small fixed
-record, and closes it immediately. Without a renderer, open cannot block and
-closing the final endpoint discards the unconsumed request before a future
-workload can observe it. The wait treats a missing acknowledgement or wrong
+timeout. The renderer holds one request FIFO read/write descriptor for its
+entire main loop, including while drawing and waiting on the terminal barrier,
+so a next request published during processing remains queued for its next read.
+The agent also opens the request FIFO read/write, writes one small fixed record,
+and closes it immediately. Without a renderer, open cannot block and closing
+the final endpoint discards the unconsumed request before a future workload can
+observe it. The wait treats a missing acknowledgement or wrong
 marker revision as a failed event and releases the guest marker lock; it never emits
 `marker_drawn` from an unacknowledged write. A
 fresh live run must still bind those pixels to the exact host frame and
@@ -275,7 +279,19 @@ run into input-to-visible evidence.
 
 The guest XI2 monitor admits only RawKeyPress, RawButtonPress, and RawMotion;
 the delivered counterpart for the same physical input is ignored and cannot
-consume a subsequently armed token. Guest event timestamps use a statically
+consume a subsequently armed token. A dedicated serialized agent worker keeps
+the XI2 reader draining while a marker is rendered. Key and click observations
+remain FIFO; a motion ownership token is created before the first RawMotion is
+queued and remains set after that call returns. Before the next arm, its unique
+invocation sync writes a checkpoint through the same event FIFO. The reader
+first drains and coalesces every earlier RawMotion, then the serialized worker
+waits for every earlier agent call, clears motion ownership, and acknowledges
+the checkpoint. Only then may the host send the arm. Thus reader scheduling
+cannot move an old queued record into the next arm epoch, and no arbitrary
+quiet-period sleep defines the boundary. One total bounded checkpoint budget
+covers both startup waiting for the event FIFO and the worker acknowledgement;
+the two phases cannot each consume a fresh timeout. Guest event
+timestamps use a statically
 linked `clock_gettime(CLOCK_MONOTONIC)` helper recorded as
 `guest_marker_clock=clock_gettime-monotonic-v1` in the build manifest. Coarse
 `/proc/uptime` text must not be scaled and represented as nanosecond evidence;
@@ -462,6 +478,7 @@ behavior remain separate acceptance gates.
 | AIP-00 | 2026-08-29 | Rocky 9 live marker run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`; eudev/Xorg/libinput registered Virtio keyboard/mouse and hotplug SPICE tablet; Release mode-aware key `4444`, motion `5555`, and click `6666` probes each emitted `guest_received` plus `marker_drawn`; motion ACK count 2 | Guest-causal subpath evidence only: client input reached guest X and invoked the marker renderer. The run does not bind marker pixels to an exact SwiftSpice generation/revision/delivery or AppKit presented callback, so it does not complete AIP-00 or justify a scheduling change. |
 | AIP-00 | 2026-08-29 | Rocky 9 rebuilt guest marker run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T194358Z.TQ3mft`; build manifest records `guest_marker_clock=clock_gettime-monotonic-v1` and `guest_linux_virt=6.12.107-r0`; Release probe exited 0 after 42 frames and two motion ACKs; token `eeeeeeeeeeeeeeee` recorded `guest_received=53621746290 ns` and `marker_drawn=53628063503 ns`, a 6.317213 ms guest-clock delta, with no marker error | Confirms only the guest-causal draw/ACK subpath. Marker pixels are not yet bound to an exact SwiftSpice frame revision and AppKit presented callback, so this evidence neither completes AIP-00 nor supports an AIP-44 scheduling change. |
 | AIP-00 | 2026-08-29 | Rocky 9 arm-barrier retry run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T201148Z.r0vGwi`; sync `b90af807995470a1595ec1a140120859` preceded `PERF_ARMED` for click token `abababababababab`, followed by `guest_received=24953841014 ns` and `marker_drawn=24959354130 ns`; Release probe exited 0 after 42 frames and two motion ACKs with no marker error; retrying the same token used distinct sync `c61a9dcca1e180bdf44d9a76af72a34f` and returned `duplicate_token`, with no stale `PERF_ARMED` accepted | Live evidence for the per-invocation log barrier, retry rejection, and guest-causal marker subpath only. It still does not bind marker pixels to an exact SwiftSpice frame revision and AppKit presented callback, so it does not complete AIP-00 or support an AIP-44 scheduling change. |
+| AIP-00 | 2026-08-29 | Rocky 9 motion-epoch drain run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T204616Z.Q0jo6t`; rebuilt Alpine guest and restarted endpoint; first Release probe exited 0 with 42 frames and two motion ACKs, and token `1111111111111111` recorded `guest_received=29908152175 ns` then `marker_drawn=29918028916 ns`; the next sync/checkpoint armed token `2222222222222222`, which remained only `PERF_ARMED` after one second with no new input and no marker/control error; a second Release probe then exited 0 with 15 frames and two motion ACKs and only its new burst produced `guest_received=77938920509 ns` then `marker_drawn=77960725095 ns` | Live evidence that RawMotion queued by the first exercise burst did not cross the explicit event-FIFO/worker checkpoint and consume the next arm. The run also exercises the persistent renderer request FIFO and exact terminal barrier through two successful marker revisions. It remains guest-causal evidence only: marker pixels are not bound to an exact SwiftSpice delivery and AppKit presented callback, so AIP-00 and AIP-44 remain open. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
