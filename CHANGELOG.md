@@ -7,6 +7,45 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added versioned guest manifests, verified artifact hashes, and private
+  per-run evidence to the existing Rocky 9 rootless Podman/KVM fixture.
+- Added a per-event causal input trace schema and private JSONL artifact, plus
+  unique guest markers for click, key, and motion probes.
+
+### Changed
+
+- `SpicePresentationMetrics.desktopReadyToDisplayLink` and the corresponding
+  session diagnostic now measure from the ready timestamp of the latest
+  accepted revision that is actually selected, rather than the first update in
+  its coalescing window. This differs from the 0.3.0 metric semantics, so the
+  values should not be treated as directly equivalent; latest-only pacing and
+  idle no-commit behavior are unchanged.
+- Reframed performance work around paired interaction latency first: separate
+  input-to-guest and receive-to-presented segments before clarity, with CPU and
+  RSS retained as guardrails rather than substitutes for latency acceptance.
+- Guest input probes now use a native XI2 source that publishes readiness only
+  after event selection and an X server round trip. Source rotation, serialized
+  motion epochs, and bounded terminal resynchronization prevent stale input or
+  terminal responses from validating a later marker.
+
+### Fixed
+
+- Rejected duplicate unsolicited desktop delivery identities without changing
+  their selected-ready timestamp or re-waking presentation, while explicit
+  authoritative redraw requests receive a fresh delivery identity.
+- Hardened the Rocky fixture against concurrent start/stop/build races, stale
+  or reused PIDs, partial artifact publication, incomplete manifests, and
+  teardown failures that would otherwise erase auditable active state.
+
+### Validation
+
+- Rocky live runs close the guest-causal input-to-marker draw/ACK subpath only.
+  They do not yet bind marker pixels to an exact SwiftSpice frame delivery and
+  AppKit presented callback, and therefore make no completed input-to-visible
+  latency or performance-improvement claim.
+
 ## [0.3.0] — 2026-08-28
 
 ### Added
