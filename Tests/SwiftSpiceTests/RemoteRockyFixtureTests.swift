@@ -432,6 +432,104 @@ struct RemoteRockyFixtureTests {
         #expect(!timedOut.output.contains("accepted"))
     }
 
+    @Test func lateTerminalStatusCannotSatisfyTheNextMarkerBarrier() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-barrier-sequence-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let terminalFIFO = directory.appending(path: "terminal")
+        let outputURL = directory.appending(path: "renderer-output.log")
+        try makeFIFOs(terminalFIFO)
+        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
+        let output = try FileHandle(forWritingTo: outputURL)
+        let renderer = Process()
+        renderer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        renderer.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+            ).path,
+            "--self-test-barrier-sequence",
+        ]
+        renderer.standardOutput = output
+        renderer.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_SELF_TEST_TERMINAL_FIFO"] = terminalFIFO.path
+        environment["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS"] = "50000000"
+        renderer.environment = environment
+        try renderer.run()
+        try output.close()
+        defer {
+            if renderer.isRunning {
+                renderer.terminate()
+                renderer.waitUntilExit()
+            }
+        }
+
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=first result=rejected tainted=true",
+            count: 1,
+            in: outputURL
+        )
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync query=cpr",
+            count: 1,
+            in: outputURL
+        )
+        let terminal = try FileHandle(forWritingTo: terminalFIFO)
+        defer { try? terminal.close() }
+        let escape = "\u{1B}"
+
+        // This is the exact response to the timed-out first DSR. The second
+        // request is waiting for a different CPR grammar, so it must drain and
+        // identify the stale response without drawing or accepting marker two.
+        terminal.write(Data("\(escape)[0n".utf8))
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync ignored=dsr",
+            count: 1,
+            in: outputURL
+        )
+        let afterStaleResponse = try String(contentsOf: outputURL, encoding: .utf8)
+        #expect(!afterStaleResponse.contains("phase=resync result=accepted"))
+        #expect(!afterStaleResponse.contains("phase=second action=draw"))
+
+        terminal.write(Data("\(escape)[1;1R".utf8))
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync result=accepted tainted=false",
+            count: 1,
+            in: outputURL
+        )
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second query=dsr",
+            count: 1,
+            in: outputURL
+        )
+        terminal.write(Data("\(escape)[0n".utf8))
+        try waitForText(
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second action=ack",
+            count: 1,
+            in: outputURL
+        )
+        try waitForExit(renderer, within: .seconds(3))
+
+        let lines = try String(contentsOf: outputURL, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        #expect(renderer.terminationStatus == 0)
+        #expect(lines == [
+            "PERF_MARKER_BARRIER_SEQUENCE phase=first query=dsr",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=first result=rejected tainted=true",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync query=cpr",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync ignored=dsr",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=resync result=accepted tainted=false",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second action=draw",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second query=dsr",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second result=accepted tainted=false",
+            "PERF_MARKER_BARRIER_SEQUENCE phase=second action=ack",
+        ])
+    }
+
     @Test func guestStartsPinnedEudevDiscoveryBeforeXorg() throws {
         let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
         let startScript = try script("Integration/RemoteRocky/remote/start.sh")
@@ -1113,8 +1211,7 @@ struct RemoteRockyFixtureTests {
         let burstCount = 32
         let burst = Array(repeating: "EVENT type 17 (RawMotion)", count: burstCount)
             .joined(separator: "\n") + "\n"
-        let checkpoint = "00000000000000000000000000000001"
-        writer.write(Data((burst + "__checkpoint__ invocation=\(checkpoint)\n").utf8))
+        writer.write(Data(burst.utf8))
 
         // The first stale RawMotion is already in the event pipe, but its reader
         // is held. Complete the worker first to exercise the race where a naive
@@ -1123,29 +1220,16 @@ struct RemoteRockyFixtureTests {
         try Data().write(to: directory.appending(path: "release-first-agent"))
         try waitForPath(directory.appending(path: "first-agent-finished"))
 
-        for index in 2...(burstCount + 2) {
+        for index in 2...(burstCount + 1) {
             try waitForPath(beforeRead.appendingPathExtension("entered.\(index)"))
             try Data().write(to: beforeRead.appendingPathExtension("release.\(index)"))
         }
+        try writer.close()
         try waitForText(
-            "PERF_INPUT_CHECKPOINT invocation=\(checkpoint)",
-            count: 1,
+            "PERF_INPUT_COALESCED action_class=motion",
+            count: burstCount,
             in: outputURL
         )
-        let callsBeforeNextArm = try String(
-            contentsOf: directory.appending(path: "agent-calls"),
-            encoding: .utf8
-        ).split(separator: "\n")
-        #expect(callsBeforeNextArm.count == 1)
-
-        // The checkpoint is the arm-ready linearization: only a genuinely new
-        // RawMotion after it may invoke the agent a second time.
-        writer.write(Data("EVENT type 17 (RawMotion)\n".utf8))
-        let newMotionIndex = burstCount + 3
-        try waitForPath(beforeRead.appendingPathExtension("entered.\(newMotionIndex)"))
-        try Data().write(to: beforeRead.appendingPathExtension("release.\(newMotionIndex)"))
-        try writer.close()
-
         try waitForExit(process, within: .seconds(3))
         let calls = try String(
             contentsOf: directory.appending(path: "agent-calls"),
@@ -1154,15 +1238,211 @@ struct RemoteRockyFixtureTests {
         let monitorOutput = try String(contentsOf: outputURL, encoding: .utf8)
 
         #expect(process.terminationStatus == 0)
-        #expect(calls == ["input motion", "input motion"])
+        #expect(calls == ["input motion"])
         #expect(monitorOutput.components(
             separatedBy: "PERF_INPUT_COALESCED action_class=motion"
         ).count - 1 == burstCount)
-        #expect(FileManager.default.fileExists(
+        #expect(!FileManager.default.fileExists(
             atPath: directory.appending(path: "second-agent-entered").path
         ))
         #expect(!FileManager.default.fileExists(
             atPath: directory.appending(path: "motion-active").path
+        ))
+    }
+
+    @Test func inputCheckpointRotatesTheXI2SourceBeforeOpeningTheNextEpoch() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-input-source-epoch-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let state = directory.appending(path: "monitor-state", directoryHint: .isDirectory)
+        #expect(!FileManager.default.fileExists(atPath: state.path))
+
+        let agent = directory.appending(path: "agent-stub.sh")
+        try writeExecutable(agent, contents: #"""
+        #!/bin/sh
+        set -eu
+        state="${PERF_MARKER_MONITOR_STATE_DIR:?}"
+        printf '%s\n' "$*" >> "${state}/agent-calls"
+        calls="$(wc -l < "${state}/agent-calls" | tr -d ' ')"
+        : > "${state}/agent-call-${calls}"
+        """#)
+        let source = directory.appending(path: "source-stub.sh")
+        try writeExecutable(source, contents: #"""
+        #!/bin/sh
+        set -eu
+        generation="${1:?}"
+        ready_path="${2:?}"
+        state="${PERF_MARKER_MONITOR_STATE_DIR:?}"
+        if test "${generation}" = 1; then
+            trap 'printf "%s\n" "EVENT type 17 (RawMotion)"; : > "${state}/old-motion-emitted"; exit 0' TERM
+            : > "${state}/source-${generation}-started"
+            : > "${ready_path}"
+            while true; do sleep 0.01; done
+        fi
+        trap 'exit 0' TERM
+        : > "${state}/source-${generation}-started"
+        : > "${ready_path}"
+        while ! test -e "${state}/release-new-motion"; do sleep 0.01; done
+        printf '%s\n' 'EVENT type 17 (RawMotion)'
+        : > "${state}/new-motion-emitted"
+        while true; do sleep 0.01; done
+        """#)
+
+        let monitorOutputURL = directory.appending(path: "monitor-output.log")
+        FileManager.default.createFile(atPath: monitorOutputURL.path, contents: Data())
+        let monitorOutput = try FileHandle(forWritingTo: monitorOutputURL)
+        let monitor = Process()
+        monitor.executableURL = URL(fileURLWithPath: "/bin/sh")
+        monitor.arguments = [repositoryRoot.appending(
+            path: "Integration/RemoteRocky/guest/input-marker-monitor.sh"
+        ).path]
+        monitor.standardOutput = monitorOutput
+        monitor.standardError = monitorOutput
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_AGENT_COMMAND"] = agent.path
+        environment["PERF_MARKER_EVENT_SOURCE_COMMAND"] = source.path
+        environment["PERF_MARKER_MONITOR_STATE_DIR"] = state.path
+        let sourceReadyGate = directory.appending(path: "source-ready")
+        environment["PERF_MARKER_MONITOR_BEFORE_SOURCE_READY_FILE"] = sourceReadyGate.path
+        monitor.environment = environment
+
+        let invocation = "00000000000000000000000000000002"
+        let checkpoint = Process()
+        let checkpointOutput = Pipe()
+        checkpoint.executableURL = URL(fileURLWithPath: "/bin/sh")
+        checkpoint.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-monitor.sh"
+            ).path,
+            "checkpoint",
+            invocation,
+        ]
+        checkpoint.standardOutput = checkpointOutput
+        checkpoint.standardError = checkpointOutput
+        checkpoint.environment = environment
+        try checkpoint.run()
+        defer {
+            if checkpoint.isRunning {
+                checkpoint.terminate()
+                checkpoint.waitUntilExit()
+            }
+        }
+
+        // A checkpoint may race the first monitor startup before its state
+        // root exists. It must remain pending instead of failing while it
+        // waits for the initial event-source subscription.
+        Thread.sleep(forTimeInterval: 0.1)
+        #expect(checkpoint.isRunning)
+
+        try monitor.run()
+        try monitorOutput.close()
+        defer {
+            if monitor.isRunning {
+                monitor.terminate()
+                monitor.waitUntilExit()
+            }
+        }
+
+        // The checkpoint begins immediately, before generation one publishes
+        // readiness. It must wait rather than hitting the shell's default USR1
+        // action or losing a rotate request against an uninitialized source.
+        try waitForPath(sourceReadyGate.appendingPathExtension("entered.1"))
+        #expect(checkpoint.isRunning)
+        try Data().write(to: sourceReadyGate.appendingPathExtension("release.1"))
+        try waitForPath(state.appending(path: "old-motion-emitted"))
+
+        // Generation two must establish its subscription endpoint before the
+        // worker publishes the checkpoint ACK that permits the host to arm.
+        try waitForPath(sourceReadyGate.appendingPathExtension("entered.2"))
+        #expect(checkpoint.isRunning)
+        try Data().write(to: sourceReadyGate.appendingPathExtension("release.2"))
+        let checkpointResult = try RunningScript(
+            process: checkpoint,
+            output: checkpointOutput
+        ).finish(within: .seconds(3))
+
+        #expect(checkpointResult.status == 0)
+        #expect(FileManager.default.fileExists(
+            atPath: state.appending(path: "old-motion-emitted").path
+        ))
+        #expect(FileManager.default.fileExists(
+            atPath: state.appending(path: "source-2-started").path
+        ))
+        try waitForPath(state.appending(path: "agent-call-1"))
+        let callsAtEpochBoundary = try String(
+            contentsOf: state.appending(path: "agent-calls"),
+            encoding: .utf8
+        ).split(separator: "\n")
+        #expect(callsAtEpochBoundary.count == 1)
+
+        try Data().write(to: state.appending(path: "release-new-motion"))
+        try waitForPath(state.appending(path: "agent-call-2"))
+        let finalCalls = try String(
+            contentsOf: state.appending(path: "agent-calls"),
+            encoding: .utf8
+        ).split(separator: "\n").map(String.init)
+        #expect(finalCalls == ["input motion", "input motion"])
+
+        monitor.terminate()
+        try waitForExit(monitor, within: .seconds(3))
+    }
+
+    @Test func inputCheckpointRejectsAStaleUnrelatedMonitorPIDWithoutSignalingIt() throws {
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-input-stale-monitor-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+        try makeFIFOs(state.appending(path: "events"))
+
+        // SIGUSR1 has a terminating default action, so this unrelated sleeper
+        // detects both an unsafe signal and PID-reuse identity confusion.
+        let sleeper = Process()
+        sleeper.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        sleeper.arguments = ["30"]
+        try sleeper.run()
+        defer {
+            if sleeper.isRunning {
+                sleeper.terminate()
+            }
+            sleeper.waitUntilExit()
+        }
+        try Data("\(sleeper.processIdentifier)\n".utf8).write(
+            to: state.appending(path: "monitor-pid")
+        )
+
+        let checkpoint = Process()
+        let output = Pipe()
+        checkpoint.executableURL = URL(fileURLWithPath: "/bin/sh")
+        checkpoint.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/guest/input-marker-monitor.sh"
+            ).path,
+            "checkpoint",
+            "00000000000000000000000000000003",
+        ]
+        checkpoint.standardOutput = output
+        checkpoint.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_MONITOR_STATE_DIR"] = state.path
+        environment["PERF_MARKER_MONITOR_CHECKPOINT_ATTEMPTS"] = "10"
+        checkpoint.environment = environment
+        try checkpoint.run()
+        let result = try RunningScript(process: checkpoint, output: output).finish(
+            within: .seconds(2)
+        )
+
+        #expect(result.status != 0)
+        #expect(sleeper.isRunning)
+        #expect(!FileManager.default.fileExists(
+            atPath: state.appending(path: "checkpoint-active").path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: state.appending(path: "checkpoint-request").path
         ))
     }
 

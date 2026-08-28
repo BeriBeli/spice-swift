@@ -11,6 +11,9 @@ request_fd_open=false
 barrier_input_fd_open=false
 barrier_timeout_ns=500000000
 host_barrier_transport_runs=0
+terminal_status_tainted=false
+barrier_sequence_mode=false
+exec 7> /dev/null
 
 restore_terminal_state() {
     if test -n "${saved_terminal_state}"; then
@@ -62,8 +65,40 @@ read_barrier_byte() {
     IFS= read -r -n 1 -t "${timeout_seconds}" barrier_byte <&6
 }
 
-await_host_terminal_status() {
+confirm_terminal_response_hex() {
+    response_kind="$1"
+    response_hex="$2"
+    response_state=ground
+    while test -n "${response_hex}"; do
+        byte_hex="${response_hex%"${response_hex#??}"}"
+        response_hex="${response_hex#??}"
+        case "${response_kind}:${response_state}:${byte_hex}" in
+            dsr:ground:1b) response_state=escape ;;
+            dsr:escape:5b) response_state=bracket ;;
+            dsr:bracket:30) response_state=zero ;;
+            dsr:zero:6e) return 0 ;;
+            cpr:ground:1b) response_state=escape ;;
+            cpr:escape:5b) response_state=bracket ;;
+            cpr:bracket:3[0-9]) response_state=row ;;
+            cpr:row:3[0-9]) response_state=row ;;
+            cpr:row:3b) response_state=column_start ;;
+            cpr:column_start:3[0-9]) response_state=column ;;
+            cpr:column:3[0-9]) response_state=column ;;
+            cpr:column:52) return 0 ;;
+            *:*:1b) response_state=escape ;;
+            *) response_state=ground ;;
+        esac
+    done
+    return 1
+}
+
+await_host_terminal_response() {
     remaining_ns="$1"
+    response_kind="$2"
+    sequence_diagnostics=0
+    if test "${barrier_sequence_mode}" = true; then
+        sequence_diagnostics=1
+    fi
     host_barrier_transport_runs=1
     barrier_hex=
     if barrier_hex="$(python3 -c '
@@ -75,7 +110,10 @@ import time
 
 deadline = time.monotonic_ns() + int(sys.argv[1])
 window = deque(maxlen=4096)
-state = 0
+target = sys.argv[2]
+diagnostics = sys.argv[3] == "1"
+state = "ground"
+dsr_state = "ground"
 while True:
     remaining = deadline - time.monotonic_ns()
     if remaining <= 0 or not select.select([6], [], [], remaining / 1_000_000_000)[0]:
@@ -85,18 +123,54 @@ while True:
         raise SystemExit(2)
     for value in chunk:
         window.append(value)
-        if state == 0:
-            state = 1 if value == 0x1B else 0
-        elif state == 1:
-            state = 2 if value == 0x5B else (1 if value == 0x1B else 0)
-        elif state == 2:
-            state = 3 if value == 0x30 else (1 if value == 0x1B else 0)
-        else:
-            if value == 0x6E:
+        if target == "cpr" and diagnostics:
+            if dsr_state == "ground":
+                dsr_state = "escape" if value == 0x1B else "ground"
+            elif dsr_state == "escape":
+                dsr_state = "bracket" if value == 0x5B else ("escape" if value == 0x1B else "ground")
+            elif dsr_state == "bracket":
+                dsr_state = "zero" if value == 0x30 else ("escape" if value == 0x1B else "ground")
+            elif value == 0x6E:
+                os.write(7, b"PERF_MARKER_BARRIER_SEQUENCE phase=resync ignored=dsr\n")
+                dsr_state = "ground"
+            else:
+                dsr_state = "escape" if value == 0x1B else "ground"
+        if target == "dsr":
+            if state == "ground":
+                state = "escape" if value == 0x1B else "ground"
+            elif state == "escape":
+                state = "bracket" if value == 0x5B else ("escape" if value == 0x1B else "ground")
+            elif state == "bracket":
+                state = "zero" if value == 0x30 else ("escape" if value == 0x1B else "ground")
+            elif value == 0x6E:
                 sys.stdout.write(bytes(window).hex())
                 raise SystemExit(0)
-            state = 1 if value == 0x1B else 0
-' "${remaining_ns}" 6<&6)"; then
+            else:
+                state = "escape" if value == 0x1B else "ground"
+        else:
+            if state == "ground":
+                state = "escape" if value == 0x1B else "ground"
+            elif state == "escape":
+                state = "bracket" if value == 0x5B else ("escape" if value == 0x1B else "ground")
+            elif state == "bracket":
+                state = "row" if 0x30 <= value <= 0x39 else ("escape" if value == 0x1B else "ground")
+            elif state == "row":
+                if 0x30 <= value <= 0x39:
+                    pass
+                elif value == 0x3B:
+                    state = "column_start"
+                else:
+                    state = "escape" if value == 0x1B else "ground"
+            elif state == "column_start":
+                state = "column" if 0x30 <= value <= 0x39 else ("escape" if value == 0x1B else "ground")
+            elif 0x30 <= value <= 0x39:
+                pass
+            elif value == 0x52:
+                sys.stdout.write(bytes(window).hex())
+                raise SystemExit(0)
+            else:
+                state = "escape" if value == 0x1B else "ground"
+' "${remaining_ns}" "${response_kind}" "${sequence_diagnostics}" 6<&6 7>&7)"; then
         :
     else
         return 1
@@ -105,34 +179,23 @@ while True:
     # Python is only the host-test transport: one bounded process may perform
     # multiple select/read calls and returns a capped hex cache. Reconfirm the
     # exact response with the same transitions used by the guest shell path.
-    barrier_state=ground
-    while test -n "${barrier_hex}"; do
-        byte_hex="${barrier_hex%"${barrier_hex#??}"}"
-        barrier_hex="${barrier_hex#??}"
-        case "${barrier_state}:${byte_hex}" in
-            ground:1b) barrier_state=escape ;;
-            escape:5b) barrier_state=bracket ;;
-            bracket:30) barrier_state=zero ;;
-            zero:6e) return 0 ;;
-            *:1b) barrier_state=escape ;;
-            *) barrier_state=ground ;;
-        esac
-    done
-    return 1
+    confirm_terminal_response_hex "${response_kind}" "${barrier_hex}"
 }
 
-await_terminal_status() {
+await_terminal_response() {
+    response_kind="$1"
     barrier_started_ns="$(monotonic_nanoseconds)" || return 1
     valid_uint64_text "${barrier_started_ns}" || return 1
     barrier_deadline_ns=$((barrier_started_ns + barrier_timeout_ns))
     barrier_state=ground
+    stale_dsr_state=ground
     escape="$(printf '\033')"
     if ! test -x /usr/local/bin/monotonic-nanoseconds; then
         barrier_now_ns="$(monotonic_nanoseconds)" || return 1
         valid_uint64_text "${barrier_now_ns}" || return 1
         remaining_ns=$((barrier_deadline_ns - barrier_now_ns))
         test "${remaining_ns}" -gt 0 || return 1
-        await_host_terminal_status "${remaining_ns}"
+        await_host_terminal_response "${remaining_ns}" "${response_kind}"
         return
     fi
     while true; do
@@ -141,15 +204,40 @@ await_terminal_status() {
         remaining_ns=$((barrier_deadline_ns - barrier_now_ns))
         test "${remaining_ns}" -gt 0 || return 1
         read_barrier_byte "${remaining_ns}" || return 1
-        case "${barrier_state}:${barrier_byte}" in
-            "ground:${escape}") barrier_state=escape ;;
-            "escape:[") barrier_state=bracket ;;
-            "bracket:0") barrier_state=zero ;;
-            "zero:n") return 0 ;;
-            *:"${escape}") barrier_state=escape ;;
+        if test "${response_kind}" = cpr && test "${barrier_sequence_mode}" = true; then
+            case "${stale_dsr_state}:${barrier_byte}" in
+                "ground:${escape}") stale_dsr_state=escape ;;
+                "escape:[") stale_dsr_state=bracket ;;
+                "bracket:0") stale_dsr_state=zero ;;
+                "zero:n")
+                    echo "PERF_MARKER_BARRIER_SEQUENCE phase=resync ignored=dsr" >&7
+                    stale_dsr_state=ground
+                    ;;
+                *:"${escape}") stale_dsr_state=escape ;;
+                *) stale_dsr_state=ground ;;
+            esac
+        fi
+        case "${response_kind}:${barrier_state}:${barrier_byte}" in
+            "dsr:ground:${escape}") barrier_state=escape ;;
+            "dsr:escape:[") barrier_state=bracket ;;
+            "dsr:bracket:0") barrier_state=zero ;;
+            "dsr:zero:n") return 0 ;;
+            "cpr:ground:${escape}") barrier_state=escape ;;
+            "cpr:escape:[") barrier_state=bracket ;;
+            cpr:bracket:[0-9]) barrier_state=row ;;
+            cpr:row:[0-9]) barrier_state=row ;;
+            "cpr:row:;") barrier_state=column_start ;;
+            cpr:column_start:[0-9]) barrier_state=column ;;
+            cpr:column:[0-9]) barrier_state=column ;;
+            "cpr:column:R") return 0 ;;
+            *:*:"${escape}") barrier_state=escape ;;
             *) barrier_state=ground ;;
         esac
     done
+}
+
+await_terminal_status() {
+    await_terminal_response dsr
 }
 
 terminate_after_signal() {
@@ -176,6 +264,68 @@ draw_marker() {
         "${token}" "${revision}" "${checksum}" > /dev/tty
 }
 
+prepare_terminal_response() {
+    if test "${barrier_sequence_mode}" = true; then
+        return
+    fi
+    saved_terminal_state="$(stty -g < /dev/tty)"
+    stty -echo -icanon min 1 time 0 < /dev/tty
+    exec 6< /dev/tty
+    barrier_input_fd_open=true
+}
+
+finish_terminal_response() {
+    if test "${barrier_sequence_mode}" = true; then
+        return
+    fi
+    exec 6<&-
+    barrier_input_fd_open=false
+    restore_terminal_state
+}
+
+send_terminal_query() {
+    response_kind="$1"
+    if test "${barrier_sequence_mode}" = true; then
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=${barrier_sequence_phase} query=${response_kind}"
+        return
+    fi
+    case "${response_kind}" in
+        # DSR reports terminal OK as ESC [ 0 n.
+        dsr) printf '\033[5n' > /dev/tty ;;
+        # CPR is deliberately a different response grammar. When a prior DSR
+        # timed out, a matching cursor report proves terminal output has passed
+        # that older query before a new marker is drawn.
+        cpr) printf '\033[6n' > /dev/tty ;;
+        *) return 2 ;;
+    esac
+}
+
+run_terminal_query() {
+    response_kind="$1"
+    prepare_terminal_response || return 1
+    result=0
+    send_terminal_query "${response_kind}" \
+        && await_terminal_response "${response_kind}" \
+        || result=$?
+    finish_terminal_response
+    return "${result}"
+}
+
+resynchronize_terminal_if_needed() {
+    if test "${terminal_status_tainted}" != true; then
+        return 0
+    fi
+    # This fence is pre-draw. A late ESC [ 0 n from the timed-out DSR is not a
+    # valid CPR and is drained as unrelated input. Only a subsequent exact
+    # ESC [ row ; column R response clears taint and permits marker rendering.
+    if run_terminal_query cpr; then
+        terminal_status_tainted=false
+        return 0
+    fi
+    terminal_status_tainted=true
+    return 1
+}
+
 terminal_visibility_barrier() {
     workload="$1"
     token="$2"
@@ -190,17 +340,12 @@ terminal_visibility_barrier() {
     # second. The state machine ignores unrelated bytes (including printable
     # `n`) and accepts only the exact ESC [ 0 n response. Timeout or EOF fails
     # this event without ACK.
-    saved_terminal_state="$(stty -g < /dev/tty)"
-    stty -echo -icanon min 1 time 0 < /dev/tty
-    exec 6< /dev/tty
-    barrier_input_fd_open=true
-    printf '\033[5n' > /dev/tty
-    result=0
-    await_terminal_status || result=$?
-    exec 6<&-
-    barrier_input_fd_open=false
-    restore_terminal_state
-    return "${result}"
+    if run_terminal_query dsr; then
+        terminal_status_tainted=false
+        return 0
+    fi
+    terminal_status_tainted=true
+    return 1
 }
 
 acknowledge_marker() {
@@ -232,7 +377,8 @@ process_marker() {
         kill -STOP "${workload_pid}"
     fi
     result=0
-    draw_marker "${workload}" "${token}" "${revision}" "${checksum}" \
+    resynchronize_terminal_if_needed \
+        && draw_marker "${workload}" "${token}" "${revision}" "${checksum}" \
         && terminal_visibility_barrier "${workload}" "${token}" "${revision}" \
         && acknowledge_marker "${workload}" "${token}" "${revision}" \
         || result=$?
@@ -243,6 +389,45 @@ process_marker() {
 }
 
 case "${1:-}" in
+    --self-test-barrier-sequence)
+        test "$#" -eq 1 || exit 2
+        terminal_fifo="${PERF_MARKER_SELF_TEST_TERMINAL_FIFO:-}"
+        test -n "${terminal_fifo}" && test -p "${terminal_fifo}" || exit 2
+        if test -n "${PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS:-}"; then
+            barrier_timeout_ns="${PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS}"
+            valid_uint64_text "${barrier_timeout_ns}" || exit 2
+            test "${barrier_timeout_ns}" -gt 0 \
+                && test "${barrier_timeout_ns}" -le 500000000 || exit 2
+        fi
+        barrier_sequence_mode=true
+        exec 7>&1
+        exec 6<> "${terminal_fifo}"
+        barrier_input_fd_open=true
+
+        barrier_sequence_phase=first
+        if terminal_visibility_barrier static first 1; then
+            echo "PERF_MARKER_BARRIER_SEQUENCE phase=first result=unexpected_accept" >&2
+            exit 1
+        fi
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=first result=rejected tainted=true"
+
+        barrier_sequence_phase=resync
+        if ! resynchronize_terminal_if_needed; then
+            echo "PERF_MARKER_BARRIER_SEQUENCE phase=resync result=rejected tainted=true" >&2
+            exit 1
+        fi
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=resync result=accepted tainted=false"
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=second action=draw"
+
+        barrier_sequence_phase=second
+        if ! terminal_visibility_barrier static second 2; then
+            echo "PERF_MARKER_BARRIER_SEQUENCE phase=second result=rejected tainted=true" >&2
+            exit 1
+        fi
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=second result=accepted tainted=false"
+        echo "PERF_MARKER_BARRIER_SEQUENCE phase=second action=ack"
+        exit 0
+        ;;
     --self-test-barrier)
         test "$#" -eq 1 || exit 2
         if test -n "${PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS:-}"; then

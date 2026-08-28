@@ -125,7 +125,13 @@ its byte-state parser ignores unrelated input, including printable `n`, and
 accepts only exact `ESC [ 0 n` before one absolute monotonic deadline. EOF,
 malformed-only input, or timeout produces no acknowledgement. Thus a
 fullscreen workload cannot stack above or repaint the ROI after the
-acknowledgement. The guest agent waits at most two seconds for this renderer
+acknowledgement. A DSR timeout taints the persistent renderer. Before any later
+marker draw, it sends the distinct cursor-position query `ESC [ 6 n` and waits
+for an exact `ESC [ <row> ; <column> R` response. A late `ESC [ 0 n` from the
+old DSR is consumed but cannot satisfy this pre-draw resynchronization fence;
+only a successful cursor report permits the new draw and its own DSR. A failed
+fence leaves the renderer tainted and produces neither a draw nor an ACK. The
+guest agent waits at most two seconds for this renderer
 acknowledgement and drains any nonmatching stale revision within that same
 overall bound; a late revision may enter the FIFO, but it cannot satisfy or
 poison the current event. A monotonic nanosecond deadline is recorded before request
@@ -143,13 +149,15 @@ ignores each delivered counterpart so one physical input cannot consume a
 second arm. It dispatches through a serialized worker so the XI2 reader keeps
 draining during marker processing. Key and click events stay FIFO; an atomic
 motion ownership token coalesces every later RawMotion delivered while one
-motion epoch is open. Before the next arm, the invocation sync places a
-checkpoint through the same XI2 event FIFO and serialized worker; only after
-all earlier records and agent calls drain does that checkpoint clear motion
-ownership and permit the sync echo. This is an explicit FIFO/worker epoch
-boundary, not a sleep-based burst heuristic. The checkpoint's single bounded
-wait budget covers both a monitor still creating its event FIFO at startup and
-the subsequent worker acknowledgement. Guest
+motion epoch is open. Before the next arm, the invocation sync rotates the XI2
+source: it terminates the old `xinput` subscription, drains all stdout already
+published by that source through EOF, and closes the old X connection so
+unread upstream events cannot cross generations. The monitor establishes the
+new subscription endpoint before placing the checkpoint behind the old epoch's
+agent work. Only after that worker checkpoint clears motion ownership does it
+permit the sync echo. This is an explicit XI2-source/FIFO/worker epoch boundary,
+not a sleep-based burst heuristic. The checkpoint's single bounded wait budget
+covers monitor/source startup and the subsequent worker acknowledgement. Guest
 timestamps come from a statically linked
 `clock_gettime(CLOCK_MONOTONIC)` helper rather than `/proc/uptime`'s coarse
 text representation. Startup requires the manifest capability
