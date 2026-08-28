@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-29
+
 ### Added
 
 - Added versioned guest manifests, verified artifact hashes, and private
@@ -294,7 +296,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/BeriBeli/spice-swift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/BeriBeli/spice-swift/compare/v0.2.7...v0.3.0
 [0.2.7]: https://github.com/BeriBeli/spice-swift/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/BeriBeli/spice-swift/compare/v0.2.5...v0.2.6
