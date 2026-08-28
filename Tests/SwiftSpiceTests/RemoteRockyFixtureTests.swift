@@ -476,6 +476,10 @@ struct RemoteRockyFixtureTests {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
+        let feederReady = FileManager.default.temporaryDirectory.appending(
+            path: "marker-barrier-feeder-\(UUID().uuidString)"
+        )
+        defer { try? FileManager.default.removeItem(at: feederReady) }
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [
             repositoryRoot.appending(
@@ -490,15 +494,31 @@ struct RemoteRockyFixtureTests {
         environment["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS"] = "50000000"
         environment["PERF_MARKER_SELF_TEST_BARRIER_DIAGNOSTICS"] = "1"
         process.environment = environment
+        let feeder = try launchOpenPipeFeeder(
+            unrelatedPrefix,
+            output: input,
+            ready: feederReady
+        )
+        defer {
+            if feeder.isRunning {
+                feeder.terminate()
+                feeder.waitUntilExit()
+            }
+        }
+        try waitForPath(feederReady)
+        try input.fileHandleForWriting.close()
         try process.run()
-        input.fileHandleForWriting.write(Data(unrelatedPrefix.utf8))
         let timedOut = try RunningScript(process: process, output: output).finish(
             within: .seconds(2)
         )
-        try input.fileHandleForWriting.close()
 
         #expect(timedOut.status != 0)
         #expect(timedOut.output.contains("PERF_MARKER_BARRIER rejected"))
+        #expect(feeder.isRunning)
+        if feeder.isRunning {
+            feeder.terminate()
+        }
+        feeder.waitUntilExit()
         let transportRecord = try #require(perfRecords(
             prefix: "PERF_MARKER_BARRIER_TRANSPORT",
             in: timedOut.output
@@ -533,7 +553,6 @@ struct RemoteRockyFixtureTests {
         renderer.standardError = output
         var environment = ProcessInfo.processInfo.environment
         environment["PERF_MARKER_SELF_TEST_TERMINAL_FIFO"] = terminalFIFO.path
-        environment["PERF_MARKER_SELF_TEST_BARRIER_TIMEOUT_NS"] = "50000000"
         renderer.environment = environment
         try renderer.run()
         try output.close()
@@ -554,14 +573,13 @@ struct RemoteRockyFixtureTests {
             count: 1,
             in: outputURL
         )
-        let terminal = try FileHandle(forWritingTo: terminalFIFO)
-        defer { try? terminal.close() }
         let escape = "\u{1B}"
 
         // This is the exact response to the timed-out first DSR. The second
         // request is waiting for a different CPR grammar, so it must drain and
         // identify the stale response without drawing or accepting marker two.
-        terminal.write(Data("\(escape)[0n".utf8))
+        let staleDSRWrite = try writeFIFOBytes("\(escape)[0n", to: terminalFIFO)
+        try #require(staleDSRWrite.status == 0)
         try waitForText(
             "PERF_MARKER_BARRIER_SEQUENCE phase=resync ignored=dsr",
             count: 1,
@@ -571,7 +589,8 @@ struct RemoteRockyFixtureTests {
         #expect(!afterStaleResponse.contains("phase=resync result=accepted"))
         #expect(!afterStaleResponse.contains("phase=second action=draw"))
 
-        terminal.write(Data("\(escape)[1;1R".utf8))
+        let resyncCPRWrite = try writeFIFOBytes("\(escape)[1;1R", to: terminalFIFO)
+        try #require(resyncCPRWrite.status == 0)
         try waitForText(
             "PERF_MARKER_BARRIER_SEQUENCE phase=resync result=accepted tainted=false",
             count: 1,
@@ -582,7 +601,8 @@ struct RemoteRockyFixtureTests {
             count: 1,
             in: outputURL
         )
-        terminal.write(Data("\(escape)[0n".utf8))
+        let secondDSRWrite = try writeFIFOBytes("\(escape)[0n", to: terminalFIFO)
+        try #require(secondDSRWrite.status == 0)
         try waitForText(
             "PERF_MARKER_BARRIER_SEQUENCE phase=second action=ack",
             count: 1,
@@ -2247,6 +2267,54 @@ struct RemoteRockyFixtureTests {
         process.standardError = output
         try process.run()
         return RunningScript(process: process, output: output)
+    }
+
+    /// Writes the complete fixture before publishing readiness, then replaces
+    /// the shell with one bounded sleeper that keeps stdout open. The test
+    /// process never writes the renderer's potentially closed stdin pipe.
+    private func launchOpenPipeFeeder(
+        _ bytes: String,
+        output: Pipe,
+        ready: URL
+    ) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "printf '%s' \"$1\"; : > \"$2\"; exec /bin/sleep 30",
+            "bounded-open-pipe-feeder",
+            bytes,
+            ready.path,
+        ]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        return process
+    }
+
+    /// Keeps a closed FIFO or EPIPE in a disposable child process so a failed
+    /// renderer becomes a normal test failure rather than SIGPIPE terminating
+    /// the Swift Testing bundle.
+    private func writeFIFOBytes(
+        _ bytes: String,
+        to FIFO: URL
+    ) throws -> ScriptResult {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "printf '%s' \"$1\" > \"$2\"",
+            "bounded-fifo-writer",
+            bytes,
+            FIFO.path,
+        ]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        return try RunningScript(process: process, output: output).finish(
+            within: .seconds(2)
+        )
     }
 
     private func launchGuestMarkerCommand(
