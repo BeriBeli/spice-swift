@@ -121,7 +121,7 @@ them on every build and also checks a release tag:
 
 ```sh
 ./Scripts/check-version.sh
-./Scripts/check-version.sh v0.2.2
+./Scripts/check-version.sh "v$(cat VERSION)"
 ```
 
 To publish a release from a clean, synchronized `main`, run the full local
@@ -131,7 +131,7 @@ version, commits the two version files, pushes `main`, and pushes the tag that
 starts the repository's GitHub Release workflow:
 
 ```sh
-./Scripts/release.sh 0.2.2
+./Scripts/release.sh 0.3.0
 ```
 
 ## Use the library
