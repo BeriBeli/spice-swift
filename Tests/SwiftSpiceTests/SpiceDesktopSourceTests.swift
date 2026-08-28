@@ -139,6 +139,59 @@ struct SpiceDesktopSourceTests {
         subscription.cancel()
     }
 
+    @Test func explicitLatestRequestRedeliversAuthoritativeFrameWithNewSequence() throws {
+        let source = SpiceDesktopSource()
+        source.beginSession(pointerMode: .absolute)
+        let delivered = Mutex<[SpiceDesktopSnapshot]>([])
+        let subscription = source.subscribe()
+        subscription.setUpdateHandler { snapshot in
+            delivered.withLock { $0.append(snapshot) }
+        }
+        subscription.setDemand(.visible)
+        source.receiveFrame(Self.frame(revision: 7), displayChannelID: 0)
+
+        let initial = try #require(delivered.withLock { snapshots in
+            snapshots.last { $0.frame != nil }
+        })
+        let initialFrame = try #require(initial.frame)
+        let latch = SpiceDesktopReadyLatch()
+
+        #expect(latch.offer(initial))
+        let selectedInitial = try #require(latch.take())
+        #expect(selectedInitial.deliverySequence == initial.deliverySequence)
+
+        // An unsolicited duplicate remains the same delivery identity and
+        // cannot wake a latch that already selected it.
+        #expect(!latch.offer(initial))
+        #expect(latch.isEmpty)
+
+        delivered.withLock { $0.removeAll(keepingCapacity: true) }
+        subscription.requestLatest()
+        let firstRedraw = try #require(delivered.withLock { $0.only })
+        let firstRedrawFrame = try #require(firstRedraw.frame)
+        #expect(firstRedrawFrame.revision == initialFrame.revision)
+        #expect(firstRedrawFrame.frame == initialFrame.frame)
+        #expect(firstRedrawFrame.damage == .full)
+        #expect(firstRedraw.deliverySequence > initial.deliverySequence)
+        #expect(latch.offer(firstRedraw))
+        let selectedFirstRedraw = try #require(latch.take())
+        #expect(selectedFirstRedraw.deliverySequence == firstRedraw.deliverySequence)
+
+        delivered.withLock { $0.removeAll(keepingCapacity: true) }
+        subscription.requestLatest()
+        let secondRedraw = try #require(delivered.withLock { $0.only })
+        let secondRedrawFrame = try #require(secondRedraw.frame)
+        #expect(secondRedrawFrame.revision == initialFrame.revision)
+        #expect(secondRedrawFrame.frame == initialFrame.frame)
+        #expect(secondRedrawFrame.damage == .full)
+        #expect(secondRedraw.deliverySequence > firstRedraw.deliverySequence)
+        #expect(latch.offer(secondRedraw))
+        let selectedSecondRedraw = try #require(latch.take())
+        #expect(selectedSecondRedraw.deliverySequence == secondRedraw.deliverySequence)
+        #expect(latch.isEmpty)
+        subscription.cancel()
+    }
+
     @Test func secondVisibleSubscriberImmediatelyReceivesRetainedLatestAsFull() async throws {
         let source = SpiceDesktopSource()
         source.beginSession(pointerMode: .absolute)
