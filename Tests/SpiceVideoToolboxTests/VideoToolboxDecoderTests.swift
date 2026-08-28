@@ -1,3 +1,4 @@
+import CoreMedia
 import CoreVideo
 import Foundation
 import Testing
@@ -6,6 +7,12 @@ import Testing
 
 @Suite("VideoToolbox decoder boundary")
 struct VideoToolboxDecoderTests {
+    enum SampleBuilderOutcome: String, Sendable {
+        case success
+        case blockCreationFailure
+        case sampleCreationFailure
+    }
+
     @Test func nativeNV12FrameReportsMetadataAndMaterializesBGRA() throws {
         let pixelBuffer = try makeNV12PixelBuffer(
             width: 2,
@@ -88,6 +95,143 @@ struct VideoToolboxDecoderTests {
         await decoder.close()
     }
 
+    @Test(arguments: [
+        SampleBuilderOutcome.success,
+        .blockCreationFailure,
+        .sampleCreationFailure,
+    ])
+    func coreMediaSampleOwnerIsReleasedExactlyOnce(
+        _ outcome: SampleBuilderOutcome
+    ) throws {
+        let injectedStatus = OSStatus(-12_345)
+        let builder = SpiceVideoToolboxSampleBufferBuilder(
+            blockBufferCreationFailureForAttempt: { attempt in
+                outcome == .blockCreationFailure && attempt == 1 ? injectedStatus : nil
+            },
+            sampleBufferCreationFailureForAttempt: { attempt in
+                outcome == .sampleCreationFailure && attempt == 1 ? injectedStatus : nil
+            }
+        )
+        let formatDescription = try makeVideoFormatDescription()
+        let sampleData = Data([0, 0, 0, 3, 0x65, 0x88, 0x84])
+
+        switch outcome {
+        case .success:
+            try buildInspectAndReleaseSample(
+                builder: builder,
+                data: sampleData,
+                formatDescription: formatDescription
+            )
+        case .blockCreationFailure:
+            #expect(throws: SpiceCodecError.backendFailure(
+                "CoreMedia block allocation status \(injectedStatus)"
+            )) {
+                try builder.makeSampleBuffer(
+                    data: sampleData,
+                    multimediaTime: 7,
+                    formatDescription: formatDescription
+                )
+            }
+        case .sampleCreationFailure:
+            #expect(throws: SpiceCodecError.backendFailure(
+                "CoreMedia sample creation status \(injectedStatus)"
+            )) {
+                try builder.makeSampleBuffer(
+                    data: sampleData,
+                    multimediaTime: 7,
+                    formatDescription: formatDescription
+                )
+            }
+        }
+
+        let released = builder.diagnosticsSnapshot()
+        #expect(released.coreMediaBlockCopyBytes == 0)
+        #expect(released.sampleOwnerRetainCount == 1)
+        #expect(released.sampleOwnerReleaseCount == 1)
+        #expect(released.activeSampleOwnerCount == 0)
+    }
+
+    @Test func cancellingTaskHoldingSampleReleasesOwnerExactlyOnce() async throws {
+        let builder = SpiceVideoToolboxSampleBufferBuilder()
+        let formatDescription = try makeVideoFormatDescription()
+        let gate = SampleCancellationGate()
+        let task = Task {
+            let sampleBuffer = try builder.makeSampleBuffer(
+                data: Data([0, 0, 0, 3, 0x65, 0x88, 0x84]),
+                multimediaTime: 11,
+                formatDescription: formatDescription
+            )
+            await withTaskCancellationHandler {
+                await gate.hold()
+                withExtendedLifetime(sampleBuffer) {}
+            } onCancel: {
+                Task { await gate.cancel() }
+            }
+        }
+
+        await gate.waitUntilStarted()
+        let retained = builder.diagnosticsSnapshot()
+        #expect(retained.sampleOwnerRetainCount == 1)
+        #expect(retained.sampleOwnerReleaseCount == 0)
+        #expect(retained.activeSampleOwnerCount == 1)
+
+        task.cancel()
+        await gate.waitUntilCancelled()
+        try await task.value
+
+        let released = builder.diagnosticsSnapshot()
+        #expect(released.coreMediaBlockCopyBytes == 0)
+        #expect(released.sampleOwnerRetainCount == 1)
+        #expect(released.sampleOwnerReleaseCount == 1)
+        #expect(released.activeSampleOwnerCount == 0)
+    }
+
+    private func buildInspectAndReleaseSample(
+        builder: SpiceVideoToolboxSampleBufferBuilder,
+        data: Data,
+        formatDescription: CMVideoFormatDescription
+    ) throws {
+        let sampleBuffer = try builder.makeSampleBuffer(
+            data: data,
+            multimediaTime: 7,
+            formatDescription: formatDescription
+        )
+        let retained = builder.diagnosticsSnapshot()
+        #expect(retained.coreMediaBlockCopyBytes == 0)
+        #expect(retained.sampleOwnerRetainCount == 1)
+        #expect(retained.sampleOwnerReleaseCount == 0)
+        #expect(retained.activeSampleOwnerCount == 1)
+
+        let blockBuffer = try #require(CMSampleBufferGetDataBuffer(sampleBuffer))
+        #expect(CMBlockBufferGetDataLength(blockBuffer) == data.count)
+        var copied = Data(count: data.count)
+        let status = copied.withUnsafeMutableBytes {
+            (bytes: UnsafeMutableRawBufferPointer) in
+            CMBlockBufferCopyDataBytes(
+                blockBuffer,
+                atOffset: 0,
+                dataLength: data.count,
+                destination: bytes.baseAddress!
+            )
+        }
+        #expect(status == kCMBlockBufferNoErr)
+        #expect(copied == data)
+    }
+
+    private func makeVideoFormatDescription() throws -> CMVideoFormatDescription {
+        var formatDescription: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: nil,
+            codecType: kCMVideoCodecType_H264,
+            width: 16,
+            height: 16,
+            extensions: nil,
+            formatDescriptionOut: &formatDescription
+        )
+        #expect(status == noErr)
+        return try #require(formatDescription)
+    }
+
     private func makeNV12PixelBuffer(
         width: Int,
         height: Int,
@@ -133,5 +277,55 @@ struct VideoToolboxDecoderTests {
             }
         }
         return buffer
+    }
+}
+
+private actor SampleCancellationGate {
+    private var started = false
+    private var cancelled = false
+    private var release: CheckedContinuation<Void, Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func hold() async {
+        started = true
+        for waiter in startWaiters {
+            waiter.resume()
+        }
+        startWaiters.removeAll()
+        guard !cancelled else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            if cancelled {
+                continuation.resume()
+            } else {
+                release = continuation
+            }
+        }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else {
+            return
+        }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func waitUntilCancelled() async {
+        guard !cancelled else {
+            return
+        }
+        await withCheckedContinuation { cancellationWaiters.append($0) }
+    }
+
+    func cancel() {
+        cancelled = true
+        release?.resume()
+        release = nil
+        for waiter in cancellationWaiters {
+            waiter.resume()
+        }
+        cancellationWaiters.removeAll()
     }
 }

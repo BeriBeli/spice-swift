@@ -19,6 +19,19 @@ package struct SpiceVideoToolboxDiagnostics: Sendable, Equatable {
     package let decodedFrameCount: UInt64
     package let droppedFrameCount: UInt64
     package let cpuMaterializationCount: UInt64
+    package let annexBScanPassCount: UInt64
+    package let annexBInputCopyBytes: UInt64
+    package let annexBNALPayloadMaterializations: UInt64
+    package let annexBNALPayloadCopyBytes: UInt64
+    package let avccSampleAllocations: UInt64
+    package let avccSampleBytes: UInt64
+    package let samplePayloadCopyBytes: UInt64
+    package let parameterSetMaterializationCount: UInt64
+    package let parameterSetMaterializationBytes: UInt64
+    package let coreMediaBlockCopyBytes: UInt64
+    package let sampleOwnerRetainCount: UInt64
+    package let sampleOwnerReleaseCount: UInt64
+    package let activeSampleOwnerCount: UInt64
     package let currentHardwareDecoderState: SpiceVideoToolboxHardwareDecoderState
 }
 
@@ -31,6 +44,18 @@ private final class VideoToolboxDiagnosticsCounter: @unchecked Sendable {
     private var decodedFrameCount: UInt64 = 0
     private var droppedFrameCount: UInt64 = 0
     private var cpuMaterializationCount: UInt64 = 0
+    private var annexBScanPassCount: UInt64 = 0
+    private var annexBInputCopyBytes: UInt64 = 0
+    private var annexBNALPayloadMaterializations: UInt64 = 0
+    private var annexBNALPayloadCopyBytes: UInt64 = 0
+    private var avccSampleAllocations: UInt64 = 0
+    private var avccSampleBytes: UInt64 = 0
+    private var samplePayloadCopyBytes: UInt64 = 0
+    private var parameterSetMaterializationCount: UInt64 = 0
+    private var parameterSetMaterializationBytes: UInt64 = 0
+    private var sampleOwnerRetainCount: UInt64 = 0
+    private var sampleOwnerReleaseCount: UInt64 = 0
+    private var activeSampleOwnerCount: UInt64 = 0
     private var currentHardwareDecoderState: SpiceVideoToolboxHardwareDecoderState = .notCreated
 
     func recordSession(state: SpiceVideoToolboxHardwareDecoderState) {
@@ -68,6 +93,41 @@ private final class VideoToolboxDiagnosticsCounter: @unchecked Sendable {
         lock.unlock()
     }
 
+    func recordParser(_ diagnostics: SpiceAnnexBParserDiagnostics) {
+        lock.lock()
+        annexBScanPassCount &+= UInt64(diagnostics.scanPassCount)
+        annexBInputCopyBytes &+= UInt64(diagnostics.inputCopyBytes)
+        annexBNALPayloadMaterializations &+= UInt64(diagnostics.nalPayloadMaterializations)
+        annexBNALPayloadCopyBytes &+= UInt64(diagnostics.nalPayloadCopyBytes)
+        avccSampleAllocations &+= UInt64(diagnostics.avccSampleAllocations)
+        avccSampleBytes &+= UInt64(diagnostics.avccSampleBytes)
+        samplePayloadCopyBytes &+= UInt64(diagnostics.samplePayloadCopyBytes)
+        lock.unlock()
+    }
+
+    func recordParameterSetMaterialization(byteCount: Int) {
+        lock.lock()
+        parameterSetMaterializationCount &+= 1
+        parameterSetMaterializationBytes &+= UInt64(byteCount)
+        lock.unlock()
+    }
+
+    func recordSampleOwnerRetained() {
+        lock.lock()
+        sampleOwnerRetainCount &+= 1
+        activeSampleOwnerCount &+= 1
+        lock.unlock()
+    }
+
+    func recordSampleOwnerReleased() {
+        lock.lock()
+        sampleOwnerReleaseCount &+= 1
+        if activeSampleOwnerCount > 0 {
+            activeSampleOwnerCount -= 1
+        }
+        lock.unlock()
+    }
+
     func snapshot() -> SpiceVideoToolboxDiagnostics {
         lock.lock()
         defer { lock.unlock() }
@@ -79,8 +139,197 @@ private final class VideoToolboxDiagnosticsCounter: @unchecked Sendable {
             decodedFrameCount: decodedFrameCount,
             droppedFrameCount: droppedFrameCount,
             cpuMaterializationCount: cpuMaterializationCount,
+            annexBScanPassCount: annexBScanPassCount,
+            annexBInputCopyBytes: annexBInputCopyBytes,
+            annexBNALPayloadMaterializations: annexBNALPayloadMaterializations,
+            annexBNALPayloadCopyBytes: annexBNALPayloadCopyBytes,
+            avccSampleAllocations: avccSampleAllocations,
+            avccSampleBytes: avccSampleBytes,
+            samplePayloadCopyBytes: samplePayloadCopyBytes,
+            parameterSetMaterializationCount: parameterSetMaterializationCount,
+            parameterSetMaterializationBytes: parameterSetMaterializationBytes,
+            coreMediaBlockCopyBytes: 0,
+            sampleOwnerRetainCount: sampleOwnerRetainCount,
+            sampleOwnerReleaseCount: sampleOwnerReleaseCount,
+            activeSampleOwnerCount: activeSampleOwnerCount,
             currentHardwareDecoderState: currentHardwareDecoderState
         )
+    }
+}
+
+private final class SpiceCoreMediaSampleOwner: @unchecked Sendable {
+    let storage: NSData
+    private let diagnostics: VideoToolboxDiagnosticsCounter
+    private let releaseLock = NSLock()
+    private var coreMediaRetainReleased = false
+
+    init(data: consuming Data, diagnostics: VideoToolboxDiagnosticsCounter) {
+        storage = data as NSData
+        self.diagnostics = diagnostics
+    }
+
+    var mutableBytes: UnsafeMutableRawPointer {
+        UnsafeMutableRawPointer(mutating: storage.bytes)
+    }
+
+    func passRetainedToCoreMedia() -> UnsafeMutableRawPointer {
+        diagnostics.recordSampleOwnerRetained()
+        return Unmanaged.passRetained(self).toOpaque()
+    }
+
+    func releaseCoreMediaRetain(_ refCon: UnsafeMutableRawPointer) {
+        releaseLock.lock()
+        guard !coreMediaRetainReleased else {
+            releaseLock.unlock()
+            return
+        }
+        coreMediaRetainReleased = true
+        releaseLock.unlock()
+        diagnostics.recordSampleOwnerReleased()
+        Unmanaged<SpiceCoreMediaSampleOwner>.fromOpaque(refCon).release()
+    }
+}
+
+private let releaseCoreMediaSampleBlock: @convention(c) (
+    UnsafeMutableRawPointer?,
+    UnsafeMutableRawPointer,
+    Int
+) -> Void = { refCon, _, _ in
+    guard let refCon else {
+        return
+    }
+    let owner = Unmanaged<SpiceCoreMediaSampleOwner>
+        .fromOpaque(refCon)
+        .takeUnretainedValue()
+    owner.releaseCoreMediaRetain(refCon)
+}
+
+/// Package-only construction seam used to verify CoreMedia ownership without
+/// requiring a hardware decoder session. Production and tests share the exact
+/// same custom-block-source path.
+package final class SpiceVideoToolboxSampleBufferBuilder: @unchecked Sendable {
+    private let diagnostics: VideoToolboxDiagnosticsCounter
+    private let blockBufferCreationFailureForAttempt: @Sendable (Int) -> OSStatus?
+    private let sampleBufferCreationFailureForAttempt: @Sendable (Int) -> OSStatus?
+    private let attemptLock = NSLock()
+    private var blockBufferCreationAttempt = 0
+    private var sampleBufferCreationAttempt = 0
+
+    package convenience init(
+        blockBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        },
+        sampleBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        }
+    ) {
+        self.init(
+            diagnostics: VideoToolboxDiagnosticsCounter(),
+            blockBufferCreationFailureForAttempt: blockBufferCreationFailureForAttempt,
+            sampleBufferCreationFailureForAttempt: sampleBufferCreationFailureForAttempt
+        )
+    }
+
+    fileprivate init(
+        diagnostics: VideoToolboxDiagnosticsCounter,
+        blockBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus?,
+        sampleBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus?
+    ) {
+        self.diagnostics = diagnostics
+        self.blockBufferCreationFailureForAttempt = blockBufferCreationFailureForAttempt
+        self.sampleBufferCreationFailureForAttempt = sampleBufferCreationFailureForAttempt
+    }
+
+    package func makeSampleBuffer(
+        data: consuming Data,
+        multimediaTime: UInt32,
+        formatDescription: CMVideoFormatDescription
+    ) throws(SpiceCodecError) -> CMSampleBuffer {
+        guard !data.isEmpty else {
+            throw .malformedPayload("cannot create a CoreMedia block for an empty sample")
+        }
+
+        let owner = SpiceCoreMediaSampleOwner(data: data, diagnostics: diagnostics)
+        let refCon = owner.passRetainedToCoreMedia()
+        var customBlockSource = CMBlockBufferCustomBlockSource()
+        customBlockSource.version = UInt32(kCMBlockBufferCustomBlockSourceVersion)
+        customBlockSource.AllocateBlock = nil
+        customBlockSource.FreeBlock = releaseCoreMediaSampleBlock
+        customBlockSource.refCon = refCon
+
+        let blockAttempt = nextBlockBufferCreationAttempt()
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus: OSStatus
+        if let injectedStatus = blockBufferCreationFailureForAttempt(blockAttempt) {
+            blockStatus = injectedStatus
+        } else {
+            blockStatus = CMBlockBufferCreateWithMemoryBlock(
+                allocator: nil,
+                memoryBlock: owner.mutableBytes,
+                blockLength: owner.storage.length,
+                blockAllocator: nil,
+                customBlockSource: &customBlockSource,
+                offsetToData: 0,
+                dataLength: owner.storage.length,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            )
+        }
+        guard blockStatus == kCMBlockBufferNoErr, let blockBuffer else {
+            // CoreMedia may synchronously invoke FreeBlock while unwinding a
+            // failed creation. The owner arbitrates both paths exactly once.
+            owner.releaseCoreMediaRetain(refCon)
+            throw .backendFailure("CoreMedia block allocation status \(blockStatus)")
+        }
+
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: CMTime(value: Int64(multimediaTime), timescale: 1_000),
+            decodeTimeStamp: .invalid
+        )
+        var sampleSize = owner.storage.length
+        var sampleBuffer: CMSampleBuffer?
+        let sampleAttempt = nextSampleBufferCreationAttempt()
+        let sampleStatus: OSStatus
+        if let injectedStatus = sampleBufferCreationFailureForAttempt(sampleAttempt) {
+            sampleStatus = injectedStatus
+        } else {
+            sampleStatus = CMSampleBufferCreateReady(
+                allocator: nil,
+                dataBuffer: blockBuffer,
+                formatDescription: formatDescription,
+                sampleCount: 1,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 1,
+                sampleSizeArray: &sampleSize,
+                sampleBufferOut: &sampleBuffer
+            )
+        }
+        guard sampleStatus == noErr, let sampleBuffer else {
+            throw .backendFailure("CoreMedia sample creation status \(sampleStatus)")
+        }
+        return sampleBuffer
+    }
+
+    package func diagnosticsSnapshot() -> SpiceVideoToolboxDiagnostics {
+        diagnostics.snapshot()
+    }
+
+    private func nextBlockBufferCreationAttempt() -> Int {
+        attemptLock.lock()
+        blockBufferCreationAttempt &+= 1
+        let attempt = blockBufferCreationAttempt
+        attemptLock.unlock()
+        return attempt
+    }
+
+    private func nextSampleBufferCreationAttempt() -> Int {
+        attemptLock.lock()
+        sampleBufferCreationAttempt &+= 1
+        let attempt = sampleBufferCreationAttempt
+        attemptLock.unlock()
+        return attempt
     }
 }
 
@@ -294,9 +543,12 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         VTDecompressionSession
     ) -> SpiceVideoToolboxHardwareDecoderState
     private let formatDescriptionFailureForAttempt: @Sendable (Int) -> OSStatus?
+    private let decodeSubmissionFailureForAttempt: @Sendable (Int) -> OSStatus?
     private var sessionCreationAttempt = 0
     private var formatDescriptionCreationAttempt = 0
-    private let diagnosticsCounter = VideoToolboxDiagnosticsCounter()
+    private var decodeSubmissionAttempt = 0
+    private let diagnosticsCounter: VideoToolboxDiagnosticsCounter
+    private let sampleBufferBuilder: SpiceVideoToolboxSampleBufferBuilder
 
     package init(
         codec: SpiceAdvancedVideoCodec,
@@ -310,6 +562,15 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             SpiceVideoToolboxDecoder.hardwareDecoderState(for: $0)
         },
         formatDescriptionFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        },
+        blockBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        },
+        sampleBufferCreationFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
+            _ in nil
+        },
+        decodeSubmissionFailureForAttempt: @escaping @Sendable (Int) -> OSStatus? = {
             _ in nil
         }
     ) throws(SpiceCodecError) {
@@ -338,6 +599,14 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         self.sessionCreationFailureForAttempt = sessionCreationFailureForAttempt
         self.hardwareStateForSession = hardwareStateForSession
         self.formatDescriptionFailureForAttempt = formatDescriptionFailureForAttempt
+        self.decodeSubmissionFailureForAttempt = decodeSubmissionFailureForAttempt
+        let diagnosticsCounter = VideoToolboxDiagnosticsCounter()
+        self.diagnosticsCounter = diagnosticsCounter
+        self.sampleBufferBuilder = SpiceVideoToolboxSampleBufferBuilder(
+            diagnostics: diagnosticsCounter,
+            blockBufferCreationFailureForAttempt: blockBufferCreationFailureForAttempt,
+            sampleBufferCreationFailureForAttempt: sampleBufferCreationFailureForAttempt
+        )
     }
 
     package func decode(
@@ -357,13 +626,18 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         payload: Data,
         multimediaTime: UInt32
     ) async throws(SpiceCodecError) -> (any SpiceDecodedVideoFrame)? {
-        let accessUnit = try parser.parse(codec: codec, payload: payload)
+        let parseResult = try parser.parseWithDiagnostics(codec: codec, payload: payload)
+        diagnosticsCounter.recordParser(parseResult.diagnostics)
+        let accessUnit = parseResult.accessUnit
         var changed = false
         for parameterSet in accessUnit.parameterSets {
-            if parameterSets[parameterSet.type] != parameterSet.bytes {
-                parameterSets[parameterSet.type] = parameterSet.bytes
-                changed = true
+            if let current = parameterSets[parameterSet.type], parameterSet.contentEquals(current) {
+                continue
             }
+            let bytes = parameterSet.bytes
+            diagnosticsCounter.recordParameterSetMaterialization(byteCount: bytes.count)
+            parameterSets[parameterSet.type] = bytes
+            changed = true
         }
         if changed {
             sessionRebuildRequired = true
@@ -381,7 +655,7 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             throw .malformedPayload("picture access unit produced an empty sample")
         }
 
-        let sampleBuffer = try makeSampleBuffer(
+        let sampleBuffer = try sampleBufferBuilder.makeSampleBuffer(
             data: accessUnit.sampleData,
             multimediaTime: multimediaTime,
             formatDescription: formatDescription
@@ -394,13 +668,19 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
             diagnostics: diagnosticsCounter
         )
         var infoFlags = VTDecodeInfoFlags()
-        let status = VTDecompressionSessionDecodeFrame(
-            session,
-            sampleBuffer: sampleBuffer,
-            flags: [],
-            frameRefcon: Unmanaged.passUnretained(output).toOpaque(),
-            infoFlagsOut: &infoFlags
-        )
+        decodeSubmissionAttempt &+= 1
+        let status: OSStatus
+        if let injectedStatus = decodeSubmissionFailureForAttempt(decodeSubmissionAttempt) {
+            status = injectedStatus
+        } else {
+            status = VTDecompressionSessionDecodeFrame(
+                session,
+                sampleBuffer: sampleBuffer,
+                flags: [],
+                frameRefcon: Unmanaged.passUnretained(output).toOpaque(),
+                infoFlagsOut: &infoFlags
+            )
+        }
         guard status == noErr else {
             throw videoToolboxCompatibilityError(codec: codec, status: status)
                 ?? .backendFailure("VideoToolbox submission status \(status)")
@@ -611,62 +891,6 @@ package actor SpiceVideoToolboxDecoder: SpiceAdvancedVideoDecoder {
         return .backendFailure(
             "VideoToolbox session creation status \(status) (\(context))"
         )
-    }
-
-    private func makeSampleBuffer(
-        data: Data,
-        multimediaTime: UInt32,
-        formatDescription: CMVideoFormatDescription
-    ) throws(SpiceCodecError) -> CMSampleBuffer {
-        var blockBuffer: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: nil,
-            memoryBlock: nil,
-            blockLength: data.count,
-            blockAllocator: nil,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: data.count,
-            flags: 0,
-            blockBufferOut: &blockBuffer
-        )
-        guard status == kCMBlockBufferNoErr, let blockBuffer else {
-            throw .backendFailure("CoreMedia block allocation status \(status)")
-        }
-        status = data.withUnsafeBytes { bytes in
-            CMBlockBufferReplaceDataBytes(
-                with: bytes.baseAddress!,
-                blockBuffer: blockBuffer,
-                offsetIntoDestination: 0,
-                dataLength: data.count
-            )
-        }
-        guard status == kCMBlockBufferNoErr else {
-            throw .backendFailure("CoreMedia block copy status \(status)")
-        }
-
-        var timing = CMSampleTimingInfo(
-            duration: .invalid,
-            presentationTimeStamp: CMTime(value: Int64(multimediaTime), timescale: 1_000),
-            decodeTimeStamp: .invalid
-        )
-        var sampleSize = data.count
-        var sampleBuffer: CMSampleBuffer?
-        status = CMSampleBufferCreateReady(
-            allocator: nil,
-            dataBuffer: blockBuffer,
-            formatDescription: formatDescription,
-            sampleCount: 1,
-            sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1,
-            sampleSizeArray: &sampleSize,
-            sampleBufferOut: &sampleBuffer
-        )
-        guard status == noErr, let sampleBuffer else {
-            throw .backendFailure("CoreMedia sample creation status \(status)")
-        }
-        return sampleBuffer
     }
 
     fileprivate nonisolated static func copyDecodedPixels(

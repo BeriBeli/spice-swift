@@ -111,13 +111,82 @@ package struct SpiceAdvancedVideoDecoderDiagnostics: Sendable, Equatable {
     }
 }
 
+private final class SpiceVideoPayloadOwner: @unchecked Sendable {
+    let data: Data
+
+    init(_ data: consuming Data) {
+        self.data = data
+    }
+}
+
 package struct SpiceVideoNALUnit: Sendable, Equatable {
     package let type: UInt8
-    package let bytes: Data
+    package let sourceRange: Range<Int>
+    private let owner: SpiceVideoPayloadOwner
+
+    package var bytes: Data {
+        if sourceRange == 0..<owner.data.count {
+            return owner.data
+        }
+        return owner.data.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+            guard let baseAddress = source.baseAddress else {
+                return Data()
+            }
+            return Data(
+                bytes: baseAddress.advanced(by: sourceRange.lowerBound),
+                count: sourceRange.count
+            )
+        }
+    }
 
     package init(type: UInt8, bytes: consuming Data) {
+        let count = bytes.count
         self.type = type
-        self.bytes = bytes
+        sourceRange = 0..<count
+        owner = SpiceVideoPayloadOwner(bytes)
+    }
+
+    fileprivate init(
+        type: UInt8,
+        owner: SpiceVideoPayloadOwner,
+        sourceRange: Range<Int>
+    ) {
+        self.type = type
+        self.owner = owner
+        self.sourceRange = sourceRange
+    }
+
+    package func sharesOwner(with other: Self) -> Bool {
+        owner === other.owner
+    }
+
+    package func contentEquals(_ data: Data) -> Bool {
+        guard sourceRange.count == data.count else {
+            return false
+        }
+        return owner.data.withUnsafeBytes { (sourceBytes: UnsafeRawBufferPointer) in
+            data.withUnsafeBytes { (comparisonBytes: UnsafeRawBufferPointer) in
+                let source = sourceBytes.bindMemory(to: UInt8.self)
+                let comparison = comparisonBytes.bindMemory(to: UInt8.self)
+                return source[sourceRange].elementsEqual(comparison)
+            }
+        }
+    }
+
+    package static func == (lhs: Self, rhs: Self) -> Bool {
+        guard lhs.type == rhs.type, lhs.sourceRange.count == rhs.sourceRange.count else {
+            return false
+        }
+        if lhs.owner === rhs.owner, lhs.sourceRange == rhs.sourceRange {
+            return true
+        }
+        return lhs.owner.data.withUnsafeBytes { (lhsBytes: UnsafeRawBufferPointer) in
+            rhs.owner.data.withUnsafeBytes { (rhsBytes: UnsafeRawBufferPointer) in
+                let lhsBuffer = lhsBytes.bindMemory(to: UInt8.self)
+                let rhsBuffer = rhsBytes.bindMemory(to: UInt8.self)
+                return lhsBuffer[lhs.sourceRange].elementsEqual(rhsBuffer[rhs.sourceRange])
+            }
+        }
     }
 }
 
@@ -146,7 +215,37 @@ package struct SpiceVideoAccessUnit: Sendable, Equatable {
     }
 }
 
+package struct SpiceAnnexBParserDiagnostics: Sendable, Equatable {
+    package let scanPassCount: Int
+    package let inputCopyBytes: Int
+    package let nalPayloadMaterializations: Int
+    package let nalPayloadCopyBytes: Int
+    package let avccSampleAllocations: Int
+    package let avccSampleBytes: Int
+    package let samplePayloadCopyBytes: Int
+    package let nalUnitCount: Int
+}
+
+package struct SpiceAnnexBParseResult: Sendable, Equatable {
+    package let accessUnit: SpiceVideoAccessUnit
+    package let diagnostics: SpiceAnnexBParserDiagnostics
+}
+
 package struct SpiceAnnexBParser: Sendable {
+    private struct NALDescriptor: Sendable {
+        let type: UInt8
+        let sourceRange: Range<Int>
+        let isParameterSet: Bool
+    }
+
+    private struct ScanResult: Sendable {
+        let descriptors: [NALDescriptor]
+        let sampleData: Data
+        let samplePayloadCopyBytes: Int
+        let containsPicture: Bool
+        let isRandomAccess: Bool
+    }
+
     private let limits: SpiceAdvancedVideoDecodeLimits
 
     package init(limits: SpiceAdvancedVideoDecodeLimits = .init()) {
@@ -157,6 +256,13 @@ package struct SpiceAnnexBParser: Sendable {
         codec: SpiceAdvancedVideoCodec,
         payload: Data
     ) throws(SpiceCodecError) -> SpiceVideoAccessUnit {
+        try parseWithDiagnostics(codec: codec, payload: payload).accessUnit
+    }
+
+    package func parseWithDiagnostics(
+        codec: SpiceAdvancedVideoCodec,
+        payload: Data
+    ) throws(SpiceCodecError) -> SpiceAnnexBParseResult {
         guard !payload.isEmpty else {
             throw .emptyPayload
         }
@@ -167,111 +273,232 @@ package struct SpiceAnnexBParser: Sendable {
             )
         }
 
-        let bytes = [UInt8](payload)
-        guard let firstStartCode = startCode(in: bytes, from: 0), firstStartCode.offset == 0 else {
-            throw .malformedPayload("advanced video access unit is not Annex-B")
+        let scanOutcome: Result<ScanResult, any Error> =
+            payload.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                Result { try scan(codec: codec, bytes: bytes) }
+            }
+        let scanResult: ScanResult
+        switch scanOutcome {
+        case .success(let result):
+            scanResult = result
+        case .failure(let error):
+            guard let codecError = error as? SpiceCodecError else {
+                throw .malformedPayload("unexpected Annex-B parser failure")
+            }
+            throw codecError
         }
-
+        let owner = SpiceVideoPayloadOwner(payload)
         var nalUnits: [SpiceVideoNALUnit] = []
-        var cursor = firstStartCode.offset + firstStartCode.length
-        while cursor < bytes.count {
-            let next = startCode(in: bytes, from: cursor)
-            var end = next?.offset ?? bytes.count
-            while end > cursor, bytes[end - 1] == 0 {
-                end -= 1
-            }
-            guard end > cursor else {
-                throw .malformedPayload("Annex-B contains an empty NAL unit")
-            }
-            let count = end - cursor
-            guard count <= limits.maximumNALUnitBytes else {
-                throw .malformedPayload("NAL unit exceeds configured byte limit")
-            }
-            guard nalUnits.count < limits.maximumNALUnits else {
-                throw .malformedPayload("access unit exceeds configured NAL unit limit")
-            }
-
-            let nal = Data(bytes[cursor..<end])
-            let type = try nalType(codec: codec, bytes: nal)
-            nalUnits.append(SpiceVideoNALUnit(type: type, bytes: nal))
-
-            guard let next else {
-                cursor = bytes.count
-                break
-            }
-            cursor = next.offset + next.length
-            guard cursor < bytes.count else {
-                throw .malformedPayload("Annex-B ends with an empty NAL unit")
+        var parameterSets: [SpiceVideoNALUnit] = []
+        nalUnits.reserveCapacity(scanResult.descriptors.count)
+        for descriptor in scanResult.descriptors {
+            let nal = SpiceVideoNALUnit(
+                type: descriptor.type,
+                owner: owner,
+                sourceRange: descriptor.sourceRange
+            )
+            nalUnits.append(nal)
+            if descriptor.isParameterSet {
+                parameterSets.append(nal)
             }
         }
-        guard !nalUnits.isEmpty else {
-            throw .malformedPayload("Annex-B contains no NAL units")
-        }
 
-        let parameterSets = nalUnits.filter { isParameterSet(codec: codec, type: $0.type) }
-        let sampleUnits = nalUnits.filter { !isParameterSet(codec: codec, type: $0.type) }
-        var sampleData = Data()
-        sampleData.reserveCapacity(sampleUnits.reduce(0) { $0 + 4 + $1.bytes.count })
-        for nal in sampleUnits {
-            guard let length = UInt32(exactly: nal.bytes.count) else {
-                throw .integerOverflow
-            }
-            sampleData.append(UInt8(truncatingIfNeeded: length >> 24))
-            sampleData.append(UInt8(truncatingIfNeeded: length >> 16))
-            sampleData.append(UInt8(truncatingIfNeeded: length >> 8))
-            sampleData.append(UInt8(truncatingIfNeeded: length))
-            sampleData.append(nal.bytes)
-        }
-
-        return SpiceVideoAccessUnit(
+        let accessUnit = SpiceVideoAccessUnit(
             codec: codec,
             nalUnits: nalUnits,
-            sampleData: sampleData,
+            sampleData: scanResult.sampleData,
             parameterSets: parameterSets,
-            containsPicture: sampleUnits.contains { isPicture(codec: codec, type: $0.type) },
-            isRandomAccess: sampleUnits.contains { isRandomAccess(codec: codec, type: $0.type) }
+            containsPicture: scanResult.containsPicture,
+            isRandomAccess: scanResult.isRandomAccess
+        )
+        return SpiceAnnexBParseResult(
+            accessUnit: accessUnit,
+            diagnostics: SpiceAnnexBParserDiagnostics(
+                scanPassCount: 1,
+                inputCopyBytes: 0,
+                nalPayloadMaterializations: 0,
+                nalPayloadCopyBytes: 0,
+                avccSampleAllocations: scanResult.sampleData.isEmpty ? 0 : 1,
+                avccSampleBytes: scanResult.sampleData.count,
+                samplePayloadCopyBytes: scanResult.samplePayloadCopyBytes,
+                nalUnitCount: scanResult.descriptors.count
+            )
         )
     }
 
-    private func startCode(
-        in bytes: [UInt8],
-        from start: Int
-    ) -> (offset: Int, length: Int)? {
-        guard bytes.count >= 3, start <= bytes.count - 3 else {
+    private func scan(
+        codec: SpiceAdvancedVideoCodec,
+        bytes: UnsafeRawBufferPointer
+    ) throws(SpiceCodecError) -> ScanResult {
+        let bytes = bytes.bindMemory(to: UInt8.self)
+        guard let firstStartCodeLength = startCodeLength(in: bytes, at: 0) else {
+            throw .malformedPayload("advanced video access unit is not Annex-B")
+        }
+
+        var descriptors: [NALDescriptor] = []
+        var sampleByteCount = 0
+        var samplePayloadCopyBytes = 0
+        var containsPicture = false
+        var containsRandomAccess = false
+        var nalStart = firstStartCodeLength
+        var cursor = nalStart
+        while cursor < bytes.count {
+            if let startCodeLength = startCodeLength(in: bytes, at: cursor) {
+                var nalEnd = cursor
+                while nalEnd > nalStart, bytes[nalEnd - 1] == 0 {
+                    nalEnd -= 1
+                }
+                try appendDescriptor(
+                    codec: codec,
+                    bytes: bytes,
+                    range: nalStart..<nalEnd,
+                    descriptors: &descriptors,
+                    sampleByteCount: &sampleByteCount,
+                    samplePayloadCopyBytes: &samplePayloadCopyBytes,
+                    containsPicture: &containsPicture,
+                    containsRandomAccess: &containsRandomAccess
+                )
+                let (nextNALStart, overflow) = cursor.addingReportingOverflow(startCodeLength)
+                guard !overflow else {
+                    throw .integerOverflow
+                }
+                guard nextNALStart < bytes.count else {
+                    throw .malformedPayload("Annex-B ends with an empty NAL unit")
+                }
+                nalStart = nextNALStart
+                cursor = nextNALStart
+            } else {
+                cursor += 1
+            }
+        }
+
+        if nalStart < bytes.count {
+            var nalEnd = bytes.count
+            while nalEnd > nalStart, bytes[nalEnd - 1] == 0 {
+                nalEnd -= 1
+            }
+            try appendDescriptor(
+                codec: codec,
+                bytes: bytes,
+                range: nalStart..<nalEnd,
+                descriptors: &descriptors,
+                sampleByteCount: &sampleByteCount,
+                samplePayloadCopyBytes: &samplePayloadCopyBytes,
+                containsPicture: &containsPicture,
+                containsRandomAccess: &containsRandomAccess
+            )
+        }
+        guard !descriptors.isEmpty else {
+            throw .malformedPayload("Annex-B contains no NAL units")
+        }
+
+        var sampleData = Data(count: sampleByteCount)
+        if sampleByteCount > 0 {
+            sampleData.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+                var destinationOffset = 0
+                for descriptor in descriptors where !descriptor.isParameterSet {
+                    let count = descriptor.sourceRange.count
+                    let length = UInt32(count)
+                    destination[destinationOffset] = UInt8(truncatingIfNeeded: length >> 24)
+                    destination[destinationOffset + 1] = UInt8(truncatingIfNeeded: length >> 16)
+                    destination[destinationOffset + 2] = UInt8(truncatingIfNeeded: length >> 8)
+                    destination[destinationOffset + 3] = UInt8(truncatingIfNeeded: length)
+                    destinationOffset += 4
+                    destination.baseAddress?.advanced(by: destinationOffset).copyMemory(
+                        from: bytes.baseAddress!.advanced(by: descriptor.sourceRange.lowerBound),
+                        byteCount: count
+                    )
+                    destinationOffset += count
+                }
+            }
+        }
+        return ScanResult(
+            descriptors: descriptors,
+            sampleData: sampleData,
+            samplePayloadCopyBytes: samplePayloadCopyBytes,
+            containsPicture: containsPicture,
+            isRandomAccess: containsRandomAccess
+        )
+    }
+
+    private func appendDescriptor(
+        codec: SpiceAdvancedVideoCodec,
+        bytes: UnsafeBufferPointer<UInt8>,
+        range: Range<Int>,
+        descriptors: inout [NALDescriptor],
+        sampleByteCount: inout Int,
+        samplePayloadCopyBytes: inout Int,
+        containsPicture: inout Bool,
+        containsRandomAccess: inout Bool
+    ) throws(SpiceCodecError) {
+        guard !range.isEmpty else {
+            throw .malformedPayload("Annex-B contains an empty NAL unit")
+        }
+        guard range.count <= limits.maximumNALUnitBytes else {
+            throw .malformedPayload("NAL unit exceeds configured byte limit")
+        }
+        guard descriptors.count < limits.maximumNALUnits else {
+            throw .malformedPayload("access unit exceeds configured NAL unit limit")
+        }
+        let type = try nalType(codec: codec, bytes: bytes, range: range)
+        let parameterSet = isParameterSet(codec: codec, type: type)
+        descriptors.append(
+            NALDescriptor(type: type, sourceRange: range, isParameterSet: parameterSet)
+        )
+        guard !parameterSet else {
+            return
+        }
+        guard UInt32(exactly: range.count) != nil else {
+            throw .integerOverflow
+        }
+        let (withHeader, headerOverflow) = range.count.addingReportingOverflow(4)
+        let (nextSampleByteCount, sampleOverflow) = sampleByteCount.addingReportingOverflow(withHeader)
+        let (nextPayloadCopyBytes, payloadOverflow) =
+            samplePayloadCopyBytes.addingReportingOverflow(range.count)
+        guard !headerOverflow, !sampleOverflow, !payloadOverflow else {
+            throw .integerOverflow
+        }
+        sampleByteCount = nextSampleByteCount
+        samplePayloadCopyBytes = nextPayloadCopyBytes
+        containsPicture = containsPicture || isPicture(codec: codec, type: type)
+        containsRandomAccess = containsRandomAccess || isRandomAccess(codec: codec, type: type)
+    }
+
+    private func startCodeLength(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        at offset: Int
+    ) -> Int? {
+        guard offset >= 0, offset <= bytes.count - 3,
+              bytes[offset] == 0, bytes[offset + 1] == 0
+        else {
             return nil
         }
-        for offset in start...(bytes.count - 3) {
-            guard bytes[offset] == 0, bytes[offset + 1] == 0 else {
-                continue
-            }
-            if offset + 3 < bytes.count,
-               bytes[offset + 2] == 0,
-               bytes[offset + 3] == 1
-            {
-                return (offset, 4)
-            }
-            if bytes[offset + 2] == 1 {
-                return (offset, 3)
-            }
+        if offset <= bytes.count - 4,
+           bytes[offset + 2] == 0,
+           bytes[offset + 3] == 1
+        {
+            return 4
         }
-        return nil
+        return bytes[offset + 2] == 1 ? 3 : nil
     }
 
     private func nalType(
         codec: SpiceAdvancedVideoCodec,
-        bytes: Data
+        bytes: UnsafeBufferPointer<UInt8>,
+        range: Range<Int>
     ) throws(SpiceCodecError) -> UInt8 {
-        guard let first = bytes.first, first & 0x80 == 0 else {
+        let first = bytes[range.lowerBound]
+        guard first & 0x80 == 0 else {
             throw .malformedPayload("NAL unit has a nonzero forbidden bit")
         }
         switch codec {
         case .h264:
             return first & 0x1f
         case .h265:
-            guard bytes.count >= 2 else {
+            guard range.count >= 2 else {
                 throw .malformedPayload("HEVC NAL unit is shorter than its header")
             }
-            guard bytes[bytes.startIndex + 1] & 0x07 != 0 else {
+            guard bytes[range.lowerBound + 1] & 0x07 != 0 else {
                 throw .malformedPayload("HEVC temporal_id_plus1 is zero")
             }
             return (first >> 1) & 0x3f
