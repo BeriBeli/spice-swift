@@ -7,6 +7,43 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added strict full-header physical-message batches with validated submessage
+  lists, shared owned storage, ordered logical delivery, and one ACK accounting
+  unit per physical message.
+- Added a bounded Session-owned image cache for cross-Display references, with
+  ordered same-ID mutations, invalidation-safe asynchronous decode, and explicit
+  waiter and retained-byte limits.
+- Added a bounded canonical `PixelRegion` and deterministic region limits for
+  clipped display commands.
+
+### Changed
+
+- Serial barriers now complete after handler and protocol-ACK processing, and
+  connection replacement keeps failure, cancellation, Agent sends, and
+  migration cleanup bound to the connection that produced the work.
+- Display mutations now validate and commit each wire draw as one transaction;
+  COPY_BITS and fill paths avoid area-sized staging, while eligible CPU updates
+  preserve IOSurface-canonical backing and publication damage.
+- Framing and parsing now use segmented receive storage, checked owned slices,
+  and synchronous Swift `Span` views, avoiding repeated compaction and bounding
+  retained owners and segment metadata.
+- LZ, GLZ, stateless codecs, and VideoToolbox input preparation now use bounded
+  work admission and explicit immutable ownership. LZ decodes into one output
+  backing, GLZ separates dependency coordination from CPU execution, and
+  Annex-B samples avoid redundant payload materialization.
+- Initial and migration child-channel connections now use deterministic bounded
+  concurrency with complete rollback of early and late successes.
+
+### Validation
+
+- The included AIP-10, AIP-11, AIP-12, AIP-20 through AIP-23, AIP-30 through
+  AIP-33, and AIP-40 changes passed their documented Swift 6 focused gates and
+  Apple Silicon SwiftPM CI. This release makes no new live SPICE
+  interoperability or performance claim: AIP-00, AIP-41 through AIP-43, and
+  AIP-90 remain pending or blocked on their recorded gates.
+
 ## [0.2.7] — 2026-08-26
 
 ### Performance
