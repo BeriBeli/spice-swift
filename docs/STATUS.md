@@ -175,7 +175,9 @@ Agent behavior, including system-trusted TLS.
   union(clips)` as ordered y bands with sorted disjoint x intervals. Nil/single
   clips stay inline; multi-clip normalization uses compressed x coordinates, a
   y sweep, and a lazy range-add coverage tree. Input is capped at 4,096 clips
-  and output at 65,536 segments before Surface mutation.
+  and output at 65,536 segments before Surface mutation. Each non-empty wire
+  fill or copy validates the complete region and commits one Surface revision,
+  mutation generation, and transaction; empty or failed regions commit none.
 - A complete Mini-header transcript test from Surface Create through real draw
   wire bodies to the expected framebuffer and Surface Destroy.
 - An external JSON golden-frame fixture that replays Surface Create, DRAW_FILL,

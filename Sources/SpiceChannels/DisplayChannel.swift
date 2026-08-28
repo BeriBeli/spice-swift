@@ -1168,19 +1168,15 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation("only solid DRAW_FILL brushes are implemented")
         }
         let region = try await pixelRegion(command.base)
-        var surfaceRevision: SurfaceRevision?
-        for rectangle in region {
-            do {
-                surfaceRevision = try await surfaces.fill(
-                    surfaceID: command.base.surfaceID,
-                    rectangle: rectangle,
-                    colorARGB: color
-                )
-            } catch {
-                throw .protocolViolation(String(describing: error))
-            }
+        do {
+            return try await surfaces.fill(
+                surfaceID: command.base.surfaceID,
+                region: region,
+                colorARGB: color
+            )
+        } catch {
+            throw .protocolViolation(String(describing: error))
         }
-        return surfaceRevision
     }
 
     private func execute(
@@ -1188,28 +1184,17 @@ package actor DisplayChannel: SpiceManagedChannel {
     ) async throws(ChannelError) -> SurfaceRevision? {
         let base = try pixelRectAllowingEmpty(command.base.box)
         let region = try await pixelRegion(command.base)
-        var surfaceRevision: SurfaceRevision?
-        let source = PixelRect(
-            x: Int(command.sourcePosition.x),
-            y: Int(command.sourcePosition.y),
-            width: base.width,
-            height: base.height
-        )
-        for destination in region.copyTraversal(source: source, destination: base) {
-            let sourceX = Int(command.sourcePosition.x) + destination.x - base.x
-            let sourceY = Int(command.sourcePosition.y) + destination.y - base.y
-            do {
-                surfaceRevision = try await surfaces.copyBits(
-                    surfaceID: command.base.surfaceID,
-                    destination: destination,
-                    sourceX: sourceX,
-                    sourceY: sourceY
-                )
-            } catch {
-                throw .protocolViolation(String(describing: error))
-            }
+        do {
+            return try await surfaces.copyBits(
+                surfaceID: command.base.surfaceID,
+                region: region,
+                destination: base,
+                sourceX: Int(command.sourcePosition.x),
+                sourceY: Int(command.sourcePosition.y)
+            )
+        } catch {
+            throw .protocolViolation(String(describing: error))
         }
-        return surfaceRevision
     }
 
     private func execute(
@@ -1332,43 +1317,28 @@ package actor DisplayChannel: SpiceManagedChannel {
         sourceArea: PixelRect,
         region: PixelRegion
     ) async throws(ChannelError) -> SurfaceRevision? {
-        var surfaceRevision: SurfaceRevision?
-        let destinations: any Sequence<PixelRect>
-        switch resolvedSource {
-        case .surface(command.base.surfaceID):
-            destinations = region.copyTraversal(source: sourceArea, destination: base)
-        case .bitmap, .surface:
-            destinations = region
-        }
-        for destination in destinations {
-            let source = PixelRect(
-                x: sourceArea.x + destination.x - base.x,
-                y: sourceArea.y + destination.y - base.y,
-                width: destination.width,
-                height: destination.height
-            )
-            do {
-                switch resolvedSource {
-                case let .bitmap(bitmap):
-                    surfaceRevision = try await surfaces.drawCopy(
-                        surfaceID: command.base.surfaceID,
-                        destination: destination,
-                        bitmap: bitmap,
-                        source: source
-                    )
-                case let .surface(sourceSurfaceID):
-                    surfaceRevision = try await surfaces.drawCopy(
-                        surfaceID: command.base.surfaceID,
-                        destination: destination,
-                        sourceSurfaceID: sourceSurfaceID,
-                        source: source
-                    )
-                }
-            } catch {
-                throw .protocolViolation(String(describing: error))
+        do {
+            switch resolvedSource {
+            case let .bitmap(bitmap):
+                return try await surfaces.drawCopy(
+                    surfaceID: command.base.surfaceID,
+                    region: region,
+                    destination: base,
+                    bitmap: bitmap,
+                    source: sourceArea
+                )
+            case let .surface(sourceSurfaceID):
+                return try await surfaces.drawCopy(
+                    surfaceID: command.base.surfaceID,
+                    region: region,
+                    destination: base,
+                    sourceSurfaceID: sourceSurfaceID,
+                    source: sourceArea
+                )
             }
+        } catch {
+            throw .protocolViolation(String(describing: error))
         }
-        return surfaceRevision
     }
 
     private func resolveSource(
