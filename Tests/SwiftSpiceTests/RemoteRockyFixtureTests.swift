@@ -821,6 +821,109 @@ struct RemoteRockyFixtureTests {
         #expect(render["background"] == "ffffff")
     }
 
+    @Test func guestMarkerAcknowledgmentIsBoundedAndReleasesItsStateLock() throws {
+        let timeout = try runGuestMarkerFIFOHandshake(acknowledgedRevision: nil)
+        #expect(timeout.input.status != 0)
+        #expect(timeout.input.output.contains("PERF_ERROR input_marker=marker_ack_timeout"))
+        #expect(!timeout.input.output.contains("event=marker_drawn"))
+        #expect(timeout.request.contains("marker_revision=1"))
+        #expect(timeout.rearm.status == 0)
+        #expect(timeout.rearm.output.contains(
+            "PERF_ARMED action_class=key token=0000000000000002"
+        ))
+
+        let acknowledged = try runGuestMarkerFIFOHandshake(acknowledgedRevision: "1")
+        #expect(acknowledged.input.status == 0)
+        let acknowledgedTraces = perfRecords(prefix: "PERF_TRACE", in: acknowledged.input.output)
+        #expect(acknowledgedTraces.map { $0["event"] } == [
+            "guest_received", "marker_drawn",
+        ])
+        #expect(acknowledgedTraces.allSatisfy { $0["marker_revision"] == "1" })
+        #expect(!acknowledged.input.output.contains("PERF_ERROR"))
+        #expect(acknowledged.rearm.status == 0)
+
+        let mismatched = try runGuestMarkerFIFOHandshake(acknowledgedRevision: "99")
+        #expect(mismatched.input.status != 0)
+        #expect(mismatched.input.output.contains("PERF_ERROR input_marker=marker_ack_mismatch"))
+        #expect(!mismatched.input.output.contains("event=marker_drawn"))
+        #expect(mismatched.rearm.status == 0)
+    }
+
+    @Test func lateMarkerAcknowledgmentCannotValidateANewerRevision() throws {
+        let agent = try script("Integration/RemoteRocky/guest/input-marker-agent.sh")
+        let renderer = try script("Integration/RemoteRocky/guest/input-marker-renderer.sh")
+        #expect(agent.contains(#"ack_timeout_seconds="${PERF_MARKER_ACK_TIMEOUT_SECONDS:-2}""#))
+        #expect(renderer.contains("read -r -d n -t 1 response"))
+
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-stale-ack-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+
+        let requestFIFO = state.appending(path: "request")
+        let acknowledgmentFIFO = state.appending(path: "ack")
+        let staleWritten = state.appending(path: "stale-written")
+        try makeFIFOs(requestFIFO, acknowledgmentFIFO)
+        let responder = try launchStaleMarkerAcknowledgmentStub(
+            requestFIFO: requestFIFO,
+            acknowledgmentFIFO: acknowledgmentFIFO,
+            staleWritten: staleWritten
+        )
+        defer {
+            if responder.process.isRunning {
+                responder.terminate()
+                responder.process.waitUntilExit()
+            }
+        }
+
+        let environment = [
+            "PERF_MARKER_TEST_MODE": "0",
+            "PERF_MARKER_REQUEST_FIFO": requestFIFO.path,
+            "PERF_MARKER_ACK_FIFO": acknowledgmentFIFO.path,
+            "PERF_MARKER_ACK_TIMEOUT_SECONDS": "1",
+        ]
+
+        let firstArm = try runGuestMarkerCommand(
+            ["arm", "click", "0000000000000001"],
+            state: state
+        )
+        try #require(firstArm.status == 0)
+        let timedOut = try launchGuestMarkerCommand(
+            ["input", "click", "100", "101"],
+            state: state,
+            additionalEnvironment: environment
+        ).finish(within: .seconds(3))
+        #expect(timedOut.status != 0)
+        #expect(timedOut.output.contains("PERF_ERROR input_marker=marker_ack_timeout"))
+        #expect(!timedOut.output.contains("event=marker_drawn"))
+
+        try waitForPath(staleWritten)
+        let secondArm = try runGuestMarkerCommand(
+            ["arm", "key", "0000000000000002"],
+            state: state
+        )
+        try #require(secondArm.status == 0)
+        let staleIgnored = try launchGuestMarkerCommand(
+            ["input", "key", "200", "201"],
+            state: state,
+            additionalEnvironment: environment
+        ).finish(within: .seconds(3))
+        #expect(staleIgnored.status == 0)
+        let recoveredTraces = perfRecords(prefix: "PERF_TRACE", in: staleIgnored.output)
+        #expect(recoveredTraces.map { $0["event"] } == [
+            "guest_received", "marker_drawn",
+        ])
+        #expect(recoveredTraces.allSatisfy { $0["marker_revision"] == "2" })
+        #expect(!staleIgnored.output.contains("PERF_ERROR"))
+
+        let requests = try responder.finish(within: .seconds(3)).output
+        #expect(requests.contains("marker_revision=1"))
+        #expect(requests.contains("marker_revision=2"))
+        #expect(!FileManager.default.fileExists(atPath: state.appending(path: "lock").path))
+    }
+
     @Test func guestMarkerRejectsInvalidConcurrentAndReusedArmsDeterministically() throws {
         let result = try runGuestMarkerSelfTest([
             "arm action_class=click token=0000000000000001",
@@ -1171,6 +1274,126 @@ struct RemoteRockyFixtureTests {
             state: state,
             additionalEnvironment: additionalEnvironment
         ).finish()
+    }
+
+    private func runGuestMarkerFIFOHandshake(
+        acknowledgedRevision: String?
+    ) throws -> (input: ScriptResult, request: String, rearm: ScriptResult) {
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-fifo-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+
+        let requestFIFO = state.appending(path: "request")
+        let acknowledgmentFIFO = state.appending(path: "ack")
+        try makeFIFOs(requestFIFO, acknowledgmentFIFO)
+
+        let firstArm = try runGuestMarkerCommand(
+            ["arm", "click", "0000000000000001"],
+            state: state
+        )
+        try #require(firstArm.status == 0)
+
+        let responder = try launchMarkerAcknowledgmentStub(
+            requestFIFO: requestFIFO,
+            acknowledgmentFIFO: acknowledgmentFIFO,
+            acknowledgedRevision: acknowledgedRevision
+        )
+        defer {
+            if responder.process.isRunning {
+                responder.terminate()
+                responder.process.waitUntilExit()
+            }
+        }
+
+        let input = try launchGuestMarkerCommand(
+            ["input", "click", "100", "101"],
+            state: state,
+            additionalEnvironment: [
+                "PERF_MARKER_TEST_MODE": "0",
+                "PERF_MARKER_REQUEST_FIFO": requestFIFO.path,
+                "PERF_MARKER_ACK_FIFO": acknowledgmentFIFO.path,
+                "PERF_MARKER_ACK_TIMEOUT_SECONDS": "1",
+            ]
+        ).finish(within: .seconds(3))
+        let request = try responder.finish(within: .seconds(3)).output
+
+        #expect(!FileManager.default.fileExists(atPath: state.appending(path: "lock").path))
+        let rearm = try runGuestMarkerCommand(
+            ["arm", "key", "0000000000000002"],
+            state: state
+        )
+        return (input, request, rearm)
+    }
+
+    private func launchMarkerAcknowledgmentStub(
+        requestFIFO: URL,
+        acknowledgmentFIFO: URL,
+        acknowledgedRevision: String?
+    ) throws -> RunningScript {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            """
+            IFS= read -r request < "$1"
+            if test "$2" != none; then
+                printf '%s\\n' "$2" > "$3"
+            fi
+            printf '%s\\n' "$request"
+            """,
+            "marker-ack-stub",
+            requestFIFO.path,
+            acknowledgedRevision ?? "none",
+            acknowledgmentFIFO.path,
+        ]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        return RunningScript(process: process, output: output)
+    }
+
+    private func launchStaleMarkerAcknowledgmentStub(
+        requestFIFO: URL,
+        acknowledgmentFIFO: URL,
+        staleWritten: URL
+    ) throws -> RunningScript {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            """
+            exec 4<> "$2"
+            IFS= read -r first < "$1"
+            sleep 2
+            printf '1\\n' >&4
+            : > "$3"
+            IFS= read -r second < "$1"
+            printf '2\\n' >&4
+            printf '%s\\n%s\\n' "$first" "$second"
+            """,
+            "marker-stale-ack-stub",
+            requestFIFO.path,
+            acknowledgmentFIFO.path,
+            staleWritten.path,
+        ]
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        return RunningScript(process: process, output: output)
+    }
+
+    private func makeFIFOs(_ URLs: URL...) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mkfifo")
+        process.arguments = URLs.map(\.path)
+        try process.run()
+        process.waitUntilExit()
+        try #require(process.terminationStatus == 0)
     }
 
     private func launchGuestMarkerCommand(

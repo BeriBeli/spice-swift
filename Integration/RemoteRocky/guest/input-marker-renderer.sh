@@ -60,31 +60,24 @@ terminal_visibility_barrier() {
     fi
 
     # Xterm answers CSI 5 n only after consuming all preceding terminal input.
-    # Temporarily make the pty noncanonical so the response needs no newline;
-    # unrelated key bytes are ignored until the exact terminal response ends.
+    # One delimiter read gives the entire barrier a one-second bound, strictly
+    # below the agent's two-second ACK bound. An unrelated `n`, malformed
+    # response, or timeout fails this event without ACK. The agent additionally
+    # filters revisions in case an external or delayed writer leaves stale data.
     saved_terminal_state="$(stty -g < /dev/tty)"
     stty -echo -icanon min 1 time 0 < /dev/tty
     printf '\033[5n' > /dev/tty
     response=
-    count=0
     escape="$(printf '\033')"
-    while test "${count}" -lt 64; do
-        character=
-        if ! IFS= read -r -n 1 -t 2 character < /dev/tty; then
-            restore_terminal_state
-            return 1
-        fi
-        response="${response}${character}"
-        case "${response}" in
-            *"${escape}[0n")
-                restore_terminal_state
-                return 0
-                ;;
-        esac
-        count=$((count + 1))
-    done
+    if ! IFS= read -r -d n -t 1 response < /dev/tty; then
+        restore_terminal_state
+        return 1
+    fi
     restore_terminal_state
-    return 1
+    case "${response}" in
+        *"${escape}[0") return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 acknowledge_marker() {
@@ -95,7 +88,7 @@ acknowledge_marker() {
         echo "PERF_MARKER_WORKLOAD action=ack workload=${workload} token=${token} marker_revision=${revision}"
         return
     fi
-    printf '%s\n' "${revision}" > "${ack_fifo}"
+    printf '%s\n' "${revision}" >&4
 }
 
 process_marker() {
@@ -168,6 +161,11 @@ case "${workload}" in
         exit 2
         ;;
 esac
+
+# Keep a nonblocking writer endpoint for late completion. If an agent times out
+# while this renderer is leaving the visibility barrier, its closed reader must
+# not strand the active fullscreen workload in a FIFO open.
+exec 4<> "${ack_fifo}"
 
 while true; do
     if read -r marker token_field revision_field checksum_field < "${request_fifo}"; then

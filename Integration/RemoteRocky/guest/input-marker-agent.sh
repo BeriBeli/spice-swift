@@ -5,8 +5,13 @@ set -eu
 state_dir="${PERF_MARKER_STATE_DIR:-/run/swiftspice-input-marker}"
 request_fifo="${PERF_MARKER_REQUEST_FIFO:-/run/perf-marker-request}"
 ack_fifo="${PERF_MARKER_ACK_FIFO:-/run/perf-marker-ack}"
+ack_timeout_seconds="${PERF_MARKER_ACK_TIMEOUT_SECONDS:-2}"
 MARKER_FOREGROUND=000000
 MARKER_BACKGROUND=ffffff
+ack_reader_pid=
+ack_timer_pid=
+ack_status_file=
+ack_done_file=
 mkdir -p "${state_dir}"
 
 fail() {
@@ -47,9 +52,69 @@ render_marker() {
         echo "PERF_MARKER_RENDER ${payload} foreground=${MARKER_FOREGROUND} background=${MARKER_BACKGROUND}"
         return
     fi
+
+    valid_uint64_text "${ack_timeout_seconds}" || fail invalid_ack_timeout
+    test "${ack_timeout_seconds}" -gt 0 || fail invalid_ack_timeout
+    test "${ack_timeout_seconds}" -le 60 || fail invalid_ack_timeout
+    # Opening a FIFO for reading can itself wait forever for a writer. O_RDWR
+    # establishes both ends before the request is visible. A watchdog bounds
+    # the reader across all records; stale revisions are drained while waiting
+    # for this request's revision, so a late ACK cannot poison the next event.
+    exec 3<> "${ack_fifo}"
     printf '%s\n' "${payload}" > "${request_fifo}"
-    acknowledged_revision="$(cat "${ack_fifo}")"
-    test "${acknowledged_revision}" = "${marker_revision}" || fail marker_ack_mismatch
+    ack_status_file="${state_dir}/ack-status.$$"
+    ack_done_file="${state_dir}/ack-done.$$"
+    (
+        trap - EXIT HUP INT TERM
+        saw_mismatch=false
+        while IFS= read -r acknowledged_revision <&3; do
+            if test "${acknowledged_revision}" = "${marker_revision}"; then
+                printf '%s\n' accepted > "${ack_status_file}"
+                exit 0
+            fi
+            saw_mismatch=true
+            printf '%s\n' mismatch > "${ack_status_file}"
+        done
+        if test "${saw_mismatch}" = false; then
+            printf '%s\n' eof > "${ack_status_file}"
+        fi
+        exit 1
+    ) &
+    ack_reader_pid=$!
+    (
+        trap - EXIT HUP INT TERM
+        remaining_ticks=$((ack_timeout_seconds * 20))
+        while test "${remaining_ticks}" -gt 0; do
+            test -f "${ack_done_file}" && exit 0
+            sleep 0.05
+            remaining_ticks=$((remaining_ticks - 1))
+        done
+        kill -TERM "${ack_reader_pid}" 2>/dev/null || true
+    ) &
+    ack_timer_pid=$!
+
+    if wait "${ack_reader_pid}"; then
+        :
+    fi
+    ack_reader_pid=
+    : > "${ack_done_file}"
+    wait "${ack_timer_pid}" 2>/dev/null || true
+    ack_timer_pid=
+    rm -f "${ack_done_file}"
+    ack_done_file=
+    exec 3>&-
+    ack_status=timeout
+    if test -f "${ack_status_file}"; then
+        ack_status="$(cat "${ack_status_file}")"
+    fi
+    rm -f "${ack_status_file}"
+    ack_status_file=
+    case "${ack_status}" in
+        accepted) return 0 ;;
+        mismatch) fail marker_ack_mismatch ;;
+        eof) fail marker_ack_eof ;;
+        *) fail marker_ack_timeout ;;
+    esac
 }
 
 if test "${1:-}" = --self-test-jsonl; then
@@ -115,6 +180,24 @@ if ! mkdir "${lock_dir}" 2>/dev/null; then
     fail state_busy
 fi
 release_lock() {
+    if test -n "${ack_reader_pid}"; then
+        kill -TERM "${ack_reader_pid}" 2>/dev/null || true
+        wait "${ack_reader_pid}" 2>/dev/null || true
+        ack_reader_pid=
+    fi
+    if test -n "${ack_timer_pid}"; then
+        kill -TERM "${ack_timer_pid}" 2>/dev/null || true
+        wait "${ack_timer_pid}" 2>/dev/null || true
+        ack_timer_pid=
+    fi
+    if test -n "${ack_status_file}"; then
+        rm -f "${ack_status_file}"
+        ack_status_file=
+    fi
+    if test -n "${ack_done_file}"; then
+        rm -f "${ack_done_file}"
+        ack_done_file=
+    fi
     rmdir "${lock_dir}" 2>/dev/null || true
 }
 terminate_after_signal() {

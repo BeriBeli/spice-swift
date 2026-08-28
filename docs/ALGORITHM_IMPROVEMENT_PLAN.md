@@ -242,6 +242,16 @@ write. It is therefore draw-call evidence, not proof that marker pixels were
 visible. The fixture now renders the reserved marker ROI inside the active
 fullscreen workload xterm itself, keeps subsequent animation frames outside
 that ROI, and acknowledges only after an xterm terminal-response barrier. A
+single delimiter read bounds the whole renderer barrier to one second and
+rejects unrelated or malformed terminal input without writing an ACK. The
+agent's longer two-second bounded FIFO wait therefore expires only after the
+renderer has either acknowledged or definitively declined the event; a late
+revision from another writer may still enter the FIFO, but the bounded reader
+drains nonmatching revisions and never lets one satisfy or poison the current
+request. The wait treats a missing
+acknowledgement or wrong marker
+revision as a failed event and releases the guest marker lock; it never emits
+`marker_drawn` from an unacknowledged write. A
 fresh live run must still bind those pixels to the exact host frame and
 presentation identities below; the stacking repair does not upgrade the older
 run into input-to-visible evidence.
