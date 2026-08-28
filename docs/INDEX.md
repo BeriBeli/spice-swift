@@ -10,6 +10,7 @@ or connect the library to a SPICE endpoint.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Module boundaries, concurrency, protocol safety, rendering, and host-resource rules |
 | [STATUS.md](STATUS.md) | Detailed implementation evidence and the boundary between local and external validation |
 | [ROADMAP.md](ROADMAP.md) | Pending work, external gates, and acceptance commands |
+| [ALGORITHM_IMPROVEMENT_PLAN.md](ALGORITHM_IMPROVEMENT_PLAN.md) | Active algorithm work, dependencies, completion gates, and evidence log |
 | [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md) | Directory ownership and file-placement rules |
 
 ## Operational guides

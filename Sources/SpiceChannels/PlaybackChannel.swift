@@ -21,7 +21,6 @@ package actor PlaybackChannel: SpiceManagedChannel {
     private var mode: SpiceAudioDataMode?
     private var configuration: SpicePlaybackStart?
     private var lastPacketTime: UInt32?
-    private var ackController = AckController()
 
     package init(
         connection: ChannelConnection,
@@ -61,7 +60,10 @@ package actor PlaybackChannel: SpiceManagedChannel {
         case let .playback(command):
             event = try await handle(command)
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -168,8 +170,6 @@ package actor PlaybackChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

@@ -34,7 +34,6 @@ package enum InputsServerEvent: Sendable, Equatable {
 package actor InputsChannel: SpiceManagedChannel {
     private var connection: ChannelConnection
     private var buttonsState: UInt16 = 0
-    private var ackController = AckController()
     private(set) var keyboardModifiers: UInt16 = 0
 
     package init(connection: ChannelConnection) {
@@ -119,7 +118,10 @@ package actor InputsChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .mouseMotionAcknowledged
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -203,8 +205,6 @@ package actor InputsChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

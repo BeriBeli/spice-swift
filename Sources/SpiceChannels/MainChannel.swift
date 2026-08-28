@@ -52,7 +52,6 @@ package actor MainChannel: SpiceManagedChannel {
     private let multimediaClock: (any MultimediaClockScheduling)?
     private let agentLimits: VDAgentWireLimits
     private let serverTokenWindow: UInt32
-    private var ackController = AckController()
     private var agentDecoder: VDAgentStreamDecoder
     private var isAgentConnected = false
     private var agentGeneration: UInt64 = 0
@@ -125,7 +124,10 @@ package actor MainChannel: SpiceManagedChannel {
                 )
                 try await acknowledgeIfNeeded()
             case let .setAck(setAck):
-                ackController.configure(generation: setAck.generation, window: setAck.window)
+                await connection.configureAcknowledgments(
+                    generation: setAck.generation,
+                    window: setAck.window
+                )
                 try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             case let .ping(ping):
                 try await connection.send(SpiceMsgcPong(id: ping.id, time: ping.time))
@@ -344,7 +346,10 @@ package actor MainChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return nil
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return nil
         case let .ping(ping):
@@ -581,8 +586,6 @@ package actor MainChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

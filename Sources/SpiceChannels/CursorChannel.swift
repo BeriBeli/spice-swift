@@ -21,7 +21,6 @@ package enum CursorEvent: Sendable, Equatable {
 package actor CursorChannel: SpiceManagedChannel {
     private var connection: ChannelConnection
     private let maximumCacheEntries: Int
-    private var ackController = AckController()
     private var cache: [UInt64: SpiceCursorPayload] = [:]
     private var isInitialized = false
     private var state = CursorSnapshot(
@@ -68,7 +67,10 @@ package actor CursorChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return event
         case let .setAck(setAck):
-            ackController.configure(generation: setAck.generation, window: setAck.window)
+            await connection.configureAcknowledgments(
+                generation: setAck.generation,
+                window: setAck.window
+            )
             try await connection.send(SpiceMsgcAckSync(generation: setAck.generation))
             return .ignored(framed.type)
         case let .ping(ping):
@@ -210,8 +212,6 @@ package actor CursorChannel: SpiceManagedChannel {
     }
 
     private func acknowledgeIfNeeded() async throws(ChannelError) {
-        if ackController.didProcessMessage() {
-            try await connection.send(SpiceMsgcAck())
-        }
+        try await connection.acknowledgeLastDelivered()
     }
 }

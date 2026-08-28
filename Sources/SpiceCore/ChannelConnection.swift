@@ -9,6 +9,10 @@ package actor ChannelConnection {
     private let transport: any SpiceTransport
     private let serialBarrier: ChannelSerialBarrier
     private var framer: MessageFramer
+    private var pendingBatch: FramedMessageBatch?
+    private var pendingMessageIndex = 0
+    private var ackController = AckController()
+    private var unclaimedAcknowledgmentCount = 0
     private var nextClientSerial: UInt64 = 1
     private var nextImplicitServerSerial: UInt64 = 1
     private var isMigrating = false
@@ -76,15 +80,34 @@ package actor ChannelConnection {
 
     private func receiveFramed() async throws(ChannelError) -> FramedMessage {
         while true {
-            let framedMessage: FramedMessage?
+            if let pendingBatch, pendingMessageIndex < pendingBatch.messages.count {
+                let message = pendingBatch.framedMessage(at: pendingMessageIndex)
+                pendingMessageIndex += 1
+                if pendingMessageIndex == pendingBatch.messages.count {
+                    self.pendingBatch = nil
+                    pendingMessageIndex = 0
+                }
+                if message.acknowledgmentCount > 0 {
+                    let (newCount, overflow) = unclaimedAcknowledgmentCount.addingReportingOverflow(
+                        message.acknowledgmentCount
+                    )
+                    guard !overflow else {
+                        throw .protocolViolation("physical message ACK count overflow")
+                    }
+                    unclaimedAcknowledgmentCount = newCount
+                }
+                return message
+            }
+
+            let framedBatch: FramedMessageBatch?
             do {
-                framedMessage = try framer.nextMessage()
+                framedBatch = try framer.nextBatch()
             } catch let error {
                 throw .wire(error)
             }
-            if let message = framedMessage {
+            if let batch = framedBatch {
                 let serial: UInt64
-                if let explicitSerial = message.serial {
+                if let explicitSerial = batch.serial {
                     serial = explicitSerial
                 } else {
                     serial = nextImplicitServerSerial
@@ -95,7 +118,17 @@ package actor ChannelConnection {
                     nextImplicitServerSerial = next
                 }
                 await serialBarrier.record(key: key, serial: serial)
-                return message
+
+                if batch.messages.isEmpty {
+                    // An empty SPICE_MSG_LIST still represents one complete
+                    // physical ACK unit. It has no logical protocol message to
+                    // dispatch, so completion is immediate.
+                    try await acknowledgePhysicalMessages(batch.acknowledgmentCount)
+                    continue
+                }
+                pendingBatch = batch
+                pendingMessageIndex = 0
+                continue
             }
 
             let bytes: Data
@@ -112,6 +145,31 @@ package actor ChannelConnection {
             } catch let error {
                 throw .wire(error)
             }
+        }
+    }
+
+    /// Configures ACK accounting at the physical-message boundary. Resetting
+    /// unclaimed state preserves the existing rule that the SET_ACK message
+    /// establishing a window is not counted against that new window.
+    package func configureAcknowledgments(generation: UInt32, window: UInt32) {
+        ackController.configure(generation: generation, window: window)
+        unclaimedAcknowledgmentCount = 0
+    }
+
+    /// Completes ACK accounting for the latest fully dispatched physical
+    /// message. Intermediate logical submessages contribute zero here.
+    package func acknowledgeLastDelivered() async throws(ChannelError) {
+        let count = unclaimedAcknowledgmentCount
+        unclaimedAcknowledgmentCount = 0
+        try await acknowledgePhysicalMessages(count)
+    }
+
+    private func acknowledgePhysicalMessages(_ count: Int) async throws(ChannelError) {
+        guard count >= 0 else {
+            throw .protocolViolation("negative physical message ACK count")
+        }
+        for _ in 0..<count where ackController.didProcessMessage() {
+            try await send(SpiceMsgcAck())
         }
     }
 

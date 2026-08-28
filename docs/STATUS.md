@@ -3,7 +3,9 @@
 This document is the detailed engineering ledger for the current implementation.
 For setup and first use, start with the [project README](../README.md). See
 [ARCHITECTURE.md](ARCHITECTURE.md) for stable design rules and
-[ROADMAP.md](ROADMAP.md) for pending acceptance gates.
+[ROADMAP.md](ROADMAP.md) for pending acceptance gates. Active protocol,
+rendering, and ownership corrections are tracked in the
+[algorithm improvement plan](ALGORITHM_IMPROVEMENT_PLAN.md).
 
 Local tests, independent fixtures, and external interoperability are reported
 separately. A locally implemented feature remains pending until its required
@@ -19,6 +21,28 @@ Agent behavior, including system-trusted TLS.
 - [Stage E: audio and Agent integration](#stage-e-local-closure)
 - [Stage F: video, migration, and peripheral channels](#stage-f-advanced-video-groundwork)
 - [Acceptance commands](#acceptance-commands)
+
+## Algorithm plan execution
+
+- AIP-10 is locally complete. Full-header messages are first validated as one
+  owned physical batch, then list submessages are dispatched in wire-list order
+  before the optional main-message prefix. `SPICE_MSG_LIST` itself is not
+  exposed as a logical protocol message.
+- Submessage bodies are ranges into the physical body owner. Parsing rejects
+  more than 4,096 entries, truncation, checked-arithmetic overflow, metadata or
+  main-prefix references, and duplicate or overlapping records before any
+  logical message is delivered.
+- ACK flow control now counts one unit per physical message across all active
+  channels. An empty list dispatches no fake logical message but still completes
+  its physical ACK unit.
+- Focused evidence is `InboundMessageBatchTests` (9 tests, including 14
+  malformed-list argument cases) and `ChannelConnectionBatchTests` (3 tests),
+  plus a warnings-as-errors build. A full test run built and showed no failure
+  before a long-running phase stopped producing output; it was
+  terminated without a final summary and is not claimed as a full-suite pass.
+- AIP-11 remains open: the cross-channel serial barrier still records receive
+  time and must move to successful physical-batch processing completion with
+  explicit failure, cancellation, and close propagation.
 
 ## Stage B local closure
 
@@ -266,25 +290,27 @@ The LZ RGB family is locally closed.
 - Display preserves QUIC's bottom-up row order and RGBA alpha semantics. A
   failed decode leaves the destination Surface unchanged.
 
-### Shared image cache slice
+### Image cache slice
 
 - Corrected the source-backed image type values to `SURFACE` 104 and `JPEG`
   105; `FROM_CACHE` 103 and `FROM_CACHE_LOSSLESS` 106 are now descriptor-only
   image references.
-- DisplayChannel owns a bounded shared image cache with both entry-count and
-  decoded-byte limits. RAW, JPEG, LZ palette/RGB, and QUIC sources are decoded
-  once per command, even when several clip rectangles are present.
+- Each DisplayChannel currently owns a bounded image cache with both entry-count
+  and decoded-byte limits. RAW, JPEG, LZ palette/RGB, and QUIC sources are
+  decoded once per command, even when several clip rectangles are present.
+  Session-wide sharing and cross-Display wait semantics are not yet implemented
+  and are tracked by AIP-12.
 - `CACHE_ME` inserts only after every clipped Surface write succeeds.
   `CACHE_REPLACE_ME` accepts only a lossless source replacing an existing lossy
   representation, and `FROM_CACHE_LOSSLESS` rejects JPEG-derived entries until
-  that replacement completes. Repeated `CACHE_ME` and targeted invalidation use
-  the reference-count semantics of spice-gtk's session-shared image cache.
+  that replacement completes within one Display channel. Repeated `CACHE_ME`
+  and targeted invalidation use compatible reference-count semantics locally.
 - Missing references, dimension disagreement, invalid
   flags, decode failure, and capacity overflow fail before publishing cache
   state. Cache byte accounting is updated on replacement and invalidation.
 - Display `INVAL_LIST` 105 and `INVAL_ALL_PIXMAPS` 106 remove the corresponding
-  shared images. RESET 103 preserves the session image cache, matching
-  spice-gtk, while clearing the Display palette cache.
+  channel-local images. RESET 103 preserves that image cache while clearing the
+  Display palette cache. Cross-Display invalidation remains part of AIP-12.
 
 ### GLZ RGB and dictionary slice
 
@@ -314,10 +340,12 @@ The LZ RGB family is locally closed.
   decode, actor reentrancy, ordered commit, and repeated dictionary eviction.
   Every dependent resolves to the source pixels, the retained window edge stays
   readable, and the immediately evicted history fails without another wait.
-- Full and Mini header receive paths now publish explicit or implicit server
-  serials to a session-wide cancellation-safe barrier. `INVAL_ALL_PIXMAPS`
-  waits for every `(channel_type, channel_id, message_serial)` dependency before
-  clearing the shared image cache.
+- Full and Mini header receive paths publish explicit or implicit server
+  serials to a session-wide cancellation-safe barrier. The current barrier is
+  updated when a message is received rather than after its handler completes;
+  AIP-11 tracks the processed-serial correction. `INVAL_ALL_PIXMAPS` therefore
+  does not yet provide the cross-Display completion guarantee required by the
+  Session cache planned in AIP-12.
 
 ### ZLIB GLZ slice
 
@@ -385,9 +413,10 @@ rejects Homebrew, local build-tree, and other non-relocatable load paths.
 
 ## Stage D local closure
 
-JPEG, LZ, QUIC, the shared image cache, GLZ/dictionary, ZLIB GLZ, and MJPEG
-stream scheduling now satisfy the local Stage D gates: exact reference output,
-bounded malformed-input handling, and transactional Surface mutation.
+JPEG, LZ, QUIC, the per-Display image cache, GLZ/dictionary, ZLIB GLZ, and
+MJPEG stream scheduling satisfy their single-channel local Stage D gates:
+exact reference output, bounded malformed-input handling, and transactional
+Surface mutation. Cross-Display cache semantics remain open in AIP-12.
 
 Live multi-Display/video interoperability remains part of the deferred QEMU
 acceptance gate rather than evidence supplied by the local corpus.
@@ -925,9 +954,10 @@ such by an embedding application.
   targets and the new active comparison against spice-gtk have not yet been
   measured; the older benchmark below is retained as historical evidence, not
   a result for the refactored presenter.
-- The latest current-tree five-second Rocky smoke used an arm64 Release probe
-  containing the uncommitted publisher revision-race fixes. SwiftSpice
-  published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911
+- The retained 2026-08-01 development-tree five-second Rocky smoke used an
+  arm64 Release probe containing the then-uncommitted publisher revision-race
+  fixes. It predates `v0.2.7` and is not current performance evidence. That
+  probe published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911
   ratio. Ready-frame (0.772646), p95 (0.673903), and RSS (0.658301) also passed.
   Publisher stale snapshots fell from the earlier 48/261 (18.39%) sample to
   0/265. CPU per frame remained the blocking metric at 1.451688 ms versus

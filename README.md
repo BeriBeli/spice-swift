@@ -276,6 +276,7 @@ transport, channel, codec, rendering, and Apple integration targets. See the
 - [Architecture](docs/ARCHITECTURE.md)
 - [Status and validation evidence](docs/STATUS.md)
 - [Roadmap](docs/ROADMAP.md)
+- [Algorithm improvement plan](docs/ALGORITHM_IMPROVEMENT_PLAN.md)
 - [Repository layout](docs/REPOSITORY_LAYOUT.md)
 
 ## License
