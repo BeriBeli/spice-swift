@@ -5,6 +5,13 @@ set -eu
 readonly rootfs_target=/work/rootfs
 readonly artifacts_target=/work/artifacts
 readonly source=/work/guest
+readonly state=/work/state
+readonly lifecycle_lock="${state}/lifecycle.lock"
+
+if ! command -v flock >/dev/null 2>&1; then
+    echo "The Alpine builder must provide flock." >&2
+    exit 1
+fi
 
 rootfs="$(mktemp -d /work/.rootfs.XXXXXX)"
 artifacts="$(mktemp -d /work/.artifacts.XXXXXX)"
@@ -155,6 +162,11 @@ du -h \
 # Publish only after APK installation, manifest generation, and artifact hash
 # verification have all succeeded. The EXIT trap restores both old directories
 # if either rename fails or the process is interrupted before the commit point.
+mkdir -p "${state}"
+chmod 0700 "${state}"
+exec 9>"${lifecycle_lock}"
+flock -x 9
+
 if [ -e "${rootfs_target}" ]; then
     rootfs_backup="$(mktemp -d /work/.rootfs-backup.XXXXXX)"
     rmdir "${rootfs_backup}"

@@ -3,6 +3,49 @@ import Testing
 
 @Suite("Remote Rocky fixture scripts")
 struct RemoteRockyFixtureTests {
+    @Test func buildPublicationAndEndpointStartupShareOneLifecycleLock() throws {
+        let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
+        let commonScript = try script("Integration/RemoteRocky/remote/common.sh")
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+
+        #expect(buildScript.contains("readonly state=/work/state"))
+        #expect(buildScript.contains(#"readonly lifecycle_lock="${state}/lifecycle.lock""#))
+        #expect(commonScript.contains(#"readonly PERF_STATE="${PERF_BASE}/state""#))
+        #expect(commonScript.contains(
+            #"readonly PERF_LIFECYCLE_LOCK="${PERF_STATE}/lifecycle.lock""#
+        ))
+
+        let buildLock = try #require(buildScript.range(of: "flock -x 9"))
+        let verifiedInitramfsHash = try #require(buildScript.range(
+            of: #"actual_initramfs_sha256="$(sha256sum "${artifacts}/perf-initramfs.cpio.gz""#
+        ))
+        let stagedEvidence = try #require(buildScript.range(of: "du -h \\"))
+        let rootfsPublication = try #require(buildScript.range(
+            of: #"mv "${rootfs}" "${rootfs_target}""#,
+            range: buildLock.upperBound..<buildScript.endIndex
+        ))
+        let artifactsPublication = try #require(buildScript.range(
+            of: #"mv "${artifacts}" "${artifacts_target}""#,
+            range: buildLock.upperBound..<buildScript.endIndex
+        ))
+
+        #expect(verifiedInitramfsHash.lowerBound < buildLock.lowerBound)
+        #expect(stagedEvidence.lowerBound < buildLock.lowerBound)
+        #expect(buildLock.lowerBound < rootfsPublication.lowerBound)
+        #expect(buildLock.lowerBound < artifactsPublication.lowerBound)
+
+        let startLock = try #require(startScript.range(of: #"enter_lifecycle_lock "$@""#))
+        let startHash = try #require(startScript.range(of: "actual_kernel_sha256="))
+        let evidenceCopy = try #require(startScript.range(
+            of: #"cp "${manifest}" "${run_dir}/guest-build-manifest.env""#
+        ))
+        let containerDetach = try #require(startScript.range(of: "podman run --detach"))
+
+        #expect(startLock.lowerBound < startHash.lowerBound)
+        #expect(startLock.lowerBound < evidenceCopy.lowerBound)
+        #expect(startLock.lowerBound < containerDetach.lowerBound)
+    }
+
     @Test func lifecycleLockIsHeldByCloseOnExecCommandWrapper() throws {
         let commonScript = try String(
             contentsOf: repositoryRoot.appending(path: "Integration/RemoteRocky/remote/common.sh"),
@@ -172,6 +215,13 @@ struct RemoteRockyFixtureTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    private func script(_ relativePath: String) throws -> String {
+        try String(
+            contentsOf: repositoryRoot.appending(path: relativePath),
+            encoding: .utf8
+        )
     }
 }
 

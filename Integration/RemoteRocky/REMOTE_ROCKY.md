@@ -53,8 +53,11 @@ lock, so concurrent starts serialize and a failed start finishes its cleanup
 before another start can publish an endpoint. Run-directory names include an
 atomic random suffix, so two attempts in the same second cannot collide. Guest
 builds use temporary rootfs and artifact directories, validate the manifest and
-hashes, and only then replace the prior build. Before launch, the kernel and
-initramfs SHA-256 values must match `artifacts/build-manifest.env`.
+hashes, and only then acquire the same lifecycle lock and replace the prior
+build. The build holds that lock through backup cleanup, while start holds it
+through artifact verification, evidence capture, and QEMU detach. Before
+launch, the kernel and initramfs SHA-256 values must match
+`artifacts/build-manifest.env`.
 
 Archive a server-log slice around each client capture:
 
