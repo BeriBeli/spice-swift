@@ -355,7 +355,7 @@ package struct SpiceDesktopPresentationPacingPolicy: Sendable {
 package final class SpiceDesktopReadyLatch: Sendable {
     private struct State: Sendable {
         var pending: SpiceDesktopSnapshot?
-        var pendingSince: ContinuousClock.Instant?
+        var pendingReadyAt: ContinuousClock.Instant?
         var newestGeneration: UInt64?
         var newestDeliverySequence: UInt64 = 0
     }
@@ -369,21 +369,25 @@ package final class SpiceDesktopReadyLatch: Sendable {
 
     /// Returns true only for the empty-to-ready transition.
     package func offer(_ snapshot: SpiceDesktopSnapshot) -> Bool {
+        offer(snapshot, at: ContinuousClock().now)
+    }
+
+    /// Returns true only for the empty-to-ready transition.
+    package func offer(
+        _ snapshot: SpiceDesktopSnapshot,
+        at readyAt: ContinuousClock.Instant
+    ) -> Bool {
         state.withLock { state in
-            if Self.isOlder(
+            guard Self.isStrictlyNewer(
                 snapshot,
                 thanGeneration: state.newestGeneration,
                 deliverySequence: state.newestDeliverySequence
-            ) {
-                return false
-            }
+            ) else { return false }
             let wasEmpty = state.pending == nil
-            if wasEmpty {
-                state.pendingSince = ContinuousClock().now
-            }
             state.pending = state.pending.map {
                 SpiceDesktopSource.merging($0, snapshot)
             } ?? snapshot
+            state.pendingReadyAt = readyAt
             state.newestGeneration = state.pending?.generation
             state.newestDeliverySequence = state.pending?.deliverySequence ?? 0
             return wasEmpty
@@ -394,7 +398,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
         state.withLock { state in
             defer {
                 state.pending = nil
-                state.pendingSince = nil
+                state.pendingReadyAt = nil
             }
             return state.pending
         }
@@ -403,18 +407,29 @@ package final class SpiceDesktopReadyLatch: Sendable {
     package func takeReady(at selectedAt: ContinuousClock.Instant) -> Ready? {
         state.withLock { state in
             guard let snapshot = state.pending else { return nil }
-            let pendingSince = state.pendingSince ?? selectedAt
+            let readyAt = state.pendingReadyAt ?? selectedAt
+            let waitingDuration = selectedAt < readyAt
+                ? Duration.zero
+                : readyAt.duration(to: selectedAt)
             state.pending = nil
-            state.pendingSince = nil
+            state.pendingReadyAt = nil
             return Ready(
                 snapshot: snapshot,
-                waitingDuration: pendingSince.duration(to: selectedAt)
+                waitingDuration: waitingDuration
             )
         }
     }
 
     /// Keeps a failed presentation pending without replacing a newer update.
     package func restoreIfEmpty(_ snapshot: SpiceDesktopSnapshot) {
+        restoreIfEmpty(snapshot, at: ContinuousClock().now)
+    }
+
+    /// Keeps a failed presentation pending without replacing a newer update.
+    package func restoreIfEmpty(
+        _ snapshot: SpiceDesktopSnapshot,
+        at readyAt: ContinuousClock.Instant
+    ) {
         state.withLock { state in
             guard state.pending == nil,
                   !Self.isOlder(
@@ -424,7 +439,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
                   )
             else { return }
             state.pending = snapshot
-            state.pendingSince = ContinuousClock().now
+            state.pendingReadyAt = readyAt
             state.newestGeneration = snapshot.generation
             state.newestDeliverySequence = snapshot.deliverySequence
         }
@@ -433,12 +448,24 @@ package final class SpiceDesktopReadyLatch: Sendable {
     package func discard() {
         state.withLock {
             $0.pending = nil
-            $0.pendingSince = nil
+            $0.pendingReadyAt = nil
         }
     }
 
     package var isEmpty: Bool {
         state.withLock { $0.pending == nil }
+    }
+
+    private static func isStrictlyNewer(
+        _ snapshot: SpiceDesktopSnapshot,
+        thanGeneration newestGeneration: UInt64?,
+        deliverySequence newestDeliverySequence: UInt64
+    ) -> Bool {
+        guard let newestGeneration else { return true }
+        if snapshot.generation != newestGeneration {
+            return snapshot.generation > newestGeneration
+        }
+        return snapshot.deliverySequence > newestDeliverySequence
     }
 
     private static func isOlder(
