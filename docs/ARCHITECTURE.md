@@ -210,6 +210,15 @@ The image cache and GLZ dictionary have explicit entry and byte limits. Shared
 Display state uses actors and serial barriers so cross-channel invalidation and
 GLZ dependencies follow protocol order.
 
+LZ decoding owns one preallocated BGRA `Data` and confines mutable pointers to
+synchronous scoped buffer access. True-color references copy one initialized
+period and double the initialized prefix, while alpha references use the
+strided overlap kernel. Palette streams reuse the BGRA backing prefix for exact
+packed bytes and expand backwards through a precomputed byte lookup, so row-tail
+padding and cross-row references remain bit-exact without a second decoded
+output. Immutable per-decode diagnostics make allocation and copy acceptance
+observable without shared mutable counters.
+
 Published frames preserve immutable packed-BGRA semantics. Eligible macOS
 frames carry an IOSurface lease for Metal presentation and materialize packed
 `Data` only when a CPU consumer first requests `pixels`; that readback is cached

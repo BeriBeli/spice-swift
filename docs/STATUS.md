@@ -309,11 +309,16 @@ native dependency artifact.
 
 - Added strict Display wire support for `SPICE_IMAGE_TYPE_LZ_RGB` (101) using
   the protocol's bounded BinaryData payload.
-- Added a pure-Swift SPICE LZ 1.1 decoder for RGB16, RGB24, RGB32, RGBA, XXXA,
-  and A8 streams. It
-  validates the big-endian magic/version/type/dimensions/stride/top-down header,
-  uses a prebounded output buffer, validates each color/alpha plane and every
+- Added a Swift 6 SPICE LZ 1.1 decoder for RGB16, RGB24, RGB32, RGBA, XXXA,
+  and A8 streams. It validates the big-endian
+  magic/version/type/dimensions/stride/top-down header, writes each plane
+  directly into one preallocated `Data` backing, validates every
   literal/back-reference, and rejects truncation and trailing bytes.
+- Overlapping color references copy one initialized period and then double it
+  with bounded bulk copies. Alpha references use the existing strided overlap
+  kernel in one Swift-to-C call. Per-decode diagnostics record output backing,
+  temporary decoded storage, reference calls, and copied bytes without global
+  mutable state.
 - Added independent fixtures for all six supported formats, generated offline
   by the fixed `spice-common` C `lz.c` encoder/decoder. Swift output matches all
   reference BGRA bytes exactly, including overlapping back-reference behavior.
@@ -331,9 +336,14 @@ The LZ RGB family is locally closed.
 
 - Added strict `SPICE_IMAGE_TYPE_LZ_PLT` parsing for canonical inline-palette
   pointers and cached palette IDs, with bounded entry and compressed-data sizes.
-- Added pure-Swift PLT1 LE/BE, PLT4 LE/BE, and PLT8 expansion. Five independent
+- Added PLT1 LE/BE, PLT4 LE/BE, and PLT8 expansion. Five independent
   `spice-common` fixtures match visible BGRA pixels byte-for-byte, including
   packed-row padding.
+- Palette LZ first decodes exact packed bytes into the prefix of the final BGRA
+  `Data`, then walks rows and packed columns backwards to expand in place from
+  a precomputed byte-to-BGRA lookup table. The reverse walk preserves packed
+  cross-row references and partial row tails without a second decoded backing;
+  diagnostics distinguish lookup expansions and visible pixels.
 - DisplayChannel uses a bounded palette cache, commits `PAL_CACHE_ME` only after
   successful decode/render, resolves `PAL_FROM_CACHE`, and handles palette 107,
   palette-all 108, and Display RESET 103 invalidation.

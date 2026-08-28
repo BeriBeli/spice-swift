@@ -1,3 +1,4 @@
+import CSpicePixelOps
 import Foundation
 
 package struct SpiceLZDecodeLimits: Sendable, Equatable {
@@ -19,6 +20,22 @@ package struct SpiceLZDecodeLimits: Sendable, Equatable {
     }
 }
 
+package struct SpiceLZDecodeDiagnostics: Sendable, Equatable {
+    package let decodedOutputAllocations: UInt64
+    package let decodedOutputBytes: UInt64
+    package let temporaryDecodedBackingAllocations: UInt64
+    package let temporaryDecodedBackingBytes: UInt64
+    package let referenceBulkCopyCalls: UInt64
+    package let referenceBulkCopyBytes: UInt64
+    package let paletteLookupExpansions: UInt64
+    package let paletteLookupPixels: UInt64
+}
+
+package struct SpiceLZDecodeResult: Sendable, Equatable {
+    package let image: SpiceDecodedImage
+    package let diagnostics: SpiceLZDecodeDiagnostics
+}
+
 package struct SpiceLZDecoder: SpiceImageDecoder {
     private static let magic: UInt32 = 0x2020_5a4c
     private static let version: UInt32 = 0x0001_0001
@@ -36,6 +53,17 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
         descriptor: SpiceCodecImageDescriptor,
         payload: Data
     ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        try await decodeWithDiagnostics(
+            descriptor: descriptor,
+            payload: payload
+        ).image
+    }
+
+    @concurrent
+    package func decodeWithDiagnostics(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data
+    ) async throws(SpiceCodecError) -> SpiceLZDecodeResult {
         guard !payload.isEmpty else {
             throw .emptyPayload
         }
@@ -92,33 +120,50 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
             )
         }
 
-        var output = [UInt8](repeating: 0, count: outputByteCount)
-        for plane in imageType.planes {
-            try decodePlane(
-                plane,
-                reader: &reader,
-                output: &output,
-                pixelCount: pixelCount
-            )
+        var metrics = MutableLZDecodeDiagnostics(outputByteCount: outputByteCount)
+        var output = Data(count: outputByteCount)
+        let decodeResult: Result<Void, SpiceCodecError> = output.withUnsafeMutableBytes {
+            (outputBytes: UnsafeMutableRawBufferPointer) in
+            do {
+                for plane in imageType.planes {
+                    try decodePlane(
+                        plane,
+                        reader: &reader,
+                        output: outputBytes,
+                        pixelCount: pixelCount,
+                        metrics: &metrics
+                    )
+                }
+                return .success(())
+            } catch let error as SpiceCodecError {
+                return .failure(error)
+            } catch {
+                preconditionFailure("LZ decoder emitted an unexpected error type: \(error)")
+            }
         }
+        try decodeResult.get()
         guard reader.isAtEnd else {
             throw .malformedPayload("trailing compressed bytes")
         }
-        return SpiceDecodedImage(
-            width: width,
-            height: height,
-            bytesPerRow: width * 4,
-            topDown: topDownValue == 1,
-            alphaMode: imageType.hasAlpha ? .straight : .opaque,
-            pixelsBGRA: Data(output)
+        return SpiceLZDecodeResult(
+            image: SpiceDecodedImage(
+                width: width,
+                height: height,
+                bytesPerRow: width * 4,
+                topDown: topDownValue == 1,
+                alphaMode: imageType.hasAlpha ? .straight : .opaque,
+                pixelsBGRA: output
+            ),
+            diagnostics: metrics.snapshot
         )
     }
 
     private func decodePlane(
         _ plane: LZPlane,
         reader: inout LZReader,
-        output: inout [UInt8],
-        pixelCount: Int
+        output: UnsafeMutableRawBufferPointer,
+        pixelCount: Int,
+        metrics: inout MutableLZDecodeDiagnostics
     ) throws(SpiceCodecError) {
         var outputPixels = 0
         while outputPixels < pixelCount {
@@ -132,7 +177,7 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
                     try decodeLiteral(
                         plane,
                         reader: &reader,
-                        output: &output,
+                        output: output,
                         pixel: outputPixels
                     )
                     outputPixels += 1
@@ -162,21 +207,15 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
                 guard length <= pixelCount - outputPixels else {
                     throw .malformedPayload("LZ reference exceeds output")
                 }
-                var reference = outputPixels - distance
-                for _ in 0..<length {
-                    let byteOffset = reference * 4
-                    let destinationOffset = outputPixels * 4
-                    if plane == .alpha {
-                        output[destinationOffset + 3] = output[byteOffset + 3]
-                    } else {
-                        output[destinationOffset] = output[byteOffset]
-                        output[destinationOffset + 1] = output[byteOffset + 1]
-                        output[destinationOffset + 2] = output[byteOffset + 2]
-                        output[destinationOffset + 3] = output[byteOffset + 3]
-                    }
-                    reference += 1
-                    outputPixels += 1
-                }
+                copyReference(
+                    plane: plane,
+                    sourceUnit: outputPixels - distance,
+                    destinationUnit: outputPixels,
+                    unitCount: length,
+                    output: output,
+                    metrics: &metrics
+                )
+                outputPixels += length
             }
         }
     }
@@ -184,7 +223,7 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
     private func decodeLiteral(
         _ plane: LZPlane,
         reader: inout LZReader,
-        output: inout [UInt8],
+        output: UnsafeMutableRawBufferPointer,
         pixel: Int
     ) throws(SpiceCodecError) {
         let offset = pixel * 4
@@ -208,6 +247,74 @@ package struct SpiceLZDecoder: SpiceImageDecoder {
         }
     }
 
+    private func copyReference(
+        plane: LZPlane,
+        sourceUnit: Int,
+        destinationUnit: Int,
+        unitCount: Int,
+        output: UnsafeMutableRawBufferPointer,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) {
+        let distance = destinationUnit - sourceUnit
+        precondition(distance > 0 && unitCount > 0)
+
+        if plane == .alpha {
+            spice_copy_bgra_alpha_overlap(
+                output.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                sourceUnit,
+                destinationUnit,
+                unitCount
+            )
+            metrics.recordReferenceCopy(byteCount: unitCount)
+            return
+        }
+
+        var copiedUnits = min(distance, unitCount)
+        copyReferenceUnits(
+            plane: plane,
+            sourceUnit: sourceUnit,
+            destinationUnit: destinationUnit,
+            unitCount: copiedUnits,
+            output: output,
+            metrics: &metrics
+        )
+        while copiedUnits < unitCount {
+            let nextUnits = min(copiedUnits, unitCount - copiedUnits)
+            copyReferenceUnits(
+                plane: plane,
+                sourceUnit: destinationUnit,
+                destinationUnit: destinationUnit + copiedUnits,
+                unitCount: nextUnits,
+                output: output,
+                metrics: &metrics
+            )
+            copiedUnits += nextUnits
+        }
+    }
+
+    private func copyReferenceUnits(
+        plane: LZPlane,
+        sourceUnit: Int,
+        destinationUnit: Int,
+        unitCount: Int,
+        output: UnsafeMutableRawBufferPointer,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) {
+        switch plane {
+        case .rgb16, .color:
+            let byteCount = unitCount * 4
+            let sourceOffset = sourceUnit * 4
+            let destinationOffset = destinationUnit * 4
+            output.baseAddress!.advanced(by: destinationOffset).copyMemory(
+                from: output.baseAddress!.advanced(by: sourceOffset),
+                byteCount: byteCount
+            )
+            metrics.recordReferenceCopy(byteCount: byteCount)
+        case .alpha:
+            preconditionFailure("alpha references use the strided C kernel")
+        }
+    }
+
     private func integer(_ value: UInt32, field: String) throws(SpiceCodecError) -> Int {
         guard let result = Int(exactly: value) else {
             throw .invalidHeader("unrepresentable \(field)")
@@ -223,6 +330,19 @@ extension SpiceLZDecoder: SpicePaletteImageDecoder {
         payload: Data,
         palette: SpiceLZPalette
     ) async throws(SpiceCodecError) -> SpiceDecodedImage {
+        try await decodePaletteWithDiagnostics(
+            descriptor: descriptor,
+            payload: payload,
+            palette: palette
+        ).image
+    }
+
+    @concurrent
+    package func decodePaletteWithDiagnostics(
+        descriptor: SpiceCodecImageDescriptor,
+        payload: Data,
+        palette: SpiceLZPalette
+    ) async throws(SpiceCodecError) -> SpiceLZDecodeResult {
         guard !payload.isEmpty else {
             throw .emptyPayload
         }
@@ -280,54 +400,66 @@ extension SpiceLZDecoder: SpicePaletteImageDecoder {
         guard !packedOverflow, !pixelOverflow, !outputOverflow else {
             throw .integerOverflow
         }
-        let (workingByteCount, workingOverflow) = outputByteCount.addingReportingOverflow(
-            packedByteCount
-        )
-        guard !workingOverflow, workingByteCount <= limits.maximumDecodedBytes else {
+        guard outputByteCount <= limits.maximumDecodedBytes else {
             throw .decodedImageTooLarge(
-                actual: workingOverflow ? Int.max : workingByteCount,
+                actual: outputByteCount,
                 maximum: limits.maximumDecodedBytes
             )
         }
 
-        let packed = try decodePaletteBytes(
-            reader: &reader,
-            outputByteCount: packedByteCount
-        )
-        guard reader.isAtEnd else {
-            throw .malformedPayload("trailing compressed bytes")
-        }
-        var output = [UInt8](repeating: 0, count: outputByteCount)
-        for row in 0..<height {
-            for column in 0..<width {
-                let packedByte = packed[row * stride + column / imageType.pixelsPerByte]
-                let index = try imageType.paletteIndex(
-                    packedByte: packedByte,
-                    pixelInByte: column % imageType.pixelsPerByte,
-                    entryCount: palette.entriesARGB.count
-                )
-                let entry = palette.entriesARGB[index]
-                let offset = (row * width + column) * 4
-                output[offset] = UInt8(truncatingIfNeeded: entry)
-                output[offset + 1] = UInt8(truncatingIfNeeded: entry >> 8)
-                output[offset + 2] = UInt8(truncatingIfNeeded: entry >> 16)
-                output[offset + 3] = 0
+        let lookup = imageType.makeLookup(entriesARGB: palette.entriesARGB)
+        var metrics = MutableLZDecodeDiagnostics(outputByteCount: outputByteCount)
+        var output = Data(count: outputByteCount)
+        let decodeResult: Result<Void, SpiceCodecError> = lookup.withUnsafeBytes {
+            (lookupBytes: UnsafeRawBufferPointer) in
+            output.withUnsafeMutableBytes { (outputBytes: UnsafeMutableRawBufferPointer) in
+                do {
+                    try decodePaletteBytes(
+                        reader: &reader,
+                        output: outputBytes,
+                        outputByteCount: packedByteCount,
+                        metrics: &metrics
+                    )
+                    guard reader.isAtEnd else {
+                        throw SpiceCodecError.malformedPayload("trailing compressed bytes")
+                    }
+                    try expandPaletteBytes(
+                        imageType: imageType,
+                        width: width,
+                        height: height,
+                        stride: stride,
+                        entryCount: palette.entriesARGB.count,
+                        lookup: lookupBytes,
+                        output: outputBytes,
+                        metrics: &metrics
+                    )
+                    return .success(())
+                } catch let error as SpiceCodecError {
+                    return .failure(error)
+                } catch {
+                    preconditionFailure("LZ palette decoder emitted an unexpected error type: \(error)")
+                }
             }
         }
-        return SpiceDecodedImage(
-            width: width,
-            height: height,
-            bytesPerRow: width * 4,
-            topDown: topDownValue == 1,
-            pixelsBGRA: Data(output)
+        try decodeResult.get()
+        return SpiceLZDecodeResult(
+            image: SpiceDecodedImage(
+                width: width,
+                height: height,
+                bytesPerRow: width * 4,
+                topDown: topDownValue == 1,
+                pixelsBGRA: output
+            ),
+            diagnostics: metrics.snapshot
         )
     }
 
     private func decodePaletteBytes(
         reader: inout LZReader,
-        outputByteCount: Int
-    ) throws(SpiceCodecError) -> [UInt8] {
-        var output = [UInt8](repeating: 0, count: outputByteCount)
+        output: UnsafeMutableRawBufferPointer,
+        outputByteCount: Int,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) throws(SpiceCodecError) {
         var outputOffset = 0
         while outputOffset < outputByteCount {
             let control = Int(try reader.readByte())
@@ -365,19 +497,101 @@ extension SpiceLZDecoder: SpicePaletteImageDecoder {
                 guard length <= outputByteCount - outputOffset else {
                     throw .malformedPayload("LZ reference exceeds output")
                 }
-                var reference = outputOffset - distance
-                for _ in 0..<length {
-                    output[outputOffset] = output[reference]
-                    outputOffset += 1
-                    reference += 1
-                }
+                copyPackedReference(
+                    sourceOffset: outputOffset - distance,
+                    destinationOffset: outputOffset,
+                    byteCount: length,
+                    output: output,
+                    metrics: &metrics
+                )
+                outputOffset += length
             }
         }
-        return output
+    }
+
+    private func copyPackedReference(
+        sourceOffset: Int,
+        destinationOffset: Int,
+        byteCount: Int,
+        output: UnsafeMutableRawBufferPointer,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) {
+        let distance = destinationOffset - sourceOffset
+        precondition(distance > 0 && byteCount > 0)
+
+        var copiedBytes = min(distance, byteCount)
+        copyPackedBytes(
+            sourceOffset: sourceOffset,
+            destinationOffset: destinationOffset,
+            byteCount: copiedBytes,
+            output: output,
+            metrics: &metrics
+        )
+        while copiedBytes < byteCount {
+            let nextBytes = min(copiedBytes, byteCount - copiedBytes)
+            copyPackedBytes(
+                sourceOffset: destinationOffset,
+                destinationOffset: destinationOffset + copiedBytes,
+                byteCount: nextBytes,
+                output: output,
+                metrics: &metrics
+            )
+            copiedBytes += nextBytes
+        }
+    }
+
+    private func copyPackedBytes(
+        sourceOffset: Int,
+        destinationOffset: Int,
+        byteCount: Int,
+        output: UnsafeMutableRawBufferPointer,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) {
+        output.baseAddress!.advanced(by: destinationOffset).copyMemory(
+            from: output.baseAddress!.advanced(by: sourceOffset),
+            byteCount: byteCount
+        )
+        metrics.recordReferenceCopy(byteCount: byteCount)
+    }
+
+    /// Packed units occupy the output prefix during LZ expansion. Walking
+    /// pixels backwards is safe because every future packed source index is
+    /// lower than the current destination byte offset. This preserves exact
+    /// cross-row packed-byte references without a second decoded backing.
+    private func expandPaletteBytes(
+        imageType: LZPaletteType,
+        width: Int,
+        height: Int,
+        stride: Int,
+        entryCount: Int,
+        lookup: UnsafeRawBufferPointer,
+        output: UnsafeMutableRawBufferPointer,
+        metrics: inout MutableLZDecodeDiagnostics
+    ) throws(SpiceCodecError) {
+        let pixelsPerByte = imageType.pixelsPerByte
+        for row in (0..<height).reversed() {
+            for packedColumn in (0..<stride).reversed() {
+                let packedOffset = row * stride + packedColumn
+                let packedByte = output[packedOffset]
+                if imageType == .plt8, Int(packedByte) >= entryCount {
+                    throw .malformedPayload("palette index out of range")
+                }
+                let firstColumn = packedColumn * pixelsPerByte
+                let expandedPixels = min(pixelsPerByte, width - firstColumn)
+                let destinationOffset = (row * width + firstColumn) * 4
+                let lookupOffset = Int(packedByte) * pixelsPerByte * 4
+                let expandedByteCount = expandedPixels * 4
+                output.baseAddress!.advanced(by: destinationOffset).copyMemory(
+                    from: lookup.baseAddress!.advanced(by: lookupOffset),
+                    byteCount: expandedByteCount
+                )
+                metrics.recordPaletteExpansion(pixelCount: expandedPixels)
+            }
+        }
     }
 }
 
-private enum LZPaletteType {
+private enum LZPaletteType: Equatable {
     case plt1LE
     case plt1BE
     case plt4LE
@@ -410,11 +624,37 @@ private enum LZPaletteType {
         }
     }
 
-    func paletteIndex(
+    func makeLookup(entriesARGB: [UInt32]) -> Data {
+        let pixelStride = pixelsPerByte * 4
+        var lookup = Data(count: 256 * pixelStride)
+        lookup.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) in
+            for packedValue in 0...255 {
+                let packedByte = UInt8(packedValue)
+                for pixelInByte in 0..<pixelsPerByte {
+                    guard let index = paletteIndexForLookup(
+                        packedByte: packedByte,
+                        pixelInByte: pixelInByte,
+                        entryCount: entriesARGB.count
+                    ) else {
+                        continue
+                    }
+                    let entry = entriesARGB[index]
+                    let offset = packedValue * pixelStride + pixelInByte * 4
+                    bytes[offset] = UInt8(truncatingIfNeeded: entry)
+                    bytes[offset + 1] = UInt8(truncatingIfNeeded: entry >> 8)
+                    bytes[offset + 2] = UInt8(truncatingIfNeeded: entry >> 16)
+                    bytes[offset + 3] = 0
+                }
+            }
+        }
+        return lookup
+    }
+
+    private func paletteIndexForLookup(
         packedByte: UInt8,
         pixelInByte: Int,
         entryCount: Int
-    ) throws(SpiceCodecError) -> Int {
+    ) -> Int? {
         switch self {
         case .plt1LE:
             return Int((packedByte >> pixelInByte) & 1)
@@ -428,11 +668,48 @@ private enum LZPaletteType {
             return Int((packedByte >> shift) & 0x0f) % entryCount
         case .plt8:
             let index = Int(packedByte)
-            guard index < entryCount else {
-                throw .malformedPayload("palette index out of range")
-            }
-            return index
+            return index < entryCount ? index : nil
         }
+    }
+}
+
+private struct MutableLZDecodeDiagnostics {
+    let outputByteCount: UInt64
+    var referenceBulkCopyCalls: UInt64 = 0
+    var referenceBulkCopyBytes: UInt64 = 0
+    var paletteLookupExpansions: UInt64 = 0
+    var paletteLookupPixels: UInt64 = 0
+
+    init(outputByteCount: Int) {
+        self.outputByteCount = UInt64(outputByteCount)
+    }
+
+    mutating func recordReferenceCopy(byteCount: Int) {
+        Self.saturatingAdd(1, to: &referenceBulkCopyCalls)
+        Self.saturatingAdd(UInt64(byteCount), to: &referenceBulkCopyBytes)
+    }
+
+    mutating func recordPaletteExpansion(pixelCount: Int) {
+        Self.saturatingAdd(1, to: &paletteLookupExpansions)
+        Self.saturatingAdd(UInt64(pixelCount), to: &paletteLookupPixels)
+    }
+
+    var snapshot: SpiceLZDecodeDiagnostics {
+        SpiceLZDecodeDiagnostics(
+            decodedOutputAllocations: 1,
+            decodedOutputBytes: outputByteCount,
+            temporaryDecodedBackingAllocations: 0,
+            temporaryDecodedBackingBytes: 0,
+            referenceBulkCopyCalls: referenceBulkCopyCalls,
+            referenceBulkCopyBytes: referenceBulkCopyBytes,
+            paletteLookupExpansions: paletteLookupExpansions,
+            paletteLookupPixels: paletteLookupPixels
+        )
+    }
+
+    private static func saturatingAdd(_ addition: UInt64, to value: inout UInt64) {
+        let (sum, overflow) = value.addingReportingOverflow(addition)
+        value = overflow ? UInt64.max : sum
     }
 }
 
@@ -482,7 +759,7 @@ private enum LZImageType {
     }
 }
 
-private enum LZPlane {
+private enum LZPlane: Equatable {
     case rgb16
     case color
     case alpha
