@@ -108,6 +108,7 @@ package actor DisplayChannel: SpiceManagedChannel {
     private let ownsImageCache: Bool
     private let jpegDecoder: any SpiceImageDecoder
     private let lzDecoder: any SpiceImageDecoder
+    private let codecTaskExecutor: SpiceCodecTaskExecutor
     private let glzDecoder: SpiceGLZDecoder
     private let zlibInflator: SpiceZlibInflator
     private let paletteLZDecoder: any SpicePaletteImageDecoder
@@ -150,9 +151,10 @@ package actor DisplayChannel: SpiceManagedChannel {
         connection: ChannelConnection,
         surfaces: SurfaceStore = SurfaceStore(),
         imageCache: DisplayImageCache? = nil,
+        codecTaskExecutor: SpiceCodecTaskExecutor = SpiceCodecTaskExecutor(),
         jpegDecoder: any SpiceImageDecoder = SpiceJPEGDecoder(),
         lzDecoder: any SpiceImageDecoder = SpiceLZDecoder(),
-        glzDecoder: SpiceGLZDecoder = SpiceGLZDecoder(),
+        glzDecoder: SpiceGLZDecoder? = nil,
         zlibInflator: SpiceZlibInflator = SpiceZlibInflator(),
         paletteLZDecoder: any SpicePaletteImageDecoder = SpiceLZDecoder(),
         quicDecoder: any SpiceImageDecoder = SpiceQUICDecoder(),
@@ -180,7 +182,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         }
         self.jpegDecoder = jpegDecoder
         self.lzDecoder = lzDecoder
-        self.glzDecoder = glzDecoder
+        self.codecTaskExecutor = codecTaskExecutor
+        self.glzDecoder = glzDecoder ?? SpiceGLZDecoder(executor: codecTaskExecutor)
         self.zlibInflator = zlibInflator
         self.paletteLZDecoder = paletteLZDecoder
         self.quicDecoder = quicDecoder
@@ -1409,29 +1412,39 @@ package actor DisplayChannel: SpiceManagedChannel {
                 name: "LZ"
             )), nil)
         case let .glzRGB(descriptor, data):
-            return (.bitmap(try await decode(
+            return (.bitmap(try await decodeGLZ(
                 descriptor: descriptor,
                 data: data.data,
-                decoder: glzDecoder,
                 name: "GLZ"
             )), nil)
         case let .zlibGLZ(descriptor, data):
             guard let glzDataSize = Int(exactly: data.glzDataSize) else {
                 throw .protocolViolation("invalid ZLIB GLZ output size")
             }
+            let compressedPayload = data.data
             let glzPayload: Data
+            let inflator = zlibInflator
             do {
-                glzPayload = try await zlibInflator.inflate(
-                    payload: data.data,
-                    exactOutputByteCount: glzDataSize
-                )
+                glzPayload = try await executeCodecWork(
+                    payloadByteCount: compressedPayload.count
+                ) {
+                    () async throws(SpiceCodecError) -> Data in
+                    try await inflator.inflate(
+                        payload: compressedPayload,
+                        exactOutputByteCount: glzDataSize
+                    )
+                }
             } catch let error {
                 throw .protocolViolation("ZLIB GLZ inflate failed: \(error.description)")
             }
-            return (.bitmap(try await decode(
+            // Inflation releases the Display executor permit before GLZ
+            // coordination begins. The first phase charges the physical wire
+            // owner above; the GLZ phase separately charges that still-live
+            // owner together with its immutable program, inflated payload,
+            // output, and dependency snapshots without nesting permits.
+            return (.bitmap(try await decodeGLZ(
                 descriptor: descriptor,
                 data: glzPayload,
-                decoder: glzDecoder,
                 name: "ZLIB GLZ"
             )), nil)
         case let .lzPalette(descriptor, data):
@@ -1441,13 +1454,20 @@ package actor DisplayChannel: SpiceManagedChannel {
                 throw .protocolViolation("invalid LZ palette dimensions")
             }
             let paletteResolution = try resolvePalette(data)
+            let compressedPayload = data.data
             let decoded: SpiceDecodedImage
+            let paletteDecoder = paletteLZDecoder
             do {
-                decoded = try await paletteLZDecoder.decodePalette(
-                    descriptor: SpiceCodecImageDescriptor(width: width, height: height),
-                    payload: data.data,
-                    palette: paletteResolution.palette
-                )
+                decoded = try await executeCodecWork(
+                    payloadByteCount: compressedPayload.count
+                ) {
+                    () async throws(SpiceCodecError) -> SpiceDecodedImage in
+                    try await paletteDecoder.decodePalette(
+                        descriptor: SpiceCodecImageDescriptor(width: width, height: height),
+                        payload: compressedPayload,
+                        palette: paletteResolution.palette
+                    )
+                }
             } catch let error {
                 throw .protocolViolation("LZ palette decode failed: \(error.description)")
             }
@@ -1470,13 +1490,67 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .protocolViolation("invalid \(name) dimensions")
         }
         do {
-            let decoded = try await decoder.decode(
+            let descriptor = SpiceCodecImageDescriptor(width: width, height: height)
+            let decoded = try await executeCodecWork(payloadByteCount: data.count) {
+                () async throws(SpiceCodecError) -> SpiceDecodedImage in
+                try await decoder.decode(descriptor: descriptor, payload: data)
+            }
+            return rawBitmap(decoded)
+        } catch let error {
+            throw .protocolViolation("\(name) decode failed: \(error.description)")
+        }
+    }
+
+    private func decodeGLZ(
+        descriptor: SpiceImageDescriptor,
+        data: Data,
+        name: String
+    ) async throws(ChannelError) -> RawBitmap {
+        guard let width = Int(exactly: descriptor.width),
+              let height = Int(exactly: descriptor.height)
+        else {
+            throw .protocolViolation("invalid \(name) dimensions")
+        }
+        do {
+            let decoded = try await glzDecoder.decode(
                 descriptor: SpiceCodecImageDescriptor(width: width, height: height),
-                payload: data
+                payload: data,
+                retainedOwnerByteCount: currentMessageRetainedByteCount ?? 0
             )
             return rawBitmap(decoded)
         } catch let error {
             throw .protocolViolation("\(name) decode failed: \(error.description)")
+        }
+    }
+
+    private func executeCodecWork<Success: Sendable>(
+        payloadByteCount: Int,
+        operation: @escaping @Sendable () async throws(SpiceCodecError) -> Success
+    ) async throws(SpiceCodecError) -> Success {
+        // `processNextImpl` retains the decoded logical message across this
+        // suspension. A small payload slice can therefore keep the complete
+        // physical FramedMessageBatch owner alive while waiting for executor
+        // admission. Charge that owner once for this admission phase, falling
+        // back to the independently retained Data boundary outside wire dispatch.
+        let retainedByteCount = max(
+            currentMessageRetainedByteCount ?? 0,
+            payloadByteCount
+        )
+        do {
+            return try await codecTaskExecutor.executeThrowing(
+                retainedByteCount: retainedByteCount,
+                operation: operation
+            )
+        } catch let error {
+            switch error {
+            case let .operation(codecError):
+                throw codecError
+            case let .executor(executorError):
+                if executorError == .cancelled || executorError == .closed {
+                    throw .cancelled
+                }
+                throw .backendFailure("codec executor rejected work: \(executorError)")
+            }
         }
     }
 

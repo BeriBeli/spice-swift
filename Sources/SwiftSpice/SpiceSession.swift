@@ -154,6 +154,7 @@ public actor SpiceSession {
     private let injectedMigrationExecutor: (any SpiceMigrationHandoffExecuting)?
     private let displayImageCacheFactory: @Sendable () -> DisplayImageCache
     private let surfaceMemoryBudget = SurfaceMemoryBudget()
+    private let codecTaskExecutor = SpiceCodecTaskExecutor()
     private let mjpegDecodeLimiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
     package nonisolated let presentationDiagnostics: SpicePresentationDiagnostics
     public nonisolated let desktop: SpiceDesktopSource
@@ -420,7 +421,7 @@ public actor SpiceSession {
         do {
             try await transport.connect()
             let serialBarrier = ChannelSerialBarrier()
-            let glzDecoder = SpiceGLZDecoder()
+            let glzDecoder = SpiceGLZDecoder(executor: codecTaskExecutor)
             let multimediaClock = MultimediaClock()
             let handshake = try await LinkHandshake().perform(
                 transport: transport,
@@ -469,6 +470,7 @@ public actor SpiceSession {
                     multimediaClock: multimediaClock,
                     surfaceMemoryBudget: surfaceMemoryBudget,
                     frameDemandCoordinator: desktop.frameDemandCoordinator,
+                    codecTaskExecutor: codecTaskExecutor,
                     mjpegDecodeLimiter: mjpegDecodeLimiter
                 )
             }
@@ -1758,7 +1760,7 @@ public actor SpiceSession {
         do {
             try await transport.connect()
             let serialBarrier = ChannelSerialBarrier()
-            let glzDecoder = SpiceGLZDecoder()
+            let glzDecoder = SpiceGLZDecoder(executor: codecTaskExecutor)
             let multimediaClock = MultimediaClock()
             let sourceVersion: UInt32?
             if case let .seamless(version) = offer.mode {
@@ -1828,6 +1830,7 @@ public actor SpiceSession {
                     multimediaClock: multimediaClock,
                     surfaceMemoryBudget: surfaceMemoryBudget,
                     frameDemandCoordinator: desktop.frameDemandCoordinator,
+                    codecTaskExecutor: codecTaskExecutor,
                     mjpegDecodeLimiter: mjpegDecodeLimiter
                 )
             }
@@ -2390,6 +2393,7 @@ public actor SpiceSession {
         multimediaClock: any MultimediaClockScheduling,
         surfaceMemoryBudget: SurfaceMemoryBudget,
         frameDemandCoordinator: DisplayFrameDemandCoordinator,
+        codecTaskExecutor: SpiceCodecTaskExecutor,
         mjpegDecodeLimiter: SpiceMJPEGDecodeLimiter
     ) -> any SpiceManagedChannel {
         switch SpiceChannelKind(rawValue: key.type) {
@@ -2398,6 +2402,7 @@ public actor SpiceSession {
                 connection: connection,
                 surfaces: SurfaceStore(memoryBudget: surfaceMemoryBudget),
                 imageCache: imageCache,
+                codecTaskExecutor: codecTaskExecutor,
                 glzDecoder: glzDecoder,
                 multimediaClock: multimediaClock,
                 frameDemandCoordinator: frameDemandCoordinator,
