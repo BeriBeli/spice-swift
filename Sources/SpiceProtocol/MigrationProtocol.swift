@@ -49,6 +49,13 @@ package enum SpiceMainMigrationCodec {
         id: UInt16,
         body: Data
     ) throws(WireError) -> SpiceMainMigrationCommand? {
+        try decode(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package static func decode(
+        id: UInt16,
+        body: WireSlice
+    ) throws(WireError) -> SpiceMainMigrationCommand? {
         switch id {
         case SpiceMainMigrationWire.serverBegin:
             var reader = try ByteReader(body)
@@ -160,7 +167,7 @@ package enum SpiceMainMigrationCodec {
         return value
     }
 
-    private static func requireEmpty(_ body: Data) throws(WireError) {
+    private static func requireEmpty(_ body: WireSlice) throws(WireError) {
         let reader = try ByteReader(body)
         try reader.requireFullyConsumed()
     }

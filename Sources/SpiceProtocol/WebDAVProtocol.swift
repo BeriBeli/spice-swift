@@ -26,6 +26,12 @@ package struct SpicePortWireCodec: Sendable {
     }
 
     package func decodeInitialization(_ body: Data) throws(WireError) -> SpicePortInitialization {
+        try decodeInitialization(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeInitialization(
+        _ body: WireSlice
+    ) throws(WireError) -> SpicePortInitialization {
         var reader = try ByteReader(body)
         let rawSize = try reader.readUInt32LE()
         let rawNameOffset = try reader.readUInt32LE()
@@ -59,6 +65,10 @@ package struct SpicePortWireCodec: Sendable {
     }
 
     package func decodeEvent(_ body: Data) throws(WireError) -> SpicePortEvent {
+        try decodeEvent(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeEvent(_ body: WireSlice) throws(WireError) -> SpicePortEvent {
         var reader = try ByteReader(body)
         let raw = try reader.readUInt8()
         guard let event = SpicePortEvent(rawValue: raw) else {

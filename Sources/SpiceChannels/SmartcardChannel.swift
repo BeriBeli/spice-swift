@@ -64,7 +64,7 @@ package actor SmartcardChannel: SpiceManagedChannel {
         do {
             decoded = try SpiceServerMessageDecoder.decode(
                 id: framed.type,
-                body: framed.body,
+                body: framed.bodySlice,
                 channel: .smartcard
             )
         } catch let error {

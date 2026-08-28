@@ -61,7 +61,7 @@ package actor RecordChannel: SpiceManagedChannel {
         do {
             message = try SpiceServerMessageDecoder.decode(
                 id: framed.type,
-                body: framed.body,
+                body: framed.bodySlice,
                 channel: .record
             )
         } catch let error {

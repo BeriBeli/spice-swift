@@ -23,6 +23,12 @@ package enum SpiceDisplayMonitorCodec {
     package static func decode(
         _ data: Data
     ) throws(WireError) -> SpiceDisplayMonitorsConfiguration {
+        try decode(OwnedBytes(data).wholeSlice)
+    }
+
+    package static func decode(
+        _ data: WireSlice
+    ) throws(WireError) -> SpiceDisplayMonitorsConfiguration {
         var reader = try ByteReader(data)
         let count = Int(try reader.readUInt16LE())
         let maximumAllowed = try reader.readUInt16LE()

@@ -8,6 +8,7 @@ package enum WireError: Error, Sendable, Equatable {
     case integerOverflow
     case invalidOffset(UInt64)
     case messageTooLarge(actual: Int, maximum: Int)
+    case tooManySegments(actual: Int, maximum: Int)
     case trailingBytes(Int)
     case invalidEnum(type: String, value: UInt64)
     case unsupportedFeature(String)
@@ -16,12 +17,15 @@ package enum WireError: Error, Sendable, Equatable {
 package struct WireLimits: Sendable, Equatable {
     package var maximumMessageSize: Int
     package var maximumBufferedBytes: Int
+    package var maximumBufferedSegments: Int
 
     package init(
         maximumMessageSize: Int = 64 * 1024 * 1024,
-        maximumBufferedBytes: Int = 128 * 1024 * 1024
+        maximumBufferedBytes: Int = 128 * 1024 * 1024,
+        maximumBufferedSegments: Int = 4_096
     ) {
         self.maximumMessageSize = maximumMessageSize
         self.maximumBufferedBytes = maximumBufferedBytes
+        self.maximumBufferedSegments = maximumBufferedSegments
     }
 }

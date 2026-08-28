@@ -38,6 +38,13 @@ package struct SpiceRecordWireCodec: Sendable {
     }
 
     package func decodeServer(id: UInt16, body: Data) throws(WireError) -> SpiceRecordCommand {
+        try decodeServer(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeServer(
+        id: UInt16,
+        body: WireSlice
+    ) throws(WireError) -> SpiceRecordCommand {
         var reader = try ByteReader(body)
         let command: SpiceRecordCommand
         switch id {

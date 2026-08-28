@@ -63,6 +63,10 @@ package struct SpicePlaybackWireDecoder: Sendable {
     }
 
     package func decode(id: UInt16, body: Data) throws(WireError) -> SpicePlaybackCommand {
+        try decode(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package func decode(id: UInt16, body: WireSlice) throws(WireError) -> SpicePlaybackCommand {
         var reader = try ByteReader(body)
         let command: SpicePlaybackCommand
         switch id {

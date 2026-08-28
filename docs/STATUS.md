@@ -75,6 +75,28 @@ Agent behavior, including system-trusted TLS.
   `SurfacePublicationDamageTests` 3/3, `DisplayChannelTests` 71/71, and the full
   Swift 6 warnings-as-errors test gate. The pre-fix focused gate produced 24
   issues; all are closed on PR #26. No throughput claim is made before AIP-00.
+- AIP-30 is locally complete. `OwnedBytes` and checked `WireSlice` ranges carry
+  immutable receive ownership across actors, while non-escaping Swift `Span`
+  views perform synchronous scalar parsing. Production channels pass slices;
+  Display payloads materialize Data only at their existing codec boundaries.
+- `MessageFramer` now uses a bounded head-index segment queue. Contiguous bodies
+  copy zero bytes, fragmented bodies coalesce once, consumed owners release
+  immediately, and received bytes are never compacted. A malformed batch is
+  validated before cursor advancement and a retry neither consumes its physical
+  boundary nor repeats its coalescing copy.
+- The receive queue independently caps live segments at 4,096, closing the
+  tiny-read owner-allocation amplification identified by latest-head review.
+  The limit is checked before owner allocation, failure does not change bytes,
+  diagnostics, or cursor state, and consumed/reset slots immediately restore
+  capacity.
+- Focused AIP-30 evidence includes `MessageFramerTests` 13 declarations / 18
+  executions, `SpiceWireTests` 35 declarations / about 53 executions,
+  `SpiceProtocolTests` 46/46, `ChannelConnectionBatchTests` 3/3,
+  `DisplayChannelTests` 71 declarations / 84 executions, focused ASan, generated
+  source and Public API checks, and the full Swift 6 warnings-as-errors gate.
+  Independent tests caught and closed physical-boundary consumption, a segment
+  boundary trap, hidden retention of consumed owners, and unbounded live segment
+  metadata. No throughput claim is made before AIP-00.
 
 ## Stage B local closure
 

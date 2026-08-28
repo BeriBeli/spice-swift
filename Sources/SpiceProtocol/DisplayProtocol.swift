@@ -43,7 +43,8 @@ package struct SpiceRawBitmap: Sendable, Equatable {
     package let width: UInt32
     package let height: UInt32
     package let stride: UInt32
-    package let pixels: Data
+    package let pixelSlice: WireSlice
+    package var pixels: Data { pixelSlice.data }
 }
 
 package struct SpicePalette: Sendable, Equatable {
@@ -59,20 +60,22 @@ package enum SpicePaletteReference: Sendable, Equatable {
 package struct SpiceLZPaletteData: Sendable, Equatable {
     package let flags: UInt8
     package let palette: SpicePaletteReference
-    package let data: Data
+    package let dataSlice: WireSlice
+    package var data: Data { dataSlice.data }
 }
 
 package struct SpiceZlibGLZData: Sendable, Equatable {
     package let glzDataSize: UInt32
-    package let data: Data
+    package let dataSlice: WireSlice
+    package var data: Data { dataSlice.data }
 }
 
 package enum SpiceImage: Sendable, Equatable {
     case bitmap(descriptor: SpiceImageDescriptor, bitmap: SpiceRawBitmap)
-    case quic(descriptor: SpiceImageDescriptor, data: Data)
-    case jpeg(descriptor: SpiceImageDescriptor, data: Data)
-    case lzRGB(descriptor: SpiceImageDescriptor, data: Data)
-    case glzRGB(descriptor: SpiceImageDescriptor, data: Data)
+    case quic(descriptor: SpiceImageDescriptor, data: WireSlice)
+    case jpeg(descriptor: SpiceImageDescriptor, data: WireSlice)
+    case lzRGB(descriptor: SpiceImageDescriptor, data: WireSlice)
+    case glzRGB(descriptor: SpiceImageDescriptor, data: WireSlice)
     case zlibGLZ(descriptor: SpiceImageDescriptor, data: SpiceZlibGLZData)
     case lzPalette(descriptor: SpiceImageDescriptor, data: SpiceLZPaletteData)
     case surface(descriptor: SpiceImageDescriptor, surfaceID: UInt32)
@@ -140,7 +143,8 @@ package struct SpiceDisplayStreamCreate: Sendable, Equatable {
 package struct SpiceDisplayStreamData: Sendable, Equatable {
     package let streamID: UInt32
     package let multimediaTime: UInt32
-    package let data: Data
+    package let dataSlice: WireSlice
+    package var data: Data { dataSlice.data }
 }
 
 package struct SpiceDisplayStreamDataSized: Sendable, Equatable {
@@ -149,7 +153,8 @@ package struct SpiceDisplayStreamDataSized: Sendable, Equatable {
     package let width: UInt32
     package let height: UInt32
     package let destination: SpiceRect
-    package let data: Data
+    package let dataSlice: WireSlice
+    package var data: Data { dataSlice.data }
 }
 
 package struct SpiceDisplayStreamClip: Sendable, Equatable {
@@ -195,6 +200,10 @@ package struct SpiceDisplayWireDecoder: Sendable {
     }
 
     package func decode(id: UInt16, body: Data) throws(WireError) -> SpiceDisplayCommand {
+        try decode(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package func decode(id: UInt16, body: WireSlice) throws(WireError) -> SpiceDisplayCommand {
         switch id {
         case 104:
             return .copyBits(try decodeCopyBits(body))
@@ -208,19 +217,79 @@ package struct SpiceDisplayWireDecoder: Sendable {
     }
 
     package func decodeCopyBitsMessage(_ body: Data) throws(WireError) -> SpiceDisplayCopyBits {
+        try decodeCopyBitsMessage(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeCopyBitsMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayCopyBits {
         try decodeCopyBits(body)
     }
 
     package func decodeDrawFillMessage(_ body: Data) throws(WireError) -> SpiceDisplayDrawFill {
+        try decodeDrawFillMessage(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeDrawFillMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayDrawFill {
         try decodeDrawFill(body)
     }
 
     package func decodeDrawCopyMessage(_ body: Data) throws(WireError) -> SpiceDisplayDrawCopy {
+        try decodeDrawCopyMessage(OwnedBytes(body).wholeSlice)
+    }
+
+    package func decodeDrawCopyMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayDrawCopy {
         try decodeDrawCopy(body)
     }
 
     package func decodeStreamCreateMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayStreamCreate {
+        try decodeStreamCreate(body)
+    }
+
+    package func decodeStreamDataMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayStreamData {
+        try decodeStreamData(body)
+    }
+
+    package func decodeStreamDataSizedMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayStreamDataSized {
+        try decodeStreamDataSized(body)
+    }
+
+    package func decodeStreamClipMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayStreamClip {
+        try decodeStreamClip(body)
+    }
+
+    package func decodeStreamDestroyMessage(
+        _ body: WireSlice
+    ) throws(WireError) -> UInt32 {
+        try decodeStreamDestroy(body)
+    }
+
+    package func decodeStreamDestroyAllMessage(
+        _ body: WireSlice
+    ) throws(WireError) {
+        try decodeStreamDestroyAll(body)
+    }
+
+    package func decodeStreamCreateMessage(
         _ body: Data
+    ) throws(WireError) -> SpiceDisplayStreamCreate {
+        try decodeStreamCreate(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamCreate(
+        _ body: WireSlice
     ) throws(WireError) -> SpiceDisplayStreamCreate {
         var reader = try ByteReader(body)
         let surfaceID = try reader.readUInt32LE()
@@ -265,6 +334,12 @@ package struct SpiceDisplayWireDecoder: Sendable {
     package func decodeStreamDataMessage(
         _ body: Data
     ) throws(WireError) -> SpiceDisplayStreamData {
+        try decodeStreamData(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamData(
+        _ body: WireSlice
+    ) throws(WireError) -> SpiceDisplayStreamData {
         var reader = try ByteReader(body)
         let streamID = try decodeStreamID(from: &reader)
         let multimediaTime = try reader.readUInt32LE()
@@ -273,12 +348,18 @@ package struct SpiceDisplayWireDecoder: Sendable {
         return SpiceDisplayStreamData(
             streamID: streamID,
             multimediaTime: multimediaTime,
-            data: data
+            dataSlice: data
         )
     }
 
     package func decodeStreamDataSizedMessage(
         _ body: Data
+    ) throws(WireError) -> SpiceDisplayStreamDataSized {
+        try decodeStreamDataSized(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamDataSized(
+        _ body: WireSlice
     ) throws(WireError) -> SpiceDisplayStreamDataSized {
         var reader = try ByteReader(body)
         let streamID = try decodeStreamID(from: &reader)
@@ -296,12 +377,18 @@ package struct SpiceDisplayWireDecoder: Sendable {
             width: width,
             height: height,
             destination: destination,
-            data: data
+            dataSlice: data
         )
     }
 
     package func decodeStreamClipMessage(
         _ body: Data
+    ) throws(WireError) -> SpiceDisplayStreamClip {
+        try decodeStreamClip(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamClip(
+        _ body: WireSlice
     ) throws(WireError) -> SpiceDisplayStreamClip {
         var reader = try ByteReader(body)
         let streamID = try decodeStreamID(from: &reader)
@@ -311,6 +398,10 @@ package struct SpiceDisplayWireDecoder: Sendable {
     }
 
     package func decodeStreamDestroyMessage(_ body: Data) throws(WireError) -> UInt32 {
+        try decodeStreamDestroy(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamDestroy(_ body: WireSlice) throws(WireError) -> UInt32 {
         var reader = try ByteReader(body)
         let streamID = try decodeStreamID(from: &reader)
         try reader.requireFullyConsumed()
@@ -318,11 +409,15 @@ package struct SpiceDisplayWireDecoder: Sendable {
     }
 
     package func decodeStreamDestroyAllMessage(_ body: Data) throws(WireError) {
+        try decodeStreamDestroyAll(OwnedBytes(body).wholeSlice)
+    }
+
+    private func decodeStreamDestroyAll(_ body: WireSlice) throws(WireError) {
         let reader = try ByteReader(body)
         try reader.requireFullyConsumed()
     }
 
-    private func decodeCopyBits(_ body: Data) throws(WireError) -> SpiceDisplayCopyBits {
+    private func decodeCopyBits(_ body: WireSlice) throws(WireError) -> SpiceDisplayCopyBits {
         var reader = try ByteReader(body)
         let base = try decodeBase(from: &reader)
         let source = try decodePoint(from: &reader)
@@ -330,7 +425,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
         return SpiceDisplayCopyBits(base: base, sourcePosition: source)
     }
 
-    private func decodeDrawFill(_ body: Data) throws(WireError) -> SpiceDisplayDrawFill {
+    private func decodeDrawFill(_ body: WireSlice) throws(WireError) -> SpiceDisplayDrawFill {
         var reader = try ByteReader(body)
         let base = try decodeBase(from: &reader)
         let brushType = try reader.readUInt8()
@@ -378,7 +473,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
         )
     }
 
-    private func decodeDrawCopy(_ body: Data) throws(WireError) -> SpiceDisplayDrawCopy {
+    private func decodeDrawCopy(_ body: WireSlice) throws(WireError) -> SpiceDisplayDrawCopy {
         var reader = try ByteReader(body)
         let base = try decodeBase(from: &reader)
         let sourceOffset = try reader.readUInt32LE()
@@ -442,7 +537,9 @@ package struct SpiceDisplayWireDecoder: Sendable {
         return streamID
     }
 
-    private func decodeStreamData(from reader: inout ByteReader) throws(WireError) -> Data {
+    private func decodeStreamData(
+        from reader: inout ByteReader
+    ) throws(WireError) -> WireSlice {
         let dataSizeValue = try reader.readUInt32LE()
         guard let dataSize = Int(exactly: dataSizeValue),
               dataSize <= limits.maximumStreamDataBytes,
@@ -450,7 +547,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
         else {
             throw .invalidSize(Int(dataSizeValue))
         }
-        return try reader.readBytes(count: dataSize)
+        return try reader.readSlice(count: dataSize)
     }
 
     private func validateStreamDimensions(width: UInt32, height: UInt32) throws(WireError) {
@@ -493,7 +590,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
 
     private func finishMask(
         _ header: (UInt8, SpicePoint, UInt32),
-        body: Data,
+        body: WireSlice,
         minimumOffset: Int,
         ranges: inout [Range<Int>]
     ) throws(WireError) -> SpiceMask {
@@ -510,7 +607,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
 
     private func decodeImage(
         at offsetValue: UInt32,
-        body: Data,
+        body: WireSlice,
         minimumOffset: Int
     ) throws(WireError) -> ImageAtOffset {
         let offset = Int(offsetValue)
@@ -562,7 +659,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
                     maximum: limits.maximumBitmapBytes
                 )
             }
-            let pixels = try reader.readBytes(count: byteCount)
+            let pixels = try reader.readSlice(count: byteCount)
             image = .bitmap(
                 descriptor: descriptor,
                 bitmap: SpiceRawBitmap(
@@ -571,7 +668,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
                     width: width,
                     height: height,
                     stride: stride,
-                    pixels: pixels
+                    pixelSlice: pixels
                 )
             )
         case 1:
@@ -586,7 +683,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
             }
             image = .quic(
                 descriptor: descriptor,
-                data: try reader.readBytes(count: dataSize)
+                data: try reader.readSlice(count: dataSize)
             )
         case 103:
             image = .cached(descriptor: descriptor, requirement: .any)
@@ -607,7 +704,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
             }
             image = .jpeg(
                 descriptor: descriptor,
-                data: try reader.readBytes(count: dataSize)
+                data: try reader.readSlice(count: dataSize)
             )
         case 106:
             image = .cached(descriptor: descriptor, requirement: .lossless)
@@ -635,7 +732,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
                 descriptor: descriptor,
                 data: SpiceZlibGLZData(
                     glzDataSize: glzDataSize,
-                    data: try reader.readBytes(count: dataSize)
+                    dataSlice: try reader.readSlice(count: dataSize)
                 )
             )
         case 100:
@@ -660,12 +757,12 @@ package struct SpiceDisplayWireDecoder: Sendable {
                     data: SpiceLZPaletteData(
                         flags: flags,
                         palette: palette,
-                        data: try reader.readBytes(count: dataSize)
+                        dataSlice: try reader.readSlice(count: dataSize)
                     )
                 )
             } else {
                 let paletteOffset = try reader.readUInt32LE()
-                let compressed = try reader.readBytes(count: dataSize)
+                let compressed = try reader.readSlice(count: dataSize)
                 guard Int(paletteOffset) == reader.offset else {
                     throw .invalidOffset(UInt64(paletteOffset))
                 }
@@ -693,7 +790,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
                     data: SpiceLZPaletteData(
                         flags: flags,
                         palette: palette,
-                        data: compressed
+                        dataSlice: compressed
                     )
                 )
             }
@@ -709,7 +806,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
             }
             image = .lzRGB(
                 descriptor: descriptor,
-                data: try reader.readBytes(count: dataSize)
+                data: try reader.readSlice(count: dataSize)
             )
         case 102:
             let dataSizeValue = try reader.readUInt32LE()
@@ -723,7 +820,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
             }
             image = .glzRGB(
                 descriptor: descriptor,
-                data: try reader.readBytes(count: dataSize)
+                data: try reader.readSlice(count: dataSize)
             )
         default:
             throw .unsupportedFeature("Spice image type \(descriptor.type)")
@@ -732,7 +829,7 @@ package struct SpiceDisplayWireDecoder: Sendable {
     }
 
     private func validateReferencedPayload(
-        body: Data,
+        body: WireSlice,
         fixedEnd: Int,
         ranges: [Range<Int>]
     ) throws(WireError) {

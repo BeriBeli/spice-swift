@@ -52,7 +52,7 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
         case SpiceVMCWire.serverData, SpiceVMCWire.serverCompressedData:
             let data: Data
             do {
-                data = try codec.decodeServer(id: framed.type, body: framed.body)
+                data = try codec.decodeServer(id: framed.type, body: framed.bodySlice)
             } catch let error {
                 throw .wire(error)
             }
@@ -61,7 +61,7 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
         case 3:
             let setAck: SpiceMsgSetAck
             do {
-                var reader = try ByteReader(framed.body)
+                var reader = try ByteReader(framed.bodySlice)
                 setAck = try SpiceMsgSetAck.decode(from: &reader)
                 try reader.requireFullyConsumed()
             } catch let error {
@@ -77,7 +77,7 @@ package actor USBRedirectionChannel: SpiceManagedChannel {
         case 4:
             let ping: SpiceMsgPing
             do {
-                var reader = try ByteReader(framed.body)
+                var reader = try ByteReader(framed.bodySlice)
                 ping = try SpiceMsgPing.decode(from: &reader)
             } catch let error {
                 throw .wire(error)

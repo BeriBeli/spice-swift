@@ -54,7 +54,7 @@ package actor ChannelConnection {
 
         let flags: SpiceChannelMigrationFlags
         do {
-            flags = try SpiceChannelMigrationCodec.decodeFlags(framed.body)
+            flags = try SpiceChannelMigrationCodec.decodeFlags(framed.bodySlice)
         } catch let error {
             let channelError = ChannelError.wire(error)
             await fail(channelError)
@@ -86,7 +86,7 @@ package actor ChannelConnection {
                 await fail(error)
                 throw error
             }
-            migrationData = dataMessage.body
+            migrationData = dataMessage.bodySlice.data
             do {
                 try await completeLastDelivered()
             } catch let error {
@@ -271,6 +271,7 @@ package actor ChannelConnection {
         }
         guard terminalError == nil else { return }
         terminalError = error
+        framer.reset()
         pendingBatch = nil
         pendingMessageIndex = 0
         pendingEffectiveSerial = nil
@@ -284,6 +285,7 @@ package actor ChannelConnection {
     package func supersede(preservingSerialBarrier: Bool) {
         isSuperseded = true
         preservesSerialBarrierAfterSupersede = preservingSerialBarrier
+        framer.reset()
         pendingBatch = nil
         pendingMessageIndex = 0
         pendingEffectiveSerial = nil

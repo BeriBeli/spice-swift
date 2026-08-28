@@ -75,6 +75,10 @@ package struct SpiceCursorWireDecoder: Sendable {
     }
 
     package func decode(id: UInt16, body: Data) throws(WireError) -> SpiceCursorCommand {
+        try decode(id: id, body: OwnedBytes(body).wholeSlice)
+    }
+
+    package func decode(id: UInt16, body: WireSlice) throws(WireError) -> SpiceCursorCommand {
         var reader = try ByteReader(body)
         let command: SpiceCursorCommand
         switch id {
