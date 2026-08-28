@@ -178,10 +178,26 @@ this optimization and acceptance order:
 4. Resource guardrails: CPU and RSS must not regress materially, but neither is
    a proxy for interaction latency.
 
-Every live comparison must replay the same timestamped interaction and carry a
-correlation token through the fixture. Mouse motion may use the SPICE motion ACK;
-keyboard and button messages have no general guest ACK, so their causal endpoint
-must be a unique guest-rendered marker and its matching presented revision. Do
+Every live comparison must replay the same timestamped interaction and establish
+an unambiguous causal endpoint. The SPICE mouse-motion ACK has a zero-length body
+and no correlation token, so it is only an optional endpoint for the guest/ACK
+subsegment, never the visible endpoint. Every motion observation admitted to an
+input-to-visible p50 or p95 requires its own unique guest-rendered marker and the
+matching presented revision, including serialized probes.
+
+An ACK may identify one motion action's guest/ACK subsegment only when the
+fixture uses a fresh Inputs channel/generation that has never sent motion, or a
+deterministic equivalent clean epoch, and keeps exactly one probe outstanding.
+Before starting its wire send, pre-arm that same-generation probe, but do not
+complete or correlate its ACK subsegment until the wire-send completion
+timestamp is recorded. If a same-generation ACK arrives first, buffer it and
+release it only at that post-send linearization point. The next motion probe may
+not start until the current ACK subsegment is resolved or the probe fails. An
+ACK captured by an old or previous generation, or arriving after close or
+migration retirement, is discarded and can never satisfy the current
+generation. Never attribute concurrent outstanding motions from ACK order; their
+visible markers remain the only causal endpoints. Keyboard and button messages
+have no general guest ACK and likewise always use a unique visible marker. Do
 not infer causality by adding unrelated aggregate histograms or pairing an input
 with whichever frame happened to arrive next.
 
@@ -245,7 +261,14 @@ Package-only deterministic seams may inject the monotonic clock, manual display
 ticks, input/revision trace tokens, drawable availability, command completion,
 and presented callbacks. Required tests cover idle immediate selection,
 steady-state tick-phase sweeps, first-ready versus selected-revision-ready
-timing, mouse-motion ACK and key/button visible-marker correlation, GPU-busy and
+timing, serialized one-outstanding mouse-motion ACK probes, rejection of
+concurrent ACK-only motion attribution, a prior-generation late ACK after
+close/migration that cannot complete the current probe, and deterministic ACK
+interleavings before, during, and after wire-send completion. The early-ACK case
+must prove pre-arming buffers only a same-generation ACK and that no ACK
+subsegment completes before the send-completion timestamp. Every serialized or
+overlapping motion observation, plus every key/button observation, must prove
+unique visible-marker correlation. The remaining matrix covers GPU-busy and
 drawable-unavailable latest-only retry, zero drawable access/commit on empty
 ticks, and strict distinction between command completion and compositor-visible
 presentation.
@@ -267,15 +290,56 @@ confidence-interval upper bound for unrelated cases must not regress beyond
 - `cpuMaterializationBytes == 0` for full-raw then 1x1 mutation on a supported
   revisioned IOSurface path.
 
-The final live decision uses ten paired 30-second runs. It first reports the
-same-action click/key/motion-to-visible p50 and p95 with the input, guest/ACK,
-display, commit, and presented segments above; then it checks clarity and
-scaling; only then does it apply resource guardrails. Average FPS or CPU cannot
-substitute for the interaction-latency result. Existing guardrails remain: fps
-lower bound 0.95; CPU-per-frame upper bound 1.10; RSS upper bound 1.15; and zero
-stale publications, pool exhaustion, GPU errors, idle commits, or violations of
-the two-command in-flight limit. Real-window 1080p/4K at 60/120 Hz and
-audio-device behavior remain separate acceptance gates.
+The AIP-90 live decision uses ten pairs, meaning 20 separate 30-second runs: one
+`v0.2.7` run and one candidate run per pair. Both members replay the same
+relative action schedule and action tokens at a fixed cadence, beginning from
+the same declared guest reset point. Before collection, declare a counterbalanced
+order with five baseline-first and five candidate-first pairs; do not choose or
+change order after observing results. Each action class must retain at least 50
+valid causally matched observations per run and 500 total per version; a missing
+marker, ambiguous motion ACK, timeout, or dropped pair is invalid rather than
+silently reassigned. Report the action-specific input-to-visible p50 and p95 and
+the input, guest/ACK, display, commit, and presented segments above.
+
+Interaction latency is the primary pass/fail gate. For each of click, key, and
+motion and for each of p50 and p95, perform exactly 10,000 paired hierarchical
+bootstrap resamples with SplitMix64 and base seed `0x5350494345414950`, not a
+runtime-selected count. The six metrics have this fixed
+index order: click p50, click p95, key p50, key p95, motion p50, motion p95.
+Metric index `i` uses its own stream initialized as
+`SplitMix64(seed: baseSeed &+ UInt64(i))`; the artifact records the PRNG, base
+seed, index order, and resample count.
+
+Map every SplitMix64 output to a bounded index with the same unbiased rejection
+rule. For a `UInt64` bound `n > 0`, compute
+`threshold = (0 &- n) % n` using wrapping arithmetic; draw the next `UInt64` `r`
+until `r >= threshold`, then use `r % n` as the index. Every rejected `r`
+consumes that metric's stream. A zero bound is undefined and fails the resample.
+Use this exact mapping for both run-cluster selection and paired-token selection;
+do not substitute floating-point scaling, truncation, or another bounded-random
+implementation.
+
+For each metric resample, sample the ten run-pair clusters with replacement.
+Each time a cluster is selected, draw with replacement exactly that cluster's
+valid paired-token count; a token selects its baseline and candidate observation
+together as one pair. Pool the selected baseline observations and candidate
+observations separately, compute each version's quantile with Hyndman-Fan type 7
+interpolation, then record the candidate/baseline quantile ratio. Form the
+two-sided 95% percentile confidence interval from the ratio distribution, again
+with type 7 interpolation at 0.025 and 0.975. A nonpositive or nonfinite baseline
+quantile, a nonfinite ratio, or any undefined resample fails the gate rather than
+being removed. The candidate passes only when the upper confidence endpoint is
+at most 1.10 for all six action/percentile combinations. Insufficient valid
+samples fails the gate; improvement in one action or percentile cannot offset a
+regression in another.
+
+Only after that primary gate passes does AIP-90 check clarity and scaling, then
+resource guardrails. Average FPS or CPU cannot substitute for the
+interaction-latency result. Existing guardrails remain: fps lower bound 0.95;
+CPU-per-frame upper bound 1.10; RSS upper bound 1.15; and zero stale
+publications, pool exhaustion, GPU errors, idle commits, or violations of the
+two-command in-flight limit. Real-window 1080p/4K at 60/120 Hz and audio-device
+behavior remain separate acceptance gates.
 
 ## Execution protocol
 
