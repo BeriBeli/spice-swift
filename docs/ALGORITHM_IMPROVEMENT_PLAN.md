@@ -55,7 +55,7 @@ Use exactly one of these values in the work table:
 
 | ID | Status | Work item | Depends on | Completion gate |
 | --- | --- | --- | --- | --- |
-| AIP-00 | pending | Establish fresh adjacent `v0.2.7`/`v0.3.0` interaction-pipeline metrics and a Release `spice-bench` JSON harness | — | Versioned artifacts identify commit, toolchain, hardware, thermal state, workload, and date; live traces separate input-to-guest and receive-to-present stages |
+| AIP-00 | in-progress | Establish fresh adjacent `v0.2.7`/`v0.3.0` interaction-pipeline metrics and a Release `spice-bench` JSON harness | — | Versioned artifacts identify commit, toolchain, hardware, thermal state, workload, and date; live traces separate input-to-guest and receive-to-present stages |
 | AIP-10 | done | Add an owned physical-message model and strict full-header submessage lists | — | List-only and main-plus-list ordering, bounds, ACK, fragmentation, and mutation tests pass |
 | AIP-11 | done | Advance the serial barrier after processing and propagate channel failure | AIP-10 | Waiters remain blocked through handler work and terminate on success, failure, cancellation, or close |
 | AIP-12 | done | Move the image cache to Session scope with ordered mutations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, FIFO, cancellation, and capacity tests pass |
@@ -235,10 +235,14 @@ Code and sample review narrow the hypotheses without proving one:
   active waits for the next tick. A 12 ms histogram result means the p95 landed
   in the `(8, 12]` ms bucket; without refresh-rate and arrival-phase data it does
   not prove that a response always waited a complete frame or missed two ticks.
-- `SpiceDesktopReadyLatch.pendingSince` records the first empty-to-ready
-  transition. A newer coalesced revision inherits that timestamp, so add both
-  first-ready and selected-revision-ready times before calling the current
-  aggregate an interaction-frame delay.
+- In the `v0.3.0` baseline, `SpiceDesktopReadyLatch.pendingSince` records the
+  first empty-to-ready transition, so a newer coalesced revision inherits that
+  timestamp. This package-only slice instead records the `readyAt` of the
+  selected/latest strictly accepted revision and rejects a duplicate
+  generation/delivery identity without changing the timestamp or re-waking the
+  latch; it does not change display-link pacing. This makes the diagnostic
+  revision-accurate, not a latency improvement. Live paired external artifacts
+  are still required to complete AIP-00 before changing AIP-44 scheduling.
 - `SpiceMetalFrameView.canPresentWithoutBlocking` currently checks only the
   two-command GPU slot. The `v0.3.0` sample contains 31 one-millisecond samples
   in `currentDrawable → nextDrawable → semaphore_timedwait`, versus about nine
@@ -390,3 +394,4 @@ behavior remain separate acceptance gates.
 | 2026-08-27 | AIP-33 | Represent Annex-B NAL units as checked ranges into one immutable payload owner, allocate AVCC exactly once, and lend CoreMedia a stable retained owner through a custom block source | The prior path copied the full Annex-B payload into an array, materialized each NAL, grew AVCC through appends, and then copied AVCC again with `CMBlockBufferReplaceDataBytes`. Swift 6 requires unsafe byte access to remain synchronous and scoped, so range metadata crosses isolation while raw pointers do not. A retained `NSData` provides stable storage for CoreMedia; its `refCon` and once-only free callback make ownership explicit and testable across synchronous creation failure, decode-submission failure, cancellation, teardown, and close. Package-only diagnostics and failure seams preserve the public API while making scan count, allocations, copies, parameter-set materialization, and owner balance deterministic acceptance criteria. |
 | 2026-08-27 | AIP-40 | Keep SPICE's independent per-channel links, but prepare child channels through one deterministic Swift task group with manual width four and explicit ownership transfer | spice-gtk's channel model keeps each advertised child on its own link; connecting those independent links serially is not a protocol-ordering requirement. Swift 6 structured concurrency can overlap the network and handshake latency, but a throwing group alone does not prove that already completed or late successful connections remain observable after a sibling fails. A nonthrowing `TaskGroup<Result>` therefore admits at most four descriptor-ordered transports, stops admission on first failure/cancellation, drains every result, closes all successes before propagating failure, and transfers ownership only after complete success. Initial bootstrap and migration preparation share this helper so cancellation and rollback cannot drift. |
 | 2026-08-28 | AIP-00, AIP-44 | Prioritize perceived interaction latency, decompose it before optimization, then evaluate clarity; keep CPU and RSS as guardrails | The adjacent Maspice observation improved snapshot and selection-request-to-presented time while ready-to-selection p95 regressed sharply. Because the reported diagnostic interval contained no correlated input event, the observation cannot identify input scheduling as a cause. Immediate or adaptive frame selection therefore requires same-action input/revision tokens, first-ready and selected-ready timestamps, tick-phase and drawable-capacity evidence, and must retain latest-only, idle no-commit, and bounded GPU in-flight invariants. |
+| 2026-08-28 | AIP-00, AIP-44 | Land revision-accurate selected-ready diagnostics before any AIP-44 scheduling change | A pacing experiment is interpretable only after coalesced revisions carry their own ready timestamp and duplicate identities cannot move or re-wake that timestamp; live paired external artifacts remain the completion gate. |
