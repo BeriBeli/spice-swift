@@ -66,13 +66,17 @@ apk \
     --repository https://dl-cdn.alpinelinux.org/alpine/v3.22/community \
     add \
         alpine-base=3.22.5-r0 \
+        coreutils=9.7-r1 \
         dbus=1.16.2-r1 \
+        eudev=3.2.14-r5 \
         font-dejavu=2.37-r6 \
         linux-virt=6.12.103-r0 \
         openbox=3.6.1-r8 \
         spice-vdagent=0.22.1-r2 \
         spice-webdavd=3.0-r4 \
         xclip=0.13-r3 \
+        xf86-input-libinput=1.5.0-r0 \
+        xinput=1.6.4-r2 \
         xorg-server=21.1.19-r0 \
         xrandr=1.5.2-r0 \
         xsetroot=1.1.3-r1 \
@@ -84,6 +88,10 @@ install -m 0644 "${source}/xorg.conf" "${rootfs}/etc/X11/xorg.conf"
 install -m 0755 "${source}/static-desktop.sh" "${rootfs}/usr/local/bin/static-desktop.sh"
 install -m 0755 "${source}/animation-load.sh" "${rootfs}/usr/local/bin/animation-load.sh"
 install -m 0755 "${source}/animation-generator.sh" "${rootfs}/usr/local/bin/animation-generator.sh"
+install -m 0755 "${source}/input-diagnostics.sh" "${rootfs}/usr/local/bin/input-diagnostics.sh"
+install -m 0755 "${source}/input-marker-agent.sh" "${rootfs}/usr/local/bin/input-marker-agent.sh"
+install -m 0755 "${source}/input-marker-monitor.sh" "${rootfs}/usr/local/bin/input-marker-monitor.sh"
+install -m 0755 "${source}/input-marker-renderer.sh" "${rootfs}/usr/local/bin/input-marker-renderer.sh"
 
 cp "${rootfs}/boot/vmlinuz-virt" "${artifacts}/vmlinuz-virt"
 (
@@ -121,13 +129,17 @@ fi
     echo 'manifest_version=1'
     printf 'guest_kernel=linux-virt-%s\n' "${kernel_version}"
     record_package alpine-base guest_alpine_base
+    record_package coreutils guest_coreutils
     record_package dbus guest_dbus
+    record_package eudev guest_eudev
     record_package font-dejavu guest_font_dejavu
     record_package linux-virt guest_linux_virt
     record_package openbox guest_openbox
     record_package spice-vdagent guest_spice_vdagent
     record_package spice-webdavd guest_spice_webdavd
     record_package xclip guest_xclip
+    record_package xf86-input-libinput guest_xf86_input_libinput
+    record_package xinput guest_xinput
     record_package xorg-server guest_xorg_server
     record_package xrandr guest_xrandr
     record_package xsetroot guest_xsetroot

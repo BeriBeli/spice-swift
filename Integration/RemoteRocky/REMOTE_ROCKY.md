@@ -39,6 +39,7 @@ Remote lifecycle commands:
 ~/swiftspice-remote-closure/perf-ab/remote/control.sh start
 ~/swiftspice-remote-closure/perf-ab/remote/control.sh reset
 ~/swiftspice-remote-closure/perf-ab/remote/control.sh stop
+~/swiftspice-remote-closure/perf-ab/remote/control.sh diagnose-input
 ~/swiftspice-remote-closure/perf-ab/remote/status.sh
 ~/swiftspice-remote-closure/perf-ab/remote/stop.sh
 ```
@@ -69,6 +70,91 @@ build. The build holds that lock through backup cleanup, while start holds it
 through artifact verification, evidence capture, and QEMU detach. Before
 launch, the kernel and initramfs SHA-256 values must match
 `artifacts/build-manifest.env`.
+
+## Causal input marker seam
+
+Arm exactly one guest marker before sending the corresponding real input:
+
+```sh
+~/swiftspice-remote-closure/perf-ab/remote/control.sh \
+  arm click 0123456789abcdef
+```
+
+The action class is `click`, `key`, or `motion`; the token is exactly 16
+lowercase hexadecimal characters. A second arm is rejected while one is
+outstanding, and a token cannot be reused during the guest boot. Inputs of a
+different class do not consume the arm. The first matching X input emits
+`guest_received`, renders a fixed black-on-white marker ROI containing the
+token, monotonically increasing guest marker revision, and the first eight
+hexadecimal digits of `SHA-256(token)`, then emits `marker_drawn`. Autonomous
+animation never consumes an arm and is not a causal interaction endpoint.
+The guest image pins `xf86-input-libinput`; without that Xorg input driver,
+SPICE input can reach the guest device while producing no XI2 event for the
+marker monitor. The build manifest records the exact driver package version,
+and startup rejects an older artifact that omits it.
+
+When live input does not reach the marker, capture the guest discovery state:
+
+```sh
+~/swiftspice-remote-closure/perf-ab/remote/control.sh diagnose-input
+```
+
+The diagnostic prints the X input hierarchy, relevant Xorg
+input/libinput/keyboard/mouse/tablet log lines, and kernel input Name/Handlers
+records between stable begin/end markers. It contains no SPICE ticket.
+
+The Release probe chooses its pointer messages only after receiving the first
+desktop snapshot and its pointer mode:
+
+```sh
+.build/release/spice-probe HOST PORT \
+  --observe-seconds 30 --exercise-input
+```
+
+Supply `SPICE_PASSWORD` through the invoking environment as for other probe
+runs; do not place the live ticket in the command.
+
+The probe always sends a key down/up pair first and a left press/release last.
+In absolute mode it sends only changing `mousePosition` coordinates on display
+zero; in relative mode it sends only `mouseMotion`. Both pointer sequences keep
+the SPICE motion/position flow-control ACK gate.
+
+The guest's raw `PERF_TRACE` records remain in `server.log`.
+`PERF_MARKER_RENDER` is emitted by the deterministic self-test at the same
+renderer call point; production presents the corresponding ROI in X. Each new
+run also creates a mode-0600 `input-events.jsonl`; the host collector appends
+normalized per-event records using schema version 1. A record includes host
+input and send timing, optional motion ACK, guest marker timing, display
+receive, Surface ready, selected-revision ready, selection, Metal commit,
+presented time, and the Surface generation/frame revision/delivery identity.
+Missing or ambiguous evidence is recorded as invalid rather than paired with a
+nearby frame.
+
+The state machine can be exercised without X using the same validation and
+renderer call point:
+
+```sh
+printf '%s\n' \
+  'arm action_class=click token=0123456789abcdef' \
+  'input action_class=click guest_ns=100' |
+  /usr/local/bin/input-marker-agent.sh --self-test-jsonl
+```
+
+This slice makes guest causality and the normalized JSONL schema
+deterministically testable. It does not yet prove that the marker's pixels were
+included in a particular AppKit `presented` callback. A live Rocky run must
+bind the unique marker evidence to the exact presented revision before the
+event is valid for click/key/motion-to-visible acceptance.
+
+The Rocky run at
+`/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`
+confirmed the current client-to-guest subpath after adding eudev discovery:
+Xorg/libinput registered the Virtio keyboard and mouse plus the hotplug SPICE
+tablet. The Release mode-aware probe produced `guest_received` and
+`marker_drawn` for key token `4444`, motion token `5555`, and click token
+`6666`; the motion run observed two SPICE ACKs. This does not associate marker
+pixels with an exact SwiftSpice frame revision or AppKit presented callback.
+That association belongs in `input-events.jsonl` and remains required evidence.
 
 Archive a server-log slice around each client capture:
 

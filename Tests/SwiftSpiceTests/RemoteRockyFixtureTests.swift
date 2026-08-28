@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 
@@ -122,6 +123,56 @@ struct RemoteRockyFixtureTests {
             )
             #expect(!fixture.didDetachContainer)
         }
+    }
+
+    @Test func guestInputMonitorUsesThePinnedLineBufferingProvider() throws {
+        let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+        let monitorScript = try script("Integration/RemoteRocky/guest/input-marker-monitor.sh")
+
+        #expect(buildScript.contains("coreutils="))
+        #expect(buildScript.contains("record_package coreutils guest_coreutils"))
+        #expect(buildScript.contains("xf86-input-libinput=1.5.0-r0"))
+        #expect(buildScript.contains(
+            "record_package xf86-input-libinput guest_xf86_input_libinput"
+        ))
+        #expect(startScript.contains("guest_coreutils"))
+        #expect(startScript.contains("guest_xf86_input_libinput"))
+        #expect(monitorScript.contains("stdbuf -oL -eL xinput test-xi2 --root"))
+        #expect(!monitorScript.contains("\nxinput test-xi2 --root |"))
+    }
+
+    @Test func guestStartsPinnedEudevDiscoveryBeforeXorg() throws {
+        let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+        let guestInit = try script("Integration/RemoteRocky/guest/init")
+
+        #expect(buildScript.contains("eudev=3.2.14-r5"))
+        #expect(buildScript.contains("record_package eudev guest_eudev"))
+        #expect(startScript.contains("guest_eudev"))
+
+        let daemon = try #require(guestInit.range(of: "udevd --daemon"))
+        let subsystemTrigger = try #require(guestInit.range(
+            of: "udevadm trigger --action=add --type=subsystems"
+        ))
+        let deviceTrigger = try #require(guestInit.range(
+            of: "udevadm trigger --action=add --type=devices"
+        ))
+        let settle = try #require(guestInit.range(of: "udevadm settle --timeout=10"))
+        let xorg = try #require(guestInit.range(of: "Xorg :0"))
+        #expect(daemon.lowerBound < subsystemTrigger.lowerBound)
+        #expect(subsystemTrigger.lowerBound < deviceTrigger.lowerBound)
+        #expect(deviceTrigger.lowerBound < settle.lowerBound)
+        #expect(settle.lowerBound < xorg.lowerBound)
+
+        let mdevCount = guestInit.components(separatedBy: "mdev -s").count - 1
+        let virtioPortWait = try #require(guestInit.range(
+            of: "while ! test -e /dev/virtio-ports"
+        ))
+        let lastMdev = try #require(guestInit.range(of: "mdev -s", options: .backwards))
+        #expect(mdevCount == 2)
+        #expect(virtioPortWait.lowerBound < lastMdev.lowerBound)
+        #expect(lastMdev.lowerBound < xorg.lowerBound)
     }
 
     @Test(arguments: ["spice-only", "control-only"])
@@ -306,6 +357,333 @@ struct RemoteRockyFixtureTests {
         #expect(result.output.contains("control=127.0.0.1:5936"))
     }
 
+    @Test func controlArmsOnlySupportedActionsWithCanonicalTokens() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+
+        let cases = [
+            (actionClass: "click", token: "0000000000000001"),
+            (actionClass: "key", token: "0000000000000002"),
+            (actionClass: "motion", token: "0000000000000003"),
+        ]
+        for testCase in cases {
+            let result = try fixture.run(
+                "remote/control.sh",
+                arguments: ["arm", testCase.actionClass, testCase.token],
+                ssMode: "both"
+            )
+            #expect(result.status == 0)
+            #expect(try fixture.lastControlInvocation().contains(
+                "arm action_class=\(testCase.actionClass) token=\(testCase.token)"
+            ))
+        }
+        #expect(try fixture.mockEventCount("control-exec") == cases.count)
+
+        let invalidArguments = [
+            ["arm", "tap", "0000000000000004"],
+            ["arm", "click", "ABCDEF0123456789"],
+            ["arm", "key", "000000000000005"],
+            ["arm", "motion", "00000000000000006"],
+            ["arm", "click", "000000000000000g"],
+            ["arm", "click"],
+        ]
+        for arguments in invalidArguments {
+            let result = try fixture.run(
+                "remote/control.sh",
+                arguments: arguments,
+                ssMode: "both"
+            )
+            #expect(result.status != 0)
+        }
+        #expect(try fixture.mockEventCount("control-exec") == cases.count)
+    }
+
+    @Test func controlDiagnosesGuestInputWithNoAdditionalArguments() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+
+        let diagnosis = try fixture.run(
+            "remote/control.sh",
+            arguments: ["diagnose-input"],
+            ssMode: "both"
+        )
+        #expect(diagnosis.status == 0)
+        let invocation = try fixture.lastControlInvocation()
+        #expect(invocation.contains("'diagnose-input'"))
+        #expect(try fixture.mockEventCount("control-exec") == 1)
+
+        let guestInit = try script("Integration/RemoteRocky/guest/init")
+        let diagnosisCase = try #require(guestInit.range(of: "diagnose-input)"))
+        let diagnosisScript = try #require(guestInit.range(
+            of: "/usr/local/bin/input-diagnostics.sh",
+            range: diagnosisCase.upperBound..<guestInit.endIndex
+        ))
+        #expect(diagnosisCase.lowerBound < diagnosisScript.lowerBound)
+
+        let extraArgument = try fixture.run(
+            "remote/control.sh",
+            arguments: ["diagnose-input", "unexpected"],
+            ssMode: "both"
+        )
+        #expect(extraArgument.status != 0)
+        #expect(try fixture.mockEventCount("control-exec") == 1)
+    }
+
+    @Test func guestInputDiagnosisFramesEveryDeviceLineAndOnlyRelevantXorgLines() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-input-diagnostics-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let xinputLines = [
+            "Virtual core pointer id=2 [master pointer (3)]",
+            "Virtual core keyboard id=3 [master keyboard (2)]",
+        ]
+        let relevantXorgLines = [
+            "[ 1.000] (II) config/udev: Adding input device QEMU USB Tablet",
+            "[ 1.001] (II) libinput: AT Translated Set 2 keyboard initialized",
+        ]
+        let irrelevantXorgLine = "[ 1.002] (II) modeset(0): Output HDMI-1 enabled"
+        let inputDeviceLines = [
+            "N: Name=\"QEMU Virtio Keyboard\"",
+            "H: Handlers=sysrq kbd event0",
+            "N: Name=\"spice tablet\"",
+            "H: Handlers=mouse0 event2",
+        ]
+        let irrelevantInputDeviceLine = "B: EV=120013"
+        let xinput = directory.appending(path: "xinput.txt")
+        let xorg = directory.appending(path: "Xorg.0.log")
+        let inputDevices = directory.appending(path: "input-devices.txt")
+        try Data((xinputLines.joined(separator: "\n") + "\n").utf8).write(to: xinput)
+        let xorgContents = (relevantXorgLines + [irrelevantXorgLine]).joined(separator: "\n") + "\n"
+        try Data(xorgContents.utf8).write(to: xorg)
+        let inputDeviceContents = (inputDeviceLines + [irrelevantInputDeviceLine])
+            .joined(separator: "\n") + "\n"
+        try Data(inputDeviceContents.utf8).write(to: inputDevices)
+
+        let result = try runGuestScript(
+            "input-diagnostics.sh",
+            environment: [
+                "PERF_XINPUT_LIST_FILE": xinput.path,
+                "PERF_XORG_LOG": xorg.path,
+                "PERF_INPUT_DEVICES_FILE": inputDevices.path,
+                "TMPDIR": directory.path,
+            ]
+        )
+
+        #expect(result.status == 0)
+        let lines = result.output.split(separator: "\n").map(String.init)
+        let expected = ["PERF_INPUT_DIAGNOSTIC_BEGIN"]
+            + xinputLines.map { "PERF_INPUT_DIAGNOSTIC source=xinput text=\($0)" }
+            + relevantXorgLines.map { "PERF_INPUT_DIAGNOSTIC source=xorg text=\($0)" }
+            + inputDeviceLines.map { "PERF_INPUT_DIAGNOSTIC source=proc_input text=\($0)" }
+            + ["PERF_INPUT_DIAGNOSTIC_END"]
+        #expect(lines == expected)
+        #expect(!result.output.contains(irrelevantXorgLine))
+        #expect(!result.output.contains(irrelevantInputDeviceLine))
+    }
+
+    @Test func guestInputDiagnosisSafelyFramesEmptyAndMissingEvidence() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "guest-input-diagnostics-empty-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let emptyXinput = directory.appending(path: "empty-xinput.txt")
+        let emptyXorg = directory.appending(path: "empty-Xorg.0.log")
+        let emptyInputDevices = directory.appending(path: "empty-input-devices.txt")
+        try Data().write(to: emptyXinput)
+        try Data().write(to: emptyXorg)
+        try Data().write(to: emptyInputDevices)
+
+        let cases = [
+            (
+                xinput: emptyXinput.path,
+                xorg: emptyXorg.path,
+                inputDevices: emptyInputDevices.path,
+                expected: [
+                    "PERF_INPUT_DIAGNOSTIC_BEGIN",
+                    "PERF_INPUT_DIAGNOSTIC source=xinput text=<empty>",
+                    "PERF_INPUT_DIAGNOSTIC source=xorg text=<empty>",
+                    "PERF_INPUT_DIAGNOSTIC source=proc_input text=<empty>",
+                    "PERF_INPUT_DIAGNOSTIC_END",
+                ]
+            ),
+            (
+                xinput: directory.appending(path: "missing-xinput.txt").path,
+                xorg: directory.appending(path: "missing-Xorg.0.log").path,
+                inputDevices: directory.appending(path: "missing-input-devices.txt").path,
+                expected: [
+                    "PERF_INPUT_DIAGNOSTIC_BEGIN",
+                    "PERF_INPUT_DIAGNOSTIC source=xinput text=<missing>",
+                    "PERF_INPUT_DIAGNOSTIC source=xorg text=<missing>",
+                    "PERF_INPUT_DIAGNOSTIC source=proc_input text=<missing>",
+                    "PERF_INPUT_DIAGNOSTIC_END",
+                ]
+            ),
+        ]
+
+        for testCase in cases {
+            let result = try runGuestScript(
+                "input-diagnostics.sh",
+                environment: [
+                    "PERF_XINPUT_LIST_FILE": testCase.xinput,
+                    "PERF_XORG_LOG": testCase.xorg,
+                    "PERF_INPUT_DEVICES_FILE": testCase.inputDevices,
+                    "TMPDIR": directory.path,
+                ]
+            )
+            #expect(result.status == 0)
+            let lines = result.output.split(separator: "\n").map(String.init)
+            #expect(lines == testCase.expected)
+        }
+    }
+
+    @Test func guestInputMonitorMatchesCommonRawAndDeliveredXI2Events() throws {
+        let events = [
+            "EVENT type 13 (RawKeyPress)",
+            "EVENT type 2 (KeyPress)",
+            "EVENT type 15 (RawButtonPress)",
+            "EVENT type 4 (ButtonPress)",
+            "EVENT type 17 (RawMotion)",
+            "EVENT type 6 (Motion)",
+            "EVENT type 14 (RawKeyRelease)",
+            "EVENT type 11 (HierarchyChanged)",
+            "    device: 2 (Virtual core pointer)",
+        ]
+        let input = events.joined(separator: "\n") + "\n"
+        let result = try runGuestScript(
+            "input-marker-monitor.sh",
+            arguments: ["--self-test-events"],
+            standardInput: input
+        )
+
+        #expect(result.status == 0)
+        let matches = result.output.split(separator: "\n").map(String.init)
+        #expect(matches == [
+            "PERF_INPUT_MATCH action_class=key",
+            "PERF_INPUT_MATCH action_class=key",
+            "PERF_INPUT_MATCH action_class=click",
+            "PERF_INPUT_MATCH action_class=click",
+            "PERF_INPUT_MATCH action_class=motion",
+            "PERF_INPUT_MATCH action_class=motion",
+        ])
+    }
+
+    @Test func guestMarkerConsumesOnlyTheNextMatchingInputAndRendersItsToken() throws {
+        let result = try runGuestMarkerSelfTest([
+            "arm action_class=click token=0000000000000001",
+            "input action_class=key guest_ns=90",
+            "input action_class=click guest_ns=100",
+            "input action_class=click guest_ns=110",
+        ])
+
+        #expect(result.status == 0)
+        let traces = perfRecords(prefix: "PERF_TRACE", in: result.output)
+        #expect(traces.count == 2)
+        #expect(traces.map { $0["event"] } == ["guest_received", "marker_drawn"])
+        #expect(traces.allSatisfy { $0["action_class"] == "click" })
+        #expect(traces.allSatisfy { $0["token"] == "0000000000000001" })
+        #expect(traces.first?["guest_ns"] == "100")
+        #expect(traces.first?["marker_revision"] == traces.last?["marker_revision"])
+
+        let renderRecords = perfRecords(prefix: "PERF_MARKER_RENDER", in: result.output)
+        #expect(renderRecords.count == 1)
+        let render = try #require(renderRecords.first)
+        #expect(render["token"] == "0000000000000001")
+        #expect(render["marker_revision"] == traces.first?["marker_revision"])
+        #expect(render["checksum"] == "665e9948")
+        #expect(render["foreground"] == "000000")
+        #expect(render["background"] == "ffffff")
+    }
+
+    @Test func guestMarkerRejectsInvalidConcurrentAndReusedArmsDeterministically() throws {
+        let result = try runGuestMarkerSelfTest([
+            "arm action_class=click token=0000000000000001",
+            "arm action_class=key token=0000000000000002",
+            "input action_class=motion guest_ns=90",
+            "input action_class=click guest_ns=100",
+            "arm action_class=motion token=0000000000000001",
+            "arm action_class=tap token=0000000000000003",
+            "arm action_class=key token=ABCDEF0123456789",
+            "arm action_class=key token=0000000000000002",
+            "input action_class=key guest_ns=200",
+        ])
+
+        #expect(result.status == 0)
+        let traces = perfRecords(prefix: "PERF_TRACE", in: result.output)
+        #expect(traces.count == 4)
+        #expect(traces.map { $0["token"] } == [
+            "0000000000000001", "0000000000000001",
+            "0000000000000002", "0000000000000002",
+        ])
+        #expect(traces.map { $0["marker_revision"] } == ["1", "1", "2", "2"])
+
+        let errors = result.output.split(separator: "\n").filter {
+            $0.hasPrefix("PERF_ERROR")
+        }
+        #expect(errors.count == 4)
+        #expect(errors.contains("PERF_ERROR input_marker=arm_outstanding"))
+        #expect(errors.contains("PERF_ERROR input_marker=duplicate_token"))
+        #expect(errors.contains("PERF_ERROR input_marker=invalid_action_class"))
+        #expect(errors.contains("PERF_ERROR input_marker=invalid_token"))
+
+        let renders = perfRecords(prefix: "PERF_MARKER_RENDER", in: result.output)
+        #expect(renders.map { $0["checksum"] } == ["665e9948", "000f6f4a"])
+        #expect(renders.allSatisfy {
+            $0["foreground"] == "000000" && $0["background"] == "ffffff"
+        })
+    }
+
+    @Test func guestMarkerSignalsReleaseTheLockBeforeAnyMutation() throws {
+        let signals = [SIGHUP, SIGTERM]
+        for (index, signal) in signals.enumerated() {
+            let state = FileManager.default.temporaryDirectory.appending(
+                path: "guest-marker-signal-\(UUID().uuidString)",
+                directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: state) }
+
+            let hold = state.appending(path: "hold")
+            let token = String(format: "%016x", index + 4)
+            let running = try launchGuestMarkerCommand(
+                ["arm", "click", token],
+                state: state,
+                additionalEnvironment: ["PERF_MARKER_HOLD_AFTER_LOCK_FILE": hold.path]
+            )
+            defer {
+                if running.process.isRunning {
+                    _ = Darwin.kill(running.process.processIdentifier, SIGKILL)
+                    running.process.waitUntilExit()
+                }
+            }
+
+            try waitForPath(hold.appendingPathExtension("entered"))
+            #expect(Darwin.kill(running.process.processIdentifier, signal) == 0)
+            let interrupted = try running.finish(within: .seconds(3))
+
+            #expect(interrupted.status != 0)
+            #expect(!interrupted.output.contains("PERF_ARMED"))
+            #expect(!interrupted.output.contains("PERF_TRACE"))
+            #expect(!interrupted.output.contains("PERF_MARKER_RENDER"))
+            #expect(!FileManager.default.fileExists(atPath: state.appending(path: "lock").path))
+            #expect(!FileManager.default.fileExists(atPath: state.appending(path: "armed").path))
+            #expect(!FileManager.default.fileExists(atPath: state.appending(path: "used-tokens").path))
+            #expect(!FileManager.default.fileExists(atPath: state.appending(path: "marker-revision").path))
+
+            let retry = try runGuestMarkerCommand(["arm", "click", token], state: state)
+            #expect(retry.status == 0)
+            #expect(retry.output.contains("PERF_ARMED action_class=click token=\(token)"))
+        }
+    }
+
     @Test func startsWithinTheSameSecondUseDistinctEvidenceDirectories() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -325,6 +703,27 @@ struct RemoteRockyFixtureTests {
         #expect(secondRun != firstRun)
         #expect(fixture.runDirectoryExists(firstRun))
         #expect(fixture.runDirectoryExists(secondRun))
+    }
+
+    @Test func successfulStartCreatesAPrivateCanonicalInputTraceArtifact() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let result = try fixture.run("remote/start.sh", ssMode: "both")
+        #expect(result.status == 0)
+        let runID = try fixture.currentRunID()
+        let trace = fixture.base.appending(path: "logs/\(runID)/input-events.jsonl")
+        let configuration = try String(
+            contentsOf: fixture.base.appending(path: "logs/\(runID)/configuration.txt"),
+            encoding: .utf8
+        )
+        let attributes = try FileManager.default.attributesOfItem(atPath: trace.path)
+        let traceData = try Data(contentsOf: trace)
+
+        #expect(FileManager.default.fileExists(atPath: trace.path))
+        #expect((attributes[.posixPermissions] as? Int) == 0o600)
+        #expect(traceData.isEmpty)
+        #expect(configuration.contains("interaction_trace_path=\(trace.path)"))
     }
 
     @Test func concurrentStartsShareOneEndpointWithoutLosingActiveState() throws {
@@ -466,6 +865,136 @@ struct RemoteRockyFixtureTests {
             encoding: .utf8
         )
     }
+
+    private func runGuestMarkerSelfTest(_ lines: [String]) throws -> ScriptResult {
+        let state = FileManager.default.temporaryDirectory.appending(
+            path: "guest-marker-state-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: state) }
+
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            repositoryRoot.appending(path: "Integration/RemoteRocky/guest/input-marker-agent.sh").path,
+            "--self-test-jsonl",
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_STATE_DIR"] = state.path
+        environment["PERF_MARKER_TEST_MODE"] = "1"
+        process.environment = environment
+
+        try process.run()
+        input.fileHandleForWriting.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        try input.fileHandleForWriting.close()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return ScriptResult(
+            status: process.terminationStatus,
+            output: String(decoding: data, as: UTF8.self)
+        )
+    }
+
+    private func runGuestScript(
+        _ name: String,
+        arguments: [String] = [],
+        standardInput: String? = nil,
+        environment overrides: [String: String] = [:]
+    ) throws -> ScriptResult {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            repositoryRoot.appending(path: "Integration/RemoteRocky/guest/\(name)").path,
+        ] + arguments
+        if standardInput != nil {
+            process.standardInput = input
+        }
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in overrides {
+            environment[key] = value
+        }
+        process.environment = environment
+
+        try process.run()
+        if let standardInput {
+            input.fileHandleForWriting.write(Data(standardInput.utf8))
+            try input.fileHandleForWriting.close()
+        }
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return ScriptResult(
+            status: process.terminationStatus,
+            output: String(decoding: data, as: UTF8.self)
+        )
+    }
+
+    private func runGuestMarkerCommand(
+        _ arguments: [String],
+        state: URL,
+        additionalEnvironment: [String: String] = [:]
+    ) throws -> ScriptResult {
+        try launchGuestMarkerCommand(
+            arguments,
+            state: state,
+            additionalEnvironment: additionalEnvironment
+        ).finish()
+    }
+
+    private func launchGuestMarkerCommand(
+        _ arguments: [String],
+        state: URL,
+        additionalEnvironment: [String: String] = [:]
+    ) throws -> RunningScript {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            repositoryRoot.appending(path: "Integration/RemoteRocky/guest/input-marker-agent.sh").path,
+        ] + arguments
+        process.standardOutput = output
+        process.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["PERF_MARKER_STATE_DIR"] = state.path
+        environment["PERF_MARKER_TEST_MODE"] = "1"
+        for (key, value) in additionalEnvironment {
+            environment[key] = value
+        }
+        process.environment = environment
+        try process.run()
+        return RunningScript(process: process, output: output)
+    }
+
+    private func waitForPath(_ path: URL) throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while !FileManager.default.fileExists(atPath: path.path) {
+            guard ContinuousClock().now < deadline else {
+                throw RemoteRockyFixtureError.timedOutWaitingForMockState(path.lastPathComponent)
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    private func perfRecords(prefix: String, in output: String) -> [[String: String]] {
+        output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: " ")
+            guard fields.first == Substring(prefix) else { return nil }
+            return Dictionary(uniqueKeysWithValues: fields.dropFirst().compactMap { field in
+                let pair = field.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { return nil }
+                return (String(pair[0]), String(pair[1]))
+            })
+        }
+    }
 }
 
 private struct RemoteRockyFixture {
@@ -473,13 +1002,17 @@ private struct RemoteRockyFixture {
         "manifest_version",
         "guest_kernel",
         "guest_alpine_base",
+        "guest_coreutils",
         "guest_dbus",
+        "guest_eudev",
         "guest_font_dejavu",
         "guest_linux_virt",
         "guest_openbox",
         "guest_spice_vdagent",
         "guest_spice_webdavd",
         "guest_xclip",
+        "guest_xinput",
+        "guest_xf86_input_libinput",
         "guest_xorg_server",
         "guest_xrandr",
         "guest_xsetroot",
@@ -544,13 +1077,17 @@ private struct RemoteRockyFixture {
             "manifest_version": "1",
             "guest_kernel": "linux-virt-6.12.103-r0",
             "guest_alpine_base": "3.22.5-r0",
+            "guest_coreutils": "9.7-r1",
             "guest_dbus": "1.16.2-r1",
+            "guest_eudev": "3.2.14-r5",
             "guest_font_dejavu": "2.37-r6",
             "guest_linux_virt": "6.12.103-r0",
             "guest_openbox": "3.6.1-r8",
             "guest_spice_vdagent": "0.22.1-r2",
             "guest_spice_webdavd": "3.0-r4",
             "guest_xclip": "0.13-r3",
+            "guest_xinput": "1.6.4-r2",
+            "guest_xf86_input_libinput": "1.5.0-r0",
             "guest_xorg_server": "21.1.19-r0",
             "guest_xrandr": "1.5.2-r0",
             "guest_xsetroot": "1.1.1-r2",
@@ -588,11 +1125,13 @@ private struct RemoteRockyFixture {
 
     func run(
         _ relativePath: String,
+        arguments: [String] = [],
         ssMode: String,
         additionalEnvironment: [String: String] = [:]
     ) throws -> ScriptResult {
         try launch(
             relativePath,
+            arguments: arguments,
             ssMode: ssMode,
             additionalEnvironment: additionalEnvironment
         ).finish()
@@ -600,6 +1139,7 @@ private struct RemoteRockyFixture {
 
     func launch(
         _ relativePath: String,
+        arguments: [String] = [],
         ssMode: String,
         additionalEnvironment: [String: String] = [:]
     ) throws -> RunningScript {
@@ -611,7 +1151,7 @@ private struct RemoteRockyFixture {
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [repositoryRoot
-            .appending(path: "Integration/RemoteRocky/\(relativePath)").path]
+            .appending(path: "Integration/RemoteRocky/\(relativePath)").path] + arguments
         process.standardOutput = output
         process.standardError = output
         var environment = ProcessInfo.processInfo.environment
@@ -719,6 +1259,10 @@ private struct RemoteRockyFixture {
         ).split(separator: "\n").filter { $0 == event }.count
     }
 
+    func lastControlInvocation() throws -> String {
+        try String(contentsOf: mockState.appending(path: "control-command"), encoding: .utf8)
+    }
+
     private func writeMocks() throws {
         try writeExecutable(name: "flock", contents: #"""
         #!/bin/bash
@@ -743,6 +1287,14 @@ private struct RemoteRockyFixture {
                 [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
                 [[ $# == 2 ]]
                 [[ -d "$state/container" ]]
+                ;;
+            exec)
+                [[ "${1:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${2:-}" == bash ]]
+                [[ "${3:-}" == -c ]]
+                [[ $# == 4 ]]
+                printf '%s\n' "${4:-}" > "$state/control-command"
+                printf 'control-exec\n' >> "$state/events"
                 ;;
             inspect)
                 [[ "${1:-}" == --format ]]

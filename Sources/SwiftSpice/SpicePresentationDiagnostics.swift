@@ -217,3 +217,359 @@ public final class SpicePresentationDiagnostics: Sendable {
         state.withLock { body(&$0.metrics) }
     }
 }
+
+package enum SpiceInteractionActionClass: String, Codable, Sendable, Equatable {
+    case click
+    case key
+    case motion
+}
+
+/// One causally correlated interaction observation. Guest monotonic timestamps
+/// are validated only against other guest timestamps; they are never compared
+/// with the host monotonic clock.
+package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
+    package let pairId: String
+    package let version: String
+    package let runId: String
+    package let order: UInt64
+    package let actionClass: SpiceInteractionActionClass
+    package let token: String
+    package let scheduledNs: UInt64?
+    package let hostInputNs: UInt64?
+    package let sendStartedNs: UInt64?
+    package let sendCompletedNs: UInt64?
+    package let motionAckNs: UInt64?
+    package let guestReceivedNs: UInt64?
+    package let guestMarkerDrawnNs: UInt64?
+    package let displayReceiveNs: UInt64?
+    package let surfaceReadyNs: UInt64?
+    package let selectedRevisionReadyNs: UInt64?
+    package let selectionNs: UInt64?
+    package let metalCommitNs: UInt64?
+    package let presentedNs: UInt64?
+    package let surfaceGeneration: UInt64?
+    package let frameRevision: UInt64?
+    package let deliverySequence: UInt64?
+    package let markerRevision: UInt64?
+    package let valid: Bool
+    package let invalidReason: String?
+
+    package init(
+        pairId: String,
+        version: String,
+        runId: String,
+        order: UInt64,
+        actionClass: SpiceInteractionActionClass,
+        token: String,
+        scheduledNs: UInt64? = nil,
+        hostInputNs: UInt64? = nil,
+        sendStartedNs: UInt64? = nil,
+        sendCompletedNs: UInt64? = nil,
+        motionAckNs: UInt64? = nil,
+        guestReceivedNs: UInt64? = nil,
+        guestMarkerDrawnNs: UInt64? = nil,
+        displayReceiveNs: UInt64? = nil,
+        surfaceReadyNs: UInt64? = nil,
+        selectedRevisionReadyNs: UInt64? = nil,
+        selectionNs: UInt64? = nil,
+        metalCommitNs: UInt64? = nil,
+        presentedNs: UInt64? = nil,
+        surfaceGeneration: UInt64? = nil,
+        frameRevision: UInt64? = nil,
+        deliverySequence: UInt64? = nil,
+        markerRevision: UInt64? = nil,
+        invalidReason externalInvalidReason: String? = nil
+    ) {
+        self.pairId = pairId
+        self.version = version
+        self.runId = runId
+        self.order = order
+        self.actionClass = actionClass
+        self.token = token
+        self.scheduledNs = scheduledNs
+        self.hostInputNs = hostInputNs
+        self.sendStartedNs = sendStartedNs
+        self.sendCompletedNs = sendCompletedNs
+        self.motionAckNs = motionAckNs
+        self.guestReceivedNs = guestReceivedNs
+        self.guestMarkerDrawnNs = guestMarkerDrawnNs
+        self.displayReceiveNs = displayReceiveNs
+        self.surfaceReadyNs = surfaceReadyNs
+        self.selectedRevisionReadyNs = selectedRevisionReadyNs
+        self.selectionNs = selectionNs
+        self.metalCommitNs = metalCommitNs
+        self.presentedNs = presentedNs
+        self.surfaceGeneration = surfaceGeneration
+        self.frameRevision = frameRevision
+        self.deliverySequence = deliverySequence
+        self.markerRevision = markerRevision
+
+        invalidReason = Self.validationFailure(
+            pairId: pairId,
+            version: version,
+            runId: runId,
+            token: token,
+            scheduledNs: scheduledNs,
+            hostInputNs: hostInputNs,
+            sendStartedNs: sendStartedNs,
+            sendCompletedNs: sendCompletedNs,
+            motionAckNs: motionAckNs,
+            guestReceivedNs: guestReceivedNs,
+            guestMarkerDrawnNs: guestMarkerDrawnNs,
+            displayReceiveNs: displayReceiveNs,
+            surfaceReadyNs: surfaceReadyNs,
+            selectedRevisionReadyNs: selectedRevisionReadyNs,
+            selectionNs: selectionNs,
+            metalCommitNs: metalCommitNs,
+            presentedNs: presentedNs,
+            surfaceGeneration: surfaceGeneration,
+            frameRevision: frameRevision,
+            deliverySequence: deliverySequence,
+            markerRevision: markerRevision,
+            externalInvalidReason: externalInvalidReason
+        )
+        valid = invalidReason == nil
+    }
+
+    package init(from decoder: any Decoder) throws {
+        let wire = try Wire(from: decoder)
+        let evidenceOnly = Self(
+            pairId: wire.pairId,
+            version: wire.version,
+            runId: wire.runId,
+            order: wire.order,
+            actionClass: wire.actionClass,
+            token: wire.token,
+            scheduledNs: wire.scheduledNs,
+            hostInputNs: wire.hostInputNs,
+            sendStartedNs: wire.sendStartedNs,
+            sendCompletedNs: wire.sendCompletedNs,
+            motionAckNs: wire.motionAckNs,
+            guestReceivedNs: wire.guestReceivedNs,
+            guestMarkerDrawnNs: wire.guestMarkerDrawnNs,
+            displayReceiveNs: wire.displayReceiveNs,
+            surfaceReadyNs: wire.surfaceReadyNs,
+            selectedRevisionReadyNs: wire.selectedRevisionReadyNs,
+            selectionNs: wire.selectionNs,
+            metalCommitNs: wire.metalCommitNs,
+            presentedNs: wire.presentedNs,
+            surfaceGeneration: wire.surfaceGeneration,
+            frameRevision: wire.frameRevision,
+            deliverySequence: wire.deliverySequence,
+            markerRevision: wire.markerRevision
+        )
+        let derived = Self(
+            pairId: wire.pairId,
+            version: wire.version,
+            runId: wire.runId,
+            order: wire.order,
+            actionClass: wire.actionClass,
+            token: wire.token,
+            scheduledNs: wire.scheduledNs,
+            hostInputNs: wire.hostInputNs,
+            sendStartedNs: wire.sendStartedNs,
+            sendCompletedNs: wire.sendCompletedNs,
+            motionAckNs: wire.motionAckNs,
+            guestReceivedNs: wire.guestReceivedNs,
+            guestMarkerDrawnNs: wire.guestMarkerDrawnNs,
+            displayReceiveNs: wire.displayReceiveNs,
+            surfaceReadyNs: wire.surfaceReadyNs,
+            selectedRevisionReadyNs: wire.selectedRevisionReadyNs,
+            selectionNs: wire.selectionNs,
+            metalCommitNs: wire.metalCommitNs,
+            presentedNs: wire.presentedNs,
+            surfaceGeneration: wire.surfaceGeneration,
+            frameRevision: wire.frameRevision,
+            deliverySequence: wire.deliverySequence,
+            markerRevision: wire.markerRevision,
+            invalidReason: wire.invalidReason
+        )
+        guard wire.valid == derived.valid,
+              wire.invalidReason == derived.invalidReason,
+              !(evidenceOnly.valid
+                  && wire.invalidReason.map(Self.isEvidenceFailure) == true) else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "interaction trace validation fields are inconsistent"
+                )
+            )
+        }
+        self = derived
+    }
+
+    package func encode(to encoder: any Encoder) throws {
+        try Wire(self).encode(to: encoder)
+    }
+
+    private static func validationFailure(
+        pairId: String,
+        version: String,
+        runId: String,
+        token: String,
+        scheduledNs: UInt64?,
+        hostInputNs: UInt64?,
+        sendStartedNs: UInt64?,
+        sendCompletedNs: UInt64?,
+        motionAckNs: UInt64?,
+        guestReceivedNs: UInt64?,
+        guestMarkerDrawnNs: UInt64?,
+        displayReceiveNs: UInt64?,
+        surfaceReadyNs: UInt64?,
+        selectedRevisionReadyNs: UInt64?,
+        selectionNs: UInt64?,
+        metalCommitNs: UInt64?,
+        presentedNs: UInt64?,
+        surfaceGeneration: UInt64?,
+        frameRevision: UInt64?,
+        deliverySequence: UInt64?,
+        markerRevision: UInt64?,
+        externalInvalidReason: String?
+    ) -> String? {
+        if let externalInvalidReason {
+            return externalInvalidReason.isEmpty ? "invalid_reason_empty" : externalInvalidReason
+        }
+        guard !pairId.isEmpty else { return "invalid_pair_id" }
+        guard !version.isEmpty else { return "invalid_version" }
+        guard !runId.isEmpty else { return "invalid_run_id" }
+        guard token.utf8.count == 16,
+              token.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            return "invalid_token"
+        }
+        guard let scheduledNs else { return "missing_scheduled" }
+        guard let hostInputNs else { return "missing_host_input" }
+        guard let sendStartedNs else { return "missing_send_started" }
+        guard let sendCompletedNs else { return "missing_send_completed" }
+        guard let guestReceivedNs else { return "missing_guest_received" }
+        guard let guestMarkerDrawnNs else { return "missing_guest_marker_drawn" }
+        guard markerRevision != nil else { return "missing_marker_revision" }
+        guard let displayReceiveNs else { return "missing_display_receive" }
+        guard let surfaceReadyNs else { return "missing_surface_ready" }
+        guard let selectedRevisionReadyNs else { return "missing_selected_revision_ready" }
+        guard let selectionNs else { return "missing_selection" }
+        guard let metalCommitNs else { return "missing_metal_commit" }
+        guard let presentedNs else { return "missing_presented" }
+        guard frameRevision != nil else { return "missing_frame_revision" }
+        guard surfaceGeneration != nil else { return "missing_surface_generation" }
+        guard deliverySequence != nil else { return "missing_delivery_sequence" }
+
+        guard scheduledNs <= hostInputNs,
+              hostInputNs <= sendStartedNs,
+              sendStartedNs <= sendCompletedNs,
+              sendCompletedNs <= displayReceiveNs,
+              displayReceiveNs <= surfaceReadyNs,
+              surfaceReadyNs <= selectedRevisionReadyNs,
+              selectedRevisionReadyNs <= selectionNs,
+              selectionNs <= metalCommitNs,
+              metalCommitNs <= presentedNs,
+              guestReceivedNs <= guestMarkerDrawnNs else {
+            return "non_monotonic_timestamps"
+        }
+        if let motionAckNs,
+           !(sendCompletedNs <= motionAckNs && motionAckNs <= presentedNs) {
+            return "non_monotonic_timestamps"
+        }
+        return nil
+    }
+
+    private static func isEvidenceFailure(_ reason: String) -> Bool {
+        switch reason {
+        case "invalid_pair_id", "invalid_version", "invalid_run_id", "invalid_token",
+             "missing_scheduled", "missing_host_input", "missing_send_started",
+             "missing_send_completed", "missing_guest_received",
+             "missing_guest_marker_drawn", "missing_marker_revision",
+             "missing_display_receive", "missing_surface_ready",
+             "missing_selected_revision_ready", "missing_selection",
+             "missing_metal_commit", "missing_presented", "missing_frame_revision",
+             "missing_surface_generation", "missing_delivery_sequence",
+             "non_monotonic_timestamps":
+            true
+        default:
+            false
+        }
+    }
+
+    private struct Wire: Codable {
+        let pairId: String
+        let version: String
+        let runId: String
+        let order: UInt64
+        let actionClass: SpiceInteractionActionClass
+        let token: String
+        let scheduledNs: UInt64?
+        let hostInputNs: UInt64?
+        let sendStartedNs: UInt64?
+        let sendCompletedNs: UInt64?
+        let motionAckNs: UInt64?
+        let guestReceivedNs: UInt64?
+        let guestMarkerDrawnNs: UInt64?
+        let displayReceiveNs: UInt64?
+        let surfaceReadyNs: UInt64?
+        let selectedRevisionReadyNs: UInt64?
+        let selectionNs: UInt64?
+        let metalCommitNs: UInt64?
+        let presentedNs: UInt64?
+        let surfaceGeneration: UInt64?
+        let frameRevision: UInt64?
+        let deliverySequence: UInt64?
+        let markerRevision: UInt64?
+        let valid: Bool
+        let invalidReason: String?
+
+        init(_ record: SpiceInteractionTraceRecord) {
+            pairId = record.pairId
+            version = record.version
+            runId = record.runId
+            order = record.order
+            actionClass = record.actionClass
+            token = record.token
+            scheduledNs = record.scheduledNs
+            hostInputNs = record.hostInputNs
+            sendStartedNs = record.sendStartedNs
+            sendCompletedNs = record.sendCompletedNs
+            motionAckNs = record.motionAckNs
+            guestReceivedNs = record.guestReceivedNs
+            guestMarkerDrawnNs = record.guestMarkerDrawnNs
+            displayReceiveNs = record.displayReceiveNs
+            surfaceReadyNs = record.surfaceReadyNs
+            selectedRevisionReadyNs = record.selectedRevisionReadyNs
+            selectionNs = record.selectionNs
+            metalCommitNs = record.metalCommitNs
+            presentedNs = record.presentedNs
+            surfaceGeneration = record.surfaceGeneration
+            frameRevision = record.frameRevision
+            deliverySequence = record.deliverySequence
+            markerRevision = record.markerRevision
+            valid = record.valid
+            invalidReason = record.invalidReason
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case pairId = "pair_id"
+            case version
+            case runId = "run_id"
+            case order
+            case actionClass = "action_class"
+            case token
+            case scheduledNs = "scheduled_ns"
+            case hostInputNs = "host_input_ns"
+            case sendStartedNs = "send_started_ns"
+            case sendCompletedNs = "send_completed_ns"
+            case motionAckNs = "motion_ack_ns"
+            case guestReceivedNs = "guest_received_ns"
+            case guestMarkerDrawnNs = "guest_marker_drawn_ns"
+            case displayReceiveNs = "display_receive_ns"
+            case surfaceReadyNs = "surface_ready_ns"
+            case selectedRevisionReadyNs = "selected_revision_ready_ns"
+            case selectionNs = "selection_ns"
+            case metalCommitNs = "metal_commit_ns"
+            case presentedNs = "presented_ns"
+            case surfaceGeneration = "surface_generation"
+            case frameRevision = "frame_revision"
+            case deliverySequence = "delivery_sequence"
+            case markerRevision = "marker_revision"
+            case valid
+            case invalidReason = "invalid_reason"
+        }
+    }
+}

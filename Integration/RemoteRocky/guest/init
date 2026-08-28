@@ -21,7 +21,20 @@ modprobe virtio_gpu
 modprobe virtio_input
 modprobe uinput
 echo /sbin/mdev > /proc/sys/kernel/hotplug
+# Keep mdev for the minimal early /dev population and virtio-port discovery.
+# Xorg input discovery is driven by eudev's netlink database instead.
 mdev -s
+
+if ! udevd --daemon; then
+    echo "PERF_ERROR eudev daemon unavailable"
+    exec sh
+fi
+if ! udevadm trigger --action=add --type=subsystems \
+    || ! udevadm trigger --action=add --type=devices \
+    || ! udevadm settle --timeout=10; then
+    echo "PERF_ERROR eudev device discovery failed"
+    exec sh
+fi
 
 dbus-uuidgen --ensure=/etc/machine-id
 dbus-daemon --system --fork --nopidfile
@@ -84,7 +97,26 @@ start_animation() {
     echo "PERF_LOAD state=animation reset_frame=0"
 }
 
+monitor_marker_inputs() {
+    while true; do
+        echo "PERF_MARKER_MONITOR state=starting buffering=line"
+        if /usr/local/bin/input-marker-monitor.sh; then
+            monitor_status=0
+        else
+            monitor_status=$?
+        fi
+        echo "PERF_ERROR input_marker_monitor=exited status=${monitor_status}"
+        sleep 1
+    done
+}
+
 start_static
+rm -f /run/perf-marker-request /run/perf-marker-ack
+mkfifo /run/perf-marker-request /run/perf-marker-ack
+/usr/local/bin/input-marker-renderer.sh &
+echo "$!" > /run/perf-marker-renderer.pid
+monitor_marker_inputs &
+echo "$!" > /run/perf-marker-monitor.pid
 echo "PERF_READY resolution=1280x720"
 
 while true; do
@@ -102,6 +134,15 @@ while true; do
                 else
                     echo "PERF_STATUS state=static resolution=1280x720"
                 fi
+                ;;
+            diagnose-input)
+                /usr/local/bin/input-diagnostics.sh
+                ;;
+            arm\ action_class=*\ token=*)
+                action_class="${command#arm action_class=}"
+                action_class="${action_class%% token=*}"
+                token="${command##* token=}"
+                /usr/local/bin/input-marker-agent.sh arm "${action_class}" "${token}"
                 ;;
             *)
                 echo "PERF_ERROR unknown_control=${command}"

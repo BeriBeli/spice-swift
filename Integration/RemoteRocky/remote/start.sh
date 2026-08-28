@@ -43,13 +43,17 @@ required_manifest_keys=(
     manifest_version
     guest_kernel
     guest_alpine_base
+    guest_coreutils
     guest_dbus
+    guest_eudev
     guest_font_dejavu
     guest_linux_virt
     guest_openbox
     guest_spice_vdagent
     guest_spice_webdavd
     guest_xclip
+    guest_xf86_input_libinput
+    guest_xinput
     guest_xorg_server
     guest_xrandr
     guest_xsetroot
@@ -85,6 +89,8 @@ run_dir="$(mktemp -d "${PERF_LOGS}/${run_prefix}.XXXXXX")"
 run_id="${run_dir##*/}"
 mkdir -p "${run_dir}/rounds"
 chmod 0700 "${run_dir}" "${run_dir}/rounds"
+: > "${run_dir}/input-events.jsonl"
+chmod 0600 "${run_dir}/input-events.jsonl"
 
 ticket="$(openssl rand -hex 24)"
 umask 077
@@ -101,6 +107,8 @@ jpeg_wan_compression=auto
 zlib_glz_wan_compression=auto
 streaming_video=filter
 playback_compression=on
+interaction_trace_schema=1
+interaction_trace_path=${run_dir}/input-events.jsonl
 EOF
 cat "${manifest}" >> "${run_dir}/configuration.txt"
 cp "${manifest}" "${run_dir}/guest-build-manifest.env"

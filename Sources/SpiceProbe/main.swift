@@ -512,11 +512,12 @@ struct SpiceProbe {
             eventTask.cancel()
         }
 
+        var exercisedPointerMode: SpicePointerMode?
         if exerciseInput {
-            try await session.send(.keyDown(scanCode: 0x1e))
-            try await session.send(.keyUp(scanCode: 0x1e))
-            for _ in 0..<8 {
-                try await session.send(.mouseMotion(dx: 1, dy: 1))
+            let pointerMode = try await waitForInputExerciseReadiness(observations)
+            exercisedPointerMode = pointerMode
+            for input in SpiceInputExercisePlan.inputs(for: pointerMode) {
+                try await session.send(input)
             }
         }
 
@@ -568,7 +569,12 @@ struct SpiceProbe {
             throw ProbeError.missingObservation("Display frame")
         }
         if exerciseInput, summary.motionAcknowledgements == 0 {
-            throw ProbeError.missingObservation("Inputs mouse-motion acknowledgement")
+            let pointerInput = exercisedPointerMode == .absolute
+                ? "mouse-position"
+                : "mouse-motion"
+            throw ProbeError.missingObservation(
+                "Inputs \(pointerInput) flow-control acknowledgement"
+            )
         }
         if requireNativeVideo {
             guard diagnostics.videoDecodedFrames > 0,
@@ -593,6 +599,26 @@ struct SpiceProbe {
                 )
             }
         }
+    }
+
+    private static func waitForInputExerciseReadiness(
+        _ observations: ProbeObservations
+    ) async throws -> SpicePointerMode {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(20))
+        while clock.now < deadline {
+            switch await observations.inputExerciseReadiness() {
+            case .pending:
+                try await clock.sleep(for: .milliseconds(100))
+            case let .ready(pointerMode):
+                return pointerMode
+            case let .failed(reason):
+                throw ProbeError.sessionFailed(reason)
+            }
+        }
+        throw ProbeError.missingObservation(
+            "desktop snapshot and pointer mode before input exercise"
+        )
     }
 
     private static func milliseconds(from duration: Duration) -> Double {
@@ -995,6 +1021,7 @@ private actor ProbeObservations {
     private var keyboardEvents = 0
     private var motionAcknowledgements = 0
     private var sessionFailure: String?
+    private var latestPointerMode: SpicePointerMode?
     private var lastFrameRevision: SpiceFrameRevision?
     private var lastCursor: SpiceCursorState?
 
@@ -1012,6 +1039,7 @@ private actor ProbeObservations {
     }
 
     func record(_ snapshot: SpiceDesktopSnapshot) {
+        latestPointerMode = snapshot.pointerMode
         if let update = snapshot.frame, update.revision != lastFrameRevision {
             let now = ContinuousClock().now
             frames += 1
@@ -1035,6 +1063,16 @@ private actor ProbeObservations {
             }
             lastCursor = snapshot.cursor
         }
+    }
+
+    func inputExerciseReadiness() -> ProbeInputExerciseReadiness {
+        if let sessionFailure {
+            return .failed(sessionFailure)
+        }
+        if let latestPointerMode {
+            return .ready(latestPointerMode)
+        }
+        return .pending
     }
 
     func summary() -> ProbeObservationSummary {
@@ -1062,6 +1100,12 @@ private actor ProbeObservations {
         let index = Int((Double(sorted.count - 1) * 0.95).rounded(.up))
         return sorted[index]
     }
+}
+
+private enum ProbeInputExerciseReadiness: Sendable {
+    case pending
+    case ready(SpicePointerMode)
+    case failed(String)
 }
 
 private struct ProbeObservationSummary {

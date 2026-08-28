@@ -201,6 +201,50 @@ have no general guest ACK and likewise always use a unique visible marker. Do
 not infer causality by adding unrelated aggregate histograms or pairing an input
 with whichever frame happened to arrive next.
 
+The Rocky fixture now provides the first causal-trace slice without changing
+display scheduling. `control.sh arm <click|key|motion> <token>` pre-arms one
+strictly unique 16-lowercase-hex token. Only the next matching real guest input
+consumes it, records guest-received time, and draws a fixed high-contrast ROI
+whose payload includes the token, guest marker revision, and SHA-256 checksum.
+The guest state machine rejects an illegal/reused token and a concurrent arm;
+autonomous animation cannot consume the arm. Every run reserves a normalized
+`input-events.jsonl` path, and the package-only Codable schema derives validity
+from the complete host-input/send, guest-marker, display, selection, commit,
+presented, and frame-identity evidence. Guest and host monotonic clocks are
+validated only within their own domains. The guest marker revision is not the
+host frame revision and must be correlated by captured marker pixels and the
+matching presented delivery, not by numeric equality.
+
+The live Rocky marker also requires the pinned guest Xorg input driver
+`xf86-input-libinput=1.5.0-r0`. A guest image without that driver may accept
+SPICE keyboard or pointer traffic without emitting the XI2 event consumed by
+the marker monitor. The driver version is therefore part of the guest build
+manifest and a required startup key, not an unrecorded host assumption.
+
+The Rocky run
+`/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`
+validated this guest-side repair. eudev discovery allowed Xorg/libinput to
+register the Virtio keyboard and mouse and the later hotplug SPICE tablet. A
+Release mode-aware probe then produced both `guest_received` and `marker_drawn`
+for key token `4444`, motion token `5555`, and click token `6666`; the motion
+exercise also observed two protocol ACKs. This proves client input reached the
+guest X server and caused the marker draw call. It does not prove that the
+marker pixels entered one exact SwiftSpice frame revision or that AppKit
+presented that delivery.
+
+This is an executable fixture/schema seam, not completion evidence. The live
+collector still must bind the rendered ROI to one exact presented revision and
+populate the per-event JSONL record. Until that Rocky gate succeeds, missing or
+ambiguous marker/presented evidence is invalid, and no input-to-visible latency
+or improvement claim may use these records.
+
+The next slice remains the `input-events.jsonl` collector plus exact marker
+pixel-to-frame-generation/revision/delivery and AppKit-presented binding,
+followed by paired `v0.2.7`/`v0.3.x` traces. Only those paired results may decide
+whether ready-to-selection should use an interaction-aware immediate path or an
+adaptive display-link policy. Either choice must retain latest-only delivery,
+zero idle commits, at most two GPU commands in flight, and CPU/RSS guardrails.
+
 An end-to-end request-to-presented measurement may summarize user experience,
 but it does not identify which path caused a change. In particular, a capture
 with no input events cannot support a conclusion about the input queue. After
@@ -366,6 +410,7 @@ behavior remain separate acceptance gates.
 | ID | Date | Commit/PR | Evidence | Notes |
 | --- | --- | --- | --- | --- |
 | AIP-00 | 2026-08-28 | Local Maspice adjacent run | `/private/tmp/maspice-swiftspice-027-controlled.sample.txt`; `/private/tmp/maspice-swiftspice-030.sample.txt`; same guest; ready-to-selection p95 0.2 ms to 12 ms (max 70.8 ms to 22.2 ms), snapshot p95 4.0 ms to 0.2 ms, selection-request-to-presented p95 100 ms to 33 ms, and warm CPU 12.51% to 12.37% / 12.23% | Directional host-local evidence only. The reported `v0.3.0` diagnostic interval contained no input event or correlation token, so it cannot measure or explain input-queue latency. The samples are not committed artifacts and do not complete AIP-00. |
+| AIP-00 | 2026-08-29 | Rocky 9 live marker run | `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`; eudev/Xorg/libinput registered Virtio keyboard/mouse and hotplug SPICE tablet; Release mode-aware key `4444`, motion `5555`, and click `6666` probes each emitted `guest_received` plus `marker_drawn`; motion ACK count 2 | Guest-causal subpath evidence only: client input reached guest X and invoked the marker renderer. The run does not bind marker pixels to an exact SwiftSpice generation/revision/delivery or AppKit presented callback, so it does not complete AIP-00 or justify a scheduling change. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
@@ -399,3 +444,5 @@ behavior remain separate acceptance gates.
 | 2026-08-28 | AIP-00, AIP-44 | Prioritize perceived interaction latency, decompose it before optimization, then evaluate clarity; keep CPU and RSS as guardrails | The adjacent Maspice observation improved snapshot and selection-request-to-presented time while ready-to-selection p95 regressed sharply. Because the reported diagnostic interval contained no correlated input event, the observation cannot identify input scheduling as a cause. Immediate or adaptive frame selection therefore requires same-action input/revision tokens, first-ready and selected-ready timestamps, tick-phase and drawable-capacity evidence, and must retain latest-only, idle no-commit, and bounded GPU in-flight invariants. |
 | 2026-08-28 | AIP-00, AIP-44 | Land revision-accurate selected-ready diagnostics before any AIP-44 scheduling change | A pacing experiment is interpretable only after coalesced revisions carry their own ready timestamp and unsolicited exact duplicate identities cannot move or re-wake that timestamp. Explicit authoritative `requestLatest()` redraws receive a fresh delivery identity even when frame revision and generation are unchanged, preserving retry and resize behavior; live paired external artifacts remain the completion gate. |
 | 2026-08-28 | AIP-00 | Use the Rocky 9 rootless Podman/KVM fixture first for real connectivity and receive-to-present baselines; do not treat its autonomous animation as paired interaction evidence | The current animation has no causal input token. Before the fixture can admit click/key/motion-to-visible observations, the guest must emit a unique rendered marker and the harness must retain a per-event trace that correlates that marker through the matching presented revision. Until then, the fixture can validate transport and the receive-to-surface-ready-to-selection-to-Metal-commit-to-presented pipeline only. |
+| 2026-08-28 | AIP-00, AIP-44 | Land a unique guest input-marker state machine and normalized per-event trace schema before scheduling experiments | The fixture can now pre-arm one click/key/motion token, consume it only on a matching real guest input, draw a deterministic high-contrast ROI, and record guest marker evidence. Autonomous animation remains ineligible. This slice does not yet bind captured marker pixels to an exact AppKit presented delivery; that live Rocky correlation remains mandatory before any paired latency artifact or AIP-44 scheduling claim. |
+| 2026-08-29 | AIP-00, AIP-44 | Treat the successful Rocky eudev/Xorg marker run as guest-causal subpath evidence, not an input-to-visible result | Key, motion, and click now reach the guest marker and relative motion produces protocol ACKs, but no collector yet binds those marker pixels to an exact SwiftSpice delivery and AppKit presented callback. Complete that binding and paired `v0.2.7`/`v0.3.x` traces before selecting an immediate or adaptive ready-to-selection policy. |
