@@ -21,16 +21,16 @@ action="${1:-}"
 case "${action}" in
     start|reset|stop|status|diagnose-input)
         if [[ "$#" != 1 ]]; then
-            echo "Usage: $0 {start|reset|stop|status|diagnose-input|arm ACTION_CLASS TOKEN}" >&2
+            echo "Usage: $0 {start|reset|stop|status|diagnose-input|arm ACTION_CLASS TOKEN|trace ACTION_CLASS TOKEN}" >&2
             exit 2
         fi
         wire_command="${action}"
         ;;
-    arm)
+    arm|trace)
         if [[ "$#" != 3 \
             || ! "${2}" =~ ^(click|key|motion)$ \
             || ! "${3}" =~ ^[0-9a-f]{16}$ ]]; then
-            echo "Usage: $0 arm {click|key|motion} TOKEN" >&2
+            echo "Usage: $0 ${action} {click|key|motion} TOKEN" >&2
             echo "TOKEN must be exactly 16 lowercase hexadecimal characters." >&2
             exit 2
         fi
@@ -39,7 +39,7 @@ case "${action}" in
         wire_command="arm action_class=${2} token=${3}"
         ;;
     *)
-        echo "Usage: $0 {start|reset|stop|status|diagnose-input|arm ACTION_CLASS TOKEN}" >&2
+        echo "Usage: $0 {start|reset|stop|status|diagnose-input|arm ACTION_CLASS TOKEN|trace ACTION_CLASS TOKEN}" >&2
         exit 2
         ;;
 esac
@@ -48,7 +48,7 @@ require_running
 run_dir="$(current_run_dir)"
 
 control_log_offset=
-if [[ "${action}" == diagnose-input || "${action}" == arm ]]; then
+if [[ "${action}" == diagnose-input || "${action}" == arm || "${action}" == trace ]]; then
     if [[ "${action}" == diagnose-input ]]; then
         # A diagnostic invocation owns its complete BEGIN/END response.
         exec 8>"${PERF_STATE}/input-diagnostic.lock"
@@ -67,19 +67,29 @@ if [[ "${action}" == diagnose-input || "${action}" == arm ]]; then
     fi
 fi
 
-if [[ "${action}" == arm ]]; then
+if [[ "${action}" == arm || "${action}" == trace ]]; then
+    arm_error_label=PERF_ARM_ERROR
+    if [[ "${action}" == trace ]]; then
+        arm_error_label=PERF_TRACE_ERROR
+        # Sync, arm acceptance, and both guest evidence records share this one
+        # failure-poll budget. Immediate successes do not consume a retry.
+        trace_attempts_remaining="${control_wait_attempts}"
+    fi
     if ! arm_invocation="$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')" \
         || [[ ! "${arm_invocation}" =~ ^[0-9a-f]{32}$ ]]; then
-        echo "PERF_ARM_ERROR action_class=${arm_action_class} token=${arm_token} reason=sync_invocation_unavailable" >&2
+        echo "${arm_error_label} action_class=${arm_action_class} token=${arm_token} reason=sync_invocation_unavailable" >&2
         exit 1
     fi
     sync_command="sync invocation=${arm_invocation}"
     if ! send_control_command "${sync_command}"; then
-        echo "PERF_ARM_ERROR action_class=${arm_action_class} token=${arm_token} reason=sync_send_failed" >&2
+        echo "${arm_error_label} action_class=${arm_action_class} token=${arm_token} reason=sync_send_failed" >&2
         exit 1
     fi
     sync_observed=false
     for ((attempt = 0; attempt < control_wait_attempts; attempt += 1)); do
+        if [[ "${action}" == trace && "${trace_attempts_remaining}" == 0 ]]; then
+            break
+        fi
         if tail -c "+$((control_log_offset + 1))" "${server_log}" 2>/dev/null |
             awk -v expected="PERF_CONTROL_SYNC invocation=${arm_invocation}" '
                 {
@@ -92,10 +102,13 @@ if [[ "${action}" == arm ]]; then
             sync_observed=true
             break
         fi
+        if [[ "${action}" == trace ]]; then
+            trace_attempts_remaining="$((trace_attempts_remaining - 1))"
+        fi
         sleep 0.1
     done
     if [[ "${sync_observed}" != true ]]; then
-        echo "PERF_ARM_ERROR action_class=${arm_action_class} token=${arm_token} reason=sync_timeout" >&2
+        echo "${arm_error_label} action_class=${arm_action_class} token=${arm_token} reason=sync_timeout" >&2
         exit 1
     fi
     # Serial order puts every earlier invocation response before this unique
@@ -146,8 +159,11 @@ if [[ "${action}" == diagnose-input ]]; then
     exit 1
 fi
 
-if [[ "${action}" == arm ]]; then
+if [[ "${action}" == arm || "${action}" == trace ]]; then
     for ((attempt = 0; attempt < control_wait_attempts; attempt += 1)); do
+        if [[ "${action}" == trace && "${trace_attempts_remaining}" == 0 ]]; then
+            break
+        fi
         arm_result="$(
             tail -c "+$((control_log_offset + 1))" "${server_log}" 2>/dev/null |
                 awk -v action_class="${arm_action_class}" -v token="${arm_token}" '
@@ -174,6 +190,14 @@ if [[ "${action}" == arm ]]; then
         )" || true
         case "${arm_result}" in
             "PERF_ARMED action_class=${arm_action_class} token=${arm_token}")
+                if [[ "${action}" == trace ]]; then
+                    # The harness cannot send its input until ARMED is printed.
+                    # Sampling first therefore creates an exact lower byte
+                    # boundary for this invocation's guest evidence.
+                    control_log_offset="$(wc -c < "${server_log}")"
+                    printf '%s\n' "${arm_result}"
+                    break
+                fi
                 printf '%s\n' "${arm_result}"
                 exit 0
                 ;;
@@ -182,9 +206,113 @@ if [[ "${action}" == arm ]]; then
                 exit 1
                 ;;
         esac
+        if [[ "${action}" == trace ]]; then
+            trace_attempts_remaining="$((trace_attempts_remaining - 1))"
+        fi
         sleep 0.1
     done
-    echo "PERF_ARM_ERROR action_class=${arm_action_class} token=${arm_token} reason=timeout" >&2
+    if [[ "${arm_result:-}" != "PERF_ARMED action_class=${arm_action_class} token=${arm_token}" ]]; then
+        arm_timeout_reason=timeout
+        if [[ "${action}" == trace ]]; then
+            arm_timeout_reason=arm_timeout
+        fi
+        echo "${arm_error_label} action_class=${arm_action_class} token=${arm_token} reason=${arm_timeout_reason}" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${action}" == trace ]]; then
+    for ((attempt = 0; attempt < control_wait_attempts; attempt += 1)); do
+        if [[ "${trace_attempts_remaining}" == 0 ]]; then
+            break
+        fi
+        trace_result="$(
+            tail -c "+$((control_log_offset + 1))" "${server_log}" 2>/dev/null |
+                awk -v action_class="${arm_action_class}" -v token="${arm_token}" '
+                    function valid_u64(value) {
+                        return value ~ /^(0|[1-9][0-9]*)$/ \
+                            && (length(value) < 20 \
+                                || (length(value) == 20 \
+                                    && ("x" value) <= "x18446744073709551615"))
+                    }
+                    function fail(reason) {
+                        print "status=error reason=" reason
+                        failed = 1
+                        exit
+                    }
+                    {
+                        line = $0
+                        sub(/\r$/, "", line)
+                        if (index(line, "PERF_TRACE ") != 1) next
+                        count = split(line, field, " ")
+                        matching = index(line, "action_class=" action_class) \
+                            && index(line, "token=" token)
+                        if (!matching) next
+                        if (count != 6 \
+                            || field[1] != "PERF_TRACE" \
+                            || field[3] != "action_class=" action_class \
+                            || field[4] != "token=" token \
+                            || field[5] !~ /^guest_ns=/ \
+                            || field[6] !~ /^marker_revision=/) {
+                            fail("trace_malformed")
+                        }
+                        event = field[2]
+                        sub(/^event=/, "", event)
+                        guest_ns = field[5]
+                        sub(/^guest_ns=/, "", guest_ns)
+                        revision = field[6]
+                        sub(/^marker_revision=/, "", revision)
+                        if (!valid_u64(guest_ns) || !valid_u64(revision)) {
+                            fail("trace_malformed")
+                        }
+                        if (event == "guest_received") {
+                            if (received) fail("trace_duplicate")
+                            received = line
+                            received_ns = guest_ns
+                            received_revision = revision
+                        } else if (event == "marker_drawn") {
+                            if (!received) fail("trace_out_of_order")
+                            if (drawn) fail("trace_duplicate")
+                            drawn = line
+                            drawn_ns = guest_ns
+                            drawn_revision = revision
+                        } else {
+                            fail("trace_malformed")
+                        }
+                    }
+                    END {
+                        if (failed) exit
+                        if (received && drawn) {
+                            if (received_revision != drawn_revision) {
+                                print "status=error reason=marker_revision_mismatch"
+                            } else if (length(received_ns) > length(drawn_ns) \
+                                || (length(received_ns) == length(drawn_ns) \
+                                    && ("x" received_ns) > ("x" drawn_ns))) {
+                                print "status=error reason=trace_out_of_order"
+                            } else {
+                                print "status=complete"
+                                print received
+                                print drawn
+                            }
+                        }
+                    }
+                '
+        )" || true
+        case "${trace_result}" in
+            status=complete$'\n'*)
+                printf '%s\n' "${trace_result#*$'\n'}"
+                exit 0
+                ;;
+            "status=error reason="*)
+                trace_reason="${trace_result#status=error reason=}"
+                echo "PERF_TRACE_ERROR action_class=${arm_action_class} token=${arm_token} reason=${trace_reason}" >&2
+                exit 1
+                ;;
+        esac
+        trace_attempts_remaining="$((trace_attempts_remaining - 1))"
+        sleep 0.1
+    done
+    echo "PERF_TRACE_ERROR action_class=${arm_action_class} token=${arm_token} reason=trace_timeout" >&2
     exit 1
 fi
 

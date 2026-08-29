@@ -391,6 +391,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         var selectedFrame: FrameObservation?
         var selectedRevisionReadyNs: UInt64?
         var selectionNs: UInt64?
+        var committedIdentity: SpiceInteractionFrameIdentity?
         var metalCommitNs: UInt64?
         var presentedNs: UInt64?
         var invalidReason: String?
@@ -405,6 +406,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
     private let actionClass: SpiceInteractionActionClass
     private let token: String
     private let checksum: UInt32
+    private let presentationWaiter: SpiceInteractionPresentationWaiter?
     private let state = Mutex(State())
 
     package init(
@@ -414,7 +416,8 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         order: UInt64,
         actionClass: SpiceInteractionActionClass,
         token: String,
-        checksum: UInt32
+        checksum: UInt32,
+        presentationWaiter: SpiceInteractionPresentationWaiter? = nil
     ) {
         self.pairId = pairId
         self.version = version
@@ -423,6 +426,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         self.actionClass = actionClass
         self.token = token
         self.checksum = checksum
+        self.presentationWaiter = presentationWaiter
     }
 
     package func recordHostEvidence(
@@ -604,6 +608,10 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                     ?? "duplicate_selection_after_commit"
                 return
             }
+            if previousSelectedIdentity != nil, previousSelectedIdentity != identity {
+                state.committedIdentity = nil
+                state.metalCommitNs = nil
+            }
             state.selectedIdentity = identity
             state.selectedRevisionReadyNs = readyNs
             state.selectionNs = selectionNs
@@ -655,33 +663,46 @@ package final class SpiceInteractionTraceAssembler: Sendable {
     package func observePresented(
         identity: SpiceInteractionFrameIdentity,
         at nanoseconds: UInt64
-    ) {
-        state.withLock { state in
+    ) -> SpiceInteractionPresentationWaiter.Resumption? {
+        let accepted = state.withLock { state -> Bool in
             guard state.selectedIdentity == identity else {
                 // An older drawable may be presented while the target delivery
                 // is already selected. It cannot complete this event.
-                return
+                return false
+            }
+            guard let marker = state.selectedFrame?.payload,
+                  marker.token == token,
+                  marker.checksum == checksum else {
+                // Control-only or unrelated desktop deliveries may be
+                // selected, committed, and presented before the marker frame.
+                // They remain useful stage observations, but cannot consume
+                // this capture's one exact presentation or wake its waiter.
+                return false
             }
             if state.presentedNs != nil {
                 state.invalidReason = state.invalidReason ?? "duplicate_presented"
-                return
+                return false
             }
-            guard state.metalCommitNs != nil else {
+            guard state.committedIdentity == identity,
+                  state.metalCommitNs != nil else {
                 state.invalidReason = state.invalidReason ?? "presented_before_commit"
-                return
+                return false
             }
             if let retired = state.retiredDesktopGeneration,
                identity.desktopGeneration <= retired {
                 state.invalidReason = state.invalidReason
                     ?? "presented_after_generation_retired"
-                return
+                return false
             }
             if Self.isRetiredSurface(identity, state: state) {
                 state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
-                return
+                return false
             }
             state.presentedNs = nanoseconds
+            return true
         }
+        guard accepted else { return nil }
+        return presentationWaiter?.prepareCompletion(identity)
     }
 
     package func retireSurfaceLifecycle(
@@ -762,7 +783,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             // another delivery is unrelated to this event, not ambiguity.
             return
         }
-        if state.metalCommitNs != nil {
+        if state.committedIdentity == identity {
             state.invalidReason = state.invalidReason ?? "duplicate_metal_commit"
             return
         }
@@ -775,6 +796,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
             return
         }
+        state.committedIdentity = identity
         state.metalCommitNs = nanoseconds
     }
 

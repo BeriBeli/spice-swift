@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added a foreground AppKit interaction harness that arms only after a visible
+  desktop subscription and initial Metal presentation, then correlates one
+  guest marker with its exact SwiftSpice delivery and presented callback.
+
+### Fixed
+
+- Bounded live-harness stdout and stderr collection and placed each spawned
+  command in an isolated process group, so timeout, inherited pipe writers,
+  and excessive output fail closed without leaving descendants behind.
+
+### Validation
+
+- The isolated Rocky live gate remains blocked before arm because the current
+  Mac WindowServer session reports the harness window as occluded. No completed
+  input-to-visible latency or pacing-improvement claim is made.
+
 ## [0.3.1] — 2026-08-29
 
 ### Added

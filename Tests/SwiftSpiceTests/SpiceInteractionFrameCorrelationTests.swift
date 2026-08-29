@@ -3,6 +3,7 @@ import QuartzCore
 import Synchronization
 @testable import SpiceChannels
 @testable import SpiceIOSurface
+@testable import SpiceLiveInteractionSupport
 @testable import SpiceRenderer
 import Testing
 @testable import SwiftSpice
@@ -311,7 +312,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: matchedReady + 10
         )
         assembler.observeCommitted(identity: matchedIdentity, at: matchedReady + 20)
-        assembler.observePresented(identity: matchedIdentity, at: matchedReady + 30)
+        _ = assembler.observePresented(identity: matchedIdentity, at: matchedReady + 30)
 
         let record = assembler.finish()
 
@@ -348,7 +349,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: matchedReady + 10
         )
         mismatched.observeCommitted(identity: unrelated, at: matchedReady + 20)
-        mismatched.observePresented(identity: unrelated, at: matchedReady + 30)
+        _ = mismatched.observePresented(identity: unrelated, at: matchedReady + 30)
         let mismatchedRecord = mismatched.finish()
         #expect(!mismatchedRecord.valid)
         #expect(mismatchedRecord.invalidReason == "marker_replaced_before_presented")
@@ -390,7 +391,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: replacementReady + 5
         )
         assembler.observeCommitted(identity: replacementIdentity, at: replacementReady + 10)
-        assembler.observePresented(identity: replacementIdentity, at: replacementReady + 15)
+        _ = assembler.observePresented(identity: replacementIdentity, at: replacementReady + 15)
 
         let record = assembler.finish()
 
@@ -422,7 +423,7 @@ struct SpiceInteractionFrameCorrelationTests {
         )
         stale.observeSelected(identity: frameIdentity, readyNs: ready, selectionNs: ready + 10)
         stale.observeCommitted(identity: frameIdentity, at: ready + 20)
-        stale.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = stale.observePresented(identity: frameIdentity, at: ready + 30)
         #expect(!stale.finish().valid)
 
         let duplicate = makeAssembler()
@@ -432,7 +433,7 @@ struct SpiceInteractionFrameCorrelationTests {
         duplicate.observeFrame(snapshot: marked, sourceTiming: timing)
         duplicate.observeSelected(identity: frameIdentity, readyNs: ready, selectionNs: ready + 10)
         duplicate.observeCommitted(identity: frameIdentity, at: ready + 20)
-        duplicate.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = duplicate.observePresented(identity: frameIdentity, at: ready + 30)
         let duplicateRecord = duplicate.finish()
         #expect(!duplicateRecord.valid)
         #expect(duplicateRecord.invalidReason == "duplicate_frame_identity")
@@ -455,7 +456,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         missingTiming.observeCommitted(identity: frameIdentity, at: ready + 20)
-        missingTiming.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = missingTiming.observePresented(identity: frameIdentity, at: ready + 30)
         let missingTimingRecord = missingTiming.finish()
         #expect(!missingTimingRecord.valid)
         #expect(missingTimingRecord.invalidReason == "missing_display_receive")
@@ -482,7 +483,7 @@ struct SpiceInteractionFrameCorrelationTests {
         )
         ambiguous.observeSelected(identity: frameIdentity, readyNs: ready, selectionNs: ready + 10)
         ambiguous.observeCommitted(identity: frameIdentity, at: ready + 20)
-        ambiguous.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = ambiguous.observePresented(identity: frameIdentity, at: ready + 30)
         let ambiguousRecord = ambiguous.finish()
         #expect(!ambiguousRecord.valid)
         #expect(ambiguousRecord.invalidReason == "ambiguous_marker_roi_2")
@@ -492,7 +493,7 @@ struct SpiceInteractionFrameCorrelationTests {
         noInput.observeFrame(snapshot: marked, sourceTiming: timing)
         noInput.observeSelected(identity: frameIdentity, readyNs: ready, selectionNs: ready + 10)
         noInput.observeCommitted(identity: frameIdentity, at: ready + 20)
-        noInput.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = noInput.observePresented(identity: frameIdentity, at: ready + 30)
         let noInputRecord = noInput.finish()
         #expect(!noInputRecord.valid)
         #expect(noInputRecord.invalidReason == "missing_input_event")
@@ -523,7 +524,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         exactLimit.observeCommitted(identity: sixteenthIdentity, at: ready + 20)
-        exactLimit.observePresented(identity: sixteenthIdentity, at: ready + 30)
+        _ = exactLimit.observePresented(identity: sixteenthIdentity, at: ready + 30)
         #expect(exactLimit.finish().valid)
 
         let overflow = makeAssembler()
@@ -549,7 +550,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         overflow.observeCommitted(identity: seventeenthIdentity, at: ready + 20)
-        overflow.observePresented(identity: seventeenthIdentity, at: ready + 30)
+        _ = overflow.observePresented(identity: seventeenthIdentity, at: ready + 30)
         let overflowRecord = overflow.finish()
         #expect(!overflowRecord.valid)
         #expect(overflowRecord.invalidReason == "too_many_observed_frames")
@@ -577,7 +578,7 @@ struct SpiceInteractionFrameCorrelationTests {
         )
         duplicateCommit.observeCommitted(identity: frameIdentity, at: ready + 20)
         duplicateCommit.observeCommitted(identity: frameIdentity, at: ready + 21)
-        duplicateCommit.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = duplicateCommit.observePresented(identity: frameIdentity, at: ready + 30)
         let duplicateCommitRecord = duplicateCommit.finish()
         #expect(!duplicateCommitRecord.valid)
         #expect(duplicateCommitRecord.invalidReason == "duplicate_metal_commit")
@@ -595,8 +596,8 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         duplicatePresented.observeCommitted(identity: frameIdentity, at: ready + 20)
-        duplicatePresented.observePresented(identity: frameIdentity, at: ready + 30)
-        duplicatePresented.observePresented(identity: frameIdentity, at: ready + 31)
+        _ = duplicatePresented.observePresented(identity: frameIdentity, at: ready + 30)
+        _ = duplicatePresented.observePresented(identity: frameIdentity, at: ready + 31)
         let duplicatePresentedRecord = duplicatePresented.finish()
         #expect(!duplicatePresentedRecord.valid)
         #expect(duplicatePresentedRecord.invalidReason == "duplicate_presented")
@@ -627,7 +628,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: retryReady + 10
         )
         assembler.observeCommitted(identity: frameIdentity, at: retryReady + 20)
-        assembler.observePresented(identity: frameIdentity, at: retryReady + 30)
+        _ = assembler.observePresented(identity: frameIdentity, at: retryReady + 30)
         let record = assembler.finish()
 
         #expect(record.valid)
@@ -653,7 +654,7 @@ struct SpiceInteractionFrameCorrelationTests {
             readyNs: ready,
             selectionNs: ready + 10
         )
-        presentedBeforeCommit.observePresented(identity: selectedIdentity, at: ready + 20)
+        _ = presentedBeforeCommit.observePresented(identity: selectedIdentity, at: ready + 20)
         presentedBeforeCommit.observeCommitted(identity: selectedIdentity, at: ready + 30)
         let outOfOrder = presentedBeforeCommit.finish()
         #expect(!outOfOrder.valid)
@@ -672,9 +673,9 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         unrelatedCallbacks.observeCommitted(identity: otherIdentity, at: ready + 15)
-        unrelatedCallbacks.observePresented(identity: otherIdentity, at: ready + 16)
+        _ = unrelatedCallbacks.observePresented(identity: otherIdentity, at: ready + 16)
         unrelatedCallbacks.observeCommitted(identity: selectedIdentity, at: ready + 20)
-        unrelatedCallbacks.observePresented(identity: selectedIdentity, at: ready + 30)
+        _ = unrelatedCallbacks.observePresented(identity: selectedIdentity, at: ready + 30)
         let unrelatedRecord = unrelatedCallbacks.finish()
         #expect(unrelatedRecord.valid)
         #expect(unrelatedRecord.metalCommitNs == ready + 20)
@@ -692,7 +693,7 @@ struct SpiceInteractionFrameCorrelationTests {
             selectionNs: ready + 10
         )
         reversedTimestamps.observeCommitted(identity: selectedIdentity, at: ready + 30)
-        reversedTimestamps.observePresented(identity: selectedIdentity, at: ready + 20)
+        _ = reversedTimestamps.observePresented(identity: selectedIdentity, at: ready + 20)
         #expect(!reversedTimestamps.finish().valid)
     }
 
@@ -719,7 +720,7 @@ struct SpiceInteractionFrameCorrelationTests {
             generation: retiredIdentity.surfaceGeneration
         )
         retired.observeCommitted(identity: retiredIdentity, at: ready + 20)
-        retired.observePresented(identity: retiredIdentity, at: ready + 30)
+        _ = retired.observePresented(identity: retiredIdentity, at: ready + 30)
         let retiredRecord = retired.finish()
         #expect(!retiredRecord.valid)
         #expect(retiredRecord.invalidReason == "surface_lifecycle_retired")
@@ -743,7 +744,7 @@ struct SpiceInteractionFrameCorrelationTests {
             generation: retiredIdentity.surfaceGeneration
         )
         unrelatedRetirement.observeCommitted(identity: retiredIdentity, at: ready + 20)
-        unrelatedRetirement.observePresented(identity: retiredIdentity, at: ready + 30)
+        _ = unrelatedRetirement.observePresented(identity: retiredIdentity, at: ready + 30)
         #expect(unrelatedRetirement.finish().valid)
 
         let completedBeforeRetirement = makeAssembler()
@@ -761,7 +762,7 @@ struct SpiceInteractionFrameCorrelationTests {
             identity: retiredIdentity,
             at: ready + 20
         )
-        completedBeforeRetirement.observePresented(
+        _ = completedBeforeRetirement.observePresented(
             identity: retiredIdentity,
             at: ready + 30
         )
@@ -864,6 +865,68 @@ struct SpiceInteractionFrameCorrelationTests {
         ) == record)
     }
 
+    @Test func liveTraceOrchestratorFinalizesAnExactPresentedDelivery() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-live-orchestrator-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-live-orchestrator",
+            version: "v0.3.1",
+            runId: "run-live-orchestrator",
+            order: 1,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 905)
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        let finalized = try await SpiceLiveTraceOrchestrator(
+            capture: capture,
+            outputURL: output
+        ).completeAfterExactPresentation(timeout: .milliseconds(100))
+
+        #expect(finalized.record.valid)
+        #expect(finalized.record.deliverySequence == frameIdentity.deliverySequence)
+        #expect(finalized.record.presentedNs == ready + 30)
+        #expect(finalized.encodedJSONL.split(separator: 0x0A).count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(finalized.encodedJSONL.split(separator: 0x0A).first))
+        ) == finalized.record)
+    }
+
     @Test func captureRetainsPresentedFrameUntilTheSendContinuationCompletes() throws {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "interaction-send-completion-\(UUID().uuidString)",
@@ -933,6 +996,330 @@ struct SpiceInteractionFrameCorrelationTests {
             SpiceInteractionTraceRecord.self,
             from: Data(try #require(lines.first))
         ) == record)
+    }
+
+    @Test func exactPresentationWaitReturnsAnAlreadyPresentedIdentityWithoutPolling() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presentation-early-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(
+                outputURL: directory.appending(path: "input-events.jsonl")
+            ),
+            pairId: "pair-presentation-early",
+            version: "v0.3.1",
+            runId: "run-presentation-wait",
+            order: 1,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 904)
+
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        let returned = try await capture.waitForExactPresentation()
+        #expect(returned == frameIdentity)
+        #expect(try capture.finish().valid)
+    }
+
+    @Test func exactPresentationWaitIgnoresUnrelatedIdentityUntilTheExactDeliveryPresents() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presentation-later-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(
+                outputURL: directory.appending(path: "input-events.jsonl")
+            ),
+            pairId: "pair-presentation-later",
+            version: "v0.3.1",
+            runId: "run-presentation-wait",
+            order: 2,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let exactIdentity = identity(deliverySequence: 905)
+        let unrelatedIdentity = identity(frameRevision: 11, deliverySequence: 906)
+        let registered = DispatchSemaphore(value: 0)
+
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: exactIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: exactIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: exactIdentity, at: ready + 20)
+
+        let waiter = Task {
+            try await capture.waitForExactPresentation {
+                registered.signal()
+            }
+        }
+        #expect(await waitForInteractionTraceSemaphore(
+            registered,
+            timeout: .seconds(2)
+        ) == .success)
+
+        diagnostics.recordInteractionCommitted(identity: unrelatedIdentity, at: ready + 21)
+        diagnostics.recordInteractionPresented(identity: unrelatedIdentity, at: ready + 22)
+        do {
+            _ = try await capture.waitForExactPresentation()
+            Issue.record("unrelated identity incorrectly completed the exact presentation wait")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .presentationWaitAlreadyRegistered)
+        }
+
+        diagnostics.recordInteractionPresented(identity: exactIdentity, at: ready + 30)
+        #expect(try await waiter.value == exactIdentity)
+        #expect(try capture.finish().valid)
+    }
+
+    @Test func markerlessPresentedDeliveryCannotConsumeTheExactPresentationWait() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presentation-markerless-first-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(
+                outputURL: directory.appending(path: "input-events.jsonl")
+            ),
+            pairId: "pair-presentation-markerless-first",
+            version: "v0.3.1",
+            runId: "run-presentation-wait",
+            order: 3,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let anchor = ContinuousClock().now
+        let unrelatedTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 50,
+            readyOffset: 60
+        )
+        let markerTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 70,
+            readyOffset: 80
+        )
+        let unrelatedReceive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: unrelatedTiming.messageReceivedAt
+        ))
+        let unrelatedReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: unrelatedTiming.surfaceReadyAt
+        ))
+        let markerReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: markerTiming.surfaceReadyAt
+        ))
+        let unrelatedIdentity = identity(frameRevision: 20, deliverySequence: 920)
+        let markerIdentity = identity(frameRevision: 21, deliverySequence: 921)
+        let registered = DispatchSemaphore(value: 0)
+
+        try capture.recordHostEvidence(
+            scheduledNs: unrelatedReceive - 40,
+            hostInputNs: unrelatedReceive - 30,
+            sendStartedNs: unrelatedReceive - 20,
+            sendCompletedNs: unrelatedReceive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        let waiter = Task {
+            try await capture.waitForExactPresentation {
+                registered.signal()
+            }
+        }
+        #expect(await waitForInteractionTraceSemaphore(
+            registered,
+            timeout: .seconds(2)
+        ) == .success)
+
+        diagnostics.recordInteractionFrameReceived(
+            snapshot(identity: unrelatedIdentity, pixels: blankPixels),
+            sourceTiming: unrelatedTiming
+        )
+        diagnostics.recordInteractionSelected(
+            identity: unrelatedIdentity,
+            readyNs: unrelatedReady,
+            selectionNs: unrelatedReady + 5
+        )
+        diagnostics.recordInteractionCommitted(
+            identity: unrelatedIdentity,
+            at: unrelatedReady + 10
+        )
+        diagnostics.recordInteractionPresented(
+            identity: unrelatedIdentity,
+            at: unrelatedReady + 15
+        )
+        do {
+            _ = try await capture.waitForExactPresentation()
+            Issue.record("markerless delivery incorrectly consumed the exact waiter")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .presentationWaitAlreadyRegistered)
+        }
+
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: markerIdentity, markerRevision: 77),
+            sourceTiming: markerTiming
+        )
+        diagnostics.recordInteractionSelected(
+            identity: markerIdentity,
+            readyNs: markerReady,
+            selectionNs: markerReady + 5
+        )
+        diagnostics.recordInteractionCommitted(
+            identity: markerIdentity,
+            at: markerReady + 10
+        )
+        diagnostics.recordInteractionPresented(
+            identity: markerIdentity,
+            at: markerReady + 15
+        )
+
+        #expect(try await waiter.value == markerIdentity)
+        let record = try capture.finish()
+        #expect(record.valid)
+        #expect(record.invalidReason == nil)
+        #expect(record.frameRevision == markerIdentity.frameRevision)
+        #expect(record.deliverySequence == markerIdentity.deliverySequence)
+        #expect(record.presentedNs == markerReady + 15)
+        #expect(record.presentedNs != unrelatedReady + 15)
+    }
+
+    @Test func cancellingExactPresentationWaitRemovesOnlyThatWaiterAndCaptureCanFinish() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presentation-cancel-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(
+                outputURL: directory.appending(path: "input-events.jsonl")
+            ),
+            pairId: "pair-presentation-cancel",
+            version: "v0.3.1",
+            runId: "run-presentation-wait",
+            order: 3,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 907)
+        let firstRegistered = DispatchSemaphore(value: 0)
+
+        let cancelled = Task {
+            try await capture.waitForExactPresentation {
+                firstRegistered.signal()
+            }
+        }
+        #expect(await waitForInteractionTraceSemaphore(
+            firstRegistered,
+            timeout: .seconds(2)
+        ) == .success)
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            Issue.record("cancelled exact presentation wait unexpectedly succeeded")
+        } catch is CancellationError {
+            // Expected. The cancellation path removes this exact waiter.
+        }
+
+        let replacementRegistered = DispatchSemaphore(value: 0)
+        let replacement = Task {
+            try await capture.waitForExactPresentation {
+                replacementRegistered.signal()
+            }
+        }
+        #expect(await waitForInteractionTraceSemaphore(
+            replacementRegistered,
+            timeout: .seconds(2)
+        ) == .success)
+
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        #expect(try await replacement.value == frameIdentity)
+        #expect(try capture.finish().valid)
     }
 
     @Test func captureRejectsMissingDuplicateOrNonMonotonicSendCompletion() throws {
@@ -1023,8 +1410,19 @@ struct SpiceInteractionFrameCorrelationTests {
             forCoreAnimationTime: mediaTime
         ))
         let after = SpiceInteractionHostClock.nowNanoseconds()
-        #expect(mapped >= before)
-        #expect(mapped <= after)
+        // CACurrentMediaTime and CLOCK_MONOTONIC are sampled separately when
+        // the one-time conversion anchor is established. Permit only a small
+        // calibration bracket while keeping later deltas exact.
+        let calibrationTolerance: UInt64 = 1_000_000
+        let (lowerCandidate, lowerUnderflow) = before.subtractingReportingOverflow(
+            calibrationTolerance
+        )
+        let lowerBound = lowerUnderflow ? UInt64.min : lowerCandidate
+        let (upperCandidate, upperOverflow) = after.addingReportingOverflow(
+            calibrationTolerance
+        )
+        let upperBound = upperOverflow ? UInt64.max : upperCandidate
+        #expect((lowerBound...upperBound).contains(mapped))
 
         let earlier = try #require(SpiceInteractionHostClock.nanoseconds(
             forCoreAnimationTime: mediaTime - 0.125
