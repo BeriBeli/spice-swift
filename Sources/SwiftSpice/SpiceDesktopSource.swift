@@ -48,6 +48,7 @@ public struct SpiceFrameUpdate: Sendable {
     public let frame: SpiceFrame
     public let revision: SpiceFrameRevision
     public let damage: SpiceDamageRegion
+    package let deliverySequence: UInt64
 
     public init(
         frame: SpiceFrame,
@@ -57,6 +58,19 @@ public struct SpiceFrameUpdate: Sendable {
         self.frame = frame
         self.revision = revision
         self.damage = damage
+        deliverySequence = 0
+    }
+
+    package init(
+        frame: SpiceFrame,
+        revision: SpiceFrameRevision,
+        damage: SpiceDamageRegion,
+        deliverySequence: UInt64
+    ) {
+        self.frame = frame
+        self.revision = revision
+        self.damage = damage
+        self.deliverySequence = deliverySequence
     }
 }
 
@@ -66,6 +80,7 @@ public struct SpiceDesktopSnapshot: Sendable {
     public let cursor: SpiceCursorState?
     public let pointerMode: SpicePointerMode
     package let deliverySequence: UInt64
+    package var frameDeliverySequence: UInt64? { frame?.deliverySequence }
 
     public init(
         generation: UInt64,
@@ -88,7 +103,15 @@ public struct SpiceDesktopSnapshot: Sendable {
         deliverySequence: UInt64
     ) {
         self.generation = generation
-        self.frame = frame
+        self.frame = frame.map {
+            guard $0.deliverySequence == 0, deliverySequence != 0 else { return $0 }
+            return SpiceFrameUpdate(
+                frame: $0.frame,
+                revision: $0.revision,
+                damage: $0.damage,
+                deliverySequence: deliverySequence
+            )
+        }
         self.cursor = cursor
         self.pointerMode = pointerMode
         self.deliverySequence = deliverySequence
@@ -309,7 +332,8 @@ public final class SpiceDesktopSource: Sendable {
         deliver(deliveries)
     }
 
-    package func receiveFrame(_ snapshot: FrameSnapshot, displayChannelID: UInt8) {
+    package func receiveFrame(_ published: PublishedDisplayFrame, displayChannelID: UInt8) {
+        let snapshot = published.snapshot
         let key = DisplaySurfaceKey(
             channelID: displayChannelID,
             surfaceID: snapshot.surfaceID
@@ -325,18 +349,38 @@ public final class SpiceDesktopSource: Sendable {
             revision: SpiceFrameRevision(surface: identity, value: snapshot.revision),
             damage: damage
         )
-        let retainedUpdate = SpiceFrameUpdate(
-            frame: deliveredUpdate.frame,
-            revision: deliveredUpdate.revision,
-            damage: .rectangles([])
-        )
         let result = state.withLock { state -> (
             deliveries: [SpiceDesktopDelivery],
-            autoAcknowledge: Bool
+            autoAcknowledge: Bool,
+            traceSnapshot: SpiceDesktopSnapshot?,
+            retiredGeneration: UInt64?
         ) in
             state.deliverySequence &+= 1
+            let sequencedUpdate = SpiceFrameUpdate(
+                frame: deliveredUpdate.frame,
+                revision: deliveredUpdate.revision,
+                damage: deliveredUpdate.damage,
+                deliverySequence: state.deliverySequence
+            )
+            let retainedUpdate = SpiceFrameUpdate(
+                frame: sequencedUpdate.frame,
+                revision: sequencedUpdate.revision,
+                damage: .rectangles([]),
+                deliverySequence: sequencedUpdate.deliverySequence
+            )
+            let previousGeneration = state.frames[key]?.revision.surface.generation
+            let retiredGeneration = previousGeneration.flatMap {
+                $0 == identity.generation ? nil : $0
+            }
             state.frames[key] = retainedUpdate
             state.surfacesAwaitingFreshPublication.remove(key)
+            let desktopSnapshot = SpiceDesktopSnapshot(
+                generation: state.generation,
+                frame: sequencedUpdate,
+                cursor: state.cursor,
+                pointerMode: state.pointerMode,
+                deliverySequence: state.deliverySequence
+            )
             let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
@@ -344,18 +388,31 @@ public final class SpiceDesktopSource: Sendable {
                 }
                 return delivery(
                     for: subscriber,
-                    snapshot: SpiceDesktopSnapshot(
-                        generation: state.generation,
-                        frame: deliveredUpdate,
-                        cursor: state.cursor,
-                        pointerMode: state.pointerMode,
-                        deliverySequence: state.deliverySequence
-                    )
+                    snapshot: desktopSnapshot
                 )
             }
             return (
                 deliveries,
-                shouldAutoAcknowledge(key: key, state: state)
+                shouldAutoAcknowledge(key: key, state: state),
+                deliveries.isEmpty ? nil : desktopSnapshot,
+                retiredGeneration
+            )
+        }
+        // A Surface may be recreated without a desktop-generation change or a
+        // separately delivered destroy event. Retire the overwritten lifecycle
+        // before the replacement can be observed or delivered, so an old
+        // drawable callback cannot complete the replacement's trace.
+        if let retiredGeneration = result.retiredGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: snapshot.surfaceID,
+                generation: retiredGeneration
+            )
+        }
+        if let traceSnapshot = result.traceSnapshot {
+            presentationDiagnostics.recordInteractionFrameReceived(
+                traceSnapshot,
+                sourceTiming: published.sourceTiming
             )
         }
         deliver(result.deliveries)
@@ -367,13 +424,24 @@ public final class SpiceDesktopSource: Sendable {
         }
     }
 
+    package func receiveFrame(_ snapshot: FrameSnapshot, displayChannelID: UInt8) {
+        receiveFrame(
+            PublishedDisplayFrame(snapshot: snapshot, sourceTiming: nil),
+            displayChannelID: displayChannelID
+        )
+    }
+
     package func surfaceDestroyed(displayChannelID: UInt8, surfaceID: UInt32) {
         let key = DisplaySurfaceKey(channelID: displayChannelID, surfaceID: surfaceID)
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            deliveries: [SpiceDesktopDelivery],
+            retiredGeneration: UInt64?
+        ) in
             state.deliverySequence &+= 1
-            state.frames.removeValue(forKey: key)
+            let retiredGeneration = state.frames.removeValue(forKey: key)?
+                .revision.surface.generation
             state.surfacesAwaitingFreshPublication.remove(key)
-            return state.subscribers.values.compactMap {
+            let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
                     return nil
@@ -387,8 +455,16 @@ public final class SpiceDesktopSource: Sendable {
                     )
                 )
             }
+            return (deliveries, retiredGeneration)
         }
-        deliver(deliveries)
+        if let retiredGeneration = result.retiredGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID,
+                generation: retiredGeneration
+            )
+        }
+        deliver(result.deliveries)
     }
 
     package func updateCursor(_ cursor: SpiceCursorState?) {
@@ -435,12 +511,14 @@ public final class SpiceDesktopSource: Sendable {
             let delivered = SpiceFrameUpdate(
                 frame: frame,
                 revision: SpiceFrameRevision(surface: identity, value: revision),
-                damage: damage
+                damage: damage,
+                deliverySequence: state.deliverySequence
             )
             state.frames[key] = SpiceFrameUpdate(
                 frame: frame,
                 revision: delivered.revision,
-                damage: .rectangles([])
+                damage: .rectangles([]),
+                deliverySequence: delivered.deliverySequence
             )
             return state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
@@ -725,7 +803,8 @@ public final class SpiceDesktopSource: Sendable {
             return SpiceFrameUpdate(
                 frame: update.frame,
                 revision: update.revision,
-                damage: .full
+                damage: .full,
+                deliverySequence: update.deliverySequence
             )
         }
         return SpiceDesktopSnapshot(
@@ -800,7 +879,8 @@ public final class SpiceDesktopSource: Sendable {
                     frame: SpiceFrameUpdate(
                         frame: newestFrame.frame,
                         revision: newestFrame.revision,
-                        damage: .full
+                        damage: .full,
+                        deliverySequence: newestFrame.deliverySequence
                     ),
                     cursor: newest.cursor,
                     pointerMode: newest.pointerMode,
@@ -816,7 +896,8 @@ public final class SpiceDesktopSource: Sendable {
                 frame: SpiceFrameUpdate(
                     frame: newestFrame.frame,
                     revision: newestFrame.revision,
-                    damage: .full
+                    damage: .full,
+                    deliverySequence: newestFrame.deliverySequence
                 ),
                 cursor: newest.cursor,
                 pointerMode: newest.pointerMode,
@@ -834,7 +915,8 @@ public final class SpiceDesktopSource: Sendable {
             frame: SpiceFrameUpdate(
                 frame: newestFrame.frame,
                 revision: newestFrame.revision,
-                damage: damage
+                damage: damage,
+                deliverySequence: newestFrame.deliverySequence
             ),
             cursor: newest.cursor,
             pointerMode: newest.pointerMode,

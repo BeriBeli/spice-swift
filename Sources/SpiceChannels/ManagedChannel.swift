@@ -6,7 +6,7 @@ package enum SpiceChannelEvent: Sendable, Equatable {
     case main(MainEvent)
     case surfaceCreated(UInt32)
     case surfaceDestroyed(UInt32)
-    case frame(FrameSnapshot)
+    case frame(PublishedDisplayFrame)
     case displayMonitors(channelID: UInt8, SpiceDisplayMonitorsConfiguration)
     case inputs(InputsServerEvent)
     case cursor(CursorEvent)

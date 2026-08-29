@@ -1533,8 +1533,8 @@ public actor SpiceSession {
             return
         }
         switch event {
-        case let .frame(snapshot):
-            desktop.receiveFrame(snapshot, displayChannelID: key.id)
+        case let .frame(frame):
+            desktop.receiveFrame(frame, displayChannelID: key.id)
         case let .surfaceDestroyed(surfaceID):
             desktop.surfaceDestroyed(displayChannelID: key.id, surfaceID: surfaceID)
         case let .cursor(cursorEvent):

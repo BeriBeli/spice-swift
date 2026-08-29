@@ -206,6 +206,39 @@ struct SpiceDesktopPresentationPolicyTests {
         #expect(selectedNewer.waitingDuration == .milliseconds(5))
     }
 
+    @Test func retryRestorationPreservesTheOriginalReadyTimestamp() throws {
+        let snapshot = SpiceDesktopSnapshot(
+            generation: 4,
+            frame: nil,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 35
+        )
+        let latch = SpiceDesktopReadyLatch()
+        let firstReadyAt = ContinuousClock().now
+        let firstReadyNanoseconds: UInt64 = 123_456
+        #expect(latch.offer(
+            snapshot,
+            at: firstReadyAt,
+            readyNanoseconds: firstReadyNanoseconds
+        ))
+        let failed = try #require(latch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(1))
+        ))
+
+        latch.restoreIfEmpty(
+            failed.snapshot,
+            at: failed.readyAt,
+            readyNanoseconds: failed.readyNanoseconds
+        )
+        let retry = try #require(latch.takeReady(
+            at: firstReadyAt.advanced(by: .milliseconds(10))
+        ))
+        #expect(retry.readyAt == firstReadyAt)
+        #expect(retry.readyNanoseconds == firstReadyNanoseconds)
+        #expect(retry.waitingDuration == .milliseconds(10))
+    }
+
     @Test func restoreIfEmptyRejectsStaleSnapshotAfterNewerSelection() throws {
         let stale = SpiceDesktopSnapshot(
             generation: 4,

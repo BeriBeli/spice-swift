@@ -74,6 +74,7 @@ public final class SpicePresentationDiagnostics: Sendable {
     private struct State {
         var metrics = SpicePresentationMetrics()
         var epoch: UInt64 = 0
+        var interactionTraceAssembler: SpiceInteractionTraceAssembler?
     }
 
     private let state = Mutex(State())
@@ -86,6 +87,67 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func currentEpoch() -> UInt64 {
         state.withLock { $0.epoch }
+    }
+
+    package func setInteractionTraceAssembler(
+        _ assembler: SpiceInteractionTraceAssembler?
+    ) {
+        state.withLock { $0.interactionTraceAssembler = assembler }
+    }
+
+    package func recordInteractionFrameReceived(
+        _ snapshot: SpiceDesktopSnapshot,
+        sourceTiming: DisplayFrameSourceTiming?
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.observeFrame(snapshot: snapshot, sourceTiming: sourceTiming)
+    }
+
+    package func recordInteractionSelected(
+        identity: SpiceInteractionFrameIdentity,
+        readyNs: UInt64,
+        selectionNs: UInt64
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.observeSelected(
+            identity: identity,
+            readyNs: readyNs,
+            selectionNs: selectionNs
+        )
+    }
+
+    package func recordInteractionCommitted(
+        identity: SpiceInteractionFrameIdentity,
+        at nanoseconds: UInt64
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.observeCommitted(identity: identity, at: nanoseconds)
+    }
+
+    package func recordInteractionPresented(
+        identity: SpiceInteractionFrameIdentity,
+        at nanoseconds: UInt64
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.observePresented(identity: identity, at: nanoseconds)
+    }
+
+    package func retireInteractionDesktopGeneration(_ generation: UInt64) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.retireDesktopGeneration(generation)
+    }
+
+    package func retireInteractionSurfaceLifecycle(
+        displayChannelID: UInt8,
+        surfaceID: UInt32,
+        generation: UInt64
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.retireSurfaceLifecycle(
+            displayChannelID: displayChannelID,
+            surfaceID: surfaceID,
+            generation: generation
+        )
     }
 
     package func recordMetalPresentedFrame(
@@ -247,10 +309,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
     package let selectionNs: UInt64?
     package let metalCommitNs: UInt64?
     package let presentedNs: UInt64?
+    package let displayChannelID: UInt8?
+    package let surfaceID: UInt32?
     package let surfaceGeneration: UInt64?
+    package let desktopGeneration: UInt64?
     package let frameRevision: UInt64?
     package let deliverySequence: UInt64?
     package let markerRevision: UInt64?
+    package let markerChecksum: String?
     package let valid: Bool
     package let invalidReason: String?
 
@@ -282,10 +348,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         selectionNs: UInt64? = nil,
         metalCommitNs: UInt64? = nil,
         presentedNs: UInt64? = nil,
+        displayChannelID: UInt8? = nil,
+        surfaceID: UInt32? = nil,
         surfaceGeneration: UInt64? = nil,
+        desktopGeneration: UInt64? = nil,
         frameRevision: UInt64? = nil,
         deliverySequence: UInt64? = nil,
         markerRevision: UInt64? = nil,
+        markerChecksum: String? = nil,
         invalidReason externalInvalidReason: String? = nil
     ) {
         self.pairId = pairId
@@ -307,10 +377,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         self.selectionNs = selectionNs
         self.metalCommitNs = metalCommitNs
         self.presentedNs = presentedNs
+        self.displayChannelID = displayChannelID
+        self.surfaceID = surfaceID
         self.surfaceGeneration = surfaceGeneration
+        self.desktopGeneration = desktopGeneration
         self.frameRevision = frameRevision
         self.deliverySequence = deliverySequence
         self.markerRevision = markerRevision
+        self.markerChecksum = markerChecksum
 
         invalidReason = Self.validationFailure(
             pairId: pairId,
@@ -330,10 +404,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             selectionNs: selectionNs,
             metalCommitNs: metalCommitNs,
             presentedNs: presentedNs,
+            displayChannelID: displayChannelID,
+            surfaceID: surfaceID,
             surfaceGeneration: surfaceGeneration,
+            desktopGeneration: desktopGeneration,
             frameRevision: frameRevision,
             deliverySequence: deliverySequence,
             markerRevision: markerRevision,
+            markerChecksum: markerChecksum,
             externalInvalidReason: externalInvalidReason
         )
         valid = invalidReason == nil
@@ -361,10 +439,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             selectionNs: wire.selectionNs,
             metalCommitNs: wire.metalCommitNs,
             presentedNs: wire.presentedNs,
+            displayChannelID: wire.displayChannelID,
+            surfaceID: wire.surfaceID,
             surfaceGeneration: wire.surfaceGeneration,
+            desktopGeneration: wire.desktopGeneration,
             frameRevision: wire.frameRevision,
             deliverySequence: wire.deliverySequence,
-            markerRevision: wire.markerRevision
+            markerRevision: wire.markerRevision,
+            markerChecksum: wire.markerChecksum
         )
         let derived = Self(
             pairId: wire.pairId,
@@ -386,10 +468,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             selectionNs: wire.selectionNs,
             metalCommitNs: wire.metalCommitNs,
             presentedNs: wire.presentedNs,
+            displayChannelID: wire.displayChannelID,
+            surfaceID: wire.surfaceID,
             surfaceGeneration: wire.surfaceGeneration,
+            desktopGeneration: wire.desktopGeneration,
             frameRevision: wire.frameRevision,
             deliverySequence: wire.deliverySequence,
             markerRevision: wire.markerRevision,
+            markerChecksum: wire.markerChecksum,
             invalidReason: wire.invalidReason
         )
         guard wire.valid == derived.valid,
@@ -428,10 +514,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         selectionNs: UInt64?,
         metalCommitNs: UInt64?,
         presentedNs: UInt64?,
+        displayChannelID: UInt8?,
+        surfaceID: UInt32?,
         surfaceGeneration: UInt64?,
+        desktopGeneration: UInt64?,
         frameRevision: UInt64?,
         deliverySequence: UInt64?,
         markerRevision: UInt64?,
+        markerChecksum: String?,
         externalInvalidReason: String?
     ) -> String? {
         if let externalInvalidReason {
@@ -451,14 +541,24 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         guard let guestReceivedNs else { return "missing_guest_received" }
         guard let guestMarkerDrawnNs else { return "missing_guest_marker_drawn" }
         guard markerRevision != nil else { return "missing_marker_revision" }
+        guard let markerChecksum else { return "missing_marker_checksum" }
+        guard markerChecksum.utf8.count == 8,
+              markerChecksum.utf8.allSatisfy({
+                  (48...57).contains($0) || (97...102).contains($0)
+              }) else {
+            return "invalid_marker_checksum"
+        }
         guard let displayReceiveNs else { return "missing_display_receive" }
         guard let surfaceReadyNs else { return "missing_surface_ready" }
         guard let selectedRevisionReadyNs else { return "missing_selected_revision_ready" }
         guard let selectionNs else { return "missing_selection" }
         guard let metalCommitNs else { return "missing_metal_commit" }
         guard let presentedNs else { return "missing_presented" }
+        guard displayChannelID != nil else { return "missing_display_channel_id" }
+        guard surfaceID != nil else { return "missing_surface_id" }
         guard frameRevision != nil else { return "missing_frame_revision" }
         guard surfaceGeneration != nil else { return "missing_surface_generation" }
+        guard desktopGeneration != nil else { return "missing_desktop_generation" }
         guard deliverySequence != nil else { return "missing_delivery_sequence" }
 
         guard scheduledNs <= hostInputNs,
@@ -486,10 +586,13 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
              "missing_scheduled", "missing_host_input", "missing_send_started",
              "missing_send_completed", "missing_guest_received",
              "missing_guest_marker_drawn", "missing_marker_revision",
+             "missing_marker_checksum", "invalid_marker_checksum",
              "missing_display_receive", "missing_surface_ready",
              "missing_selected_revision_ready", "missing_selection",
              "missing_metal_commit", "missing_presented", "missing_frame_revision",
-             "missing_surface_generation", "missing_delivery_sequence",
+             "missing_display_channel_id", "missing_surface_id",
+             "missing_surface_generation", "missing_desktop_generation",
+             "missing_delivery_sequence",
              "non_monotonic_timestamps":
             true
         default:
@@ -517,10 +620,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         let selectionNs: UInt64?
         let metalCommitNs: UInt64?
         let presentedNs: UInt64?
+        let displayChannelID: UInt8?
+        let surfaceID: UInt32?
         let surfaceGeneration: UInt64?
+        let desktopGeneration: UInt64?
         let frameRevision: UInt64?
         let deliverySequence: UInt64?
         let markerRevision: UInt64?
+        let markerChecksum: String?
         let valid: Bool
         let invalidReason: String?
 
@@ -544,10 +651,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             selectionNs = record.selectionNs
             metalCommitNs = record.metalCommitNs
             presentedNs = record.presentedNs
+            displayChannelID = record.displayChannelID
+            surfaceID = record.surfaceID
             surfaceGeneration = record.surfaceGeneration
+            desktopGeneration = record.desktopGeneration
             frameRevision = record.frameRevision
             deliverySequence = record.deliverySequence
             markerRevision = record.markerRevision
+            markerChecksum = record.markerChecksum
             valid = record.valid
             invalidReason = record.invalidReason
         }
@@ -572,10 +683,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
             case selectionNs = "selection_ns"
             case metalCommitNs = "metal_commit_ns"
             case presentedNs = "presented_ns"
+            case displayChannelID = "display_channel_id"
+            case surfaceID = "surface_id"
             case surfaceGeneration = "surface_generation"
+            case desktopGeneration = "desktop_generation"
             case frameRevision = "frame_revision"
             case deliverySequence = "delivery_sequence"
             case markerRevision = "marker_revision"
+            case markerChecksum = "marker_checksum"
             case valid
             case invalidReason = "invalid_reason"
         }

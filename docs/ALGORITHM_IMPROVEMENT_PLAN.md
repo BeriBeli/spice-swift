@@ -366,6 +366,48 @@ whether ready-to-selection should use an interaction-aware immediate path or an
 adaptive display-link policy. Either choice must retain latest-only delivery,
 zero idle commits, at most two GPU commands in flight, and CPU/RSS guardrails.
 
+The first host-correlation slice lands only the fail-closed Swift evidence
+pipeline. A Display publication carries the `messageReceivedAt` and
+`surfaceReadyAt` belonging to its exact emitted revision; a prepared frame that
+covers a pending replacement uses the replacement's timing and never inherits
+the older request's timestamps. The package-only marker detector reads actual
+BGRA storage, and the correlation identity contains desktop generation,
+display channel ID, surface ID, Surface lifecycle generation, frame revision,
+and delivery sequence. Selection, the Metal command-buffer commit-call
+boundary, and `CAMetalDrawable` presentation all retain that same identity. A
+desktop snapshot's envelope delivery sequence orders cursor, pointer-mode, and
+latest-state coalescing independently; only the sequence owned by the retained
+frame publication participates in the frame identity. A control-only merge
+therefore cannot relabel an older frame, while a real frame publication obtains
+a new frame sequence. A GPU-busy or drawable-unavailable retry restores the selected delivery's
+original ready instant and nanoseconds rather than manufacturing a new ready
+event. Surface destruction or direct lifecycle replacement retires that
+display-channel/surface lifecycle, so an old drawable cannot complete a
+recreated surface's trace; a trace already presented before retirement remains
+historical evidence. The presented stage uses the drawable's actual
+`presentedTime` mapped into the host monotonic clock, while MainActor
+serialization keeps its trace mutation after the corresponding Metal
+`commit()` call. The commit timestamp is stored at the immediately preceding
+call boundary after every handler has been installed, with no diagnostics or
+external work between that store and `commit()`; completion can therefore
+never observe a missing timestamp. A missing marker, ambiguous ROI, duplicate
+identity,
+retired generation, latest-only replacement, CPU fallback without a presented
+callback, or missing input remains invalid. Invalid replacement records still
+retain the stages and identity actually selected so a failure can be diagnosed
+without reassigning the older marker.
+
+This slice includes a deterministic package encoder for a proposed
+`binary-grid-v1` marker ROI, but the Rocky guest renderer and run manifest do
+not yet emit that pixel protocol, and the mode-0600 `input-events.jsonl` remains
+unpopulated. The next fixture/collector slice must make the guest and Swift
+codec share one versioned layout, bump the normalized schema for
+`desktop_generation`, `display_channel_id`, `surface_id`, and
+`marker_checksum`, and atomically append both valid and invalid records. Until
+that live gate binds captured pixels to the exact
+presented delivery, this internal seam is not completion evidence and supports
+no input-to-visible latency or scheduling conclusion.
+
 An end-to-end request-to-presented measurement may summarize user experience,
 but it does not identify which path caused a change. In particular, a capture
 with no input events cannot support a conclusion about the input queue. After
@@ -573,3 +615,4 @@ behavior remain separate acceptance gates.
 | 2026-08-28 | AIP-00 | Use the Rocky 9 rootless Podman/KVM fixture first for real connectivity and receive-to-present baselines; do not treat its autonomous animation as paired interaction evidence | The current animation has no causal input token. Before the fixture can admit click/key/motion-to-visible observations, the guest must emit a unique rendered marker and the harness must retain a per-event trace that correlates that marker through the matching presented revision. Until then, the fixture can validate transport and the receive-to-surface-ready-to-selection-to-Metal-commit-to-presented pipeline only. |
 | 2026-08-28 | AIP-00, AIP-44 | Land a unique guest input-marker state machine and normalized per-event trace schema before scheduling experiments | The fixture can now pre-arm one click/key/motion token, consume it only on a matching real guest input, draw a deterministic high-contrast ROI, and record guest marker evidence. Autonomous animation remains ineligible. This slice does not yet bind captured marker pixels to an exact AppKit presented delivery; that live Rocky correlation remains mandatory before any paired latency artifact or AIP-44 scheduling claim. |
 | 2026-08-29 | AIP-00, AIP-44 | Treat the successful Rocky eudev/Xorg marker run as guest-causal subpath evidence, not an input-to-visible result | Key, motion, and click now reach the guest marker and relative motion produces protocol ACKs, but no collector yet binds those marker pixels to an exact SwiftSpice delivery and AppKit presented callback. Complete that binding and paired `v0.2.7`/`v0.3.x` traces before selecting an immediate or adaptive ready-to-selection policy. |
+| 2026-08-29 | AIP-00 | Land the exact host identity and presented-callback correlation seam before changing the Rocky pixel protocol or collector | Keeping source timing beside the exact emitted Display revision prevents coalesced replacements from inheriting neighboring evidence. The internal BGRA detector and assembler now fail closed across marker, generation, selection, commit, and presented identity, while the separate fixture slice remains responsible for a shared versioned ROI and normalized JSONL artifacts. No pacing behavior or performance conclusion changes in this slice. |
