@@ -324,6 +324,63 @@ struct RemoteRockyLiveInteractionTests {
         expectNoSurvivingProcesses(identifiers)
     }
 
+    @Test func successfulLeaderExitStillReapsResidualDescendantAfterCleanPipeEOF() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "swiftspice-live-residual-descendant-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let descendantReady = directory.appending(path: "descendant-ready")
+        let fixture = try SpiceLiveScriptFixture(
+            """
+            (
+                trap '' TERM
+                exec >/dev/null 2>&1
+                : > "$1"
+                while :; do
+                    :
+                done
+            ) &
+            descendant=$!
+            while [ ! -f "$1" ]; do
+                :
+            done
+            printf 'READY parent=%s descendant=%s\n' "$$" "$descendant"
+            exit 0
+            """
+        )
+        defer { fixture.remove() }
+        let child = try SpiceLiveProcessRunner(
+            executableURL: fixture.executableURL
+        ).launch(arguments: [descendantReady.path])
+        let identifiers = try processIdentifiers(
+            from: await child.readOutputLine(within: .seconds(1))
+        )
+        let outerLimit = SpiceLiveChildProcess.pipeDrainGrace
+            + SpiceLiveChildProcess.terminationGrace
+            + SpiceLiveChildProcess.killGrace
+            + .milliseconds(500)
+        let watchdog = terminationWatchdog(
+            processIdentifiers: identifiers,
+            after: outerLimit
+        )
+        var result: SpiceLiveProcessResult?
+
+        do {
+            result = try await child.finish(within: .seconds(2))
+        } catch {
+            Issue.record("clean EOF success path unexpectedly failed")
+        }
+
+        watchdog.cancel()
+        #expect(!(await watchdog.value))
+        #expect(result?.status == 0)
+        #expect(result?.standardOutput.isEmpty == true)
+        #expect(result?.standardError.isEmpty == true)
+        expectNoSurvivingProcesses(identifiers)
+    }
+
     @Test func outputLimitsAcceptExactBoundsAndFailClosedOneBytePast() async throws {
         let streamLimit = SpiceLiveChildProcess.maximumOutputBytesPerStream
         let exactFixture = try SpiceLiveScriptFixture(

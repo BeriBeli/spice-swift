@@ -258,6 +258,9 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
             await stderrReader.value
             stdoutCollector.close()
             stderrCollector.close()
+            guard await stopResidualGroupBoundedly() else {
+                throw SpiceLiveInteractionSupportError.childFailed
+            }
             guard let status = process.reap() else {
                 throw SpiceLiveInteractionSupportError.childFailed
             }
@@ -332,6 +335,11 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
             _ = process.reap()
             return !process.groupExists
         }.value
+    }
+
+    private func stopResidualGroupBoundedly() async -> Bool {
+        guard process.hasResidualGroupMembers else { return true }
+        return await stopBoundedly()
     }
 
     private func waitForCollectors(
@@ -619,6 +627,25 @@ private final class SpiceLiveSpawnedProcess: @unchecked Sendable {
 
     var isReaped: Bool {
         state.withLock(\.reaped)
+    }
+
+    var hasResidualGroupMembers: Bool {
+        state.withLock { state in
+            guard !state.reaped else { return groupExists }
+            // The dead leader remains a zombie here, anchoring both PID and
+            // PGID. With no other member, no process can later fork into this
+            // group, so the fast path can reap without a grace-period wait.
+            var identifiers = [pid_t](repeating: 0, count: 16)
+            let count = proc_listpgrppids(
+                processGroup,
+                &identifiers,
+                Int32(identifiers.count * MemoryLayout<pid_t>.stride)
+            )
+            guard count >= 0 else { return true }
+            return identifiers.prefix(Int(count)).contains {
+                $0 > 0 && $0 != processIdentifier
+            }
+        }
     }
 
     func reap() -> Int32? {
