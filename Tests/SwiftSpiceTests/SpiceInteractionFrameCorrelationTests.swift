@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 @testable import SpiceChannels
 import Testing
 @testable import SwiftSpice
@@ -403,6 +404,199 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(!duplicatePresentedRecord.valid)
         #expect(duplicatePresentedRecord.invalidReason == "duplicate_presented")
         #expect(duplicatePresentedRecord.presentedNs == ready + 30)
+    }
+
+    @Test func sameDeliveryRetryPreservesItsFirstReadyTimestamp() {
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = SpiceInteractionHostClock.nanoseconds(for: timing.messageReceivedAt)!
+        let firstReady = SpiceInteractionHostClock.nanoseconds(for: timing.surfaceReadyAt)!
+        let frameIdentity = identity(deliverySequence: 601)
+        let assembler = makeAssembler()
+        recordInputAndGuest(on: assembler, beforeDisplayReceiveNs: receive)
+        assembler.observeFrame(
+            snapshot: markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        assembler.observeSelected(
+            identity: frameIdentity,
+            readyNs: firstReady,
+            selectionNs: firstReady + 10
+        )
+
+        let retryReady = firstReady + 100
+        assembler.observeSelected(
+            identity: frameIdentity,
+            readyNs: firstReady,
+            selectionNs: retryReady + 10
+        )
+        assembler.observeCommitted(identity: frameIdentity, at: retryReady + 20)
+        assembler.observePresented(identity: frameIdentity, at: retryReady + 30)
+        let record = assembler.finish()
+
+        #expect(record.valid)
+        #expect(record.selectedRevisionReadyNs == firstReady)
+        #expect(record.selectionNs == retryReady + 10)
+    }
+
+    @Test func presentationOrderingFailsClosedButOtherInFlightIdentityIsIgnored() {
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = SpiceInteractionHostClock.nanoseconds(for: timing.messageReceivedAt)!
+        let ready = SpiceInteractionHostClock.nanoseconds(for: timing.surfaceReadyAt)!
+        let selectedIdentity = identity(deliverySequence: 701)
+        let otherIdentity = identity(frameRevision: 11, deliverySequence: 702)
+
+        let presentedBeforeCommit = makeAssembler()
+        recordInputAndGuest(on: presentedBeforeCommit, beforeDisplayReceiveNs: receive)
+        presentedBeforeCommit.observeFrame(
+            snapshot: markerSnapshot(identity: selectedIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        presentedBeforeCommit.observeSelected(
+            identity: selectedIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        presentedBeforeCommit.observePresented(identity: selectedIdentity, at: ready + 20)
+        presentedBeforeCommit.observeCommitted(identity: selectedIdentity, at: ready + 30)
+        let outOfOrder = presentedBeforeCommit.finish()
+        #expect(!outOfOrder.valid)
+        #expect(outOfOrder.invalidReason == "presented_before_commit")
+        #expect(outOfOrder.presentedNs == nil)
+
+        let unrelatedCallbacks = makeAssembler()
+        recordInputAndGuest(on: unrelatedCallbacks, beforeDisplayReceiveNs: receive)
+        unrelatedCallbacks.observeFrame(
+            snapshot: markerSnapshot(identity: selectedIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        unrelatedCallbacks.observeSelected(
+            identity: selectedIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        unrelatedCallbacks.observeCommitted(identity: otherIdentity, at: ready + 15)
+        unrelatedCallbacks.observePresented(identity: otherIdentity, at: ready + 16)
+        unrelatedCallbacks.observeCommitted(identity: selectedIdentity, at: ready + 20)
+        unrelatedCallbacks.observePresented(identity: selectedIdentity, at: ready + 30)
+        let unrelatedRecord = unrelatedCallbacks.finish()
+        #expect(unrelatedRecord.valid)
+        #expect(unrelatedRecord.metalCommitNs == ready + 20)
+        #expect(unrelatedRecord.presentedNs == ready + 30)
+
+        let reversedTimestamps = makeAssembler()
+        recordInputAndGuest(on: reversedTimestamps, beforeDisplayReceiveNs: receive)
+        reversedTimestamps.observeFrame(
+            snapshot: markerSnapshot(identity: selectedIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        reversedTimestamps.observeSelected(
+            identity: selectedIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        reversedTimestamps.observeCommitted(identity: selectedIdentity, at: ready + 30)
+        reversedTimestamps.observePresented(identity: selectedIdentity, at: ready + 20)
+        #expect(!reversedTimestamps.finish().valid)
+    }
+
+    @Test func retiredSurfaceLifecycleCannotBeCompletedByLateCallbacks() {
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = SpiceInteractionHostClock.nanoseconds(for: timing.messageReceivedAt)!
+        let ready = SpiceInteractionHostClock.nanoseconds(for: timing.surfaceReadyAt)!
+        let retiredIdentity = identity(surfaceGeneration: 9, deliverySequence: 801)
+
+        let retired = makeAssembler()
+        recordInputAndGuest(on: retired, beforeDisplayReceiveNs: receive)
+        retired.observeFrame(
+            snapshot: markerSnapshot(identity: retiredIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        retired.observeSelected(
+            identity: retiredIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        retired.retireSurfaceLifecycle(
+            displayChannelID: retiredIdentity.displayChannelID,
+            surfaceID: retiredIdentity.surfaceID,
+            generation: retiredIdentity.surfaceGeneration
+        )
+        retired.observeCommitted(identity: retiredIdentity, at: ready + 20)
+        retired.observePresented(identity: retiredIdentity, at: ready + 30)
+        let retiredRecord = retired.finish()
+        #expect(!retiredRecord.valid)
+        #expect(retiredRecord.invalidReason == "surface_lifecycle_retired")
+        #expect(retiredRecord.metalCommitNs == nil)
+        #expect(retiredRecord.presentedNs == nil)
+
+        let unrelatedRetirement = makeAssembler()
+        recordInputAndGuest(on: unrelatedRetirement, beforeDisplayReceiveNs: receive)
+        unrelatedRetirement.observeFrame(
+            snapshot: markerSnapshot(identity: retiredIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        unrelatedRetirement.observeSelected(
+            identity: retiredIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        unrelatedRetirement.retireSurfaceLifecycle(
+            displayChannelID: retiredIdentity.displayChannelID,
+            surfaceID: retiredIdentity.surfaceID + 1,
+            generation: retiredIdentity.surfaceGeneration
+        )
+        unrelatedRetirement.observeCommitted(identity: retiredIdentity, at: ready + 20)
+        unrelatedRetirement.observePresented(identity: retiredIdentity, at: ready + 30)
+        #expect(unrelatedRetirement.finish().valid)
+
+        let completedBeforeRetirement = makeAssembler()
+        recordInputAndGuest(on: completedBeforeRetirement, beforeDisplayReceiveNs: receive)
+        completedBeforeRetirement.observeFrame(
+            snapshot: markerSnapshot(identity: retiredIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        completedBeforeRetirement.observeSelected(
+            identity: retiredIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        completedBeforeRetirement.observeCommitted(
+            identity: retiredIdentity,
+            at: ready + 20
+        )
+        completedBeforeRetirement.observePresented(
+            identity: retiredIdentity,
+            at: ready + 30
+        )
+        completedBeforeRetirement.retireSurfaceLifecycle(
+            displayChannelID: retiredIdentity.displayChannelID,
+            surfaceID: retiredIdentity.surfaceID,
+            generation: retiredIdentity.surfaceGeneration
+        )
+        #expect(completedBeforeRetirement.finish().valid)
+    }
+
+    @Test func coreAnimationPresentedTimeMapsIntoTheHostMonotonicClock() throws {
+        let before = SpiceInteractionHostClock.nowNanoseconds()
+        let mediaTime = CACurrentMediaTime()
+        let mapped = try #require(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTime
+        ))
+        let after = SpiceInteractionHostClock.nowNanoseconds()
+        #expect(mapped >= before)
+        #expect(mapped <= after)
+
+        let earlier = try #require(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTime - 0.125
+        ))
+        let delta = mapped - earlier
+        #expect((124_999_998...125_000_002).contains(delta))
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: .nan
+        ) == nil)
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: .infinity
+        ) == nil)
     }
 
     private let token = "0123456789abcdef"

@@ -137,6 +137,19 @@ public final class SpicePresentationDiagnostics: Sendable {
         assembler?.retireDesktopGeneration(generation)
     }
 
+    package func retireInteractionSurfaceLifecycle(
+        displayChannelID: UInt8,
+        surfaceID: UInt32,
+        generation: UInt64
+    ) {
+        let assembler = state.withLock { $0.interactionTraceAssembler }
+        assembler?.retireSurfaceLifecycle(
+            displayChannelID: displayChannelID,
+            surfaceID: surfaceID,
+            generation: generation
+        )
+    }
+
     package func recordMetalPresentedFrame(
         isAdvancedVideo: Bool = false,
         epoch: UInt64? = nil

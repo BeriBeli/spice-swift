@@ -285,6 +285,155 @@ struct SpiceDesktopSourceTests {
         subscription.cancel()
     }
 
+    @Test func directLifecycleReplacementRetiresOldTraceWithoutRetiringRevisionUpdates() throws {
+        let anchor = ContinuousClock().now
+        let oldTiming = DisplayFrameSourceTiming(
+            messageReceivedAt: anchor.advanced(by: .nanoseconds(50)),
+            surfaceReadyAt: anchor.advanced(by: .nanoseconds(60))
+        )
+        let updatedTiming = DisplayFrameSourceTiming(
+            messageReceivedAt: anchor.advanced(by: .nanoseconds(70)),
+            surfaceReadyAt: anchor.advanced(by: .nanoseconds(80))
+        )
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: oldTiming.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: oldTiming.surfaceReadyAt
+        ))
+
+        let replacedDiagnostics = SpicePresentationDiagnostics()
+        let replacedAssembler = Self.interactionAssembler()
+        replacedDiagnostics.setInteractionTraceAssembler(replacedAssembler)
+        Self.recordInteractionEvidence(
+            on: replacedAssembler,
+            beforeDisplayReceiveNs: receive
+        )
+        let replacedSource = SpiceDesktopSource(
+            presentationDiagnostics: replacedDiagnostics
+        )
+        replacedSource.beginSession(pointerMode: .absolute)
+        let replacedDeliveries = Mutex<[SpiceDesktopSnapshot]>([])
+        let replacedSubscription = replacedSource.subscribe()
+        defer { replacedSubscription.cancel() }
+        replacedSubscription.setUpdateHandler { snapshot in
+            replacedDeliveries.withLock { $0.append(snapshot) }
+        }
+        replacedSubscription.setDemand(.visible)
+
+        replacedSource.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Self.interactionFrame(
+                    lifecycle: 1,
+                    revision: 1,
+                    containsMarker: true
+                ),
+                sourceTiming: oldTiming
+            ),
+            displayChannelID: 0
+        )
+        let replacedOld = try #require(replacedDeliveries.withLock { snapshots in
+            snapshots.last { $0.frame?.revision.surface.generation == 1 }
+        })
+        let replacedOldIdentity = try #require(replacedOld.interactionFrameIdentity)
+        replacedDiagnostics.recordInteractionSelected(
+            identity: replacedOldIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+
+        replacedSource.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Self.interactionFrame(
+                    lifecycle: 2,
+                    revision: 0,
+                    containsMarker: false
+                ),
+                sourceTiming: updatedTiming
+            ),
+            displayChannelID: 0
+        )
+        let replacement = try #require(replacedDeliveries.withLock { snapshots in
+            snapshots.last { $0.frame?.revision.surface.generation == 2 }
+        })
+        #expect(replacement.generation == replacedOld.generation)
+        replacedDiagnostics.recordInteractionCommitted(
+            identity: replacedOldIdentity,
+            at: ready + 20
+        )
+        replacedDiagnostics.recordInteractionPresented(
+            identity: replacedOldIdentity,
+            at: ready + 30
+        )
+        let replacedRecord = replacedAssembler.finish()
+        #expect(!replacedRecord.valid)
+        #expect(replacedRecord.invalidReason == "surface_lifecycle_retired")
+        #expect(replacedRecord.metalCommitNs == nil)
+        #expect(replacedRecord.presentedNs == nil)
+
+        let revisionDiagnostics = SpicePresentationDiagnostics()
+        let revisionAssembler = Self.interactionAssembler()
+        revisionDiagnostics.setInteractionTraceAssembler(revisionAssembler)
+        Self.recordInteractionEvidence(
+            on: revisionAssembler,
+            beforeDisplayReceiveNs: receive
+        )
+        let revisionSource = SpiceDesktopSource(
+            presentationDiagnostics: revisionDiagnostics
+        )
+        revisionSource.beginSession(pointerMode: .absolute)
+        let revisionDeliveries = Mutex<[SpiceDesktopSnapshot]>([])
+        let revisionSubscription = revisionSource.subscribe()
+        defer { revisionSubscription.cancel() }
+        revisionSubscription.setUpdateHandler { snapshot in
+            revisionDeliveries.withLock { $0.append(snapshot) }
+        }
+        revisionSubscription.setDemand(.visible)
+        revisionSource.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Self.interactionFrame(
+                    lifecycle: 4,
+                    revision: 1,
+                    containsMarker: true
+                ),
+                sourceTiming: oldTiming
+            ),
+            displayChannelID: 0
+        )
+        let revisionOld = try #require(revisionDeliveries.withLock { snapshots in
+            snapshots.last { $0.frame?.revision.value == 1 }
+        })
+        let revisionOldIdentity = try #require(revisionOld.interactionFrameIdentity)
+        revisionDiagnostics.recordInteractionSelected(
+            identity: revisionOldIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        revisionSource.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Self.interactionFrame(
+                    lifecycle: 4,
+                    revision: 2,
+                    containsMarker: false
+                ),
+                sourceTiming: updatedTiming
+            ),
+            displayChannelID: 0
+        )
+        revisionDiagnostics.recordInteractionCommitted(
+            identity: revisionOldIdentity,
+            at: ready + 20
+        )
+        revisionDiagnostics.recordInteractionPresented(
+            identity: revisionOldIdentity,
+            at: ready + 30
+        )
+        let revisionRecord = revisionAssembler.finish()
+        #expect(revisionRecord.valid)
+        #expect(revisionRecord.surfaceGeneration == 4)
+        #expect(revisionRecord.frameRevision == 1)
+    }
+
     @Test func reconnectAdvancesDesktopGenerationAndPublishesBootstrapPointerMode() async throws {
         let source = SpiceDesktopSource()
         let subscription = source.subscribe()
@@ -381,6 +530,70 @@ struct SpiceDesktopSourceTests {
             lifecycleGeneration: lifecycle,
             revision: revision,
             pixels: Data(repeating: UInt8(truncatingIfNeeded: revision), count: 16),
+            ioSurfaceFrame: nil
+        )
+    }
+
+    private static func interactionAssembler() -> SpiceInteractionTraceAssembler {
+        SpiceInteractionTraceAssembler(
+            pairId: "pair-lifecycle",
+            version: "v0.3.1",
+            runId: "run-lifecycle",
+            order: 1,
+            actionClass: .click,
+            token: "0123456789abcdef",
+            checksum: 0x9f9f_5111
+        )
+    }
+
+    private static func recordInteractionEvidence(
+        on assembler: SpiceInteractionTraceAssembler,
+        beforeDisplayReceiveNs displayReceiveNs: UInt64
+    ) {
+        assembler.recordHostEvidence(
+            scheduledNs: displayReceiveNs - 40,
+            hostInputNs: displayReceiveNs - 30,
+            sendStartedNs: displayReceiveNs - 20,
+            sendCompletedNs: displayReceiveNs - 10
+        )
+        assembler.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+    }
+
+    private static func interactionFrame(
+        lifecycle: UInt64,
+        revision: UInt64,
+        containsMarker: Bool
+    ) -> FrameSnapshot {
+        let width = 384
+        let height = 48
+        let bytesPerRow = width * 4
+        let pixels: Data
+        if containsMarker {
+            pixels = SpiceInteractionMarkerROIDetector.renderForTesting(
+                placements: [SpiceInteractionMarkerPlacement(
+                    payload: SpiceInteractionMarkerPayload(
+                        token: "0123456789abcdef",
+                        markerRevision: 77,
+                        checksum: 0x9f9f_5111
+                    ),
+                    originX: 8,
+                    originY: 8
+                )],
+                frameWidth: width,
+                frameHeight: height,
+                bytesPerRow: bytesPerRow
+            )
+        } else {
+            pixels = Data(repeating: 0x7f, count: bytesPerRow * height)
+        }
+        return FrameSnapshot(
+            surfaceID: 0,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            lifecycleGeneration: lifecycle,
+            revision: revision,
+            pixels: pixels,
             ioSurfaceFrame: nil
         )
     }

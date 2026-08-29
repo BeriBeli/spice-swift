@@ -334,9 +334,14 @@ public final class SpiceDesktopSource: Sendable {
         let result = state.withLock { state -> (
             deliveries: [SpiceDesktopDelivery],
             autoAcknowledge: Bool,
-            traceSnapshot: SpiceDesktopSnapshot?
+            traceSnapshot: SpiceDesktopSnapshot?,
+            retiredGeneration: UInt64?
         ) in
             state.deliverySequence &+= 1
+            let previousGeneration = state.frames[key]?.revision.surface.generation
+            let retiredGeneration = previousGeneration.flatMap {
+                $0 == identity.generation ? nil : $0
+            }
             state.frames[key] = retainedUpdate
             state.surfacesAwaitingFreshPublication.remove(key)
             let desktopSnapshot = SpiceDesktopSnapshot(
@@ -359,7 +364,19 @@ public final class SpiceDesktopSource: Sendable {
             return (
                 deliveries,
                 shouldAutoAcknowledge(key: key, state: state),
-                deliveries.isEmpty ? nil : desktopSnapshot
+                deliveries.isEmpty ? nil : desktopSnapshot,
+                retiredGeneration
+            )
+        }
+        // A Surface may be recreated without a desktop-generation change or a
+        // separately delivered destroy event. Retire the overwritten lifecycle
+        // before the replacement can be observed or delivered, so an old
+        // drawable callback cannot complete the replacement's trace.
+        if let retiredGeneration = result.retiredGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: snapshot.surfaceID,
+                generation: retiredGeneration
             )
         }
         if let traceSnapshot = result.traceSnapshot {
@@ -386,11 +403,15 @@ public final class SpiceDesktopSource: Sendable {
 
     package func surfaceDestroyed(displayChannelID: UInt8, surfaceID: UInt32) {
         let key = DisplaySurfaceKey(channelID: displayChannelID, surfaceID: surfaceID)
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            deliveries: [SpiceDesktopDelivery],
+            retiredGeneration: UInt64?
+        ) in
             state.deliverySequence &+= 1
-            state.frames.removeValue(forKey: key)
+            let retiredGeneration = state.frames.removeValue(forKey: key)?
+                .revision.surface.generation
             state.surfacesAwaitingFreshPublication.remove(key)
-            return state.subscribers.values.compactMap {
+            let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
                     return nil
@@ -404,8 +425,16 @@ public final class SpiceDesktopSource: Sendable {
                     )
                 )
             }
+            return (deliveries, retiredGeneration)
         }
-        deliver(deliveries)
+        if let retiredGeneration = result.retiredGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID,
+                generation: retiredGeneration
+            )
+        }
+        deliver(result.deliveries)
     }
 
     package func updateCursor(_ cursor: SpiceCursorState?) {

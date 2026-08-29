@@ -365,6 +365,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
 
     package struct Ready: Sendable {
         package let snapshot: SpiceDesktopSnapshot
+        package let readyAt: ContinuousClock.Instant
         package let waitingDuration: Duration
         package let readyNanoseconds: UInt64
     }
@@ -439,6 +440,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
             state.pendingReadyNanoseconds = nil
             return Ready(
                 snapshot: snapshot,
+                readyAt: readyAt,
                 waitingDuration: waitingDuration,
                 readyNanoseconds: readyNanoseconds
             )
@@ -850,7 +852,11 @@ package final class SpiceFramebufferView: NSView {
             // newest pending revision.
             startDisplayLinkPacing()
         case .retry:
-            readyLatch.restoreIfEmpty(ready.snapshot)
+            readyLatch.restoreIfEmpty(
+                ready.snapshot,
+                at: ready.readyAt,
+                readyNanoseconds: ready.readyNanoseconds
+            )
             wakeDisplayLinkIfNeeded()
         }
     }
@@ -921,7 +927,11 @@ package final class SpiceFramebufferView: NSView {
             // from repeatedly taking the immediate idle fast path.
             break
         case .retry:
-            readyLatch.restoreIfEmpty(snapshot)
+            readyLatch.restoreIfEmpty(
+                snapshot,
+                at: ready.readyAt,
+                readyNanoseconds: ready.readyNanoseconds
+            )
             wakeDisplayLinkIfNeeded()
         }
     }

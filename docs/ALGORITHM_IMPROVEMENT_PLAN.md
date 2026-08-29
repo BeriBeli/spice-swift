@@ -375,7 +375,15 @@ BGRA storage, and the correlation identity contains desktop generation,
 display channel ID, surface ID, Surface lifecycle generation, frame revision,
 and delivery sequence. Selection, the Metal command-buffer commit-call
 boundary, and `CAMetalDrawable` presentation all retain that same identity. A
-missing marker, ambiguous ROI, duplicate identity,
+GPU-busy or drawable-unavailable retry restores the selected delivery's
+original ready instant and nanoseconds rather than manufacturing a new ready
+event. Surface destruction or direct lifecycle replacement retires that
+display-channel/surface lifecycle, so an old drawable cannot complete a
+recreated surface's trace; a trace already presented before retirement remains
+historical evidence. The presented stage uses the drawable's actual
+`presentedTime` mapped into the host monotonic clock, while MainActor
+serialization keeps its trace mutation after the corresponding Metal
+`commit()` call boundary. A missing marker, ambiguous ROI, duplicate identity,
 retired generation, latest-only replacement, CPU fallback without a presented
 callback, or missing input remains invalid. Invalid replacement records still
 retain the stages and identity actually selected so a failure can be diagnosed

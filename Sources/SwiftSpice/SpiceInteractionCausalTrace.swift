@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 import SpiceChannels
 import Synchronization
 
@@ -272,12 +273,36 @@ package enum SpiceInteractionMarkerROIDetector {
 }
 
 package enum SpiceInteractionHostClock {
+    private struct CoreAnimationAnchor: Sendable {
+        let mediaTime: TimeInterval
+        let monotonicNanoseconds: UInt64
+    }
+
     private static let anchor: (instant: ContinuousClock.Instant, nanoseconds: UInt64) = {
-        var time = timespec()
-        precondition(clock_gettime(CLOCK_MONOTONIC, &time) == 0)
-        let nanoseconds = UInt64(time.tv_sec) * 1_000_000_000 + UInt64(time.tv_nsec)
+        let nanoseconds = monotonicNanoseconds()
         return (ContinuousClock().now, nanoseconds)
     }()
+
+    /// Maps Core Animation's media-time domain into the interaction trace's
+    /// CLOCK_MONOTONIC domain. Bracketing the media-time sample bounds the
+    /// one-time anchor error without substituting callback execution time for
+    /// a drawable's actual `presentedTime`.
+    private static let coreAnimationAnchor: CoreAnimationAnchor = {
+        let before = monotonicNanoseconds()
+        let mediaTime = CACurrentMediaTime()
+        let after = monotonicNanoseconds()
+        let midpoint = before + ((after - before) / 2)
+        return CoreAnimationAnchor(
+            mediaTime: mediaTime,
+            monotonicNanoseconds: midpoint
+        )
+    }()
+
+    private static func monotonicNanoseconds() -> UInt64 {
+        var time = timespec()
+        precondition(clock_gettime(CLOCK_MONOTONIC, &time) == 0)
+        return UInt64(time.tv_sec) * 1_000_000_000 + UInt64(time.tv_nsec)
+    }
 
     package static func nowNanoseconds() -> UInt64 {
         nanoseconds(for: ContinuousClock().now) ?? anchor.nanoseconds
@@ -301,9 +326,36 @@ package enum SpiceInteractionHostClock {
         guard magnitude <= anchor.nanoseconds else { return nil }
         return anchor.nanoseconds - magnitude
     }
+
+    package static func nanoseconds(
+        forCoreAnimationTime mediaTime: TimeInterval
+    ) -> UInt64? {
+        guard mediaTime.isFinite else { return nil }
+        let deltaSeconds = mediaTime - coreAnimationAnchor.mediaTime
+        let deltaNanoseconds = (deltaSeconds * 1_000_000_000).rounded()
+        guard deltaNanoseconds.isFinite,
+              let delta = Int64(exactly: deltaNanoseconds)
+        else {
+            return nil
+        }
+        if delta >= 0 {
+            let (value, overflow) = coreAnimationAnchor.monotonicNanoseconds
+                .addingReportingOverflow(UInt64(delta))
+            return overflow ? nil : value
+        }
+        guard delta != Int64.min else { return nil }
+        let magnitude = UInt64(-delta)
+        guard magnitude <= coreAnimationAnchor.monotonicNanoseconds else { return nil }
+        return coreAnimationAnchor.monotonicNanoseconds - magnitude
+    }
 }
 
 package final class SpiceInteractionTraceAssembler: Sendable {
+    private struct SurfaceLifecycleKey: Sendable, Hashable {
+        let displayChannelID: UInt8
+        let surfaceID: UInt32
+    }
+
     private struct FrameObservation: Sendable {
         let payload: SpiceInteractionMarkerPayload?
         let displayReceiveNs: UInt64?
@@ -328,6 +380,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         var presentedNs: UInt64?
         var invalidReason: String?
         var retiredDesktopGeneration: UInt64?
+        var retiredSurfaceGenerations: [SurfaceLifecycleKey: UInt64] = [:]
     }
 
     private let pairId: String
@@ -443,6 +496,10 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 state.invalidReason = state.invalidReason ?? "retired_generation_frame"
                 return
             }
+            if Self.isRetiredSurface(identity, state: state) {
+                state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
+                return
+            }
             guard state.frames[identity] == nil else {
                 state.invalidReason = state.invalidReason ?? "duplicate_frame_identity"
                 return
@@ -506,6 +563,11 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                     ?? "retired_generation_selection"
                 return
             }
+            if Self.isRetiredSurface(identity, state: state) {
+                state.selectedFrame = nil
+                state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
+                return
+            }
             guard let selectedFrame = state.frames[identity] else {
                 state.selectedFrame = nil
                 if previousSelectedMarker != nil
@@ -535,21 +597,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         at nanoseconds: UInt64
     ) {
         state.withLock { state in
-            guard state.selectedIdentity == identity else {
-                // Up to two Metal commands may be in flight. A completion for
-                // another delivery is unrelated to this event, not ambiguity.
-                return
-            }
-            if state.metalCommitNs != nil {
-                state.invalidReason = state.invalidReason ?? "duplicate_metal_commit"
-                return
-            }
-            if let retired = state.retiredDesktopGeneration,
-               identity.desktopGeneration <= retired {
-                state.invalidReason = state.invalidReason ?? "commit_after_generation_retired"
-                return
-            }
-            state.metalCommitNs = nanoseconds
+            Self.recordCommit(identity: identity, at: nanoseconds, state: &state)
         }
     }
 
@@ -577,7 +625,47 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                     ?? "presented_after_generation_retired"
                 return
             }
+            if Self.isRetiredSurface(identity, state: state) {
+                state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
+                return
+            }
             state.presentedNs = nanoseconds
+        }
+    }
+
+    package func retireSurfaceLifecycle(
+        displayChannelID: UInt8,
+        surfaceID: UInt32,
+        generation: UInt64
+    ) {
+        state.withLock { state in
+            let key = SurfaceLifecycleKey(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID
+            )
+            state.retiredSurfaceGenerations[key] = max(
+                state.retiredSurfaceGenerations[key] ?? 0,
+                generation
+            )
+            let selectedWasRetired = state.selectedIdentity.map {
+                $0.displayChannelID == displayChannelID
+                    && $0.surfaceID == surfaceID
+                    && $0.surfaceGeneration <= generation
+            } ?? false
+            let markerWasRetired = state.frames.contains {
+                $0.value.payload != nil
+                    && $0.key.displayChannelID == displayChannelID
+                    && $0.key.surfaceID == surfaceID
+                    && $0.key.surfaceGeneration <= generation
+            }
+            if state.presentedNs == nil, selectedWasRetired || markerWasRetired {
+                state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
+            }
+            state.frames = state.frames.filter {
+                $0.key.displayChannelID != displayChannelID
+                    || $0.key.surfaceID != surfaceID
+                    || $0.key.surfaceGeneration > generation
+            }
         }
     }
 
@@ -599,6 +687,44 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 $0.key.desktopGeneration > generation
             }
         }
+    }
+
+    private static func isRetiredSurface(
+        _ identity: SpiceInteractionFrameIdentity,
+        state: State
+    ) -> Bool {
+        let key = SurfaceLifecycleKey(
+            displayChannelID: identity.displayChannelID,
+            surfaceID: identity.surfaceID
+        )
+        guard let retired = state.retiredSurfaceGenerations[key] else { return false }
+        return identity.surfaceGeneration <= retired
+    }
+
+    private static func recordCommit(
+        identity: SpiceInteractionFrameIdentity,
+        at nanoseconds: UInt64,
+        state: inout State
+    ) {
+        guard state.selectedIdentity == identity else {
+            // Up to two Metal commands may be in flight. A completion for
+            // another delivery is unrelated to this event, not ambiguity.
+            return
+        }
+        if state.metalCommitNs != nil {
+            state.invalidReason = state.invalidReason ?? "duplicate_metal_commit"
+            return
+        }
+        if let retired = state.retiredDesktopGeneration,
+           identity.desktopGeneration <= retired {
+            state.invalidReason = state.invalidReason ?? "commit_after_generation_retired"
+            return
+        }
+        if isRetiredSurface(identity, state: state) {
+            state.invalidReason = state.invalidReason ?? "surface_lifecycle_retired"
+            return
+        }
+        state.metalCommitNs = nanoseconds
     }
 
     package func finish(invalidReason: String? = nil) -> SpiceInteractionTraceRecord {

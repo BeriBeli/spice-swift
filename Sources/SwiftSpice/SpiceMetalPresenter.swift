@@ -571,55 +571,76 @@ package final class SpiceMetalFrameView: MTKView {
         let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
         let requestToPresentedStartedAt = pending.requestedAt
         let interactionIdentity = pending.interactionContext?.identity
-        drawable.addPresentedHandler { [presentationDiagnostics] _ in
-            let presentedNanoseconds = SpiceInteractionHostClock.nowNanoseconds()
-            let duration = requestToPresentedStartedAt.duration(
-                to: ContinuousClock().now
+        drawable.addPresentedHandler { [presentationDiagnostics] presentedDrawable in
+            let presentedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+                forCoreAnimationTime: presentedDrawable.presentedTime
             )
-            completionMetrics.recordDrawablePresented(duration)
+            if let presentedNanoseconds,
+               let requestedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+                   for: requestToPresentedStartedAt
+               ),
+               presentedNanoseconds >= requestedNanoseconds,
+               let elapsed = Int64(
+                   exactly: presentedNanoseconds - requestedNanoseconds
+               ) {
+                let duration = Duration.nanoseconds(elapsed)
+                completionMetrics.recordDrawablePresented(duration)
+                presentationDiagnostics?.recordMetalRequestToPresented(
+                    duration,
+                    epoch: presentationEpoch
+                )
+            }
             presentationDiagnostics?.recordMetalPresentedFrame(
                 isAdvancedVideo: isAdvancedVideoFrame,
                 epoch: presentationEpoch
             )
-            presentationDiagnostics?.recordMetalRequestToPresented(
-                duration,
-                epoch: presentationEpoch
-            )
-            if let interactionIdentity {
-                presentationDiagnostics?.recordInteractionPresented(
-                    identity: interactionIdentity,
-                    at: presentedNanoseconds
-                )
+            if let interactionIdentity, let presentedNanoseconds {
+                // The callback may arrive on a Metal-owned thread. Queue trace
+                // mutation on this view's MainActor so the actual commit call
+                // and its immediately following evidence always linearize first.
+                Task { @MainActor in
+                    presentationDiagnostics?.recordInteractionPresented(
+                        identity: interactionIdentity,
+                        at: presentedNanoseconds
+                    )
+                }
             }
         }
         commandBuffer.present(drawable)
-        // Sample the commit phase after presentation is encoded and before the
-        // actual commit call. Publish causal evidence first so an exceptionally
-        // fast completion/presented callback cannot overtake its commit stage.
-        let committedAt = clock.now
-        presentationDiagnostics?.recordViewUpdateToMetalCommit(
-            pending.requestedAt.duration(to: committedAt)
-        )
+        let committedAt = Mutex<ContinuousClock.Instant?>(nil)
         commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
-            presentationDiagnostics?.recordMetalCommitToCompletion(
-                committedAt.duration(to: ContinuousClock().now),
-                epoch: presentationEpoch
-            )
+            let completedAt = ContinuousClock().now
             let completion: SpiceMetalCommandCompletion =
                 commandBuffer.status == .completed ? .succeeded : .failed
             Task { @MainActor in
+                if let committed = committedAt.withLock({ $0 }) {
+                    presentationDiagnostics?.recordMetalCommitToCompletion(
+                        committed.duration(to: completedAt),
+                        epoch: presentationEpoch
+                    )
+                }
                 onCompletion(completion)
             }
         }
+        commandBuffer.commit()
+        // Sample immediately after the actual commit call. Presented and
+        // completion callbacks only mutate view-owned trace state after hopping
+        // back to this MainActor, so neither can overtake this evidence.
+        let commitCallBoundary = clock.now
+        committedAt.withLock { $0 = commitCallBoundary }
+        presentationDiagnostics?.recordViewUpdateToMetalCommit(
+            pending.requestedAt.duration(to: commitCallBoundary)
+        )
         if let interactionIdentity = pending.interactionContext?.identity,
-           let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(for: committedAt) {
+           let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+               for: commitCallBoundary
+           ) {
             presentationDiagnostics?.recordInteractionCommitted(
                 identity: interactionIdentity,
                 at: committedNanoseconds
             )
         }
         presentationDiagnostics?.recordMetalCommandBufferCommitted()
-        commandBuffer.commit()
 
         if !wasUsingMetal {
             spiceRenderingLogger.info("Presentation path changed to Metal IOSurface")
