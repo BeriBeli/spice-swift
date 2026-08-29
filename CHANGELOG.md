@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-08-29
+
 ### Changed
 
 - Replaced realtime playback and capture packet handoffs with fixed-capacity
@@ -31,6 +33,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   while preserving exact `Content-Length`; depth-one `PROPFIND` lazily enforces
   its response limit and a 4,096-child metadata cap. The existing public
   synchronous API remains available.
+
+### Validation
+
+- AIP-42 and AIP-43 close deterministic ownership, movement, concurrency, and
+  retention gates only. This release makes no measured audio/device-performance,
+  WebDAV-throughput, or live-interoperability claim; real audio and WebDAV
+  behavior remains part of the AIP-90 live gates.
 
 ## [0.3.2] — 2026-08-29
 
@@ -341,7 +350,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/BeriBeli/spice-swift/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/BeriBeli/spice-swift/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/BeriBeli/spice-swift/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/BeriBeli/spice-swift/compare/v0.2.7...v0.3.0
