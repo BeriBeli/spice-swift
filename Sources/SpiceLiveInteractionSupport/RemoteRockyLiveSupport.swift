@@ -12,6 +12,7 @@ package enum SpiceLiveInteractionSupportError: Error, Sendable, Equatable {
     case invalidTraceProtocol
     case childFailed
     case childTimedOut
+    case outputLimitExceeded
     case operationTimedOut
 }
 
@@ -117,16 +118,11 @@ package struct SpiceLiveProcessRunner: Sendable {
         arguments: [String],
         standardInput: Data? = nil
     ) throws -> SpiceLiveChildProcess {
-        let process = Process()
         let standardOutput = Pipe()
         let standardError = Pipe()
-        process.executableURL = executableURL
-        process.arguments = argumentPrefix + arguments
-        process.standardOutput = standardOutput
-        process.standardError = standardError
 
         var inputURL: URL?
-        var inputHandle: FileHandle?
+        var inputDescriptor: Int32 = -1
         if let standardInput {
             let url = FileManager.default.temporaryDirectory.appending(
                 path: "swiftspice-live-stdin-\(UUID().uuidString)",
@@ -138,18 +134,33 @@ package struct SpiceLiveProcessRunner: Sendable {
                 throw SpiceLiveInteractionSupportError.childFailed
             }
             inputURL = url
-            inputHandle = try FileHandle(forReadingFrom: url)
-            process.standardInput = inputHandle
+            inputDescriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
         } else {
-            process.standardInput = FileHandle.nullDevice
+            inputDescriptor = Darwin.open("/dev/null", O_RDONLY | O_CLOEXEC)
         }
         defer {
-            try? inputHandle?.close()
+            if inputDescriptor >= 0 { Darwin.close(inputDescriptor) }
             if let inputURL {
                 try? FileManager.default.removeItem(at: inputURL)
             }
+            try? standardOutput.fileHandleForWriting.close()
+            try? standardError.fileHandleForWriting.close()
         }
-        try process.run()
+        guard inputDescriptor >= 0 else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+
+        let process = try SpiceLiveSpawnedProcess.spawn(
+            executablePath: executableURL.path,
+            arguments: argumentPrefix + arguments,
+            standardInput: inputDescriptor,
+            standardOutput: standardOutput.fileHandleForWriting.fileDescriptor,
+            standardError: standardError.fileHandleForWriting.fileDescriptor,
+            descriptorsClosedInChild: [
+                standardOutput.fileHandleForReading.fileDescriptor,
+                standardError.fileHandleForReading.fileDescriptor,
+            ]
+        )
         return SpiceLiveChildProcess(
             process: process,
             standardOutput: standardOutput,
@@ -162,13 +173,15 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
     package static let terminationGrace = Duration.milliseconds(500)
     package static let killGrace = Duration.milliseconds(500)
     package static let pipeDrainGrace = Duration.milliseconds(500)
+    package static let maximumOutputBytesPerStream = 256 * 1_024
+    package static let maximumCombinedOutputBytes = 512 * 1_024
 
-    private let process: Process
+    private let process: SpiceLiveSpawnedProcess
     private let standardOutput: Pipe
     private let standardError: Pipe
 
     fileprivate init(
-        process: Process,
+        process: SpiceLiveSpawnedProcess,
         standardOutput: Pipe,
         standardError: Pipe
     ) {
@@ -187,18 +200,29 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
     }
 
     package func finish(within timeout: Duration) async throws -> SpiceLiveProcessResult {
+        let outputBudget = SpiceLiveOutputBudget(
+            maximumBytes: Self.maximumCombinedOutputBytes
+        )
         let stdoutCollector = SpiceLivePipeCollector(
-            handle: standardOutput.fileHandleForReading
+            handle: standardOutput.fileHandleForReading,
+            maximumBytes: Self.maximumOutputBytesPerStream,
+            budget: outputBudget
         )
         let stderrCollector = SpiceLivePipeCollector(
-            handle: standardError.fileHandleForReading
+            handle: standardError.fileHandleForReading,
+            maximumBytes: Self.maximumOutputBytesPerStream,
+            budget: outputBudget
         )
         let stdoutReader = Task.detached { stdoutCollector.collect() }
         let stderrReader = Task.detached { stderrCollector.collect() }
         var collectorsStopped = false
 
         do {
-            let exited = try await waitForExit(within: timeout)
+            let exited = try await waitForExit(
+                stdoutCollector,
+                stderrCollector,
+                within: timeout
+            )
             guard exited else {
                 _ = await stopBoundedly()
                 await stopCollectors(
@@ -226,12 +250,18 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
                 collectorsStopped = true
                 throw SpiceLiveInteractionSupportError.childTimedOut
             }
+            guard !(stdoutCollector.exceededLimit || stderrCollector.exceededLimit) else {
+                throw SpiceLiveInteractionSupportError.outputLimitExceeded
+            }
             await stdoutReader.value
             await stderrReader.value
             stdoutCollector.close()
             stderrCollector.close()
+            guard let status = process.reap() else {
+                throw SpiceLiveInteractionSupportError.childFailed
+            }
             return SpiceLiveProcessResult(
-                status: process.terminationStatus,
+                status: status,
                 standardOutput: String(decoding: stdoutCollector.data, as: UTF8.self),
                 standardError: String(decoding: stderrCollector.data, as: UTF8.self)
             )
@@ -257,32 +287,49 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
         return exited
     }
 
-    private func waitForExit(within timeout: Duration) async throws -> Bool {
+    private func waitForExit(
+        _ stdout: SpiceLivePipeCollector,
+        _ stderr: SpiceLivePipeCollector,
+        within timeout: Duration
+    ) async throws -> Bool {
         let deadline = ContinuousClock().now.advanced(by: timeout)
-        while process.isRunning, ContinuousClock().now < deadline {
+        while !process.hasExited, ContinuousClock().now < deadline {
+            if stdout.exceededLimit || stderr.exceededLimit {
+                throw SpiceLiveInteractionSupportError.outputLimitExceeded
+            }
             try await Task.sleep(for: .milliseconds(10))
         }
-        return !process.isRunning
+        if stdout.exceededLimit || stderr.exceededLimit {
+            throw SpiceLiveInteractionSupportError.outputLimitExceeded
+        }
+        return process.hasExited
     }
 
     private func stopBoundedly() async -> Bool {
-        guard process.isRunning else { return true }
-        process.terminate()
-        if await waitForExitIgnoringCancellation(within: Self.terminationGrace) {
-            return true
-        }
-        _ = Darwin.kill(process.processIdentifier, SIGKILL)
-        return await waitForExitIgnoringCancellation(within: Self.killGrace)
-    }
-
-    private func waitForExitIgnoringCancellation(within timeout: Duration) async -> Bool {
         let process = process
         return await Task.detached {
-            let deadline = ContinuousClock().now.advanced(by: timeout)
-            while process.isRunning, ContinuousClock().now < deadline {
+            if process.isReaped { return !process.groupExists }
+            // The leader remains unreaped while signals are sent, so its PID
+            // cannot be reused and the atomically-created PGID still names
+            // only this launch's process tree.
+            process.signalGroup(SIGTERM)
+            let termDeadline = ContinuousClock().now.advanced(
+                by: Self.terminationGrace
+            )
+            while ContinuousClock().now < termDeadline {
                 usleep(10_000)
             }
-            return !process.isRunning
+            process.signalGroup(SIGKILL)
+            let killDeadline = ContinuousClock().now.advanced(by: Self.killGrace)
+            while ContinuousClock().now < killDeadline {
+                if process.hasExited {
+                    _ = process.reap()
+                    if !process.groupExists { return true }
+                }
+                usleep(10_000)
+            }
+            _ = process.reap()
+            return !process.groupExists
         }.value
     }
 
@@ -294,7 +341,13 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
         let deadline = ContinuousClock().now.advanced(by: timeout)
         while !(stdout.isFinished && stderr.isFinished),
               ContinuousClock().now < deadline {
+            if stdout.exceededLimit || stderr.exceededLimit {
+                throw SpiceLiveInteractionSupportError.outputLimitExceeded
+            }
             try await Task.sleep(for: .milliseconds(10))
+        }
+        if stdout.exceededLimit || stderr.exceededLimit {
+            throw SpiceLiveInteractionSupportError.outputLimitExceeded
         }
         return stdout.isFinished && stderr.isFinished
     }
@@ -355,13 +408,22 @@ private final class SpiceLivePipeCollector: @unchecked Sendable {
     private struct State: Sendable {
         var data = Data()
         var isFinished = false
+        var exceededLimit = false
     }
 
     private let handle: FileHandle
+    private let maximumBytes: Int
+    private let budget: SpiceLiveOutputBudget
     private let state = Mutex(State())
 
-    init(handle: FileHandle) {
+    init(
+        handle: FileHandle,
+        maximumBytes: Int,
+        budget: SpiceLiveOutputBudget
+    ) {
         self.handle = handle
+        self.maximumBytes = maximumBytes
+        self.budget = budget
     }
 
     var data: Data {
@@ -370,6 +432,10 @@ private final class SpiceLivePipeCollector: @unchecked Sendable {
 
     var isFinished: Bool {
         state.withLock(\.isFinished)
+    }
+
+    var exceededLimit: Bool {
+        state.withLock(\.exceededLimit)
     }
 
     func collect() {
@@ -399,7 +465,16 @@ private final class SpiceLivePipeCollector: @unchecked Sendable {
                 let count = Darwin.read(descriptor, &buffer, buffer.count)
                 if count > 0 {
                     let chunk = Data(buffer.prefix(count))
-                    state.withLock { $0.data.append(chunk) }
+                    let accepted = state.withLock { state -> Bool in
+                        guard state.data.count <= maximumBytes - chunk.count,
+                              budget.reserve(chunk.count) else {
+                            state.exceededLimit = true
+                            return false
+                        }
+                        state.data.append(chunk)
+                        return true
+                    }
+                    if !accepted { return }
                     continue
                 }
                 if count == 0 { return }
@@ -412,6 +487,165 @@ private final class SpiceLivePipeCollector: @unchecked Sendable {
 
     func close() {
         try? handle.close()
+    }
+}
+
+private final class SpiceLiveOutputBudget: Sendable {
+    private let maximumBytes: Int
+    private let usedBytes = Mutex(0)
+
+    init(maximumBytes: Int) {
+        self.maximumBytes = maximumBytes
+    }
+
+    func reserve(_ count: Int) -> Bool {
+        usedBytes.withLock { usedBytes in
+            guard usedBytes <= maximumBytes - count else { return false }
+            usedBytes += count
+            return true
+        }
+    }
+}
+
+private final class SpiceLiveSpawnedProcess: @unchecked Sendable {
+    private struct State: Sendable {
+        var terminationStatus: Int32?
+        var reaped = false
+    }
+
+    private let processIdentifier: pid_t
+    private let processGroup: pid_t
+    private let state = Mutex(State())
+
+    private init(processIdentifier: pid_t) {
+        self.processIdentifier = processIdentifier
+        processGroup = processIdentifier
+    }
+
+    static func spawn(
+        executablePath: String,
+        arguments: [String],
+        standardInput: Int32,
+        standardOutput: Int32,
+        standardError: Int32,
+        descriptorsClosedInChild: [Int32]
+    ) throws -> SpiceLiveSpawnedProcess {
+        let allArguments = [executablePath] + arguments
+        guard !allArguments.contains(where: { $0.utf8.contains(0) }) else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+
+        var actions: posix_spawn_file_actions_t? = nil
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        guard posix_spawn_file_actions_adddup2(&actions, standardInput, STDIN_FILENO) == 0,
+              posix_spawn_file_actions_adddup2(&actions, standardOutput, STDOUT_FILENO) == 0,
+              posix_spawn_file_actions_adddup2(&actions, standardError, STDERR_FILENO) == 0
+        else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+        for descriptor in descriptorsClosedInChild {
+            guard posix_spawn_file_actions_addclose(&actions, descriptor) == 0 else {
+                throw SpiceLiveInteractionSupportError.childFailed
+            }
+        }
+        for descriptor in [standardInput, standardOutput, standardError]
+        where descriptor > STDERR_FILENO {
+            guard posix_spawn_file_actions_addclose(&actions, descriptor) == 0 else {
+                throw SpiceLiveInteractionSupportError.childFailed
+            }
+        }
+
+        var attributes: posix_spawnattr_t? = nil
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+        guard posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP)
+        ) == 0,
+            posix_spawnattr_setpgroup(&attributes, 0) == 0
+        else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+
+        let duplicatedArguments = allArguments.map { argument in
+            argument.withCString { strdup($0) }
+        }
+        guard duplicatedArguments.allSatisfy({ $0 != nil }) else {
+            for argument in duplicatedArguments { free(argument) }
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+        defer {
+            for argument in duplicatedArguments { free(argument) }
+        }
+        var mutableArguments = duplicatedArguments + [nil]
+        var pid: pid_t = 0
+        let result = mutableArguments.withUnsafeMutableBufferPointer { arguments in
+            posix_spawn(
+                &pid,
+                executablePath,
+                &actions,
+                &attributes,
+                arguments.baseAddress,
+                environ
+            )
+        }
+        guard result == 0, pid > 0 else {
+            throw SpiceLiveInteractionSupportError.childFailed
+        }
+        return SpiceLiveSpawnedProcess(processIdentifier: pid)
+    }
+
+    var hasExited: Bool {
+        state.withLock { state in
+            if state.reaped { return true }
+            var information = siginfo_t()
+            guard waitid(
+                P_PID,
+                id_t(processIdentifier),
+                &information,
+                WEXITED | WNOHANG | WNOWAIT
+            ) == 0 else {
+                return errno == ECHILD
+            }
+            return information.si_pid == processIdentifier
+        }
+    }
+
+    var isReaped: Bool {
+        state.withLock(\.reaped)
+    }
+
+    func reap() -> Int32? {
+        state.withLock { state in
+            if state.reaped { return state.terminationStatus }
+            var rawStatus: Int32 = 0
+            let result = waitpid(processIdentifier, &rawStatus, WNOHANG)
+            guard result == processIdentifier else { return nil }
+            let signal = rawStatus & 0x7f
+            let status = signal == 0
+                ? (rawStatus >> 8) & 0xff
+                : 128 + signal
+            state.terminationStatus = status
+            state.reaped = true
+            return status
+        }
+    }
+
+    func signalGroup(_ signal: Int32) {
+        state.withLock { state in
+            guard !state.reaped else { return }
+            _ = Darwin.kill(-processGroup, signal)
+        }
+    }
+
+    var groupExists: Bool {
+        if Darwin.kill(-processGroup, 0) == 0 { return true }
+        return errno == EPERM
     }
 }
 

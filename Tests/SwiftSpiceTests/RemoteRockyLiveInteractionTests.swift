@@ -209,7 +209,6 @@ struct RemoteRockyLiveInteractionTests {
         let identifiers = try processIdentifiers(
             from: await child.readOutputLine(within: .seconds(1))
         )
-        defer { forceTerminate(identifiers) }
         let operationTimeout = Duration.milliseconds(20)
         let outerLimit = operationTimeout
             + SpiceLiveChildProcess.terminationGrace
@@ -233,14 +232,21 @@ struct RemoteRockyLiveInteractionTests {
         watchdog.cancel()
         #expect(!(await watchdog.value))
         #expect(elapsed < outerLimit)
-        #expect(Darwin.kill(try #require(identifiers.first), 0) != 0)
+        expectNoSurvivingProcesses(identifiers)
     }
 
     @Test func terminateAndWaitEscalatesPastIgnoredTERMWithinItsOuterLimit() async throws {
         let fixture = try SpiceLiveScriptFixture(
             """
             trap '' TERM
-            printf 'READY parent=%s\n' "$$"
+            (
+                trap '' TERM
+                while :; do
+                    :
+                done
+            ) &
+            descendant=$!
+            printf 'READY parent=%s descendant=%s\n' "$$" "$descendant"
             while :; do
                 :
             done
@@ -253,7 +259,6 @@ struct RemoteRockyLiveInteractionTests {
         let identifiers = try processIdentifiers(
             from: await child.readOutputLine(within: .seconds(1))
         )
-        defer { forceTerminate(identifiers) }
         let outerLimit = SpiceLiveChildProcess.terminationGrace
             + SpiceLiveChildProcess.killGrace
             + .milliseconds(500)
@@ -270,7 +275,92 @@ struct RemoteRockyLiveInteractionTests {
         #expect(!(await watchdog.value))
         #expect(exited)
         #expect(elapsed < outerLimit)
-        #expect(Darwin.kill(try #require(identifiers.first), 0) != 0)
+        expectNoSurvivingProcesses(identifiers)
+    }
+
+    @Test func outputLimitsAcceptExactBoundsAndFailClosedOneBytePast() async throws {
+        let streamLimit = SpiceLiveChildProcess.maximumOutputBytesPerStream
+        let exactFixture = try SpiceLiveScriptFixture(
+            """
+            /bin/dd if=/dev/zero bs=\(streamLimit) count=1 2>/dev/null
+            exec 3>&2
+            /bin/dd if=/dev/zero bs=\(streamLimit) count=1 2>/dev/null 1>&3
+            exec 3>&-
+            """
+        )
+        defer { exactFixture.remove() }
+        let exactChild = try SpiceLiveProcessRunner(
+            executableURL: exactFixture.executableURL
+        ).launch(arguments: [])
+
+        let exactResult = try await exactChild.finish(within: .seconds(2))
+
+        #expect(exactResult.standardOutput.utf8.count == streamLimit)
+        #expect(exactResult.standardError.utf8.count == streamLimit)
+        #expect(
+            exactResult.standardOutput.utf8.count + exactResult.standardError.utf8.count
+                == SpiceLiveChildProcess.maximumCombinedOutputBytes
+        )
+
+        for stream in ["stdout", "stderr"] {
+            let sensitiveOutput = "ticket=0123456789abcdef0123456789abcdef0123456789abcdef"
+            let overflowBytes = streamLimit - sensitiveOutput.utf8.count + 1
+            let directory = FileManager.default.temporaryDirectory.appending(
+                path: "swiftspice-live-\(stream)-limit-\(UUID().uuidString)",
+                directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let pidFile = directory.appending(path: "pid")
+            let outputCommands: String
+            if stream == "stdout" {
+                outputCommands = """
+                printf '%s' '\(sensitiveOutput)'
+                /bin/dd if=/dev/zero bs=\(overflowBytes) count=1 2>/dev/null
+                """
+            } else {
+                outputCommands = """
+                exec 3>&2
+                printf '%s' '\(sensitiveOutput)' >&3
+                /bin/dd if=/dev/zero bs=\(overflowBytes) count=1 2>/dev/null 1>&3
+                exec 3>&-
+                """
+            }
+            let overflowFixture = try SpiceLiveScriptFixture(
+                """
+                printf '%s\n' "$$" > "$1"
+                trap '' TERM
+                \(outputCommands)
+                while :; do
+                    :
+                done
+                """
+            )
+            defer { overflowFixture.remove() }
+            let overflowChild = try SpiceLiveProcessRunner(
+                executableURL: overflowFixture.executableURL
+            ).launch(arguments: [pidFile.path])
+            var observedError: SpiceLiveInteractionSupportError?
+
+            do {
+                _ = try await overflowChild.finish(within: .seconds(2))
+                Issue.record("one-past-limit \(stream) unexpectedly returned a result")
+            } catch let error as SpiceLiveInteractionSupportError {
+                observedError = error
+            }
+
+            #expect(observedError == .outputLimitExceeded)
+            #expect(!String(reflecting: observedError).contains(sensitiveOutput))
+            let rawProcessIdentifier = try String(
+                contentsOf: pidFile,
+                encoding: .utf8
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let processIdentifier = try #require(pid_t(rawProcessIdentifier))
+            expectNoSurvivingProcesses([processIdentifier])
+        }
     }
 
     @Test func timeoutFinalizationPreservesTheDerivedFirstMissingStage() async throws {
@@ -414,5 +504,15 @@ private func terminationWatchdog(
 private func forceTerminate(_ processIdentifiers: [pid_t]) {
     for identifier in processIdentifiers where Darwin.kill(identifier, 0) == 0 {
         _ = Darwin.kill(identifier, SIGKILL)
+    }
+}
+
+private func expectNoSurvivingProcesses(_ processIdentifiers: [pid_t]) {
+    let survivors = processIdentifiers.filter { Darwin.kill($0, 0) == 0 }
+    #expect(survivors.isEmpty)
+    // Emergency cleanup happens only after recording the orphan regression;
+    // it cannot turn a surviving descendant into a passing assertion.
+    if !survivors.isEmpty {
+        forceTerminate(survivors)
     }
 }
