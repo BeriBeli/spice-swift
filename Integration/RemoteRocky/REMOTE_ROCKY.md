@@ -1,9 +1,12 @@
 # Rocky x86_64 SPICE performance fixture
 
 This fixture runs a disposable Alpine guest under rootless Podman and KVM on a
-configured Rocky SSH host. It is isolated from the Apple/container closure and
-uses the unique container name `swiftspice-perf-ab-qemu`. Set the alias once in
-the invoking shell; `rocky9` is the current fixture host:
+configured Rocky SSH host. It is isolated from the Apple/container closure.
+The default lifecycle remains compatible with the existing
+`swiftspice-perf-ab-qemu` container. A separate experiment must set its own
+base, container, image, and ports in every lifecycle shell; values are strictly
+validated before Podman or state paths are touched. Set the alias once in the
+invoking shell; `rocky9` is the current fixture host:
 
 ```sh
 export SWIFTSPICE_ROCKY_SSH_HOST=rocky9
@@ -14,6 +17,30 @@ The endpoint is deliberately bound only to remote loopback:
 - SPICE: `127.0.0.1:5935`
 - guest load control: `127.0.0.1:5936`
 - fixed guest display: `1280x720`
+
+For the AIP-00b live gate, use an independently built/deployed fixture rather
+than reusing or stopping the default endpoint:
+
+```sh
+export SWIFTSPICE_PERF_BASE="$HOME/swiftspice-aip00b/perf-ab"
+export SWIFTSPICE_PERF_CONTAINER=swiftspice-aip00b-qemu
+export SWIFTSPICE_PERF_IMAGE=localhost/swiftspice-qemu-x86:local
+export SWIFTSPICE_PERF_SPICE_PORT=5945
+export SWIFTSPICE_PERF_CONTROL_PORT=5946
+```
+
+Container names accept only lowercase letters, digits, dot, underscore, and
+dash, beginning with a letter or digit. Image references accept lowercase
+repository path components and an optional OCI-style tag. The selected
+container and image are copied into each run's `configuration.txt`; start,
+stop, status, control, ticket, and round scripts all inherit the same isolated
+base and container values. The five override variables above are an all-or-none
+identity: a partial environment, including a later shell that retains the base
+or ports but loses the container or image, exits with status 2 before creating
+state or invoking Podman. The base must use one canonical absolute spelling;
+trailing slashes, repeated slashes, and dot segments are rejected rather than
+normalized to a potentially different lifecycle identity. With all five unset,
+the historical default lifecycle remains unchanged.
 
 Connect one client at a time through an SSH tunnel:
 
@@ -169,7 +196,15 @@ text representation. Startup requires the manifest capability
 `guest_marker_clock=clock_gettime-monotonic-v1`, and a missing or malformed
 clock sample fails the event explicitly. Startup also requires
 `guest_xi2_monitor=native-xi2-select-sync-v1` plus the pinned libXi/libX11
-runtime versions; `xinput` remains installed only for input diagnostics.
+runtime versions and `guest_marker_roi=binary-grid-v1`; `xinput` remains
+installed only for input diagnostics. The binary marker contains magic
+`0xA5C3`, the 16-lowercase-hex token, the guest UInt64 marker revision, and the
+8-lowercase-hex checksum in an 88-by-2 bit grid of 4-by-4 BGRA cells. The guest
+draw helper targets the active xterm's `WINDOWID`, aligns the ROI in the
+bounded top-left search region, and completes `XSync` before the existing DSR
+visibility barrier may acknowledge it. Its encode-only build mode emits the
+same tightly packed 352-by-8 BGRA layout without requiring X11, so host tests
+and the guest renderer do not maintain separate encoders.
 Each host `arm` invocation is serialized and first sends a random 128-bit
 control barrier. The guest strictly accepts 32 lowercase hexadecimal digits
 and echoes `PERF_CONTROL_SYNC invocation=<id>` to the serial log. The host waits
@@ -212,12 +247,39 @@ The guest's raw `PERF_TRACE` records remain in `server.log`.
 `PERF_MARKER_RENDER` is emitted by the deterministic self-test at the same
 renderer call point; production presents the corresponding ROI in X. Each new
 run also creates a mode-0600 `input-events.jsonl`; the host collector appends
-normalized per-event records using schema version 1. A record includes host
+normalized per-event records using schema version 2. A record includes host
 input and send timing, optional motion ACK, guest marker timing, display
 receive, Surface ready, selected-revision ready, selection, Metal commit,
-presented time, and the Surface generation/frame revision/delivery identity.
+presented time, marker checksum, desktop generation, display channel ID,
+surface ID, and the Surface lifecycle/frame revision/delivery identity.
 Missing or ambiguous evidence is recorded as invalid rather than paired with a
 nearby frame.
+
+The package-only `SpiceInteractionTraceCapture` attaches exactly one assembler
+to a session's presentation diagnostics, caches one finished record, and uses
+`SpiceInteractionTraceJSONLWriter` for bounded mode-0600 publication. Writer
+publication is serialized by a sidecar lock, validates every existing schema-2
+line, writes a same-directory temporary inode, fsyncs it, replaces the output,
+and fsyncs the directory. An exact existing line makes a retry idempotent. The
+remote normalizer applies the same derived-validity rules and never reads the
+ticket. Stream one macOS-produced record to an independently selected run:
+
+```sh
+cat input-event.json | ssh "${SWIFTSPICE_ROCKY_SSH_HOST}" \
+  '$HOME/swiftspice-aip00b/perf-ab/remote/collect-input-events.sh "$HOME/swiftspice-aip00b/perf-ab/logs/RUN_ID"'
+```
+
+Malformed JSON or a record without a stable pair/version/run/order/action/token
+attribution is rejected without writing. Attributable but incomplete evidence
+is atomically retained with `valid=false` and a deterministic reason. The
+record and whole file are capped at 64 KiB and 16 MiB respectively.
+
+The host records `scheduledNs`, `hostInputNs`, and `sendStartedNs` before the
+wire send, then records `sendCompletedNs` after its continuation resumes. This
+lets a causally eligible Display frame arriving during the send continuation be
+retained instead of being dropped for lack of host evidence. A motion ACK may
+be buffered before send completion; the completion stage may confirm that same
+timestamp, while a different or duplicate completion fails closed.
 
 The state machine can be exercised without X using the same validation and
 renderer call point:
@@ -229,11 +291,16 @@ printf '%s\n' \
   /usr/local/bin/input-marker-agent.sh --self-test-jsonl
 ```
 
-This slice makes guest causality and the normalized JSONL schema
-deterministically testable. It does not yet prove that the marker's pixels were
-included in a particular AppKit `presented` callback. A live Rocky run must
-bind the unique marker evidence to the exact presented revision before the
-event is valid for click/key/motion-to-visible acceptance.
+This local slice makes the shared pixel protocol, exact host correlation, and
+normalized JSONL schema deterministically testable. It does not by itself
+prove a live Rocky marker was included in a particular AppKit `presented`
+callback. The host detector synchronously samples only the bounded top-left
+marker ROI at aligned origins 8 through 32 from an immutable publication; an
+IOSurface read is closure-scoped
+and does not populate the full-frame CPU materialization cache. A new
+independent Rocky run must bind the unique marker evidence to
+the exact presented revision before the event is valid for
+click/key/motion-to-visible acceptance.
 
 The Rocky run at
 `/home/beribeli/swiftspice-remote-closure/perf-ab/logs/20260828T170315Z.cfDtZd`

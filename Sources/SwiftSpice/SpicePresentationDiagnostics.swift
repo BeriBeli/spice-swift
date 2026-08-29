@@ -74,10 +74,15 @@ public final class SpicePresentationDiagnostics: Sendable {
     private struct State {
         var metrics = SpicePresentationMetrics()
         var epoch: UInt64 = 0
+    }
+
+    private struct InteractionState: Sendable {
         var interactionTraceAssembler: SpiceInteractionTraceAssembler?
+        var interactionEvidenceWillCommitForTesting: (@Sendable () -> Void)?
     }
 
     private let state = Mutex(State())
+    private let interactionState = Mutex(InteractionState())
 
     public init() {}
 
@@ -92,15 +97,43 @@ public final class SpicePresentationDiagnostics: Sendable {
     package func setInteractionTraceAssembler(
         _ assembler: SpiceInteractionTraceAssembler?
     ) {
-        state.withLock { $0.interactionTraceAssembler = assembler }
+        interactionState.withLock { $0.interactionTraceAssembler = assembler }
+    }
+
+    package func installInteractionTraceAssembler(
+        _ assembler: SpiceInteractionTraceAssembler
+    ) -> Bool {
+        interactionState.withLock { state in
+            guard state.interactionTraceAssembler == nil else { return false }
+            state.interactionTraceAssembler = assembler
+            return true
+        }
+    }
+
+    package func removeInteractionTraceAssembler(
+        _ assembler: SpiceInteractionTraceAssembler
+    ) {
+        interactionState.withLock { state in
+            guard state.interactionTraceAssembler === assembler else { return }
+            state.interactionTraceAssembler = nil
+        }
+    }
+
+    package func setInteractionEvidenceWillCommitForTesting(
+        _ observer: (@Sendable () -> Void)?
+    ) {
+        interactionState.withLock { $0.interactionEvidenceWillCommitForTesting = observer }
     }
 
     package func recordInteractionFrameReceived(
         _ snapshot: SpiceDesktopSnapshot,
         sourceTiming: DisplayFrameSourceTiming?
     ) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.observeFrame(snapshot: snapshot, sourceTiming: sourceTiming)
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.observeFrame(snapshot: snapshot, sourceTiming: sourceTiming)
+        }
     }
 
     package func recordInteractionSelected(
@@ -108,33 +141,45 @@ public final class SpicePresentationDiagnostics: Sendable {
         readyNs: UInt64,
         selectionNs: UInt64
     ) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.observeSelected(
-            identity: identity,
-            readyNs: readyNs,
-            selectionNs: selectionNs
-        )
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.observeSelected(
+                identity: identity,
+                readyNs: readyNs,
+                selectionNs: selectionNs
+            )
+        }
     }
 
     package func recordInteractionCommitted(
         identity: SpiceInteractionFrameIdentity,
         at nanoseconds: UInt64
     ) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.observeCommitted(identity: identity, at: nanoseconds)
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.observeCommitted(identity: identity, at: nanoseconds)
+        }
     }
 
     package func recordInteractionPresented(
         identity: SpiceInteractionFrameIdentity,
         at nanoseconds: UInt64
     ) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.observePresented(identity: identity, at: nanoseconds)
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.observePresented(identity: identity, at: nanoseconds)
+        }
     }
 
     package func retireInteractionDesktopGeneration(_ generation: UInt64) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.retireDesktopGeneration(generation)
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.retireDesktopGeneration(generation)
+        }
     }
 
     package func retireInteractionSurfaceLifecycle(
@@ -142,12 +187,15 @@ public final class SpicePresentationDiagnostics: Sendable {
         surfaceID: UInt32,
         generation: UInt64
     ) {
-        let assembler = state.withLock { $0.interactionTraceAssembler }
-        assembler?.retireSurfaceLifecycle(
-            displayChannelID: displayChannelID,
-            surfaceID: surfaceID,
-            generation: generation
-        )
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.retireSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID,
+                generation: generation
+            )
+        }
     }
 
     package func recordMetalPresentedFrame(
@@ -290,6 +338,9 @@ package enum SpiceInteractionActionClass: String, Codable, Sendable, Equatable {
 /// are validated only against other guest timestamps; they are never compared
 /// with the host monotonic clock.
 package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
+    package static let currentSchemaVersion: UInt64 = 2
+
+    package let schemaVersion: UInt64
     package let pairId: String
     package let version: String
     package let runId: String
@@ -358,6 +409,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         markerChecksum: String? = nil,
         invalidReason externalInvalidReason: String? = nil
     ) {
+        schemaVersion = Self.currentSchemaVersion
         self.pairId = pairId
         self.version = version
         self.runId = runId
@@ -419,6 +471,14 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
 
     package init(from decoder: any Decoder) throws {
         let wire = try Wire(from: decoder)
+        guard wire.schemaVersion == Self.currentSchemaVersion else {
+            throw DecodingError.dataCorrupted(
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "unsupported interaction trace schema version"
+                )
+            )
+        }
         let evidenceOnly = Self(
             pairId: wire.pairId,
             version: wire.version,
@@ -601,6 +661,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
     }
 
     private struct Wire: Codable {
+        let schemaVersion: UInt64
         let pairId: String
         let version: String
         let runId: String
@@ -632,6 +693,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         let invalidReason: String?
 
         init(_ record: SpiceInteractionTraceRecord) {
+            schemaVersion = record.schemaVersion
             pairId = record.pairId
             version = record.version
             runId = record.runId
@@ -664,6 +726,7 @@ package struct SpiceInteractionTraceRecord: Codable, Sendable, Equatable {
         }
 
         enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
             case pairId = "pair_id"
             case version
             case runId = "run_id"

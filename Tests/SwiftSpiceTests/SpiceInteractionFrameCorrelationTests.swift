@@ -1,11 +1,90 @@
 import Foundation
 import QuartzCore
+import Synchronization
 @testable import SpiceChannels
+@testable import SpiceIOSurface
+@testable import SpiceRenderer
 import Testing
 @testable import SwiftSpice
 
 @Suite("Interaction frame correlation")
 struct SpiceInteractionFrameCorrelationTests {
+    @Test func guestBinaryGridEncoderMatchesTheSwiftDetector() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory.appending(
+            path: "binary-grid-marker-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = repositoryRoot.appending(
+            path: "Integration/RemoteRocky/guest/binary-grid-marker.c"
+        )
+        let executable = temporaryDirectory.appending(path: "binary-grid-marker")
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/clang")
+        compiler.arguments = [
+            "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-DBINARY_GRID_MARKER_ENCODE_ONLY",
+            source.path, "-o", executable.path,
+        ]
+        try compiler.run()
+        compiler.waitUntilExit()
+        try #require(compiler.terminationStatus == 0)
+
+        let output = Pipe()
+        let encoder = Process()
+        encoder.executableURL = executable
+        encoder.arguments = [
+            "--encode-bgra", token, "77", String(format: "%08x", checksum),
+        ]
+        encoder.standardOutput = output
+        try encoder.run()
+        let encodedMarker = output.fileHandleForReading.readDataToEndOfFile()
+        encoder.waitUntilExit()
+        try #require(encoder.terminationStatus == 0)
+
+        let markerWidth = 88 * 4
+        let markerHeight = 2 * 4
+        #expect(encodedMarker.count == markerWidth * markerHeight * 4)
+        var pixels = blankPixels
+        let originX = 8
+        let originY = 8
+        for row in 0..<markerHeight {
+            let sourceStart = row * markerWidth * 4
+            let destinationStart = (originY + row) * bytesPerRow + originX * 4
+            pixels.replaceSubrange(
+                destinationStart..<(destinationStart + markerWidth * 4),
+                with: encodedMarker[sourceStart..<(sourceStart + markerWidth * 4)]
+            )
+        }
+        let markedSnapshot = snapshot(
+            identity: identity(deliverySequence: 40),
+            pixels: pixels
+        )
+
+        guard case let .exact(payload, detectedIdentity) =
+            SpiceInteractionMarkerROIDetector.detect(
+                in: markedSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+        else {
+            Issue.record("guest binary-grid-v1 pixels were not decoded exactly")
+            return
+        }
+        #expect(payload.token == token)
+        #expect(payload.markerRevision == 77)
+        #expect(payload.checksum == checksum)
+        #expect(detectedIdentity == identity(deliverySequence: 40))
+    }
+
     @Test func markerROIDetectorDecodesPayloadFromTheExactFrameIdentity() throws {
         let markedSnapshot = markerSnapshot(
             identity: identity(deliverySequence: 41),
@@ -54,13 +133,13 @@ struct SpiceInteractionFrameCorrelationTests {
             placements: [
                 SpiceInteractionMarkerPlacement(
                     payload: ambiguousPayload,
-                    originX: 0,
-                    originY: 0
+                    originX: 8,
+                    originY: 8
                 ),
                 SpiceInteractionMarkerPlacement(
                     payload: ambiguousPayload,
-                    originX: 0,
-                    originY: 12
+                    originX: 8,
+                    originY: 20
                 ),
             ],
             frameWidth: width,
@@ -76,6 +155,124 @@ struct SpiceInteractionFrameCorrelationTests {
             expectedToken: token,
             expectedChecksum: checksum
         ) == .ambiguous(matchCount: 2))
+    }
+
+    @Test func iosurfaceMarkerDetectionBorrowsOnlyTheBoundedROIAndNeverMaterializesPixels() throws {
+        // One pixel below 1280 forces the IOSurface's physical row stride to
+        // differ from the compact frame width on the production pool.
+        let frameWidth = 1_279
+        let frameHeight = 720
+        let sourceBytesPerRow = frameWidth * 4 + 16
+        let markerPayload = SpiceInteractionMarkerPayload(
+            token: token,
+            markerRevision: 77,
+            checksum: checksum
+        )
+        let sourcePixels = SpiceInteractionMarkerROIDetector.renderForTesting(
+            placements: [SpiceInteractionMarkerPlacement(
+                payload: markerPayload,
+                originX: 32,
+                originY: 32
+            )],
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            bytesPerRow: sourceBytesPerRow
+        )
+        let pool = IOSurfaceFramePool(limits: .init(
+            maximumFrames: 1,
+            maximumBytes: 8 * 1_024 * 1_024
+        ))
+        let materializationMetrics = FrameMaterializationMetrics()
+        let expectedIdentity = identity(deliverySequence: 43)
+
+        func exerciseDetector() throws -> (
+            SpiceInteractionMarkerDetection,
+            SpiceInteractionMarkerDetection,
+            SpiceInteractionMarkerDetection
+        ) {
+            let ioSurfaceFrame = try #require(pool.makeFrame(
+                width: frameWidth,
+                height: frameHeight,
+                sourceBytesPerRow: sourceBytesPerRow,
+                pixels: sourcePixels
+            ))
+            try #require(ioSurfaceFrame.bytesPerRow > frameWidth * 4)
+            let pixelStorage = FramePixelStorage(
+                pixels: nil,
+                ioSurfaceFrame: ioSurfaceFrame,
+                expectedPixelBytes: frameWidth * frameHeight * 4,
+                materializationMetrics: materializationMetrics
+            )
+            let rendererSnapshot = FrameSnapshot(
+                surfaceID: expectedIdentity.surfaceID,
+                width: frameWidth,
+                height: frameHeight,
+                bytesPerRow: ioSurfaceFrame.bytesPerRow,
+                lifecycleGeneration: expectedIdentity.surfaceGeneration,
+                revision: expectedIdentity.frameRevision,
+                pixelStorage: pixelStorage,
+                ioSurfaceFrame: ioSurfaceFrame
+            )
+            let desktopSnapshot = snapshot(
+                identity: expectedIdentity,
+                rendererSnapshot: rendererSnapshot
+            )
+
+            let exact = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            pixelStorage.failNextReadForTesting()
+            let failedRead = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            let recovered = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            return (exact, failedRead, recovered)
+        }
+
+        let (exact, failedRead, recovered) = try exerciseDetector()
+        #expect(exact == .exact(payload: markerPayload, identity: expectedIdentity))
+        #expect(failedRead == .none)
+        #expect(recovered == exact)
+        #expect(materializationMetrics.snapshot().count == 0)
+        #expect(materializationMetrics.snapshot().bytes == 0)
+        #expect(pool.metrics().inUseFrames == 0)
+
+        let maximumROIPixelBytes = (
+            32 + SpiceInteractionMarkerROIDetector.columns
+                * SpiceInteractionMarkerROIDetector.cellSize
+        ) * (
+            32 + SpiceInteractionMarkerROIDetector.rows
+                * SpiceInteractionMarkerROIDetector.cellSize
+        ) * 4
+        let fullFramePixelBytes = 1_280 * frameHeight * 4
+        #expect(maximumROIPixelBytes == 61_440)
+        #expect(maximumROIPixelBytes < fullFramePixelBytes / 50)
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "Sources/SwiftSpice/SpiceInteractionCausalTrace.swift")
+        let detectorSource = try String(contentsOf: sourceURL, encoding: .utf8)
+        let detectStart = try #require(detectorSource.range(
+            of: "package static func detect("
+        ))
+        let decodeStart = try #require(detectorSource.range(
+            of: "private static func decode(",
+            range: detectStart.upperBound..<detectorSource.endIndex
+        ))
+        let detectBody = detectorSource[detectStart.lowerBound..<decodeStart.lowerBound]
+        #expect(detectBody.contains("withReadOnlyPixelBytes"))
+        #expect(!detectBody.contains("frame.pixels"))
+        #expect(!detectBody.contains("copyPixels"))
     }
 
     @Test func guestMarkerAcknowledgmentAloneCannotBecomeVisibleEvidence() {
@@ -272,8 +469,8 @@ struct SpiceInteractionFrameCorrelationTests {
         )
         let ambiguousPixels = SpiceInteractionMarkerROIDetector.renderForTesting(
             placements: [
-                SpiceInteractionMarkerPlacement(payload: payload, originX: 0, originY: 0),
-                SpiceInteractionMarkerPlacement(payload: payload, originX: 0, originY: 12),
+                SpiceInteractionMarkerPlacement(payload: payload, originX: 8, originY: 8),
+                SpiceInteractionMarkerPlacement(payload: payload, originX: 8, originY: 20),
             ],
             frameWidth: width,
             frameHeight: height,
@@ -576,6 +773,249 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(completedBeforeRetirement.finish().valid)
     }
 
+    @Test func presentedCallbackLinearizesBeforeCaptureFinishOrIsDetached() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presented-race-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-presented-race",
+            version: "v0.3.1",
+            runId: "run-presented-race",
+            order: 1,
+            actionClass: .motion,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 901)
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10,
+            motionAckNs: receive - 15
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+
+        let callbackEntered = DispatchSemaphore(value: 0)
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let callbackCount = Mutex(0)
+        diagnostics.setInteractionEvidenceWillCommitForTesting {
+            callbackCount.withLock { $0 += 1 }
+            callbackEntered.signal()
+            releaseCallback.wait()
+        }
+        let presented = Task.detached {
+            diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+        }
+        try #require(await waitForInteractionTraceSemaphore(
+            callbackEntered,
+            timeout: .seconds(1)
+        ) == .success)
+        let finishing = Task.detached {
+            try capture.finish()
+        }
+        releaseCallback.signal()
+
+        await presented.value
+        let record = try await finishing.value
+        #expect(record.valid)
+        #expect(record.presentedNs == ready + 30)
+        #expect(callbackCount.withLock { $0 } == 1)
+
+        // Finish detached the assembler. A subsequent callback neither enters
+        // the commit hook nor mutates the cached record.
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 40)
+        #expect(callbackCount.withLock { $0 } == 1)
+        do {
+            _ = try capture.finish()
+            Issue.record("finished capture rebuilt or appended its cached record")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .captureAlreadyFinished)
+        }
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        ) == record)
+    }
+
+    @Test func captureRetainsPresentedFrameUntilTheSendContinuationCompletes() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-send-completion-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-send-completion",
+            version: "v0.3.1",
+            runId: "run-send-completion",
+            order: 1,
+            actionClass: .motion,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let earlyMotionAcknowledgment = receive - 5
+        let frameIdentity = identity(deliverySequence: 902)
+
+        try capture.recordHostInput(
+            scheduledNs: receive - 30,
+            hostInputNs: receive - 20,
+            sendStartedNs: receive - 10
+        )
+        try capture.recordMotionAcknowledged(at: earlyMotionAcknowledgment)
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        // The transport continuation resumes last. Supplying the same ACK is
+        // an idempotent linearization of evidence that arrived during send.
+        try capture.recordSendCompleted(
+            at: receive + 5,
+            motionAckNs: earlyMotionAcknowledgment
+        )
+        let record = try capture.finish()
+
+        #expect(record.valid)
+        #expect(record.sendStartedNs == receive - 10)
+        #expect(record.displayReceiveNs == receive)
+        #expect(record.sendCompletedNs == receive + 5)
+        #expect(record.motionAckNs == earlyMotionAcknowledgment)
+        #expect(record.presentedNs == ready + 30)
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        ) == record)
+    }
+
+    @Test func captureRejectsMissingDuplicateOrNonMonotonicSendCompletion() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-send-failures-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func makeCapture(
+            _ name: String
+        ) throws -> (SpiceInteractionTraceCapture, SpicePresentationDiagnostics) {
+            let diagnostics = SpicePresentationDiagnostics()
+            let capture = try SpiceInteractionTraceCapture(
+                presentationDiagnostics: diagnostics,
+                writer: SpiceInteractionTraceJSONLWriter(
+                    outputURL: directory.appending(path: "\(name).jsonl")
+                ),
+                pairId: "pair-\(name)",
+                version: "v0.3.1",
+                runId: "run-send-failures",
+                order: 1,
+                actionClass: .motion,
+                token: token,
+                checksum: checksum
+            )
+            return (capture, diagnostics)
+        }
+
+        let (missingPrelude, _) = try makeCapture("missing-prelude")
+        try missingPrelude.recordSendCompleted(at: 40)
+        let missingPreludeRecord = try missingPrelude.finish()
+        #expect(missingPreludeRecord.invalidReason == "send_completion_before_host_evidence")
+
+        let (duplicate, _) = try makeCapture("duplicate")
+        try duplicate.recordHostInput(scheduledNs: 10, hostInputNs: 20, sendStartedNs: 30)
+        try duplicate.recordSendCompleted(at: 40)
+        try duplicate.recordSendCompleted(at: 41)
+        let duplicateRecord = try duplicate.finish()
+        #expect(duplicateRecord.invalidReason == "duplicate_send_completion")
+
+        let (nonMonotonic, nonMonotonicDiagnostics) = try makeCapture("non-monotonic")
+        try nonMonotonic.recordHostInput(scheduledNs: 10, hostInputNs: 20, sendStartedNs: 30)
+        try nonMonotonic.recordSendCompleted(at: 29)
+        try nonMonotonic.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        let nonMonotonicTiming = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let nonMonotonicReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: nonMonotonicTiming.surfaceReadyAt
+        ))
+        let nonMonotonicIdentity = identity(deliverySequence: 903)
+        nonMonotonicDiagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: nonMonotonicIdentity, markerRevision: 77),
+            sourceTiming: nonMonotonicTiming
+        )
+        nonMonotonicDiagnostics.recordInteractionSelected(
+            identity: nonMonotonicIdentity,
+            readyNs: nonMonotonicReady,
+            selectionNs: nonMonotonicReady + 10
+        )
+        nonMonotonicDiagnostics.recordInteractionCommitted(
+            identity: nonMonotonicIdentity,
+            at: nonMonotonicReady + 20
+        )
+        nonMonotonicDiagnostics.recordInteractionPresented(
+            identity: nonMonotonicIdentity,
+            at: nonMonotonicReady + 30
+        )
+        let nonMonotonicRecord = try nonMonotonic.finish()
+        #expect(nonMonotonicRecord.invalidReason == "non_monotonic_timestamps")
+
+        let (conflictingAcknowledgment, _) = try makeCapture("conflicting-ack")
+        try conflictingAcknowledgment.recordHostInput(
+            scheduledNs: 10,
+            hostInputNs: 20,
+            sendStartedNs: 30
+        )
+        try conflictingAcknowledgment.recordMotionAcknowledged(at: 35)
+        try conflictingAcknowledgment.recordSendCompleted(at: 40, motionAckNs: 36)
+        let conflictingAcknowledgmentRecord = try conflictingAcknowledgment.finish()
+        #expect(conflictingAcknowledgmentRecord.invalidReason == "duplicate_motion_ack")
+    }
+
     @Test func coreAnimationPresentedTimeMapsIntoTheHostMonotonicClock() throws {
         let before = SpiceInteractionHostClock.nowNanoseconds()
         let mediaTime = CACurrentMediaTime()
@@ -687,6 +1127,31 @@ struct SpiceInteractionFrameCorrelationTests {
 
     private func snapshot(
         identity: SpiceInteractionFrameIdentity,
+        rendererSnapshot: FrameSnapshot
+    ) -> SpiceDesktopSnapshot {
+        let surface = SpiceSurfaceIdentity(
+            displayChannelID: identity.displayChannelID,
+            surfaceID: identity.surfaceID,
+            generation: identity.surfaceGeneration
+        )
+        return SpiceDesktopSnapshot(
+            generation: identity.desktopGeneration,
+            frame: SpiceFrameUpdate(
+                frame: SpiceFrame(rendererSnapshot),
+                revision: SpiceFrameRevision(
+                    surface: surface,
+                    value: identity.frameRevision
+                ),
+                damage: .full
+            ),
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: identity.deliverySequence
+        )
+    }
+
+    private func snapshot(
+        identity: SpiceInteractionFrameIdentity,
         pixels: Data
     ) -> SpiceDesktopSnapshot {
         let surface = SpiceSurfaceIdentity(
@@ -715,5 +1180,16 @@ struct SpiceInteractionFrameCorrelationTests {
             pointerMode: .absolute,
             deliverySequence: identity.deliverySequence
         )
+    }
+}
+
+private func waitForInteractionTraceSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: DispatchTimeInterval
+) async -> DispatchTimeoutResult {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + timeout))
+        }
     }
 }

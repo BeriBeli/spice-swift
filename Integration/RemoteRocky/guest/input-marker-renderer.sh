@@ -258,10 +258,10 @@ draw_marker() {
         return
     fi
 
-    # Rows 1-4 are reserved by both fullscreen workloads. Emit the complete
-    # ROI in one terminal write while the animation producer is stopped.
-    printf '\033[1;1H\033[30;107m\033[2KCAUSAL INPUT MARKER\n\033[2Ktoken=%s\n\033[2Kmarker_revision=%s checksum=%s\n\033[2K\033[0m' \
-        "${token}" "${revision}" "${checksum}" > /dev/tty
+    # The helper draws the versioned binary-grid-v1 payload into this xterm's
+    # WINDOWID and completes XSync before the existing terminal DSR barrier.
+    /usr/local/bin/binary-grid-marker --draw \
+        "${token}" "${revision}" "${checksum}"
 }
 
 prepare_terminal_response() {
