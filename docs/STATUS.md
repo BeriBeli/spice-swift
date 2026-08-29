@@ -55,12 +55,23 @@ Agent behavior, including system-trusted TLS.
   without claiming measured audio latency or device performance; real-device
   behavior remains part of AIP-90.
 
-- AIP-43 is active on a clean successor branch from current `main`. Its
-  deterministic gate moves blocking WebDAV filesystem operations to a
-  width-two bounded executor while preserving per-client filesystem/send order,
-  allowing unrelated-client progress, and retaining the existing synchronous
-  public API. Draft PR #35 supplies the previously resolved review constraints;
-  this work makes no performance or live-interoperability claim before AIP-90.
+- AIP-43 is complete on PR #48. Blocking WebDAV filesystem work now runs on a
+  width-two executor with 64-job and 256 MiB retained-storage limits. One
+  client's filesystem operations and complete response sends remain ordered,
+  while unrelated clients overlap; close, cancellation, failed delivery,
+  Session identity changes, and same-ID filesystem or suspended-sender
+  retirement suppress stale work with exactly-once accounting. `HEAD` is
+  metadata-only with exact `Content-Length`; depth-one `PROPFIND` enumerates
+  lazily, stops at the response limit, and retains at most 4,096 child
+  fragments. The existing synchronous public API is unchanged. Focused WebDAV
+  Debug and Release gates passed 20/20, and the related 33-execution filter
+  passed under ThreadSanitizer and AddressSanitizer. Apple Silicon CI run
+  `33251870601`, job `99098817923`, passed build, public API, full tests,
+  AddressSanitizer, and coverage in 11m45s; exact implementation-head review
+  found no major issue after all three successor P1 threads were fixed, replied
+  to with source/test evidence, and resolved, and all four retained Draft #35
+  constraints were rechecked. This is a deterministic completion only; no
+  throughput or live-interoperability claim is made before AIP-90.
 
 - AIP-10 is locally complete. Full-header messages are first validated as one
   owned physical batch, then list submessages are dispatched in wire-list order

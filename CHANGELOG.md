@@ -26,8 +26,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
   have explicit checked limits.
 - Kept WebDAV close, response failure, cancellation, and same-client-ID reuse
   generation-safe even when a synchronous filesystem operation cannot be
-  preempted. Late results and queued suffixes are suppressed with exactly-once
-  accounting, and the existing public synchronous API remains available.
+  preempted or a response sender is suspended. Late results and queued suffixes
+  are suppressed with exactly-once accounting. `HEAD` now reads metadata only
+  while preserving exact `Content-Length`; depth-one `PROPFIND` lazily enforces
+  its response limit and a 4,096-child metadata cap. The existing public
+  synchronous API remains available.
 
 ## [0.3.2] — 2026-08-29
 
