@@ -28,8 +28,12 @@ public actor SpiceWebDAVServer {
     /// currently emitted header, a 20-digit Content-Length, and ample growth
     /// room while remaining independent from the inbound header limit.
     private static let maximumGeneratedResponseHeaderBytes = 4 * 1_024
+    /// Sorting requires bounded child metadata even when names and generated
+    /// fragments are individually small.
+    private static let maximumPropfindChildEntries = 4_096
     package typealias FileOperationObserver = @Sendable (Int64, UInt64) -> Void
     package typealias FileBodyReadObserver = @Sendable (URL, UInt64) -> Void
+    package typealias DirectoryEntryObserver = @Sendable (URL) -> Void
     package typealias ResponseSender = @Sendable (
         Result<[Data], SpiceWebDAVPipelineError>
     ) async -> Bool
@@ -64,6 +68,11 @@ public actor SpiceWebDAVServer {
     private struct ActiveResponseOwner: Sendable, Equatable {
         let generation: UInt64
         let submissionID: UInt64
+    }
+
+    private struct PropertyFragment: Sendable {
+        let sortKey: String
+        var data: Data?
     }
 
     package struct Diagnostics: Sendable, Equatable {
@@ -118,6 +127,7 @@ public actor SpiceWebDAVServer {
     private nonisolated let filesystemExecutor: SpiceFilesystemTaskExecutor
     private nonisolated let fileOperationWillBegin: FileOperationObserver?
     private nonisolated let fileBodyWillRead: FileBodyReadObserver?
+    private nonisolated let directoryEntryWasEnumerated: DirectoryEntryObserver?
     private var clients: [Int64: ClientState] = [:]
     private var legacyBuffers: [Int64: Data] = [:]
     private var legacyBufferedInputBytes = 0
@@ -169,6 +179,7 @@ public actor SpiceWebDAVServer {
         filesystemExecutor = SpiceFilesystemTaskExecutor()
         fileOperationWillBegin = nil
         fileBodyWillRead = nil
+        directoryEntryWasEnumerated = nil
     }
 
     package init(
@@ -181,7 +192,8 @@ public actor SpiceWebDAVServer {
         maximumQueuedRetainedBytes: Int = 256 * 1_024 * 1_024,
         filesystemExecutor: SpiceFilesystemTaskExecutor,
         fileOperationWillBegin: FileOperationObserver? = nil,
-        fileBodyWillRead: FileBodyReadObserver? = nil
+        fileBodyWillRead: FileBodyReadObserver? = nil,
+        directoryEntryWasEnumerated: DirectoryEntryObserver? = nil
     ) throws(SpiceWebDAVServerError) {
         let resolved = root.standardizedFileURL.resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
@@ -208,6 +220,7 @@ public actor SpiceWebDAVServer {
         self.filesystemExecutor = filesystemExecutor
         self.fileOperationWillBegin = fileOperationWillBegin
         self.fileBodyWillRead = fileBodyWillRead
+        self.directoryEntryWasEnumerated = directoryEntryWasEnumerated
     }
 
     /// Compatibility path preserving the original synchronous actor API.
@@ -932,38 +945,100 @@ public actor SpiceWebDAVServer {
         guard depth == "0" || depth == "1" else {
             return Response(status: 403, reason: "Forbidden")
         }
-        var urls = [url]
-        if depth == "1", isDirectory(url, fileManager: fileManager) {
-            urls += try fileManager.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ).sorted { $0.lastPathComponent < $1.lastPathComponent }
-        }
         let prefix = Data(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>".utf8
         ) + Data("<D:multistatus xmlns:D=\"DAV:\">".utf8)
         let suffix = Data("</D:multistatus>".utf8)
-        var xml = prefix
-        for itemURL in urls {
-            let entry = Data(try propertyResponse(
-                itemURL,
-                fileManager: fileManager
-            ).utf8)
-            let (withEntry, entryOverflow) = xml.count.addingReportingOverflow(entry.count)
-            let (finalSize, finalOverflow) = withEntry.addingReportingOverflow(suffix.count)
-            guard !entryOverflow, !finalOverflow, finalSize <= maximumBodyBytes else {
-                return Response(status: 507, reason: "Insufficient Storage")
+        let rootFragment = Data(try propertyResponse(
+            url,
+            fileManager: fileManager
+        ).utf8)
+        guard let rootBodyBytes = checkedPropertyBodySize(
+            current: prefix.count,
+            adding: rootFragment.count,
+            suffix: suffix.count
+        ) else {
+            return Response(status: 507, reason: "Insufficient Storage")
+        }
+
+        var bodyBytes = rootBodyBytes - suffix.count
+        var childFragments: [PropertyFragment] = []
+        if depth == "1", isDirectory(url, fileManager: fileManager) {
+            var enumerationFailure: (any Error)?
+            guard let enumerator = fileManager.enumerator(
+                at: url,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+                errorHandler: { _, error in
+                    enumerationFailure = error
+                    return false
+                }
+            ) else {
+                throw SpiceWebDAVServerError.invalidRequest
             }
-            xml.append(entry)
+            while let value = enumerator.nextObject() {
+                guard let childURL = value as? URL else {
+                    throw SpiceWebDAVServerError.invalidRequest
+                }
+                directoryEntryWasEnumerated?(childURL)
+                guard childFragments.count < Self.maximumPropfindChildEntries else {
+                    return Response(status: 507, reason: "Insufficient Storage")
+                }
+                let fragment = Data(try propertyResponse(
+                    childURL,
+                    fileManager: fileManager
+                ).utf8)
+                guard let nextBodyBytes = checkedPropertyBodySize(
+                    current: bodyBytes,
+                    adding: fragment.count,
+                    suffix: suffix.count
+                ) else {
+                    return Response(status: 507, reason: "Insufficient Storage")
+                }
+                bodyBytes = nextBodyBytes - suffix.count
+                childFragments.append(PropertyFragment(
+                    sortKey: childURL.lastPathComponent,
+                    data: fragment
+                ))
+            }
+            if let enumerationFailure {
+                throw enumerationFailure
+            }
+        }
+
+        childFragments.sort { lhs, rhs in
+            lhs.sortKey < rhs.sortKey
+        }
+        var xml = prefix
+        xml.append(rootFragment)
+        for index in childFragments.indices {
+            guard let fragment = childFragments[index].data else {
+                preconditionFailure("property fragment consumed more than once")
+            }
+            childFragments[index].data = nil
+            xml.append(fragment)
         }
         xml.append(suffix)
+        precondition(xml.count == bodyBytes + suffix.count)
         return Response(
             status: 207,
             reason: "Multi-Status",
             headers: ["Content-Type": "application/xml; charset=utf-8"],
             body: xml
         )
+    }
+
+    private nonisolated func checkedPropertyBodySize(
+        current: Int,
+        adding: Int,
+        suffix: Int
+    ) -> Int? {
+        let (withEntry, entryOverflow) = current.addingReportingOverflow(adding)
+        let (finalSize, finalOverflow) = withEntry.addingReportingOverflow(suffix)
+        guard !entryOverflow, !finalOverflow, finalSize <= maximumBodyBytes else {
+            return nil
+        }
+        return finalSize
     }
 
     private nonisolated func get(
