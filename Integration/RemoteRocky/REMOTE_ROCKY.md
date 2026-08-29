@@ -37,8 +37,10 @@ stop, status, control, ticket, and round scripts all inherit the same isolated
 base and container values. The five override variables above are an all-or-none
 identity: a partial environment, including a later shell that retains the base
 or ports but loses the container or image, exits with status 2 before creating
-state or invoking Podman. With all five unset, the historical default lifecycle
-remains unchanged.
+state or invoking Podman. The base must use one canonical absolute spelling;
+trailing slashes, repeated slashes, and dot segments are rejected rather than
+normalized to a potentially different lifecycle identity. With all five unset,
+the historical default lifecycle remains unchanged.
 
 Connect one client at a time through an SSH tunnel:
 

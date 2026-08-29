@@ -38,6 +38,8 @@ readonly PERF_LIFECYCLE_LOCK="${PERF_STATE}/lifecycle.lock"
 
 if [[ ! "${PERF_BASE}" =~ ^/[^[:cntrl:]]+$ \
     || "${PERF_BASE}" == / \
+    || "${PERF_BASE}" == */ \
+    || "${PERF_BASE}" == *"//"* \
     || "${PERF_BASE}" == *'/../'* \
     || "${PERF_BASE}" == */.. \
     || "${PERF_BASE}" == *'/./'* \

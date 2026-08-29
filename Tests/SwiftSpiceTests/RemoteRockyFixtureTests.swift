@@ -2376,6 +2376,97 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
     }
 
+    @Test func isolatedEndpointRejectsEveryNonCanonicalBaseBeforeCreatingState() throws {
+        let container = "swiftspice-base-validation.test"
+        let invalidFixture = try RemoteRockyFixture()
+        defer { invalidFixture.remove() }
+        let existingComponent = invalidFixture.root.appending(path: "existing")
+        try FileManager.default.createDirectory(
+            at: existingComponent,
+            withIntermediateDirectories: true
+        )
+        let invalidBases: [(value: String, forbiddenState: URL)] = [
+            (
+                "\(invalidFixture.root.path)/invalid-trailing/",
+                invalidFixture.root.appending(path: "invalid-trailing/state")
+            ),
+            (
+                "\(invalidFixture.root.path)/invalid-internal//base",
+                invalidFixture.root.appending(path: "invalid-internal/base/state")
+            ),
+            (
+                "/\(invalidFixture.root.path)/invalid-leading",
+                invalidFixture.root.appending(path: "invalid-leading/state")
+            ),
+            (
+                "\(invalidFixture.root.path)/./invalid-dot",
+                invalidFixture.root.appending(path: "invalid-dot/state")
+            ),
+            (
+                "\(existingComponent.path)/../invalid-dotdot",
+                invalidFixture.root.appending(path: "invalid-dotdot/state")
+            ),
+        ]
+
+        for invalidBase in invalidBases {
+            let overrides = [
+                "SWIFTSPICE_PERF_BASE": invalidBase.value,
+                "SWIFTSPICE_PERF_CONTAINER": container,
+                "SWIFTSPICE_PERF_IMAGE": "registry.example/swiftspice/qemu:base-validation",
+                "SWIFTSPICE_PERF_SPICE_PORT": "8935",
+                "SWIFTSPICE_PERF_CONTROL_PORT": "8936",
+            ]
+            let result = try invalidFixture.run(
+                "remote/start.sh",
+                ssMode: "both",
+                additionalEnvironment: overrides
+            )
+            #expect(result.status == 2)
+            #expect(result.output.contains("SWIFTSPICE_PERF_BASE is invalid."))
+            #expect(!FileManager.default.fileExists(atPath: invalidBase.forbiddenState.path))
+            #expect(!invalidFixture.didDetachContainer)
+            #expect(!invalidFixture.evidenceOrArgumentsContain(container))
+            #expect(!invalidFixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+        }
+
+        let canonicalFixture = try RemoteRockyFixture()
+        defer { canonicalFixture.remove() }
+        let canonicalOverrides = [
+            "SWIFTSPICE_PERF_BASE": canonicalFixture.base.path,
+            "SWIFTSPICE_PERF_CONTAINER": container,
+            "SWIFTSPICE_PERF_IMAGE": "registry.example/swiftspice/qemu:base-validation",
+            "SWIFTSPICE_PERF_SPICE_PORT": "8935",
+            "SWIFTSPICE_PERF_CONTROL_PORT": "8936",
+        ]
+        let start = try canonicalFixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: canonicalOverrides
+        )
+        try #require(start.status == 0)
+        let runID = try canonicalFixture.currentRunID()
+        let runDirectory = canonicalFixture.base.appending(path: "logs/\(runID)")
+        let collected = try runInputCollector(
+            runDirectory: runDirectory,
+            event: Self.collectorEvent(runID: runID, order: 1)
+        )
+        #expect(collected.status == 0)
+        let output = runDirectory.appending(path: "input-events.jsonl")
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        ).valid)
+        let stop = try canonicalFixture.run(
+            "remote/stop.sh",
+            ssMode: "both",
+            additionalEnvironment: canonicalOverrides
+        )
+        #expect(stop.status == 0)
+        #expect(!canonicalFixture.isContainerRunning)
+    }
+
     @Test func concurrentStartsShareOneEndpointWithoutLosingActiveState() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
