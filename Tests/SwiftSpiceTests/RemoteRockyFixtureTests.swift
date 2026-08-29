@@ -956,6 +956,171 @@ struct RemoteRockyFixtureTests {
         #expect(!timeout.output.contains("PERF_ARM_REJECTED"))
     }
 
+    @Test func controlTraceStreamsArmedBeforeOneExactGuestRevision() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+        let token = "0000000000000030"
+        let isolatedEnvironment = [
+            "SWIFTSPICE_PERF_BASE": fixture.base.path,
+            "SWIFTSPICE_PERF_CONTAINER": "swiftspice-aip00c-test",
+            "SWIFTSPICE_PERF_IMAGE": "localhost/swiftspice-aip00c:test",
+            "SWIFTSPICE_PERF_SPICE_PORT": "6135",
+            "SWIFTSPICE_PERF_CONTROL_PORT": "6136",
+            "PERF_CONTROL_WAIT_ATTEMPTS": "100",
+        ]
+        let trace = try fixture.launch(
+            "remote/control.sh",
+            arguments: ["trace", "click", token],
+            ssMode: "both",
+            additionalEnvironment: isolatedEnvironment
+        )
+        let armed = try readScriptLine(
+            from: trace.output.fileHandleForReading,
+            within: .seconds(2)
+        )
+        #expect(armed == "PERF_ARMED action_class=click token=\(token)")
+        #expect(trace.process.isRunning)
+
+        try fixture.appendServerLog([
+            "PERF_TRACE event=guest_received action_class=click token=\(token) guest_ns=100 marker_revision=7",
+            "PERF_TRACE event=marker_drawn action_class=click token=\(token) guest_ns=101 marker_revision=7",
+        ], usingCRLF: true)
+        let completed = try trace.finish(within: .seconds(3))
+        #expect(completed.status == 0)
+        #expect(!completed.output.contains("\r"))
+        #expect(completed.output.split(separator: "\n").map(String.init) == [
+            "PERF_TRACE event=guest_received action_class=click token=\(token) guest_ns=100 marker_revision=7",
+            "PERF_TRACE event=marker_drawn action_class=click token=\(token) guest_ns=101 marker_revision=7",
+        ])
+        #expect(try fixture.mockEventCount("control-sync") == 1)
+        #expect(try fixture.mockEventCount("control-exec") == 1)
+        #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+
+        let invalidArguments = [
+            ["trace", "tap", token],
+            ["trace", "click", "ABCDEF0123456789"],
+            ["trace", "key", "000000000000030"],
+            ["trace", "motion"],
+            ["trace", "click", token, "extra"],
+        ]
+        for arguments in invalidArguments {
+            let invalid = try fixture.run(
+                "remote/control.sh",
+                arguments: arguments,
+                ssMode: "both",
+                additionalEnvironment: isolatedEnvironment
+            )
+            #expect(invalid.status == 2)
+        }
+        #expect(try fixture.mockEventCount("control-exec") == 1)
+    }
+
+    @Test(arguments: [
+        (
+            name: "revision-mismatch",
+            lines: [
+                "PERF_TRACE event=guest_received action_class=click token=0000000000000031 guest_ns=100 marker_revision=7",
+                "PERF_TRACE event=marker_drawn action_class=click token=0000000000000031 guest_ns=101 marker_revision=8",
+            ],
+            reason: "marker_revision_mismatch"
+        ),
+        (
+            name: "duplicate",
+            lines: [
+                "PERF_TRACE event=guest_received action_class=click token=0000000000000031 guest_ns=100 marker_revision=7",
+                "PERF_TRACE event=guest_received action_class=click token=0000000000000031 guest_ns=101 marker_revision=7",
+            ],
+            reason: "trace_duplicate"
+        ),
+        (
+            name: "out-of-order",
+            lines: [
+                "PERF_TRACE event=marker_drawn action_class=click token=0000000000000031 guest_ns=101 marker_revision=7",
+                "PERF_TRACE event=guest_received action_class=click token=0000000000000031 guest_ns=100 marker_revision=7",
+            ],
+            reason: "trace_out_of_order"
+        ),
+        (
+            name: "malformed",
+            lines: [
+                "PERF_TRACE event=guest_received action_class=click token=0000000000000031 guest_ns=not-a-clock marker_revision=7",
+            ],
+            reason: "trace_malformed"
+        ),
+    ])
+    func controlTraceRejectsMismatchedDuplicateOutOfOrderOrMalformedEvidence(
+        name: String,
+        lines: [String],
+        reason: String
+    ) throws {
+        _ = name
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+        let token = "0000000000000031"
+        let trace = try fixture.launch(
+            "remote/control.sh",
+            arguments: ["trace", "click", token],
+            ssMode: "both",
+            additionalEnvironment: ["PERF_CONTROL_WAIT_ATTEMPTS": "100"]
+        )
+        #expect(try readScriptLine(
+            from: trace.output.fileHandleForReading,
+            within: .seconds(2)
+        ) == "PERF_ARMED action_class=click token=\(token)")
+
+        try fixture.appendServerLog(lines, usingCRLF: true)
+        let rejected = try trace.finish(within: .seconds(3))
+        #expect(rejected.status != 0)
+        #expect(rejected.output == (
+            "PERF_TRACE_ERROR action_class=click token=\(token) reason=\(reason)\n"
+        ))
+        #expect(!rejected.output.contains("marker_drawn") || reason == "trace_malformed")
+    }
+
+    @Test func controlTraceUsesOneBoundedGuestEvidenceWaitAndFailsClosedOnTimeout() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        try fixture.prepareRunningState()
+        let token = "0000000000000032"
+        let trace = try fixture.launch(
+            "remote/control.sh",
+            arguments: ["trace", "motion", token],
+            ssMode: "both",
+            additionalEnvironment: ["PERF_CONTROL_WAIT_ATTEMPTS": "1"]
+        )
+        #expect(try readScriptLine(
+            from: trace.output.fileHandleForReading,
+            within: .seconds(2)
+        ) == "PERF_ARMED action_class=motion token=\(token)")
+
+        let timedOut = try trace.finish(within: .seconds(2))
+        #expect(timedOut.status != 0)
+        #expect(timedOut.output == (
+            "PERF_TRACE_ERROR action_class=motion token=\(token) reason=trace_timeout\n"
+        ))
+        #expect(try fixture.mockEventCount("control-exec") == 1)
+
+        let armTimeoutFixture = try RemoteRockyFixture()
+        defer { armTimeoutFixture.remove() }
+        try armTimeoutFixture.prepareRunningState()
+        let armTimeout = try armTimeoutFixture.run(
+            "remote/control.sh",
+            arguments: ["trace", "motion", "0000000000000033"],
+            ssMode: "both",
+            additionalEnvironment: [
+                "MOCK_ARM_RESULT": "timeout",
+                "PERF_CONTROL_WAIT_ATTEMPTS": "1",
+            ]
+        )
+        #expect(armTimeout.status != 0)
+        #expect(armTimeout.output == (
+            "PERF_TRACE_ERROR action_class=motion token=0000000000000033 reason=arm_timeout\n"
+        ))
+        #expect(!armTimeout.output.contains("PERF_ARMED"))
+    }
+
     @Test func controlArmRetryCannotReuseADelayedPriorAcceptance() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -3379,6 +3544,21 @@ private struct RemoteRockyFixture {
         try String(contentsOf: mockState.appending(path: "control-command"), encoding: .utf8)
     }
 
+    func appendServerLog(_ lines: [String], usingCRLF: Bool = false) throws {
+        let runID = try currentRunID()
+        let log = base.appending(path: "logs/\(runID)/server.log")
+        let separator = usingCRLF ? "\r\n" : "\n"
+        let data = Data((lines.joined(separator: separator) + separator).utf8)
+        if !fileManager.fileExists(atPath: log.path) {
+            try data.write(to: log)
+            return
+        }
+        let handle = try FileHandle(forWritingTo: log)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+    }
+
     private func writeMocks() throws {
         try writeExecutable(name: "flock", contents: #"""
         #!/bin/bash
@@ -3699,6 +3879,38 @@ private struct RemoteRockyFixture {
 private struct ScriptResult {
     let status: Int32
     let output: String
+}
+
+private func readScriptLine(
+    from handle: FileHandle,
+    within timeout: Duration
+) throws -> String {
+    let deadline = ContinuousClock().now.advanced(by: timeout)
+    var bytes = Data()
+    while ContinuousClock().now < deadline {
+        var descriptor = pollfd(
+            fd: handle.fileDescriptor,
+            events: Int16(POLLIN),
+            revents: 0
+        )
+        let result = Darwin.poll(&descriptor, 1, 50)
+        if result < 0, errno == EINTR { continue }
+        guard result >= 0 else {
+            throw RemoteRockyFixtureError.timedOutWaitingForScript
+        }
+        guard result > 0 else { continue }
+        var byte: UInt8 = 0
+        let count = Darwin.read(handle.fileDescriptor, &byte, 1)
+        guard count == 1 else {
+            throw RemoteRockyFixtureError.timedOutWaitingForScript
+        }
+        if byte == 0x0A {
+            if bytes.last == 0x0D { bytes.removeLast() }
+            return String(decoding: bytes, as: UTF8.self)
+        }
+        bytes.append(byte)
+    }
+    throw RemoteRockyFixtureError.timedOutWaitingForScript
 }
 
 private struct RunningScript {

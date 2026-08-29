@@ -5,12 +5,173 @@ import Synchronization
 package enum SpiceInteractionTraceCollectionError: Error, Sendable, Equatable {
     case captureAlreadyActive
     case captureAlreadyFinished
+    case presentationWaitAlreadyRegistered
     case outputDirectoryUnavailable
     case outputIsSymbolicLink
     case invalidExistingJSONL
     case recordTooLarge(actual: Int, maximum: Int)
     case outputTooLarge(actual: Int, maximum: Int)
     case fileOperationFailed(operation: String, code: Int32)
+}
+
+package final class SpiceInteractionPresentationWaiter: @unchecked Sendable {
+    private enum Waiting: @unchecked Sendable {
+        case reserved(id: UUID, cancelled: Bool)
+        case registered(id: UUID, CheckedContinuation<SpiceInteractionFrameIdentity, any Error>)
+    }
+
+    package struct Resumption: @unchecked Sendable {
+        fileprivate let continuation: CheckedContinuation<SpiceInteractionFrameIdentity, any Error>
+        fileprivate let result: Result<SpiceInteractionFrameIdentity, any Error>
+
+        package func resume() {
+            continuation.resume(with: result)
+        }
+    }
+
+    private enum Phase: @unchecked Sendable {
+        case active(Waiting?)
+        case completed(SpiceInteractionFrameIdentity)
+        case finished
+    }
+
+    private let phase = Mutex<Phase>(.active(nil))
+
+    package func wait(
+        waiterRegistered: (@Sendable () -> Void)?
+    ) async throws -> SpiceInteractionFrameIdentity {
+        let reservationID = UUID()
+        if let immediate = try reserve(reservationID) {
+            return immediate
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let (registered, resumption) = register(
+                    reservationID,
+                    continuation: continuation,
+                    taskIsCancelled: Task.isCancelled
+                )
+                if registered {
+                    waiterRegistered?()
+                }
+                resumption?.resume()
+            }
+        } onCancel: {
+            self.cancel(reservationID)?.resume()
+        }
+    }
+
+    package func prepareCompletion(
+        _ identity: SpiceInteractionFrameIdentity
+    ) -> Resumption? {
+        phase.withLock { phase in
+            guard case let .active(waiting) = phase else { return nil }
+            phase = .completed(identity)
+            guard case let .registered(_, continuation) = waiting else { return nil }
+            return Resumption(continuation: continuation, result: .success(identity))
+        }
+    }
+
+    package func prepareFinish() -> Resumption? {
+        phase.withLock { phase in
+            guard case let .active(waiting) = phase else { return nil }
+            phase = .finished
+            guard case let .registered(_, continuation) = waiting else { return nil }
+            return Resumption(
+                continuation: continuation,
+                result: .failure(SpiceInteractionTraceCollectionError.captureAlreadyFinished)
+            )
+        }
+    }
+
+    private func reserve(
+        _ reservationID: UUID
+    ) throws -> SpiceInteractionFrameIdentity? {
+        try phase.withLock { phase in
+            switch phase {
+            case let .completed(identity):
+                return identity
+            case .finished:
+                throw SpiceInteractionTraceCollectionError.captureAlreadyFinished
+            case let .active(waiting):
+                guard waiting == nil else {
+                    throw SpiceInteractionTraceCollectionError.presentationWaitAlreadyRegistered
+                }
+                phase = .active(.reserved(id: reservationID, cancelled: false))
+                return nil
+            }
+        }
+    }
+
+    private func register(
+        _ reservationID: UUID,
+        continuation: CheckedContinuation<SpiceInteractionFrameIdentity, any Error>,
+        taskIsCancelled: Bool
+    ) -> (registered: Bool, resumption: Resumption?) {
+        phase.withLock { phase in
+            switch phase {
+            case let .completed(identity):
+                return (
+                    false,
+                    Resumption(continuation: continuation, result: .success(identity))
+                )
+            case .finished:
+                return (
+                    false,
+                    Resumption(
+                        continuation: continuation,
+                        result: .failure(
+                            SpiceInteractionTraceCollectionError.captureAlreadyFinished
+                        )
+                    )
+                )
+            case let .active(waiting):
+                guard case let .reserved(id, wasCancelled) = waiting,
+                      id == reservationID else {
+                    return (
+                        false,
+                        Resumption(
+                            continuation: continuation,
+                            result: .failure(
+                                SpiceInteractionTraceCollectionError.captureAlreadyFinished
+                            )
+                        )
+                    )
+                }
+                if wasCancelled || taskIsCancelled {
+                    phase = .active(nil)
+                    return (
+                        false,
+                        Resumption(
+                            continuation: continuation,
+                            result: .failure(CancellationError())
+                        )
+                    )
+                }
+                phase = .active(.registered(id: reservationID, continuation))
+                return (true, nil)
+            }
+        }
+    }
+
+    private func cancel(_ reservationID: UUID) -> Resumption? {
+        phase.withLock { phase in
+            guard case let .active(waiting) = phase else { return nil }
+            switch waiting {
+            case let .reserved(id, _) where id == reservationID:
+                phase = .active(.reserved(id: id, cancelled: true))
+                return nil
+            case let .registered(id, continuation) where id == reservationID:
+                phase = .active(nil)
+                return Resumption(
+                    continuation: continuation,
+                    result: .failure(CancellationError())
+                )
+            default:
+                return nil
+            }
+        }
+    }
 }
 
 /// A cross-process serialized, bounded writer for normalized interaction
@@ -262,6 +423,7 @@ package final class SpiceInteractionTraceCapture: Sendable {
     private let presentationDiagnostics: SpicePresentationDiagnostics
     private let writer: SpiceInteractionTraceJSONLWriter
     private let assembler: SpiceInteractionTraceAssembler
+    private let presentationWaiter: SpiceInteractionPresentationWaiter
     private let evidenceWillCommit: (@Sendable () -> Void)?
     private let state = Mutex(State())
     private let appendLock = Mutex<Void>(())
@@ -307,6 +469,8 @@ package final class SpiceInteractionTraceCapture: Sendable {
         self.presentationDiagnostics = presentationDiagnostics
         self.writer = writer
         self.evidenceWillCommit = evidenceWillCommit
+        let presentationWaiter = SpiceInteractionPresentationWaiter()
+        self.presentationWaiter = presentationWaiter
         assembler = SpiceInteractionTraceAssembler(
             pairId: pairId,
             version: version,
@@ -314,7 +478,8 @@ package final class SpiceInteractionTraceCapture: Sendable {
             order: order,
             actionClass: actionClass,
             token: token,
-            checksum: checksum
+            checksum: checksum,
+            presentationWaiter: presentationWaiter
         )
         guard presentationDiagnostics.installInteractionTraceAssembler(assembler) else {
             throw SpiceInteractionTraceCollectionError.captureAlreadyActive
@@ -323,6 +488,7 @@ package final class SpiceInteractionTraceCapture: Sendable {
 
     deinit {
         presentationDiagnostics.removeInteractionTraceAssembler(assembler)
+        presentationWaiter.prepareFinish()?.resume()
     }
 
     package func recordHostEvidence(
@@ -389,23 +555,39 @@ package final class SpiceInteractionTraceCapture: Sendable {
         }
     }
 
+    /// Suspends without polling until this capture's selected, committed
+    /// delivery is accepted by the AppKit presented callback. The wait neither
+    /// finishes nor appends the capture, and an already accepted presentation
+    /// is returned immediately.
+    package func waitForExactPresentation(
+        waiterRegistered: (@Sendable () -> Void)? = nil
+    ) async throws -> SpiceInteractionFrameIdentity {
+        try state.withLock { state in
+            guard case .active = state.phase else {
+                throw SpiceInteractionTraceCollectionError.captureAlreadyFinished
+            }
+        }
+        return try await presentationWaiter.wait(waiterRegistered: waiterRegistered)
+    }
+
     @discardableResult
     package func finish(
         invalidReason: String? = nil
     ) throws -> SpiceInteractionTraceRecord {
-        let record = try state.withLock { state in
+        let (record, waitResumption) = try state.withLock { state in
             switch state.phase {
             case .active:
                 presentationDiagnostics.removeInteractionTraceAssembler(assembler)
                 let record = assembler.finish(invalidReason: invalidReason)
                 state.phase = .pending(record)
-                return record
+                return (record, presentationWaiter.prepareFinish())
             case let .pending(record):
-                return record
+                return (record, nil)
             case .appended:
                 throw SpiceInteractionTraceCollectionError.captureAlreadyFinished
             }
         }
+        waitResumption?.resume()
         return try appendLock.withLock { _ in
             if case .appended = state.withLock({ $0.phase }) {
                 throw SpiceInteractionTraceCollectionError.captureAlreadyFinished

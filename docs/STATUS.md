@@ -24,6 +24,16 @@ Agent behavior, including system-trusted TLS.
 
 ## Algorithm plan execution
 
+- AIP-00c now has two local harness synchronization seams without changing the
+  Viewer or display pacing: `control.sh trace` streams one strictly correlated
+  guest arm/received/drawn transaction, and a package-only cancellation-safe
+  wait returns only the selected and committed identity accepted by AppKit
+  presented. The isolated `5945`/`5946` run at
+  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T061937Z.9FuYes`
+  remains guest-causal smoke evidence. A real env-gated AppKit capture still
+  must bind its marker pixels and exact presented identity into schema-2 JSONL;
+  no input-to-visible or scheduling conclusion is claimed.
+
 - AIP-10 is locally complete. Full-header messages are first validated as one
   owned physical batch, then list submessages are dispatched in wire-list order
   before the optional main-message prefix. `SPICE_MSG_LIST` itself is not

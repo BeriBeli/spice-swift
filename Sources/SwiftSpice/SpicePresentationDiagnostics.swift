@@ -167,11 +167,16 @@ public final class SpicePresentationDiagnostics: Sendable {
         identity: SpiceInteractionFrameIdentity,
         at nanoseconds: UInt64
     ) {
-        interactionState.withLock { state in
-            guard let assembler = state.interactionTraceAssembler else { return }
+        let resumption = interactionState.withLock {
+            state -> SpiceInteractionPresentationWaiter.Resumption? in
+            guard let assembler = state.interactionTraceAssembler else { return nil }
             state.interactionEvidenceWillCommitForTesting?()
-            assembler.observePresented(identity: identity, at: nanoseconds)
+            return assembler.observePresented(identity: identity, at: nanoseconds)
         }
+        // Resuming an arbitrary task while holding the diagnostics/assembler
+        // lock would permit synchronous re-entry. Only the accepted identity
+        // and its continuation cross this boundary.
+        resumption?.resume()
     }
 
     package func retireInteractionDesktopGeneration(_ generation: UInt64) {

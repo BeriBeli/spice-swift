@@ -217,6 +217,23 @@ SPICE input can reach the guest device while producing no XI2 event for the
 marker monitor. The build manifest records the exact driver package version,
 and startup rejects an older artifact that omits it.
 
+For a live harness that must not poll `server.log`, use the streaming form on
+the same isolated endpoint:
+
+```sh
+~/swiftspice-aip00b/perf-ab/remote/control.sh trace click 0123456789abcdef
+```
+
+`trace` owns the same arm lock and unique sync boundary as `arm`. It first
+prints the exact `PERF_ARMED` line; the local harness sends its real input only
+after reading that line. Sync, arm acceptance, and the matching
+`guest_received` followed by `marker_drawn` share one bounded
+`PERF_CONTROL_WAIT_ATTEMPTS` retry budget. The two evidence lines are printed
+only when action, token, and marker revision agree. A duplicate, malformed,
+reversed, mismatched, or timed out sequence exits nonzero with
+`PERF_TRACE_ERROR`. Unrelated log traffic is ignored, and neither output path
+reads or prints the SPICE ticket.
+
 When live input does not reach the marker, capture the guest discovery state:
 
 ```sh
@@ -274,6 +291,15 @@ attribution is rejected without writing. Attributable but incomplete evidence
 is atomically retained with `valid=false` and a deterministic reason. The
 record and whole file are capped at 64 KiB and 16 MiB respectively.
 
+A harness may await
+`SpiceInteractionTraceCapture.waitForExactPresentation(waiterRegistered:)`
+without polling. The one-shot wait returns the exact frame identity only after
+that capture selected and committed it and the real AppKit presented callback
+accepted the same delivery. An earlier accepted presentation is cached;
+unrelated in-flight deliveries do not wake it, task cancellation removes the
+waiter, and finishing the capture terminates an outstanding wait without
+finishing or appending on the wait path itself.
+
 The host records `scheduledNs`, `hostInputNs`, and `sendStartedNs` before the
 wire send, then records `sendCompletedNs` after its continuation resumes. This
 lets a causally eligible Display frame arriving during the send continuation be
@@ -311,6 +337,13 @@ tablet. The Release mode-aware probe produced `guest_received` and
 `6666`; the motion run observed two SPICE ACKs. This does not associate marker
 pixels with an exact SwiftSpice frame revision or AppKit presented callback.
 That association belongs in `input-events.jsonl` and remains required evidence.
+
+The independently named `5945`/`5946` fixture run at
+`/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T061937Z.9FuYes`
+also captured the arm-to-guest marker smoke sequence. It is guest-causal
+evidence only. The run did not use the package wait to bind marker pixels to an
+exact SwiftSpice frame and AppKit presented callback, so it is not a completed
+input-to-visible trace or a latency result.
 
 Archive a server-log slice around each client capture:
 
