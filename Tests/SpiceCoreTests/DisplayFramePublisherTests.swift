@@ -330,6 +330,168 @@ struct DisplayFramePublisherTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func cancellationRemovesRegisteredSurfaceReservationWithoutConsumingDamage() async throws {
+        let waiterProbe = SurfaceOperationWaiterProbe()
+        let fixture = try await makeDamagedSurfaceStore(
+            waiterWillRegister: { surfaceID, reservationID in
+                await waiterProbe.record(surfaceID: surfaceID, reservationID: reservationID)
+            }
+        )
+        let blocker = HeldSurfaceOperationGate()
+        let holder = Task {
+            try await fixture.store.withSurfaceOperationForTesting(surfaceID: 1) {
+                await blocker.hold()
+            }
+        }
+        await blocker.waitUntilHeld()
+        let observations = FramePublisherObservations()
+        let publisher = makeSurfaceStorePublisher(
+            store: fixture.store,
+            observations: observations
+        )
+        await publisher.submit(fixture.revision)
+        let baseline = await fixture.store.metrics()
+
+        let flush = Task { await publisher.flushNow() }
+        await waiterProbe.waitUntilRegistrationCount(1)
+        #expect(await fixture.store.surfaceOperationReservationDiagnostics().waitingCount == 1)
+        await publisher.cancel()
+        await flush.value
+
+        let cancelled = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(cancelled.activeSurfaceCount == 1)
+        #expect(cancelled.waitingCount == 0)
+        #expect(cancelled.grantedWaiterCount == 0)
+        #expect(cancelled.reservedCount == 0)
+        #expect(await observations.emittedRevisions.isEmpty)
+        let afterCancellation = await fixture.store.metrics()
+        #expect(afterCancellation.snapshots == baseline.snapshots)
+        #expect(afterCancellation.cpuMaterializations == baseline.cpuMaterializations)
+        #expect(afterCancellation.cpuMaterializationBytes == baseline.cpuMaterializationBytes)
+
+        await blocker.release()
+        try await holder.value
+        let released = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(released.activeSurfaceCount == 0)
+        #expect(released.waitingCount == 0)
+        #expect(released.grantedWaiterCount == 0)
+        #expect(released.reservedCount == 0)
+        let publication = try #require(
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        )
+        #expect(publication.publicationDamage.copyRectangles == [fixture.damage])
+        let duplicate = try #require(
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        )
+        #expect(duplicate.publicationDamage.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancellationBeforeSurfaceReservationRegistrationLeavesNoWaiter() async throws {
+        let registrationGate = CancellableSurfaceReservationPhaseGate()
+        let fixture = try await makeDamagedSurfaceStore(
+            waiterWillRegister: { surfaceID, reservationID in
+                await registrationGate.blockUntilCancelled(
+                    surfaceID: surfaceID,
+                    reservationID: reservationID
+                )
+            }
+        )
+        let blocker = HeldSurfaceOperationGate()
+        let holder = Task {
+            try await fixture.store.withSurfaceOperationForTesting(surfaceID: 1) {
+                await blocker.hold()
+            }
+        }
+        await blocker.waitUntilHeld()
+        let observations = FramePublisherObservations()
+        let publisher = makeSurfaceStorePublisher(
+            store: fixture.store,
+            observations: observations
+        )
+        await publisher.submit(fixture.revision)
+        let baseline = await fixture.store.metrics()
+
+        let flush = Task { await publisher.flushNow() }
+        await registrationGate.waitUntilEntered()
+        await publisher.cancel()
+        await flush.value
+
+        #expect(await registrationGate.observedCancellation)
+        let cancelled = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(cancelled.activeSurfaceCount == 1)
+        #expect(cancelled.waitingCount == 0)
+        #expect(cancelled.grantedWaiterCount == 0)
+        #expect(cancelled.reservedCount == 0)
+        #expect(await fixture.store.metrics().snapshots == baseline.snapshots)
+        #expect(await observations.emittedRevisions.isEmpty)
+
+        await blocker.release()
+        try await holder.value
+        let publication = try #require(
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        )
+        #expect(publication.publicationDamage.copyRectangles == [fixture.damage])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func grantRacingCancellationAdvancesTheNextSurfaceReservationExactlyOnce() async throws {
+        let waiterProbe = SurfaceOperationWaiterProbe()
+        let grantGate = FirstGrantedSurfaceReservationGate()
+        let fixture = try await makeDamagedSurfaceStore(
+            waiterWillRegister: { surfaceID, reservationID in
+                await waiterProbe.record(surfaceID: surfaceID, reservationID: reservationID)
+            },
+            grantWillBeClaimed: { surfaceID, reservationID in
+                await grantGate.blockFirstGrantUntilCancelled(
+                    surfaceID: surfaceID,
+                    reservationID: reservationID
+                )
+            }
+        )
+        let blocker = HeldSurfaceOperationGate()
+        let holder = Task {
+            try await fixture.store.withSurfaceOperationForTesting(surfaceID: 1) {
+                await blocker.hold()
+            }
+        }
+        await blocker.waitUntilHeld()
+        let observations = FramePublisherObservations()
+        let publisher = makeSurfaceStorePublisher(
+            store: fixture.store,
+            observations: observations
+        )
+        await publisher.submit(fixture.revision)
+
+        let flush = Task { await publisher.flushNow() }
+        await waiterProbe.waitUntilRegistrationCount(1)
+        await blocker.release()
+        await grantGate.waitUntilFirstGrant()
+
+        let nextPublication = Task {
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        }
+        await waiterProbe.waitUntilRegistrationCount(2)
+        await publisher.cancel()
+        await flush.value
+        try await holder.value
+
+        #expect(await grantGate.firstGrantObservedCancellation)
+        #expect(await observations.emittedRevisions.isEmpty)
+        let publication = try #require(await nextPublication.value)
+        #expect(publication.publicationDamage.copyRectangles == [fixture.damage])
+        let drained = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(drained.activeSurfaceCount == 0)
+        #expect(drained.waitingCount == 0)
+        #expect(drained.grantedWaiterCount == 0)
+        #expect(drained.reservedCount == 0)
+        let duplicate = try #require(
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        )
+        #expect(duplicate.publicationDamage.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func cancellationDirectlyStopsAdmissionAndDrainsEveryStartedSnapshot() async {
         let gate = FramePublisherSnapshotGate()
         let observations = FramePublisherObservations()
@@ -709,6 +871,43 @@ struct DisplayFramePublisherTests {
         )
     }
 
+    private func makeSurfaceStorePublisher(
+        store: SurfaceStore,
+        observations: FramePublisherObservations
+    ) -> DisplayFramePublisher {
+        DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 1,
+            snapshot: { revision in
+                await store.publicationSnapshot(atLeast: revision)
+            },
+            emit: { frame in
+                await observations.emit(frame)
+            }
+        )
+    }
+
+    private func makeDamagedSurfaceStore(
+        waiterWillRegister: SurfaceOperationWaiterObserver? = nil,
+        grantWillBeClaimed: SurfaceOperationWaiterObserver? = nil
+    ) async throws -> (store: SurfaceStore, revision: SurfaceRevision, damage: PixelRect) {
+        let store = SurfaceStore(
+            backingPolicy: .dataOnly,
+            surfaceOperationWaiterWillRegister: waiterWillRegister,
+            surfaceOperationGrantWillBeClaimed: grantWillBeClaimed
+        )
+        try await store.create(id: 1, width: 8, height: 1, format: 32)
+        let created = try await store.descriptor(surfaceID: 1).surfaceRevision
+        _ = try #require(await store.publicationSnapshot(atLeast: created))
+        let damage = PixelRect(x: 2, y: 0, width: 2, height: 1)
+        let revision = try await store.fill(
+            surfaceID: 1,
+            rectangle: damage,
+            colorARGB: 0x0011_2233
+        )
+        return (store, revision, damage)
+    }
+
     private func surfaceRevision(
         surfaceID: UInt32,
         lifecycle: UInt64 = 1,
@@ -886,6 +1085,145 @@ private actor SurfacePublicationStartGate {
     func releaseBlockedSnapshot() {
         blockedContinuation?.resume()
         blockedContinuation = nil
+    }
+}
+
+private actor HeldSurfaceOperationGate {
+    private var isHeld = false
+    private var holdWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func hold() async {
+        isHeld = true
+        let waiters = holdWaiters
+        holdWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilHeld() async {
+        guard !isHeld else { return }
+        await withCheckedContinuation { holdWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor SurfaceOperationWaiterProbe {
+    private var registrations: [(surfaceID: UInt32, reservationID: UInt64)] = []
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func record(surfaceID: UInt32, reservationID: UInt64) {
+        registrations.append((surfaceID, reservationID))
+        let ready = waiters.filter { registrations.count >= $0.0 }
+        waiters.removeAll { registrations.count >= $0.0 }
+        for (_, continuation) in ready {
+            continuation.resume()
+        }
+    }
+
+    func waitUntilRegistrationCount(_ count: Int) async {
+        guard registrations.count < count else { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+}
+
+private actor CancellableSurfaceReservationPhaseGate {
+    private var entered = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var cancellationArrivedEarly = false
+    private(set) var observedCancellation = false
+
+    func blockUntilCancelled(surfaceID _: UInt32, reservationID _: UInt64) async {
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if cancellationArrivedEarly {
+                    cancellationArrivedEarly = false
+                    continuation.resume()
+                } else {
+                    blockedContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.observeCancellation() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    private func observeCancellation() {
+        observedCancellation = true
+        if let blockedContinuation {
+            self.blockedContinuation = nil
+            blockedContinuation.resume()
+        } else {
+            cancellationArrivedEarly = true
+        }
+    }
+}
+
+private actor FirstGrantedSurfaceReservationGate {
+    private var didBlockFirstGrant = false
+    private var firstGrantWaiters: [CheckedContinuation<Void, Never>] = []
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var cancellationArrivedEarly = false
+    private(set) var firstGrantObservedCancellation = false
+
+    func blockFirstGrantUntilCancelled(
+        surfaceID _: UInt32,
+        reservationID _: UInt64
+    ) async {
+        guard !didBlockFirstGrant else { return }
+        didBlockFirstGrant = true
+        let waiters = firstGrantWaiters
+        firstGrantWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if cancellationArrivedEarly {
+                    cancellationArrivedEarly = false
+                    continuation.resume()
+                } else {
+                    blockedContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.observeCancellation() }
+        }
+    }
+
+    func waitUntilFirstGrant() async {
+        guard didBlockFirstGrant else {
+            await withCheckedContinuation { firstGrantWaiters.append($0) }
+            return
+        }
+    }
+
+    private func observeCancellation() {
+        firstGrantObservedCancellation = true
+        if let blockedContinuation {
+            self.blockedContinuation = nil
+            blockedContinuation.resume()
+        } else {
+            cancellationArrivedEarly = true
+        }
     }
 }
 
