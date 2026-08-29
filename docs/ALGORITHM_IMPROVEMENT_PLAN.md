@@ -380,9 +380,13 @@ pipeline. A Display publication carries the `messageReceivedAt` and
 `surfaceReadyAt` belonging to its exact emitted revision; a prepared frame that
 covers a pending replacement uses the replacement's timing and never inherits
 the older request's timestamps. The package-only marker detector reads actual
-BGRA storage, and the correlation identity contains desktop generation,
-display channel ID, surface ID, Surface lifecycle generation, frame revision,
-and delivery sequence. Selection, the Metal command-buffer commit-call
+BGRA storage through one synchronous, closure-scoped bounded ROI borrow. For
+IOSurface publications it read-locks only while sampling the top-left marker
+candidates at aligned origins 8 through 32 and does not materialize or cache a
+full-frame CPU copy; Data-backed
+fallbacks use their existing bytes. The correlation identity contains desktop
+generation, display channel ID, surface ID, Surface lifecycle generation,
+frame revision, and delivery sequence. Selection, the Metal command-buffer commit-call
 boundary, and `CAMetalDrawable` presentation all retain that same identity. A
 desktop snapshot's envelope delivery sequence orders cursor, pointer-mode, and
 latest-state coalescing independently; only the sequence owned by the retained

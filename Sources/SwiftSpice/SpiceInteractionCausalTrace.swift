@@ -87,6 +87,7 @@ package enum SpiceInteractionMarkerROIDetector {
     package static let rows = 2
     package static let foregroundBGRA: UInt32 = 0xFF00_0000
     package static let backgroundBGRA: UInt32 = 0xFFFF_FFFF
+    package static let minimumOrigin = 8
 
     private static let bitCount = 176
     private static let maximumOrigin = 32
@@ -148,34 +149,48 @@ package enum SpiceInteractionMarkerROIDetector {
         let markerHeight = rows * cellSize
         let (minimumRowBytes, rowBytesOverflow) = frame.width
             .multipliedReportingOverflow(by: 4)
-        let (coveredBytes, coveredBytesOverflow) = frame.bytesPerRow
-            .multipliedReportingOverflow(by: frame.height)
         guard frame.width >= 0,
               frame.height >= 0,
               frame.bytesPerRow >= 0,
               !rowBytesOverflow,
-              !coveredBytesOverflow,
-              frame.width >= markerWidth,
-              frame.height >= markerHeight,
+              frame.width >= markerWidth + minimumOrigin,
+              frame.height >= markerHeight + minimumOrigin,
               frame.bytesPerRow >= minimumRowBytes
         else {
             return .none
         }
-        let pixels = frame.pixels
-        guard pixels.count >= coveredBytes else { return .none }
-
-        var matches: [SpiceInteractionMarkerPayload] = []
         let maximumX = min(maximumOrigin, frame.width - markerWidth)
         let maximumY = min(maximumOrigin, frame.height - markerHeight)
-        pixels.withUnsafeBytes { bytes in
-            guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return
+        return frame.withReadOnlyPixelBytes { rawBase, bytesPerRow, byteCount in
+            let (lastRowOffset, rowOverflow) = (maximumY + markerHeight - 1)
+                .multipliedReportingOverflow(by: bytesPerRow)
+            let (lastColumnBytes, columnOverflow) = (maximumX + markerWidth)
+                .multipliedReportingOverflow(by: 4)
+            let (requiredBytes, requiredOverflow) = lastRowOffset.addingReportingOverflow(
+                lastColumnBytes
+            )
+            guard !rowOverflow,
+                  !columnOverflow,
+                  !requiredOverflow,
+                  requiredBytes <= byteCount
+            else {
+                return .none
             }
-            for originY in stride(from: 0, through: maximumY, by: cellSize) {
-                for originX in stride(from: 0, through: maximumX, by: cellSize) {
+            let base = rawBase.assumingMemoryBound(to: UInt8.self)
+            var matches: [SpiceInteractionMarkerPayload] = []
+            for originY in stride(
+                from: minimumOrigin,
+                through: maximumY,
+                by: cellSize
+            ) {
+                for originX in stride(
+                    from: minimumOrigin,
+                    through: maximumX,
+                    by: cellSize
+                ) {
                     guard let payload = decode(
                         base: base,
-                        bytesPerRow: frame.bytesPerRow,
+                        bytesPerRow: bytesPerRow,
                         originX: originX,
                         originY: originY
                     ), payload.token == expectedToken,
@@ -187,15 +202,15 @@ package enum SpiceInteractionMarkerROIDetector {
                     matches.append(payload)
                 }
             }
-        }
-        switch matches.count {
-        case 0:
-            return .none
-        case 1:
-            return .exact(payload: matches[0], identity: identity)
-        default:
-            return .ambiguous(matchCount: matches.count)
-        }
+            switch matches.count {
+            case 0:
+                return .none
+            case 1:
+                return .exact(payload: matches[0], identity: identity)
+            default:
+                return .ambiguous(matchCount: matches.count)
+            }
+        } ?? .none
     }
 
     private static func decode(

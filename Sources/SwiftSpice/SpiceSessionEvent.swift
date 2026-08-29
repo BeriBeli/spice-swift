@@ -1,3 +1,4 @@
+import CoreVideo
 import Foundation
 import SpiceChannels
 import SpiceIOSurface
@@ -45,6 +46,26 @@ public struct SpiceFrame: Sendable, Equatable {
     /// a second full-frame Data snapshot.
     public var pixels: Data {
         pixelStorage.pixels()
+    }
+
+    /// Borrows the published BGRA bytes without populating the full-frame
+    /// IOSurface materialization cache. The pointer is closure-scoped.
+    package func withReadOnlyPixelBytes<Result>(
+        _ body: (UnsafeRawPointer, Int, Int) -> Result
+    ) -> Result? {
+        let (compactBytesPerRow, overflow) = width.multipliedReportingOverflow(by: 4)
+        guard width >= 0,
+              height >= 0,
+              bytesPerRow >= compactBytesPerRow,
+              !overflow,
+              ioSurface.map({ $0.pixelFormat == kCVPixelFormatType_32BGRA }) ?? true
+        else {
+            return nil
+        }
+        return pixelStorage.withReadOnlyBytes(
+            dataBytesPerRow: ioSurface == nil ? bytesPerRow : compactBytesPerRow,
+            body
+        )
     }
 
     package init(_ snapshot: FrameSnapshot) {

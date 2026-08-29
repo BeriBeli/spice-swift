@@ -292,7 +292,11 @@ printf '%s\n' \
 This local slice makes the shared pixel protocol, exact host correlation, and
 normalized JSONL schema deterministically testable. It does not by itself
 prove a live Rocky marker was included in a particular AppKit `presented`
-callback. A new independent Rocky run must bind the unique marker evidence to
+callback. The host detector synchronously samples only the bounded top-left
+marker ROI at aligned origins 8 through 32 from an immutable publication; an
+IOSurface read is closure-scoped
+and does not populate the full-frame CPU materialization cache. A new
+independent Rocky run must bind the unique marker evidence to
 the exact presented revision before the event is valid for
 click/key/motion-to-visible acceptance.
 

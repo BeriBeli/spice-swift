@@ -2,6 +2,8 @@ import Foundation
 import QuartzCore
 import Synchronization
 @testable import SpiceChannels
+@testable import SpiceIOSurface
+@testable import SpiceRenderer
 import Testing
 @testable import SwiftSpice
 
@@ -131,13 +133,13 @@ struct SpiceInteractionFrameCorrelationTests {
             placements: [
                 SpiceInteractionMarkerPlacement(
                     payload: ambiguousPayload,
-                    originX: 0,
-                    originY: 0
+                    originX: 8,
+                    originY: 8
                 ),
                 SpiceInteractionMarkerPlacement(
                     payload: ambiguousPayload,
-                    originX: 0,
-                    originY: 12
+                    originX: 8,
+                    originY: 20
                 ),
             ],
             frameWidth: width,
@@ -153,6 +155,124 @@ struct SpiceInteractionFrameCorrelationTests {
             expectedToken: token,
             expectedChecksum: checksum
         ) == .ambiguous(matchCount: 2))
+    }
+
+    @Test func iosurfaceMarkerDetectionBorrowsOnlyTheBoundedROIAndNeverMaterializesPixels() throws {
+        // One pixel below 1280 forces the IOSurface's physical row stride to
+        // differ from the compact frame width on the production pool.
+        let frameWidth = 1_279
+        let frameHeight = 720
+        let sourceBytesPerRow = frameWidth * 4 + 16
+        let markerPayload = SpiceInteractionMarkerPayload(
+            token: token,
+            markerRevision: 77,
+            checksum: checksum
+        )
+        let sourcePixels = SpiceInteractionMarkerROIDetector.renderForTesting(
+            placements: [SpiceInteractionMarkerPlacement(
+                payload: markerPayload,
+                originX: 32,
+                originY: 32
+            )],
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            bytesPerRow: sourceBytesPerRow
+        )
+        let pool = IOSurfaceFramePool(limits: .init(
+            maximumFrames: 1,
+            maximumBytes: 8 * 1_024 * 1_024
+        ))
+        let materializationMetrics = FrameMaterializationMetrics()
+        let expectedIdentity = identity(deliverySequence: 43)
+
+        func exerciseDetector() throws -> (
+            SpiceInteractionMarkerDetection,
+            SpiceInteractionMarkerDetection,
+            SpiceInteractionMarkerDetection
+        ) {
+            let ioSurfaceFrame = try #require(pool.makeFrame(
+                width: frameWidth,
+                height: frameHeight,
+                sourceBytesPerRow: sourceBytesPerRow,
+                pixels: sourcePixels
+            ))
+            try #require(ioSurfaceFrame.bytesPerRow > frameWidth * 4)
+            let pixelStorage = FramePixelStorage(
+                pixels: nil,
+                ioSurfaceFrame: ioSurfaceFrame,
+                expectedPixelBytes: frameWidth * frameHeight * 4,
+                materializationMetrics: materializationMetrics
+            )
+            let rendererSnapshot = FrameSnapshot(
+                surfaceID: expectedIdentity.surfaceID,
+                width: frameWidth,
+                height: frameHeight,
+                bytesPerRow: ioSurfaceFrame.bytesPerRow,
+                lifecycleGeneration: expectedIdentity.surfaceGeneration,
+                revision: expectedIdentity.frameRevision,
+                pixelStorage: pixelStorage,
+                ioSurfaceFrame: ioSurfaceFrame
+            )
+            let desktopSnapshot = snapshot(
+                identity: expectedIdentity,
+                rendererSnapshot: rendererSnapshot
+            )
+
+            let exact = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            pixelStorage.failNextReadForTesting()
+            let failedRead = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            let recovered = SpiceInteractionMarkerROIDetector.detect(
+                in: desktopSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+            return (exact, failedRead, recovered)
+        }
+
+        let (exact, failedRead, recovered) = try exerciseDetector()
+        #expect(exact == .exact(payload: markerPayload, identity: expectedIdentity))
+        #expect(failedRead == .none)
+        #expect(recovered == exact)
+        #expect(materializationMetrics.snapshot().count == 0)
+        #expect(materializationMetrics.snapshot().bytes == 0)
+        #expect(pool.metrics().inUseFrames == 0)
+
+        let maximumROIPixelBytes = (
+            32 + SpiceInteractionMarkerROIDetector.columns
+                * SpiceInteractionMarkerROIDetector.cellSize
+        ) * (
+            32 + SpiceInteractionMarkerROIDetector.rows
+                * SpiceInteractionMarkerROIDetector.cellSize
+        ) * 4
+        let fullFramePixelBytes = 1_280 * frameHeight * 4
+        #expect(maximumROIPixelBytes == 61_440)
+        #expect(maximumROIPixelBytes < fullFramePixelBytes / 50)
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "Sources/SwiftSpice/SpiceInteractionCausalTrace.swift")
+        let detectorSource = try String(contentsOf: sourceURL, encoding: .utf8)
+        let detectStart = try #require(detectorSource.range(
+            of: "package static func detect("
+        ))
+        let decodeStart = try #require(detectorSource.range(
+            of: "private static func decode(",
+            range: detectStart.upperBound..<detectorSource.endIndex
+        ))
+        let detectBody = detectorSource[detectStart.lowerBound..<decodeStart.lowerBound]
+        #expect(detectBody.contains("withReadOnlyPixelBytes"))
+        #expect(!detectBody.contains("frame.pixels"))
+        #expect(!detectBody.contains("copyPixels"))
     }
 
     @Test func guestMarkerAcknowledgmentAloneCannotBecomeVisibleEvidence() {
@@ -349,8 +469,8 @@ struct SpiceInteractionFrameCorrelationTests {
         )
         let ambiguousPixels = SpiceInteractionMarkerROIDetector.renderForTesting(
             placements: [
-                SpiceInteractionMarkerPlacement(payload: payload, originX: 0, originY: 0),
-                SpiceInteractionMarkerPlacement(payload: payload, originX: 0, originY: 12),
+                SpiceInteractionMarkerPlacement(payload: payload, originX: 8, originY: 8),
+                SpiceInteractionMarkerPlacement(payload: payload, originX: 8, originY: 20),
             ],
             frameWidth: width,
             frameHeight: height,
@@ -1003,6 +1123,31 @@ struct SpiceInteractionFrameCorrelationTests {
             bytesPerRow: bytesPerRow
         )
         return snapshot(identity: identity, pixels: pixels)
+    }
+
+    private func snapshot(
+        identity: SpiceInteractionFrameIdentity,
+        rendererSnapshot: FrameSnapshot
+    ) -> SpiceDesktopSnapshot {
+        let surface = SpiceSurfaceIdentity(
+            displayChannelID: identity.displayChannelID,
+            surfaceID: identity.surfaceID,
+            generation: identity.surfaceGeneration
+        )
+        return SpiceDesktopSnapshot(
+            generation: identity.desktopGeneration,
+            frame: SpiceFrameUpdate(
+                frame: SpiceFrame(rendererSnapshot),
+                revision: SpiceFrameRevision(
+                    surface: surface,
+                    value: identity.frameRevision
+                ),
+                damage: .full
+            ),
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: identity.deliverySequence
+        )
     }
 
     private func snapshot(
