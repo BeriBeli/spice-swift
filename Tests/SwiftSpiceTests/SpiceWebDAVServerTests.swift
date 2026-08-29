@@ -58,6 +58,128 @@ struct SpiceWebDAVServerTests {
         #expect(status(traversal) == 403)
     }
 
+    @Test func depthOnePropfindStopsLazyEnumerationAtBodyLimit() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entryCount = 128
+        for index in 0..<entryCount {
+            try Data().write(to: root.appendingPathComponent(
+                String(format: "entry-%03d.txt", index)
+            ))
+        }
+
+        let baseline = try SpiceWebDAVServer(root: root)
+        let depthZero = try #require(await baseline.receive(
+            clientID: 160,
+            data: request("PROPFIND", "/", headers: ["Depth": "0"])
+        ).first)
+        #expect(status(depthZero) == 207)
+        let rootOnlyBody = try #require(responseBody(depthZero))
+
+        let gate = WebDAVFileOperationGate(
+            blocking: [.init(clientID: 161, sequence: 1)]
+        )
+        let enumerated = WebDAVDirectoryEntryProbe()
+        let delivery = WebDAVDeliveryProbe()
+        let server = try SpiceWebDAVServer(
+            root: root,
+            maximumBodyBytes: rootOnlyBody.count,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            fileOperationWillBegin: gate.operationWillBegin,
+            directoryEntryWasEnumerated: enumerated.observer
+        )
+        #expect(try await server.submit(
+            clientID: 161,
+            data: request("PROPFIND", "/", headers: ["Depth": "1"])
+        ) { result in
+            delivery.accept(result)
+        })
+        try #require(await gate.waitUntilStarted(clientID: 161, sequence: 1))
+
+        let admitted = await server.diagnosticsSnapshot()
+        #expect(admitted.reservedResponseBytes == 4_096 + rootOnlyBody.count)
+        #expect(
+            admitted.currentRetainedBytes
+                == admitted.pendingRetainedBytes + admitted.reservedResponseBytes
+        )
+        #expect(enumerated.values.isEmpty)
+
+        gate.release(clientID: 161, sequence: 1)
+        try #require(await delivery.waitUntilDelivered(count: 1))
+        let response = try #require(delivery.outcomes.first?.responses?.first)
+        #expect(status(response) == 507)
+        #expect(enumerated.values.count == 1)
+        #expect(enumerated.values.count < entryCount)
+        await waitForWebDAVServer(server) {
+            $0.pendingJobs == 0
+                && $0.pendingRetainedBytes == 0
+                && $0.reservedResponseBytes == 0
+                && $0.currentRetainedBytes == 0
+                && $0.executor.activeJobs == 0
+                && $0.executor.queuedJobs == 0
+                && $0.executor.currentRetainedBytes == 0
+        }
+    }
+
+    @Test func depthOnePropfindPreservesSortedOrderAtExactBodyLimit() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let childNames = ["zeta.txt", "alpha.txt", "middle.txt"]
+        for name in childNames {
+            try Data(name.utf8).write(to: root.appendingPathComponent(name))
+        }
+
+        let baseline = try SpiceWebDAVServer(root: root)
+        let baselineResponse = try #require(await baseline.receive(
+            clientID: 162,
+            data: request("PROPFIND", "/", headers: ["Depth": "1"])
+        ).first)
+        #expect(status(baselineResponse) == 207)
+        let exactBody = try #require(responseBody(baselineResponse))
+
+        let exactEnumeration = WebDAVDirectoryEntryProbe()
+        let exactServer = try SpiceWebDAVServer(
+            root: root,
+            maximumBodyBytes: exactBody.count,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            directoryEntryWasEnumerated: exactEnumeration.observer
+        )
+        let exactResponse = try #require(await exactServer.receive(
+            clientID: 163,
+            data: request("PROPFIND", "/", headers: ["Depth": "1"])
+        ).first)
+        #expect(status(exactResponse) == 207)
+        #expect(responseBody(exactResponse)?.count == exactBody.count)
+        #expect(Set(exactEnumeration.values) == Set(childNames))
+        #expect(exactEnumeration.values.count == childNames.count)
+        let text = String(decoding: exactResponse, as: UTF8.self)
+        let alpha = try #require(text.range(of: "<D:href>/alpha.txt</D:href>"))
+        let middle = try #require(text.range(of: "<D:href>/middle.txt</D:href>"))
+        let zeta = try #require(text.range(of: "<D:href>/zeta.txt</D:href>"))
+        #expect(alpha.lowerBound < middle.lowerBound)
+        #expect(middle.lowerBound < zeta.lowerBound)
+
+        let oneLessEnumeration = WebDAVDirectoryEntryProbe()
+        let oneLessServer = try SpiceWebDAVServer(
+            root: root,
+            maximumBodyBytes: exactBody.count - 1,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            directoryEntryWasEnumerated: oneLessEnumeration.observer
+        )
+        let oneLessResponse = try #require(await oneLessServer.receive(
+            clientID: 164,
+            data: request("PROPFIND", "/", headers: ["Depth": "1"])
+        ).first)
+        #expect(status(oneLessResponse) == 507)
+        #expect(oneLessEnumeration.values.count == childNames.count)
+        let exactDiagnostics = await exactServer.diagnosticsSnapshot()
+        let oneLessDiagnostics = await oneLessServer.diagnosticsSnapshot()
+        #expect(exactDiagnostics.currentRetainedBytes == 0)
+        #expect(exactDiagnostics.executor.currentRetainedBytes == 0)
+        #expect(oneLessDiagnostics.currentRetainedBytes == 0)
+        #expect(oneLessDiagnostics.executor.currentRetainedBytes == 0)
+    }
+
     @Test func readWriteServerSupportsBoundedFileLifecycle() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -973,6 +1095,12 @@ struct SpiceWebDAVServerTests {
             Int(String($0))
         }
     }
+
+    private func responseBody(_ response: Data) -> Data? {
+        let delimiter = Data("\r\n\r\n".utf8)
+        guard let range = response.range(of: delimiter) else { return nil }
+        return Data(response[range.upperBound...])
+    }
 }
 
 private struct WebDAVOperationKey: Hashable, Sendable {
@@ -1000,6 +1128,20 @@ private final class WebDAVFileBodyReadProbe: @unchecked Sendable {
     }
 
     var values: [WebDAVFileBodyRead] {
+        storage.withLock { $0 }
+    }
+}
+
+private final class WebDAVDirectoryEntryProbe: @unchecked Sendable {
+    private let storage = Mutex<[String]>([])
+
+    var observer: SpiceWebDAVServer.DirectoryEntryObserver {
+        { [self] url in
+            storage.withLock { $0.append(url.lastPathComponent) }
+        }
+    }
+
+    var values: [String] {
         storage.withLock { $0 }
     }
 }
