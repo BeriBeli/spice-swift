@@ -492,6 +492,73 @@ struct DisplayFramePublisherTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func waiterRegistersAfterCancelledGrantFreedSurfaceClaimsItAtomically() async throws {
+        let registrationGate = SecondSurfaceReservationRegistrationGate()
+        let grantGate = FirstGrantedSurfaceReservationGate()
+        let fixture = try await makeDamagedSurfaceStore(
+            waiterWillRegister: { surfaceID, reservationID in
+                await registrationGate.pauseSecondRegistration(
+                    surfaceID: surfaceID,
+                    reservationID: reservationID
+                )
+            },
+            grantWillBeClaimed: { surfaceID, reservationID in
+                await grantGate.blockFirstGrantUntilCancelled(
+                    surfaceID: surfaceID,
+                    reservationID: reservationID
+                )
+            }
+        )
+        let blocker = HeldSurfaceOperationGate()
+        let holder = Task {
+            try await fixture.store.withSurfaceOperationForTesting(surfaceID: 1) {
+                await blocker.hold()
+            }
+        }
+        await blocker.waitUntilHeld()
+        let observations = FramePublisherObservations()
+        let publisher = makeSurfaceStorePublisher(
+            store: fixture.store,
+            observations: observations
+        )
+        await publisher.submit(fixture.revision)
+
+        let flush = Task { await publisher.flushNow() }
+        await registrationGate.waitUntilRegistrationCount(1)
+        await blocker.release()
+        await grantGate.waitUntilFirstGrant()
+        try await holder.value
+
+        let nextPublication = Task {
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        }
+        await registrationGate.waitUntilSecondRegistrationPaused()
+        await publisher.cancel()
+        await flush.value
+
+        #expect(await grantGate.firstGrantObservedCancellation)
+        #expect(await observations.emittedRevisions.isEmpty)
+        let free = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(free.activeSurfaceCount == 0)
+        #expect(free.waitingCount == 0)
+        #expect(free.grantedWaiterCount == 0)
+        #expect(free.reservedCount == 1)
+
+        await registrationGate.releaseSecondRegistration()
+        let publication = try #require(await nextPublication.value)
+        #expect(publication.publicationDamage.copyRectangles == [fixture.damage])
+        let drained = await fixture.store.surfaceOperationReservationDiagnostics()
+        #expect(drained.activeSurfaceCount == 0)
+        #expect(drained.waitingCount == 0)
+        #expect(drained.grantedWaiterCount == 0)
+        #expect(drained.reservedCount == 0)
+        let duplicate = try #require(
+            await fixture.store.publicationSnapshot(atLeast: fixture.revision)
+        )
+        #expect(duplicate.publicationDamage.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func cancellationDirectlyStopsAdmissionAndDrainsEveryStartedSnapshot() async {
         let gate = FramePublisherSnapshotGate()
         let observations = FramePublisherObservations()
@@ -1130,6 +1197,50 @@ private actor SurfaceOperationWaiterProbe {
     func waitUntilRegistrationCount(_ count: Int) async {
         guard registrations.count < count else { return }
         await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+}
+
+private actor SecondSurfaceReservationRegistrationGate {
+    private var registrationCount = 0
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var secondRegistrationPaused = false
+    private var secondPauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var secondReleaseContinuation: CheckedContinuation<Void, Never>?
+
+    func pauseSecondRegistration(
+        surfaceID _: UInt32,
+        reservationID _: UInt64
+    ) async {
+        registrationCount += 1
+        let countReady = countWaiters.filter { registrationCount >= $0.0 }
+        countWaiters.removeAll { registrationCount >= $0.0 }
+        for (_, continuation) in countReady {
+            continuation.resume()
+        }
+        guard registrationCount == 2 else { return }
+
+        secondRegistrationPaused = true
+        let pauseWaiters = secondPauseWaiters
+        secondPauseWaiters.removeAll(keepingCapacity: false)
+        for waiter in pauseWaiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { secondReleaseContinuation = $0 }
+    }
+
+    func waitUntilRegistrationCount(_ count: Int) async {
+        guard registrationCount < count else { return }
+        await withCheckedContinuation { countWaiters.append((count, $0)) }
+    }
+
+    func waitUntilSecondRegistrationPaused() async {
+        guard !secondRegistrationPaused else { return }
+        await withCheckedContinuation { secondPauseWaiters.append($0) }
+    }
+
+    func releaseSecondRegistration() {
+        secondReleaseContinuation?.resume()
+        secondReleaseContinuation = nil
     }
 }
 
