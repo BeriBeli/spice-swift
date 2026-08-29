@@ -371,6 +371,85 @@ struct SpiceWebDAVServerTests {
         }
     }
 
+    @Test func headUsesMetadataWithoutMaterializingFileBody() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let maximumBodyBytes = 1 * 1_024 * 1_024
+        let body = Data(repeating: 0x5a, count: maximumBodyBytes)
+        let file = root.appendingPathComponent("large.bin")
+        try body.write(to: file)
+        try Data(repeating: 0x6b, count: maximumBodyBytes + 1).write(
+            to: root.appendingPathComponent("oversized.bin")
+        )
+
+        let gate = WebDAVFileOperationGate(
+            blocking: [.init(clientID: 56, sequence: 1)]
+        )
+        let reads = WebDAVFileBodyReadProbe()
+        let delivery = WebDAVDeliveryProbe()
+        let server = try SpiceWebDAVServer(
+            root: root,
+            maximumBodyBytes: maximumBodyBytes,
+            filesystemExecutor: SpiceFilesystemTaskExecutor(),
+            fileOperationWillBegin: gate.operationWillBegin,
+            fileBodyWillRead: reads.observer
+        )
+        #expect(try await server.submit(
+            clientID: 56,
+            data: request("HEAD", "/large.bin")
+        ) { result in
+            delivery.accept(result)
+        })
+        try #require(await gate.waitUntilStarted(clientID: 56, sequence: 1))
+
+        let admitted = await server.diagnosticsSnapshot()
+        #expect(admitted.bufferedInputBytes == 0)
+        #expect(admitted.reservedResponseBytes == 4_096)
+        #expect(
+            admitted.currentRetainedBytes
+                == admitted.pendingRetainedBytes + admitted.reservedResponseBytes
+        )
+        #expect(reads.values.isEmpty)
+
+        gate.release(clientID: 56, sequence: 1)
+        try #require(await delivery.waitUntilDelivered(count: 1))
+        let headResponse = try #require(delivery.outcomes.first?.responses?.first)
+        #expect(status(headResponse) == 200)
+        #expect(String(decoding: headResponse, as: UTF8.self).contains(
+            "Content-Length: \(maximumBodyBytes)\r\n"
+        ))
+        let headerDelimiter = Data("\r\n\r\n".utf8)
+        #expect(headResponse.range(of: headerDelimiter)?.upperBound == headResponse.endIndex)
+        #expect(reads.values.isEmpty)
+
+        let oversizedHead = try #require(await server.receive(
+            clientID: 57,
+            data: request("HEAD", "/oversized.bin")
+        ).first)
+        let oversizedGet = try #require(await server.receive(
+            clientID: 58,
+            data: request("GET", "/oversized.bin")
+        ).first)
+        #expect(status(oversizedHead) == 413)
+        #expect(status(oversizedGet) == 413)
+        #expect(reads.values.isEmpty)
+
+        let getResponse = try #require(await server.receive(
+            clientID: 59,
+            data: request("GET", "/large.bin")
+        ).first)
+        #expect(status(getResponse) == 200)
+        #expect(getResponse.suffix(body.count) == body)
+        #expect(reads.values == [WebDAVFileBodyRead(
+            path: file.standardizedFileURL.path,
+            byteCount: UInt64(maximumBodyBytes)
+        )])
+
+        await waitForWebDAVServer(server) {
+            $0.reservedResponseBytes == 0 && $0.currentRetainedBytes == 0
+        }
+    }
+
     @Test func serverAdmissionLimitsRejectAtomicallyAtExactBoundaries() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -730,6 +809,30 @@ struct SpiceWebDAVServerTests {
 private struct WebDAVOperationKey: Hashable, Sendable {
     let clientID: Int64
     let sequence: UInt64
+}
+
+private struct WebDAVFileBodyRead: Sendable, Equatable {
+    let path: String
+    let byteCount: UInt64
+}
+
+private final class WebDAVFileBodyReadProbe: @unchecked Sendable {
+    private let storage = Mutex<[WebDAVFileBodyRead]>([])
+
+    var observer: SpiceWebDAVServer.FileBodyReadObserver {
+        { [self] url, byteCount in
+            storage.withLock { reads in
+                reads.append(WebDAVFileBodyRead(
+                    path: url.standardizedFileURL.path,
+                    byteCount: byteCount
+                ))
+            }
+        }
+    }
+
+    var values: [WebDAVFileBodyRead] {
+        storage.withLock { $0 }
+    }
 }
 
 private enum WebDAVSenderOutcome: Sendable, Equatable {
