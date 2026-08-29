@@ -670,6 +670,15 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 // is already selected. It cannot complete this event.
                 return false
             }
+            guard let marker = state.selectedFrame?.payload,
+                  marker.token == token,
+                  marker.checksum == checksum else {
+                // Control-only or unrelated desktop deliveries may be
+                // selected, committed, and presented before the marker frame.
+                // They remain useful stage observations, but cannot consume
+                // this capture's one exact presentation or wake its waiter.
+                return false
+            }
             if state.presentedNs != nil {
                 state.invalidReason = state.invalidReason ?? "duplicate_presented"
                 return false

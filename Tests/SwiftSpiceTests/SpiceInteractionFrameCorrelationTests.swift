@@ -1126,6 +1126,120 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(try capture.finish().valid)
     }
 
+    @Test func markerlessPresentedDeliveryCannotConsumeTheExactPresentationWait() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presentation-markerless-first-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(
+                outputURL: directory.appending(path: "input-events.jsonl")
+            ),
+            pairId: "pair-presentation-markerless-first",
+            version: "v0.3.1",
+            runId: "run-presentation-wait",
+            order: 3,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let anchor = ContinuousClock().now
+        let unrelatedTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 50,
+            readyOffset: 60
+        )
+        let markerTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 70,
+            readyOffset: 80
+        )
+        let unrelatedReceive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: unrelatedTiming.messageReceivedAt
+        ))
+        let unrelatedReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: unrelatedTiming.surfaceReadyAt
+        ))
+        let markerReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: markerTiming.surfaceReadyAt
+        ))
+        let unrelatedIdentity = identity(frameRevision: 20, deliverySequence: 920)
+        let markerIdentity = identity(frameRevision: 21, deliverySequence: 921)
+        let registered = DispatchSemaphore(value: 0)
+
+        try capture.recordHostEvidence(
+            scheduledNs: unrelatedReceive - 40,
+            hostInputNs: unrelatedReceive - 30,
+            sendStartedNs: unrelatedReceive - 20,
+            sendCompletedNs: unrelatedReceive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        let waiter = Task {
+            try await capture.waitForExactPresentation {
+                registered.signal()
+            }
+        }
+        #expect(await waitForInteractionTraceSemaphore(
+            registered,
+            timeout: .seconds(2)
+        ) == .success)
+
+        diagnostics.recordInteractionFrameReceived(
+            snapshot(identity: unrelatedIdentity, pixels: blankPixels),
+            sourceTiming: unrelatedTiming
+        )
+        diagnostics.recordInteractionSelected(
+            identity: unrelatedIdentity,
+            readyNs: unrelatedReady,
+            selectionNs: unrelatedReady + 5
+        )
+        diagnostics.recordInteractionCommitted(
+            identity: unrelatedIdentity,
+            at: unrelatedReady + 10
+        )
+        diagnostics.recordInteractionPresented(
+            identity: unrelatedIdentity,
+            at: unrelatedReady + 15
+        )
+        do {
+            _ = try await capture.waitForExactPresentation()
+            Issue.record("markerless delivery incorrectly consumed the exact waiter")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .presentationWaitAlreadyRegistered)
+        }
+
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: markerIdentity, markerRevision: 77),
+            sourceTiming: markerTiming
+        )
+        diagnostics.recordInteractionSelected(
+            identity: markerIdentity,
+            readyNs: markerReady,
+            selectionNs: markerReady + 5
+        )
+        diagnostics.recordInteractionCommitted(
+            identity: markerIdentity,
+            at: markerReady + 10
+        )
+        diagnostics.recordInteractionPresented(
+            identity: markerIdentity,
+            at: markerReady + 15
+        )
+
+        #expect(try await waiter.value == markerIdentity)
+        let record = try capture.finish()
+        #expect(record.valid)
+        #expect(record.invalidReason == nil)
+        #expect(record.frameRevision == markerIdentity.frameRevision)
+        #expect(record.deliverySequence == markerIdentity.deliverySequence)
+        #expect(record.presentedNs == markerReady + 15)
+        #expect(record.presentedNs != unrelatedReady + 15)
+    }
+
     @Test func cancellingExactPresentationWaitRemovesOnlyThatWaiterAndCaptureCanFinish() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "interaction-presentation-cancel-\(UUID().uuidString)",
