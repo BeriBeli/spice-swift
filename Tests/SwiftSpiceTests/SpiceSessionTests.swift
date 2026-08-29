@@ -4566,9 +4566,11 @@ private final class SessionWebDAVOperationGate: @unchecked Sendable {
 
     func waitUntilStarted(clientID: Int64, sequence: UInt64) async -> Bool {
         let key = SessionWebDAVOperationKey(clientID: clientID, sequence: sequence)
-        return await Task.detached { [self] in
-            blockingWaitUntilStarted(key)
-        }.value
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                continuation.resume(returning: blockingWaitUntilStarted(key))
+            }
+        }
     }
 
     func didStart(clientID: Int64, sequence: UInt64) -> Bool {
@@ -4595,9 +4597,11 @@ private struct SessionWebDAVOperationKey: Hashable, Sendable {
 }
 
 private func waitForSessionWebDAVSemaphore(_ semaphore: DispatchSemaphore) async -> Bool {
-    await Task.detached {
-        blockingWaitForSessionWebDAVSemaphore(semaphore)
-    }.value
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            continuation.resume(returning: blockingWaitForSessionWebDAVSemaphore(semaphore))
+        }
+    }
 }
 
 private func blockingWaitForSessionWebDAVSemaphore(_ semaphore: DispatchSemaphore) -> Bool {

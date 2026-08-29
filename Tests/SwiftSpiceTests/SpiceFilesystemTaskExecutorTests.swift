@@ -203,9 +203,11 @@ private final class FilesystemOperationGate: @unchecked Sendable {
     }
 
     func waitUntilAnotherOperationStarts() async -> Bool {
-        await Task.detached { [started] in
-            blockingWaitForFilesystemSemaphore(started)
-        }.value
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [started] in
+                continuation.resume(returning: blockingWaitForFilesystemSemaphore(started))
+            }
+        }
     }
 
     func release(id: Int) {

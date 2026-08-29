@@ -804,9 +804,11 @@ private final class WebDAVDeliveryProbe: @unchecked Sendable {
     }
 
     func waitUntilDelivered(count: Int) async -> Bool {
-        await Task.detached { [self] in
-            blockingWaitUntilDelivered(count: count)
-        }.value
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                continuation.resume(returning: blockingWaitUntilDelivered(count: count))
+            }
+        }
     }
 
     private func blockingWaitUntilDelivered(count: Int) -> Bool {
@@ -864,9 +866,15 @@ private final class WebDAVFileOperationGate: @unchecked Sendable {
         timeout: DispatchTimeInterval = .seconds(10)
     ) async -> Bool {
         let key = WebDAVOperationKey(clientID: clientID, sequence: sequence)
-        return await Task.detached { [self] in
-            blockingWaitUntilStarted(key, occurrence: occurrence, timeout: timeout)
-        }.value
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                continuation.resume(returning: blockingWaitUntilStarted(
+                    key,
+                    occurrence: occurrence,
+                    timeout: timeout
+                ))
+            }
+        }
     }
 
     func release(clientID: Int64, sequence: UInt64) {
