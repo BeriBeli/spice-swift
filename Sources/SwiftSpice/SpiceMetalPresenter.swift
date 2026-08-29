@@ -612,8 +612,9 @@ package final class SpiceMetalFrameView: MTKView {
             let completedAt = ContinuousClock().now
             let completion: SpiceMetalCommandCompletion =
                 commandBuffer.status == .completed ? .succeeded : .failed
+            let committed = committedAt.withLock { $0 }
             Task { @MainActor in
-                if let committed = committedAt.withLock({ $0 }) {
+                if let committed {
                     presentationDiagnostics?.recordMetalCommitToCompletion(
                         committed.duration(to: completedAt),
                         epoch: presentationEpoch
