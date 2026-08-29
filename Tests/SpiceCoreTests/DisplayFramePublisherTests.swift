@@ -329,7 +329,8 @@ struct DisplayFramePublisherTests {
         #expect(secondDuplicate.publicationDamage.isEmpty)
     }
 
-    @Test func cancellationStopsAdmissionAndDrainsEveryStartedSnapshot() async {
+    @Test(.timeLimit(.minutes(1)))
+    func cancellationDirectlyStopsAdmissionAndDrainsEveryStartedSnapshot() async {
         let gate = FramePublisherSnapshotGate()
         let observations = FramePublisherObservations()
         let publisher = DisplayFramePublisher(
@@ -352,16 +353,26 @@ struct DisplayFramePublisherTests {
         let flush = Task { await publisher.flushNow() }
         await gate.waitUntilStarted(count: 3)
         await publisher.cancel()
-        // One structured child result wakes the manager so it can observe the
-        // invalidated generation, cancel its siblings, and drain the group.
-        await gate.succeed(surfaceID: 2)
-        await gate.waitUntilActiveCount(0)
+
+        // `cancel()` itself owns structured teardown. Capture its postcondition
+        // before any fallback cleanup so the pre-fix implementation fails
+        // deterministically instead of leaving the test process hung.
+        let activeAfterPublisherCancellation = await gate.activeCount
+        if activeAfterPublisherCancellation != 0 {
+            flush.cancel()
+        }
         await flush.value
 
+        #expect(activeAfterPublisherCancellation == 0)
         #expect(Set(await gate.startedRevisions) == Set(revisions.prefix(3)))
-        #expect(await gate.cancelledSurfaceIDs.sorted() == [1, 3])
+        #expect(await gate.cancelledSurfaceIDs.sorted() == [1, 2, 3])
         #expect(await gate.activeCount == 0)
         #expect(await gate.peakActiveCount == 3)
+        #expect(await observations.emittedRevisions.isEmpty)
+
+        await publisher.submit(surfaceRevision(surfaceID: 7, revision: 1))
+        await publisher.flushNow()
+        #expect(Set(await gate.startedRevisions) == Set(revisions.prefix(3)))
         #expect(await observations.emittedRevisions.isEmpty)
         let metrics = await publisher.metrics()
         #expect(metrics.pendingSurfaces == 0)
@@ -588,7 +599,8 @@ struct DisplayFramePublisherTests {
         #expect(metrics.pendingSurfaces == 0)
     }
 
-    @Test func cancellationDuringSnapshotClearsPendingWork() async {
+    @Test(.timeLimit(.minutes(1)))
+    func cancellationDuringSnapshotClearsPendingWork() async {
         let observations = FramePublisherObservations(blockNextSnapshot: true)
         let publisher = makePublisher(observations: observations)
         await publisher.submit(surfaceRevision(surfaceID: 1, revision: 1))
@@ -596,9 +608,9 @@ struct DisplayFramePublisherTests {
         let flush = Task { await publisher.flushNow() }
         await waitForSnapshotStart(observations)
         await publisher.cancel()
-        await observations.resumeSnapshot()
         await flush.value
 
+        #expect(await observations.snapshotCancellationCount == 1)
         #expect(await observations.emittedRevisions.isEmpty)
         #expect(await publisher.metrics().pendingSurfaces == 0)
     }
@@ -743,8 +755,10 @@ private actor FramePublisherObservations {
     private var shouldBlockNextEmit: Bool
     private var nextSnapshotRevision: SurfaceRevision?
     private var snapshotContinuation: CheckedContinuation<Void, Never>?
+    private var snapshotCancellationPending = false
     private var emitContinuation: CheckedContinuation<Void, Never>?
     private(set) var snapshotCount = 0
+    private(set) var snapshotCancellationCount = 0
     private(set) var emitCount = 0
     private(set) var emittedRevisions: [SurfaceRevision] = []
     private(set) var emittedFullDamage: [Bool] = []
@@ -764,8 +778,17 @@ private actor FramePublisherObservations {
         snapshotCount += 1
         if shouldBlockNextSnapshot {
             shouldBlockNextSnapshot = false
-            await withCheckedContinuation { continuation in
-                snapshotContinuation = continuation
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if snapshotCancellationPending {
+                        snapshotCancellationPending = false
+                        continuation.resume()
+                    } else {
+                        snapshotContinuation = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelBlockedSnapshot() }
             }
         }
         let capturedRevision = nextSnapshotRevision ?? revision
@@ -786,6 +809,16 @@ private actor FramePublisherObservations {
     func resumeSnapshot() {
         snapshotContinuation?.resume()
         snapshotContinuation = nil
+    }
+
+    private func cancelBlockedSnapshot() {
+        snapshotCancellationCount += 1
+        if let snapshotContinuation {
+            self.snapshotContinuation = nil
+            snapshotContinuation.resume()
+        } else {
+            snapshotCancellationPending = true
+        }
     }
 
     func emit(_ frame: FrameSnapshot) async {
