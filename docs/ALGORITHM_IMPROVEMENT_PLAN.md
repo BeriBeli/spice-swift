@@ -6,7 +6,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active |
-| Plan version | 1.2 |
+| Plan version | 1.3 |
 | Swift baseline | `v0.2.7` / `2c577d7` |
 | Reference client | spice-gtk `88ad5f1` (v0.43/master) / spice-common `71e4570` (master), reverified 2026-08-27 |
 | Created | 2026-08-26 |
@@ -55,7 +55,7 @@ Use exactly one of these values in the work table:
 
 | ID | Status | Work item | Depends on | Completion gate |
 | --- | --- | --- | --- | --- |
-| AIP-00 | in-progress | Establish fresh adjacent `v0.2.7`/`v0.3.0` interaction-pipeline metrics and a Release `spice-bench` JSON harness | — | Versioned artifacts identify commit, toolchain, hardware, thermal state, workload, and date; live traces separate input-to-guest and receive-to-present stages |
+| AIP-00 | blocked | Establish fresh adjacent `v0.2.7`/`v0.3.0` interaction-pipeline metrics and a Release `spice-bench` JSON harness | — | Versioned artifacts identify commit, toolchain, hardware, thermal state, workload, and date; live traces separate input-to-guest and receive-to-present stages |
 | AIP-10 | done | Add an owned physical-message model and strict full-header submessage lists | — | List-only and main-plus-list ordering, bounds, ACK, fragmentation, and mutation tests pass |
 | AIP-11 | done | Advance the serial barrier after processing and propagate channel failure | AIP-10 | Waiters remain blocked through handler work and terminate on success, failure, cancellation, or close |
 | AIP-12 | done | Move the image cache to Session scope with ordered mutations and asynchronous resolves | AIP-11 | Cross-Display cache, lossless replacement, invalidation, FIFO, cancellation, and capacity tests pass |
@@ -69,7 +69,7 @@ Use exactly one of these values in the work table:
 | AIP-33 | done | Parse Annex-B once and reduce VideoToolbox sample copies | AIP-30 | Copy counters improve and CoreMedia owner-lifetime tests pass on success, cancellation, and teardown |
 | AIP-40 | done | Connect child channels with bounded concurrency | AIP-32 | Concurrency never exceeds four and failure leaves no connected transport behind |
 | AIP-41 | done | Prepare independent Surface snapshots with bounded concurrency | AIP-32 | A blocked Surface does not prevent another from starting and emit order stays stable |
-| AIP-42 | pending | Replace realtime audio queues with preallocated rings | AIP-00 | Realtime callbacks perform no linear queue movement or per-packet allocation |
+| AIP-42 | in-progress | Replace realtime audio queues with preallocated rings | — | Realtime callbacks perform no linear queue movement or per-packet allocation |
 | AIP-43 | pending | Move blocking WebDAV filesystem work to a bounded executor | AIP-00 | Slow I/O does not block an unrelated client while per-client order is preserved |
 | AIP-44 | pending | Correlate input and display stages, then add interaction-aware low-latency frame selection | AIP-00 | Same-action paired traces reduce click/key/motion-to-visible p50 and p95 without weakening latest-only delivery, idle no-commit, drawable nonblocking, or the two-command GPU bound |
 | AIP-90 | pending | Run final regression, interoperability, and documentation closure | All applicable items | Full tests and fresh live gates pass and final evidence is recorded in `STATUS.md` |
@@ -205,6 +205,34 @@ Use exactly one of these values in the work table:
   Publisher cancellation drains snapshot children and all outstanding damage
   restorations before returning, including frames prepared behind a suspended
   earlier emit.
+
+### Preallocated realtime audio handoff
+
+- Playback and capture each use a preallocated 16 MiB logical PCM queue with at
+  most 262,144 metadata slots. Playback may own one additional 16 MiB staging
+  bank so a producer never copies packet payload while holding the realtime
+  render gate; diagnostics report queued, staging, and total ownership
+  separately. Capture remains single-bank.
+- Playback uses a pull render source. The realtime callback consumes published
+  ring bytes or zero-fills underflow; it does not create a `Task`, allocate an
+  `AVAudioPCMBuffer`, move an array prefix, or materialize packet `Data`.
+  Producers serialize, copy ordinary packets into an unpublished active-bank
+  range, and publish only metadata under the short gate. Overflow is prepared
+  in the inactive bank and committed by one O(1) bank swap plus startup reset.
+  Close rejects a late staged commit, reset cannot revive stale PCM, and FIFO
+  order survives wraparound and concurrent producer admission.
+- The capture tap validates the complete callback before publication, copies
+  fixed 1,024-frame interleaved or planar chunks into one preallocated input
+  buffer, converts through one ratio-sized reusable output buffer, and writes
+  PCM into the ring without callback-owned allocation. Capture metadata is
+  sized from the output-frame byte budget, not an assumed minimum callback
+  shape. Realtime failures retain a fixed typed token; `String` formatting and
+  packet `Data` materialization occur only on the async drain side.
+- A two-phase capture dequeue lease keeps allocation and copy outside the
+  producer mutex while preventing overwrite of leased bytes. Each drain is
+  bounded to the queued-slot snapshot taken at entry, so continuous production
+  cannot make one async drain unbounded. Wraparound uses at most two copies and
+  overflow/drop accounting uses checked, deterministic limits.
 
 ## Measurement and acceptance
 
@@ -663,3 +691,4 @@ behavior remain separate acceptance gates.
 | 2026-08-29 | AIP-00 | Share `binary-grid-v1` between the guest and Swift, normalize schema 2 through a bounded atomic collector, and reserve a separately named Rocky endpoint for the live gate | The local implementation can retain exact valid and attributable-invalid evidence without partial JSON lines, but it is not live completion evidence. The next run must use an isolated base/container/ports, verify the manifest capability, and bind real marker pixels to the same presented delivery before paired latency work or any AIP-44 scheduling decision. |
 | 2026-08-29 | AIP-00 | Make fixture identity overrides all-or-none and split host send-start from send-completion evidence | A partial later-shell environment must fail before filesystem or Podman effects rather than target the default endpoint. Recording the host-input/send-start boundary before the wire send allows a frame received before the send continuation resumes to remain causally eligible; send completion and a same-generation buffered motion ACK are linearized afterward without changing scheduling. |
 | 2026-08-29 | AIP-00 | Add a streaming guest trace boundary and a cancellation-safe exact-presentation wait before an env-gated live AppKit harness | The guest transaction exposes ARMED before input and accepts one ordered action/token/revision pair under one total budget. The package wait wakes only for the selected, committed identity accepted by AppKit presented; neither seam finishes a trace, changes pacing, or turns the isolated guest-causal smoke run into presented evidence. |
+| 2026-08-29 | AIP-00, AIP-42 | Record the foreground live gate as blocked and resume deterministic AIP-42 work on `main` without making a performance claim | The isolated Rocky endpoint is available, but the current Mac WindowServer session remains occluded and cannot establish visible demand. Preallocated audio ownership, FIFO, overflow, cancellation, allocation-counter, and sanitizer gates are deterministic and independent of that display environment. The earlier reviewed Draft PR #34 is retained only as design/review evidence because its stacked base was not integrated; a clean successor carries the current implementation. AIP-42 may be marked done when its deterministic completion gate and current-head review pass, while live audio-device behavior remains part of AIP-90. |
