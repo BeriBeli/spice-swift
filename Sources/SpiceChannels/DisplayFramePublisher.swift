@@ -372,6 +372,11 @@ package actor DisplayFramePublisher {
         let duration: Duration
     }
 
+    private struct ActiveSnapshotPreparation: Sendable {
+        let identifier: UInt64
+        let task: Task<[SnapshotPreparation], Never>
+    }
+
     private let interval: Duration
     private let maximumPendingSurfaces: Int
     private let maximumConcurrentSnapshots: Int
@@ -389,6 +394,8 @@ package actor DisplayFramePublisher {
     private var preparedRevisions: [UInt32: SurfaceRevision] = [:]
     private var forceFullDamage: Set<UInt32> = []
     private var flushTask: Task<Void, Never>?
+    private var activeSnapshotPreparation: ActiveSnapshotPreparation?
+    private var nextSnapshotPreparationIdentifier: UInt64 = 0
     private var isFlushing = false
     private var isCancelled = false
     private var lastFlushStart: ContinuousClock.Instant?
@@ -606,11 +613,13 @@ package actor DisplayFramePublisher {
         await flush()
     }
 
-    package func cancel() {
+    package func cancel() async {
         isCancelled = true
         generation &+= 1
         flushTask?.cancel()
         flushTask = nil
+        let activePreparation = activeSnapshotPreparation
+        activePreparation?.task.cancel()
         isFlushing = false
         lastFlushStart = nil
         lastBatchStart = nil
@@ -622,6 +631,13 @@ package actor DisplayFramePublisher {
         demandedSurfaces.removeAll(keepingCapacity: false)
         preparedRevisions.removeAll(keepingCapacity: false)
         forceFullDamage.removeAll(keepingCapacity: false)
+
+        if let activePreparation {
+            _ = await activePreparation.task.value
+            clearActiveSnapshotPreparation(
+                matching: activePreparation.identifier
+            )
+        }
     }
 
     package func metrics() -> DisplayFramePublisherMetrics {
@@ -677,10 +693,9 @@ package actor DisplayFramePublisher {
         order.removeAll { eligibleSet.contains($0) }
         flushTask = nil
 
-        let preparations = await prepareSnapshots(
-            requests,
-            flushGeneration: flushGeneration
-        )
+        let activePreparation = startSnapshotPreparation(for: requests)
+        let preparations = await activePreparation.task.value
+        clearActiveSnapshotPreparation(matching: activePreparation.identifier)
         guard generation == flushGeneration else { return }
 
         for preparation in preparations {
@@ -767,13 +782,35 @@ package actor DisplayFramePublisher {
     /// Prepares independent Surfaces concurrently without changing their
     /// publication order. Only `maximumConcurrentSnapshots` child tasks exist
     /// at once; the remaining work stays in the already-bounded request batch.
-    /// A generation change stops further admission, cancels the admitted
-    /// children, and still drains them before returning ownership to teardown.
+    /// Cancelling the one retained manager immediately cancels the admitted
+    /// children, stops further admission, and still drains them before
+    /// returning ownership to teardown.
+    private func startSnapshotPreparation(
+        for requests: [Request]
+    ) -> ActiveSnapshotPreparation {
+        let identifier = nextSnapshotPreparationIdentifier
+        nextSnapshotPreparationIdentifier &+= 1
+        let task = Task<[SnapshotPreparation], Never> { [weak self] in
+            guard let self else { return [] }
+            return await self.prepareSnapshots(requests)
+        }
+        let preparation = ActiveSnapshotPreparation(
+            identifier: identifier,
+            task: task
+        )
+        activeSnapshotPreparation = preparation
+        return preparation
+    }
+
+    private func clearActiveSnapshotPreparation(matching identifier: UInt64) {
+        guard activeSnapshotPreparation?.identifier == identifier else { return }
+        activeSnapshotPreparation = nil
+    }
+
     private func prepareSnapshots(
-        _ requests: [Request],
-        flushGeneration: UInt64
+        _ requests: [Request]
     ) async -> [SnapshotPreparation] {
-        guard !requests.isEmpty else { return [] }
+        guard !requests.isEmpty, !Task.isCancelled else { return [] }
         let snapshot = self.snapshot
         let clock = self.clock
         var ordered = [SnapshotPreparation?](
@@ -785,6 +822,7 @@ package actor DisplayFramePublisher {
             var nextRequestIndex = 0
             let initialCount = min(maximumConcurrentSnapshots, requests.count)
             for _ in 0..<initialCount {
+                guard !Task.isCancelled else { break }
                 let requestIndex = nextRequestIndex
                 let request = requests[requestIndex]
                 nextRequestIndex += 1
@@ -804,7 +842,7 @@ package actor DisplayFramePublisher {
                 snapshotDuration.record(completed.duration)
                 ordered[completed.requestIndex] = completed
 
-                guard generation == flushGeneration, !isCancelled else {
+                guard !Task.isCancelled else {
                     group.cancelAll()
                     continue
                 }

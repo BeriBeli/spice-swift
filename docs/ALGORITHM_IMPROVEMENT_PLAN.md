@@ -178,12 +178,16 @@ Use exactly one of these values in the work table:
   replacement, damage, prepared-frame, and emit state is evaluated; emit
   remains serial. One Surface returning no snapshot does not cancel independent
   Surface work.
-- Cancellation invalidates the publisher generation, stops further snapshot
-  admission, cancels and drains already admitted children, and suppresses every
-  late result. Surface removal and recreation retain their per-ID invalidation
-  check. The `SurfaceStore` remains the owner of per-Surface operation leases
-  and atomically selects the revision, constructs its immutable snapshot, and
-  transfers publication damage; teardown never abandons an acquired lease.
+- The publisher retains at most one preparation-manager task in addition to its
+  two structured snapshot children. Cancellation invalidates the publisher
+  generation, directly cancels that manager so cancellation propagates to all
+  admitted children without waiting for a natural completion, stops further
+  admission, and awaits the manager's complete drain before returning. Every
+  late result is suppressed. Surface removal and recreation retain their per-ID
+  invalidation check. The `SurfaceStore` remains the owner of per-Surface
+  operation leases and atomically selects the revision, constructs its
+  immutable snapshot, and transfers publication damage; teardown never
+  abandons an acquired lease.
 
 ## Measurement and acceptance
 
