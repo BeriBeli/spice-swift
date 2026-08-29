@@ -20,14 +20,18 @@ struct SpiceInteractionTraceTests {
             "scheduled_ns", "host_input_ns", "send_started_ns", "send_completed_ns",
             "motion_ack_ns", "guest_received_ns", "guest_marker_drawn_ns",
             "display_receive_ns", "surface_ready_ns", "selected_revision_ready_ns",
-            "selection_ns", "metal_commit_ns", "presented_ns", "surface_generation",
-            "frame_revision", "delivery_sequence", "marker_revision", "valid",
+            "selection_ns", "metal_commit_ns", "presented_ns", "display_channel_id",
+            "surface_id", "surface_generation",
+            "desktop_generation", "frame_revision", "delivery_sequence",
+            "marker_revision", "marker_checksum", "valid",
         ]
         #expect(Set(object.keys).isSuperset(of: requiredKeys))
         #expect(object["pair_id"] as? String == "pair-0001")
         #expect(object["action_class"] as? String == "motion")
         #expect(object["token"] as? String == "0123456789abcdef")
         #expect(object["valid"] as? Bool == true)
+        #expect((object["display_channel_id"] as? NSNumber)?.uint8Value == 0)
+        #expect((object["surface_id"] as? NSNumber)?.uint32Value == 1)
         #expect((object["marker_revision"] as? NSNumber)?.uint64Value == 77)
 
         let decoded = try JSONDecoder().decode(SpiceInteractionTraceRecord.self, from: encoded)
@@ -175,10 +179,14 @@ struct SpiceInteractionTraceTests {
             selectionNs: 100,
             metalCommitNs: 110,
             presentedNs: 120,
+            displayChannelID: 0,
+            surfaceID: 1,
             surfaceGeneration: 7,
+            desktopGeneration: 9,
             frameRevision: 76,
             deliverySequence: 1001,
             markerRevision: markerRevision,
+            markerChecksum: "9f9f5111",
             invalidReason: invalidReason
         )
     }

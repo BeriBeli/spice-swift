@@ -431,6 +431,7 @@ package final class SpiceMetalFrameView: MTKView {
         let sourceTexture: any MTLTexture
         let frame: SpiceFrame
         let requestedAt: ContinuousClock.Instant
+        let interactionContext: SpiceInteractionPresentationContext?
         let onCompletion: @MainActor @Sendable (
             SpiceMetalCommandCompletion
         ) -> Void
@@ -481,6 +482,7 @@ package final class SpiceMetalFrameView: MTKView {
     package func present(
         _ frame: SpiceFrame,
         requestedAt: ContinuousClock.Instant,
+        interactionContext: SpiceInteractionPresentationContext? = nil,
         onCompletion: @escaping @MainActor @Sendable (
             SpiceMetalCommandCompletion
         ) -> Void = { _ in }
@@ -515,6 +517,7 @@ package final class SpiceMetalFrameView: MTKView {
             sourceTexture: sourceTexture,
             frame: frame,
             requestedAt: requestedAt,
+            interactionContext: interactionContext,
             onCompletion: onCompletion
         )
         pendingDrawResult = nil
@@ -563,27 +566,13 @@ package final class SpiceMetalFrameView: MTKView {
             return .cpuFallback(.metalCommandFailure)
         }
 
-        let committedAt = clock.now
-        presentationDiagnostics?.recordViewUpdateToMetalCommit(
-            pending.requestedAt.duration(to: committedAt)
-        )
-        let completionStartedAt = committedAt
         let onCompletion = pending.onCompletion
-        commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
-            presentationDiagnostics?.recordMetalCommitToCompletion(
-                completionStartedAt.duration(to: ContinuousClock().now),
-                epoch: presentationEpoch
-            )
-            let completion: SpiceMetalCommandCompletion =
-                commandBuffer.status == .completed ? .succeeded : .failed
-            Task { @MainActor in
-                onCompletion(completion)
-            }
-        }
         let completionMetrics = presenter.completionMetrics
         let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
         let requestToPresentedStartedAt = pending.requestedAt
+        let interactionIdentity = pending.interactionContext?.identity
         drawable.addPresentedHandler { [presentationDiagnostics] _ in
+            let presentedNanoseconds = SpiceInteractionHostClock.nowNanoseconds()
             let duration = requestToPresentedStartedAt.duration(
                 to: ContinuousClock().now
             )
@@ -596,8 +585,39 @@ package final class SpiceMetalFrameView: MTKView {
                 duration,
                 epoch: presentationEpoch
             )
+            if let interactionIdentity {
+                presentationDiagnostics?.recordInteractionPresented(
+                    identity: interactionIdentity,
+                    at: presentedNanoseconds
+                )
+            }
         }
         commandBuffer.present(drawable)
+        // Sample the commit phase after presentation is encoded and before the
+        // actual commit call. Publish causal evidence first so an exceptionally
+        // fast completion/presented callback cannot overtake its commit stage.
+        let committedAt = clock.now
+        presentationDiagnostics?.recordViewUpdateToMetalCommit(
+            pending.requestedAt.duration(to: committedAt)
+        )
+        commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
+            presentationDiagnostics?.recordMetalCommitToCompletion(
+                committedAt.duration(to: ContinuousClock().now),
+                epoch: presentationEpoch
+            )
+            let completion: SpiceMetalCommandCompletion =
+                commandBuffer.status == .completed ? .succeeded : .failed
+            Task { @MainActor in
+                onCompletion(completion)
+            }
+        }
+        if let interactionIdentity = pending.interactionContext?.identity,
+           let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(for: committedAt) {
+            presentationDiagnostics?.recordInteractionCommitted(
+                identity: interactionIdentity,
+                at: committedNanoseconds
+            )
+        }
         presentationDiagnostics?.recordMetalCommandBufferCommitted()
         commandBuffer.commit()
 

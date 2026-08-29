@@ -356,6 +356,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
     private struct State: Sendable {
         var pending: SpiceDesktopSnapshot?
         var pendingReadyAt: ContinuousClock.Instant?
+        var pendingReadyNanoseconds: UInt64?
         var newestGeneration: UInt64?
         var newestDeliverySequence: UInt64 = 0
     }
@@ -365,17 +366,35 @@ package final class SpiceDesktopReadyLatch: Sendable {
     package struct Ready: Sendable {
         package let snapshot: SpiceDesktopSnapshot
         package let waitingDuration: Duration
+        package let readyNanoseconds: UInt64
     }
 
     /// Returns true only for the empty-to-ready transition.
     package func offer(_ snapshot: SpiceDesktopSnapshot) -> Bool {
-        offer(snapshot, at: ContinuousClock().now)
+        offer(
+            snapshot,
+            at: ContinuousClock().now,
+            readyNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+        )
     }
 
     /// Returns true only for the empty-to-ready transition.
     package func offer(
         _ snapshot: SpiceDesktopSnapshot,
         at readyAt: ContinuousClock.Instant
+    ) -> Bool {
+        offer(
+            snapshot,
+            at: readyAt,
+            readyNanoseconds: SpiceInteractionHostClock.nanoseconds(for: readyAt)
+                ?? SpiceInteractionHostClock.nowNanoseconds()
+        )
+    }
+
+    package func offer(
+        _ snapshot: SpiceDesktopSnapshot,
+        at readyAt: ContinuousClock.Instant,
+        readyNanoseconds: UInt64
     ) -> Bool {
         state.withLock { state in
             guard Self.isStrictlyNewer(
@@ -388,6 +407,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
                 SpiceDesktopSource.merging($0, snapshot)
             } ?? snapshot
             state.pendingReadyAt = readyAt
+            state.pendingReadyNanoseconds = readyNanoseconds
             state.newestGeneration = state.pending?.generation
             state.newestDeliverySequence = state.pending?.deliverySequence ?? 0
             return wasEmpty
@@ -399,6 +419,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
             defer {
                 state.pending = nil
                 state.pendingReadyAt = nil
+                state.pendingReadyNanoseconds = nil
             }
             return state.pending
         }
@@ -408,27 +429,48 @@ package final class SpiceDesktopReadyLatch: Sendable {
         state.withLock { state in
             guard let snapshot = state.pending else { return nil }
             let readyAt = state.pendingReadyAt ?? selectedAt
+            let readyNanoseconds = state.pendingReadyNanoseconds
+                ?? SpiceInteractionHostClock.nowNanoseconds()
             let waitingDuration = selectedAt < readyAt
                 ? Duration.zero
                 : readyAt.duration(to: selectedAt)
             state.pending = nil
             state.pendingReadyAt = nil
+            state.pendingReadyNanoseconds = nil
             return Ready(
                 snapshot: snapshot,
-                waitingDuration: waitingDuration
+                waitingDuration: waitingDuration,
+                readyNanoseconds: readyNanoseconds
             )
         }
     }
 
     /// Keeps a failed presentation pending without replacing a newer update.
     package func restoreIfEmpty(_ snapshot: SpiceDesktopSnapshot) {
-        restoreIfEmpty(snapshot, at: ContinuousClock().now)
+        restoreIfEmpty(
+            snapshot,
+            at: ContinuousClock().now,
+            readyNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+        )
     }
 
     /// Keeps a failed presentation pending without replacing a newer update.
     package func restoreIfEmpty(
         _ snapshot: SpiceDesktopSnapshot,
         at readyAt: ContinuousClock.Instant
+    ) {
+        restoreIfEmpty(
+            snapshot,
+            at: readyAt,
+            readyNanoseconds: SpiceInteractionHostClock.nanoseconds(for: readyAt)
+                ?? SpiceInteractionHostClock.nowNanoseconds()
+        )
+    }
+
+    package func restoreIfEmpty(
+        _ snapshot: SpiceDesktopSnapshot,
+        at readyAt: ContinuousClock.Instant,
+        readyNanoseconds: UInt64
     ) {
         state.withLock { state in
             guard state.pending == nil,
@@ -440,6 +482,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
             else { return }
             state.pending = snapshot
             state.pendingReadyAt = readyAt
+            state.pendingReadyNanoseconds = readyNanoseconds
             state.newestGeneration = snapshot.generation
             state.newestDeliverySequence = snapshot.deliverySequence
         }
@@ -449,6 +492,7 @@ package final class SpiceDesktopReadyLatch: Sendable {
         state.withLock {
             $0.pending = nil
             $0.pendingReadyAt = nil
+            $0.pendingReadyNanoseconds = nil
         }
     }
 
@@ -793,7 +837,13 @@ package final class SpiceFramebufferView: NSView {
         )
         presentationDiagnostics?.recordDesktopImmediateSelection()
 
-        switch apply(ready.snapshot, requestedAt: clock.now) {
+        let selectedAt = clock.now
+        switch apply(
+            ready.snapshot,
+            requestedAt: selectedAt,
+            readyNanoseconds: ready.readyNanoseconds,
+            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+        ) {
         case .consumed:
             // Keep one display tick armed as a pacing fence. If no newer update
             // arrived, that tick pauses the link; otherwise it selects only the
@@ -858,7 +908,13 @@ package final class SpiceFramebufferView: NSView {
         )
         let snapshot = ready.snapshot
 
-        switch apply(snapshot, requestedAt: clock.now) {
+        let selectedAt = clock.now
+        switch apply(
+            snapshot,
+            requestedAt: selectedAt,
+            readyNanoseconds: ready.readyNanoseconds,
+            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+        ) {
         case .consumed:
             // Keep the link active until a later tick observes no pending
             // update. This is the pacing fence that prevents a 120 Hz producer
@@ -872,12 +928,19 @@ package final class SpiceFramebufferView: NSView {
 
     private func apply(
         _ snapshot: SpiceDesktopSnapshot,
-        requestedAt: ContinuousClock.Instant
+        requestedAt: ContinuousClock.Instant,
+        readyNanoseconds: UInt64,
+        selectionNanoseconds: UInt64
     ) -> SnapshotApplicationResult {
         if let desktopGeneration, snapshot.generation < desktopGeneration {
             return .consumed
         }
         if desktopGeneration != snapshot.generation {
+            if let desktopGeneration, snapshot.generation > desktopGeneration {
+                presentationDiagnostics?.retireInteractionDesktopGeneration(
+                    desktopGeneration
+                )
+            }
             desktopGeneration = snapshot.generation
             selectedRevision = nil
             acknowledgedRevision = nil
@@ -926,6 +989,13 @@ package final class SpiceFramebufferView: NSView {
             updateRevision: update.revision,
             requiresRedraw: requiresFrameRedraw
         ) {
+            if let identity = snapshot.interactionFrameIdentity {
+                self.presentationDiagnostics?.recordInteractionSelected(
+                    identity: identity,
+                    readyNs: readyNanoseconds,
+                    selectionNs: selectionNanoseconds
+                )
+            }
             let updatedGeometry = SpiceDesktopFrameGeometry(
                 width: update.frame.width,
                 height: update.frame.height
@@ -945,7 +1015,14 @@ package final class SpiceFramebufferView: NSView {
                 )
                 let result = metalView.present(
                     update.frame,
-                    requestedAt: requestedAt
+                    requestedAt: requestedAt,
+                    interactionContext: snapshot.interactionFrameIdentity.map {
+                        SpiceInteractionPresentationContext(
+                            identity: $0,
+                            readyNanoseconds: readyNanoseconds,
+                            selectionNanoseconds: selectionNanoseconds
+                        )
+                    }
                 ) { [weak self] completion in
                     self?.metalCommandCompleted(
                         attempt,

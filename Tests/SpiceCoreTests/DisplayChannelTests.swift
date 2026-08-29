@@ -78,7 +78,10 @@ struct DisplayChannelTests {
         var eventIterator = events.stream.makeAsyncIterator()
         var finalFrame: FrameSnapshot?
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event, frame.pixels.first == 90 else { continue }
+            guard case let .frame(published) = event,
+                  published.snapshot.pixels.first == 90
+            else { continue }
+            let frame = published.snapshot
             finalFrame = frame
             break
         }
@@ -320,8 +323,8 @@ struct DisplayChannelTests {
 
         var eventIterator = events.stream.makeAsyncIterator()
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event,
-                  pixel(frame, x: 0, y: 0) == [0, 0, 255, 255]
+            guard case let .frame(published) = event,
+                  pixel(published.snapshot, x: 0, y: 0) == [0, 0, 255, 255]
             else {
                 continue
             }
@@ -331,7 +334,10 @@ struct DisplayChannelTests {
         await decoder.releaseFirstDecode()
         var finalFrame: FrameSnapshot?
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event, frame.pixels.first == 50 else { continue }
+            guard case let .frame(published) = event,
+                  published.snapshot.pixels.first == 50
+            else { continue }
+            let frame = published.snapshot
             finalFrame = frame
             break
         }
@@ -543,7 +549,10 @@ struct DisplayChannelTests {
 
         var eventIterator = events.stream.makeAsyncIterator()
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event, frame.pixels.first == 50 else { continue }
+            guard case let .frame(published) = event,
+                  published.snapshot.pixels.first == 50
+            else { continue }
+            let frame = published.snapshot
             #expect(frame.revision == 1)
             break
         }
@@ -551,7 +560,10 @@ struct DisplayChannelTests {
         await decoder.releaseFirstDecode()
         var finalFrame: FrameSnapshot?
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event, frame.pixels.first == 90 else { continue }
+            guard case let .frame(published) = event,
+                  published.snapshot.pixels.first == 90
+            else { continue }
+            let frame = published.snapshot
             finalFrame = frame
             break
         }
@@ -625,7 +637,10 @@ struct DisplayChannelTests {
 
         var finalFrame: FrameSnapshot?
         while let event = await eventIterator.next() {
-            guard case let .frame(frame) = event, frame.pixels.first == 10 else { continue }
+            guard case let .frame(published) = event,
+                  published.snapshot.pixels.first == 10
+            else { continue }
+            let frame = published.snapshot
             if pixel(frame, x: 2, y: 0) == [70, 0, 0, 255] {
                 finalFrame = frame
                 break

@@ -309,7 +309,8 @@ public final class SpiceDesktopSource: Sendable {
         deliver(deliveries)
     }
 
-    package func receiveFrame(_ snapshot: FrameSnapshot, displayChannelID: UInt8) {
+    package func receiveFrame(_ published: PublishedDisplayFrame, displayChannelID: UInt8) {
+        let snapshot = published.snapshot
         let key = DisplaySurfaceKey(
             channelID: displayChannelID,
             surfaceID: snapshot.surfaceID
@@ -332,11 +333,19 @@ public final class SpiceDesktopSource: Sendable {
         )
         let result = state.withLock { state -> (
             deliveries: [SpiceDesktopDelivery],
-            autoAcknowledge: Bool
+            autoAcknowledge: Bool,
+            traceSnapshot: SpiceDesktopSnapshot?
         ) in
             state.deliverySequence &+= 1
             state.frames[key] = retainedUpdate
             state.surfacesAwaitingFreshPublication.remove(key)
+            let desktopSnapshot = SpiceDesktopSnapshot(
+                generation: state.generation,
+                frame: deliveredUpdate,
+                cursor: state.cursor,
+                pointerMode: state.pointerMode,
+                deliverySequence: state.deliverySequence
+            )
             let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
@@ -344,18 +353,19 @@ public final class SpiceDesktopSource: Sendable {
                 }
                 return delivery(
                     for: subscriber,
-                    snapshot: SpiceDesktopSnapshot(
-                        generation: state.generation,
-                        frame: deliveredUpdate,
-                        cursor: state.cursor,
-                        pointerMode: state.pointerMode,
-                        deliverySequence: state.deliverySequence
-                    )
+                    snapshot: desktopSnapshot
                 )
             }
             return (
                 deliveries,
-                shouldAutoAcknowledge(key: key, state: state)
+                shouldAutoAcknowledge(key: key, state: state),
+                deliveries.isEmpty ? nil : desktopSnapshot
+            )
+        }
+        if let traceSnapshot = result.traceSnapshot {
+            presentationDiagnostics.recordInteractionFrameReceived(
+                traceSnapshot,
+                sourceTiming: published.sourceTiming
             )
         }
         deliver(result.deliveries)
@@ -365,6 +375,13 @@ public final class SpiceDesktopSource: Sendable {
                 revision: snapshot.surfaceRevision
             )
         }
+    }
+
+    package func receiveFrame(_ snapshot: FrameSnapshot, displayChannelID: UInt8) {
+        receiveFrame(
+            PublishedDisplayFrame(snapshot: snapshot, sourceTiming: nil),
+            displayChannelID: displayChannelID
+        )
     }
 
     package func surfaceDestroyed(displayChannelID: UInt8, surfaceID: UInt32) {
