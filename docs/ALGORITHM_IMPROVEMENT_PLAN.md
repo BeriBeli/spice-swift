@@ -383,7 +383,11 @@ recreated surface's trace; a trace already presented before retirement remains
 historical evidence. The presented stage uses the drawable's actual
 `presentedTime` mapped into the host monotonic clock, while MainActor
 serialization keeps its trace mutation after the corresponding Metal
-`commit()` call boundary. A missing marker, ambiguous ROI, duplicate identity,
+`commit()` call. The commit timestamp is stored at the immediately preceding
+call boundary after every handler has been installed, with no diagnostics or
+external work between that store and `commit()`; completion can therefore
+never observe a missing timestamp. A missing marker, ambiguous ROI, duplicate
+identity,
 retired generation, latest-only replacement, CPU fallback without a presented
 callback, or missing input remains invalid. Invalid replacement records still
 retain the stages and identity actually selected so a failure can be diagnosed

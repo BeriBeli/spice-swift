@@ -623,12 +623,14 @@ package final class SpiceMetalFrameView: MTKView {
                 onCompletion(completion)
             }
         }
-        commandBuffer.commit()
-        // Sample immediately after the actual commit call. Presented and
-        // completion callbacks only mutate view-owned trace state after hopping
-        // back to this MainActor, so neither can overtake this evidence.
+        // Publish the call-boundary timestamp before commit so a completion on
+        // another thread can never observe an empty timestamp. No diagnostics
+        // or external work may be inserted between this store and `commit()`.
         let commitCallBoundary = clock.now
         committedAt.withLock { $0 = commitCallBoundary }
+        commandBuffer.commit()
+        // Presented callbacks only mutate view-owned trace state after hopping
+        // back to this MainActor, so they cannot overtake this commit evidence.
         presentationDiagnostics?.recordViewUpdateToMetalCommit(
             pending.requestedAt.duration(to: commitCallBoundary)
         )
