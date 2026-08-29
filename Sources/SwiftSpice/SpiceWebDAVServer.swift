@@ -61,6 +61,11 @@ public actor SpiceWebDAVServer {
         var worker: Task<Void, Never>?
     }
 
+    private struct ActiveResponseOwner: Sendable, Equatable {
+        let generation: UInt64
+        let submissionID: UInt64
+    }
+
     package struct Diagnostics: Sendable, Equatable {
         package let clients: Int
         package let bufferedInputBytes: Int
@@ -129,6 +134,7 @@ public actor SpiceWebDAVServer {
     private var rejectedJobs: UInt64 = 0
     private var discardedLateResults: UInt64 = 0
     private var activeResponseSubmissions: Set<UInt64> = []
+    private var activeResponseOwners: [Int64: ActiveResponseOwner] = [:]
     private var activeFilesystemGenerations: [Int64: UInt64] = [:]
     private var activeFilesystemSubmissions: Set<UInt64> = []
     private var retiredFilesystemSubmissions: Set<UInt64> = []
@@ -217,8 +223,10 @@ public actor SpiceWebDAVServer {
         let existingBuffer = legacyBuffers[clientID]
         if existingBuffer == nil {
             // This synchronous compatibility API cannot await retirement.
-            // Reject same-ID reuse until the old executor operation drains.
-            guard activeFilesystemGenerations[clientID] == nil else {
+            // Reject same-ID reuse until old filesystem or response ownership
+            // drains.
+            guard activeFilesystemGenerations[clientID] == nil,
+                  activeResponseOwners[clientID] == nil else {
                 throw .invalidRequest
             }
             guard clients[clientID] == nil else { throw .invalidRequest }
@@ -612,14 +620,23 @@ public actor SpiceWebDAVServer {
             // The response reservation remains charged while the sender owns
             // the result. This bounds slow-client response retention without
             // holding a filesystem executor permit during transport I/O.
-            activeResponseSubmissions.insert(submission.id)
+            let responseOwner = ActiveResponseOwner(
+                generation: generation,
+                submissionID: submission.id
+            )
+            precondition(activeResponseOwners[clientID] == nil)
+            precondition(activeResponseSubmissions.insert(submission.id).inserted)
+            activeResponseOwners[clientID] = responseOwner
             clients[clientID] = current
             let delivered = await submission.responseSender(result)
 
-            guard activeResponseSubmissions.remove(submission.id) != nil else {
+            guard finishResponseDelivery(submission, owner: responseOwner) else {
                 return
             }
-            release([submission])
+            // This is the sole handoff for same-ID reuse after response
+            // retirement. Admission may already have installed a newer
+            // generation, but it cannot start until ownership is released.
+            defer { startClientWorkerIfPossible(clientID: clientID) }
             if var latest = clients[clientID],
                latest.generation == generation,
                latest.submissions.first?.id == submission.id {
@@ -704,6 +721,7 @@ public actor SpiceWebDAVServer {
 
     private func startClientWorkerIfPossible(clientID: Int64) {
         guard activeFilesystemGenerations[clientID] == nil,
+              activeResponseOwners[clientID] == nil,
               var client = clients[clientID],
               client.worker == nil,
               !client.submissions.isEmpty else {
@@ -714,6 +732,20 @@ public actor SpiceWebDAVServer {
             await self?.runClient(clientID: clientID, generation: generation)
         }
         clients[clientID] = client
+    }
+
+    private func finishResponseDelivery(
+        _ submission: Submission,
+        owner: ActiveResponseOwner
+    ) -> Bool {
+        guard activeResponseSubmissions.contains(submission.id),
+              activeResponseOwners[submission.clientID] == owner else {
+            return false
+        }
+        activeResponseSubmissions.remove(submission.id)
+        activeResponseOwners.removeValue(forKey: submission.clientID)
+        release([submission])
+        return true
     }
 
     private func clearWorker(clientID: Int64, generation: UInt64) {
