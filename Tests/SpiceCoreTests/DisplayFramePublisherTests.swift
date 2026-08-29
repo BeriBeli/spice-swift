@@ -1,4 +1,5 @@
 import Foundation
+import SpiceIOSurface
 import Synchronization
 import Testing
 @testable import SpiceChannels
@@ -279,7 +280,8 @@ struct DisplayFramePublisherTests {
         for surfaceID: UInt32 in [1, 2] {
             try await store.create(id: surfaceID, width: 8, height: 1, format: 32)
             let created = try await store.descriptor(surfaceID: surfaceID).surfaceRevision
-            _ = try #require(await store.publicationSnapshot(atLeast: created))
+            let initial = try #require(await store.publicationSnapshot(atLeast: created))
+            initial.commitPublicationDamage()
         }
         let firstDamage = PixelRect(x: 0, y: 0, width: 1, height: 1)
         let secondDamage = PixelRect(x: 2, y: 0, width: 2, height: 1)
@@ -327,6 +329,97 @@ struct DisplayFramePublisherTests {
         let secondDuplicate = try #require(await store.publicationSnapshot(atLeast: second))
         #expect(firstDuplicate.publicationDamage.isEmpty)
         #expect(secondDuplicate.publicationDamage.isEmpty)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancellationDuringOrderedEmitRestoresEveryUncommittedPublicationDamage() async throws {
+        let framePool = IOSurfaceFramePool(limits: .init(maximumFrames: 4))
+        let store = SurfaceStore(framePool: framePool, backingPolicy: .dataOnly)
+        for surfaceID: UInt32 in [1, 2] {
+            try await store.create(id: surfaceID, width: 16, height: 1, format: 32)
+            let created = try await store.descriptor(surfaceID: surfaceID).surfaceRevision
+            let initial = try #require(await store.publicationSnapshot(atLeast: created))
+            initial.commitPublicationDamage()
+        }
+        let firstDamage = PixelRect(x: 1, y: 0, width: 2, height: 1)
+        let secondOriginalDamage = PixelRect(x: 4, y: 0, width: 2, height: 1)
+        let secondConcurrentDamage = PixelRect(x: 10, y: 0, width: 1, height: 1)
+        let first = try await store.fill(
+            surfaceID: 1,
+            rectangle: firstDamage,
+            colorARGB: 0x0011_2233
+        )
+        let second = try await store.fill(
+            surfaceID: 2,
+            rectangle: secondOriginalDamage,
+            colorARGB: 0x0044_5566
+        )
+        let snapshotProbe = CompletedPublicationSnapshotProbe(store: store)
+        let emitGate = OrderedEmitCancellationGate()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            maximumConcurrentSnapshots: 2,
+            snapshot: { revision in
+                await snapshotProbe.snapshot(atLeast: revision)
+            },
+            emit: { frame in
+                await emitGate.emit(frame)
+            }
+        )
+        await publisher.submit(first)
+        await publisher.submit(second)
+
+        let flush = Task { await publisher.flushNow() }
+        await snapshotProbe.waitUntilCompleted(count: 2)
+        await emitGate.waitUntilFirstEmitEntered()
+        #expect(Set(await snapshotProbe.completedRevisions) == Set([first, second]))
+
+        let secondLatest = try await store.fill(
+            surfaceID: 2,
+            rectangle: secondConcurrentDamage,
+            colorARGB: 0x0077_8899
+        )
+        // Cancellation must restore prepared damage without waiting for the
+        // already-entered emitter hook to return.
+        await publisher.cancel()
+        #expect(await emitGate.attemptedRevisions == [first])
+        #expect(await emitGate.deliveredRevisions.isEmpty)
+        await emitGate.releaseFirstEmit(deliver: false)
+        await flush.value
+
+        #expect(await emitGate.attemptedRevisions == [first])
+        #expect(await emitGate.deliveredRevisions.isEmpty)
+        #expect(await publisher.metrics().emittedFrames == 0)
+
+        let replacementObservations = FramePublisherObservations()
+        let replacement = makeSurfaceStorePublisher(
+            store: store,
+            observations: replacementObservations
+        )
+        await replacement.submit(secondLatest)
+        await replacement.flushNow()
+        #expect(await replacementObservations.emittedRevisions == [secondLatest])
+        #expect(await replacementObservations.emittedFullDamage == [false])
+        let restoredSecondDamage = try #require(
+            await replacementObservations.emittedDamageRectangles.first
+        )
+        #expect(restoredSecondDamage.sorted { $0.x < $1.x } == [
+            secondOriginalDamage,
+            secondConcurrentDamage,
+        ])
+
+        let firstRestored = try #require(await store.publicationSnapshot(atLeast: first))
+        #expect(firstRestored.publicationDamage.copyRectangles == [firstDamage])
+        firstRestored.commitPublicationDamage()
+        let firstDuplicate = try #require(await store.publicationSnapshot(atLeast: first))
+        let secondDuplicate = try #require(await store.publicationSnapshot(atLeast: secondLatest))
+        #expect(firstDuplicate.publicationDamage.isEmpty)
+        #expect(secondDuplicate.publicationDamage.isEmpty)
+        let reservations = await store.surfaceOperationReservationDiagnostics()
+        #expect(reservations.activeSurfaceCount == 0)
+        #expect(reservations.waitingCount == 0)
+        #expect(reservations.grantedWaiterCount == 0)
+        #expect(reservations.reservedCount == 0)
     }
 
     @Test(.timeLimit(.minutes(1)))
@@ -733,7 +826,8 @@ struct DisplayFramePublisherTests {
     }
 
     @Test func surfaceStorePublicationWaitsUntilNewerRevisionIsSubmitted() async throws {
-        let store = SurfaceStore(backingPolicy: .dataOnly)
+        let framePool = IOSurfaceFramePool(limits: .init(maximumFrames: 2))
+        let store = SurfaceStore(framePool: framePool, backingPolicy: .dataOnly)
         try await store.create(id: 7, width: 1, height: 1, format: 32)
         let requested = try await store.descriptor(surfaceID: 7).surfaceRevision
         try await store.fill(
@@ -965,7 +1059,8 @@ struct DisplayFramePublisherTests {
         )
         try await store.create(id: 1, width: 8, height: 1, format: 32)
         let created = try await store.descriptor(surfaceID: 1).surfaceRevision
-        _ = try #require(await store.publicationSnapshot(atLeast: created))
+        let initial = try #require(await store.publicationSnapshot(atLeast: created))
+        initial.commitPublicationDamage()
         let damage = PixelRect(x: 2, y: 0, width: 2, height: 1)
         let revision = try await store.fill(
             surfaceID: 1,
@@ -1152,6 +1247,73 @@ private actor SurfacePublicationStartGate {
     func releaseBlockedSnapshot() {
         blockedContinuation?.resume()
         blockedContinuation = nil
+    }
+}
+
+private actor CompletedPublicationSnapshotProbe {
+    private let store: SurfaceStore
+    private var completionWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private(set) var completedRevisions: [SurfaceRevision] = []
+
+    init(store: SurfaceStore) {
+        self.store = store
+    }
+
+    func snapshot(atLeast revision: SurfaceRevision) async -> FrameSnapshot? {
+        let frame = await store.publicationSnapshot(atLeast: revision)
+        if let frame {
+            completedRevisions.append(frame.surfaceRevision)
+            let ready = completionWaiters.filter { completedRevisions.count >= $0.0 }
+            completionWaiters.removeAll { completedRevisions.count >= $0.0 }
+            for (_, continuation) in ready {
+                continuation.resume()
+            }
+        }
+        return frame
+    }
+
+    func waitUntilCompleted(count: Int) async {
+        guard completedRevisions.count < count else { return }
+        await withCheckedContinuation { completionWaiters.append((count, $0)) }
+    }
+}
+
+private actor OrderedEmitCancellationGate {
+    private var firstEmitEntered = false
+    private var firstEmitWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstEmitContinuation: CheckedContinuation<Bool, Never>?
+    private(set) var attemptedRevisions: [SurfaceRevision] = []
+    private(set) var deliveredRevisions: [SurfaceRevision] = []
+
+    func emit(_ frame: FrameSnapshot) async {
+        attemptedRevisions.append(frame.surfaceRevision)
+        let shouldDeliver: Bool
+        if attemptedRevisions.count == 1 {
+            firstEmitEntered = true
+            let waiters = firstEmitWaiters
+            firstEmitWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resume()
+            }
+            shouldDeliver = await withCheckedContinuation {
+                firstEmitContinuation = $0
+            }
+        } else {
+            shouldDeliver = true
+        }
+        if shouldDeliver {
+            deliveredRevisions.append(frame.surfaceRevision)
+        }
+    }
+
+    func waitUntilFirstEmitEntered() async {
+        guard !firstEmitEntered else { return }
+        await withCheckedContinuation { firstEmitWaiters.append($0) }
+    }
+
+    func releaseFirstEmit(deliver: Bool) {
+        firstEmitContinuation?.resume(returning: deliver)
+        firstEmitContinuation = nil
     }
 }
 
