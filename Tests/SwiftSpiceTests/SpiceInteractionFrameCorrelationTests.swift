@@ -1410,8 +1410,19 @@ struct SpiceInteractionFrameCorrelationTests {
             forCoreAnimationTime: mediaTime
         ))
         let after = SpiceInteractionHostClock.nowNanoseconds()
-        #expect(mapped >= before)
-        #expect(mapped <= after)
+        // CACurrentMediaTime and CLOCK_MONOTONIC are sampled separately when
+        // the one-time conversion anchor is established. Permit only a small
+        // calibration bracket while keeping later deltas exact.
+        let calibrationTolerance: UInt64 = 1_000_000
+        let (lowerCandidate, lowerUnderflow) = before.subtractingReportingOverflow(
+            calibrationTolerance
+        )
+        let lowerBound = lowerUnderflow ? UInt64.min : lowerCandidate
+        let (upperCandidate, upperOverflow) = after.addingReportingOverflow(
+            calibrationTolerance
+        )
+        let upperBound = upperOverflow ? UInt64.max : upperCandidate
+        #expect((lowerBound...upperBound).contains(mapped))
 
         let earlier = try #require(SpiceInteractionHostClock.nanoseconds(
             forCoreAnimationTime: mediaTime - 0.125

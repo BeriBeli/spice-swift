@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import SwiftSpice
+import Synchronization
 
 package enum SpiceLiveInteractionSupportError: Error, Sendable, Equatable {
     case notExplicitlyEnabled
@@ -158,6 +159,10 @@ package struct SpiceLiveProcessRunner: Sendable {
 }
 
 package final class SpiceLiveChildProcess: @unchecked Sendable {
+    package static let terminationGrace = Duration.milliseconds(500)
+    package static let killGrace = Duration.milliseconds(500)
+    package static let pipeDrainGrace = Duration.milliseconds(500)
+
     private let process: Process
     private let standardOutput: Pipe
     private let standardError: Pipe
@@ -182,42 +187,133 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
     }
 
     package func finish(within timeout: Duration) async throws -> SpiceLiveProcessResult {
-        try await Task.detached {
-            let stdoutReader = Task.detached {
-                self.standardOutput.fileHandleForReading.readDataToEndOfFile()
-            }
-            let stderrReader = Task.detached {
-                self.standardError.fileHandleForReading.readDataToEndOfFile()
-            }
-            let deadline = ContinuousClock().now.advanced(by: timeout)
-            while self.process.isRunning, ContinuousClock().now < deadline {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            let timedOut = self.process.isRunning
-            if timedOut {
-                self.process.terminate()
-            }
-            self.process.waitUntilExit()
-            let stdout = await stdoutReader.value
-            let stderr = await stderrReader.value
-            guard !timedOut else {
+        let stdoutCollector = SpiceLivePipeCollector(
+            handle: standardOutput.fileHandleForReading
+        )
+        let stderrCollector = SpiceLivePipeCollector(
+            handle: standardError.fileHandleForReading
+        )
+        let stdoutReader = Task.detached { stdoutCollector.collect() }
+        let stderrReader = Task.detached { stderrCollector.collect() }
+        var collectorsStopped = false
+
+        do {
+            let exited = try await waitForExit(within: timeout)
+            guard exited else {
+                _ = await stopBoundedly()
+                await stopCollectors(
+                    stdoutCollector,
+                    stderrCollector,
+                    stdoutReader,
+                    stderrReader
+                )
+                collectorsStopped = true
                 throw SpiceLiveInteractionSupportError.childTimedOut
             }
-            return SpiceLiveProcessResult(
-                status: self.process.terminationStatus,
-                standardOutput: String(decoding: stdout, as: UTF8.self),
-                standardError: String(decoding: stderr, as: UTF8.self)
+
+            let drained = try await waitForCollectors(
+                stdoutCollector,
+                stderrCollector,
+                within: Self.pipeDrainGrace
             )
+            guard drained else {
+                await stopCollectors(
+                    stdoutCollector,
+                    stderrCollector,
+                    stdoutReader,
+                    stderrReader
+                )
+                collectorsStopped = true
+                throw SpiceLiveInteractionSupportError.childTimedOut
+            }
+            await stdoutReader.value
+            await stderrReader.value
+            stdoutCollector.close()
+            stderrCollector.close()
+            return SpiceLiveProcessResult(
+                status: process.terminationStatus,
+                standardOutput: String(decoding: stdoutCollector.data, as: UTF8.self),
+                standardError: String(decoding: stderrCollector.data, as: UTF8.self)
+            )
+        } catch {
+            if !collectorsStopped {
+                _ = await stopBoundedly()
+                await stopCollectors(
+                    stdoutCollector,
+                    stderrCollector,
+                    stdoutReader,
+                    stderrReader
+                )
+            }
+            throw error
+        }
+    }
+
+    @discardableResult
+    package func terminateAndWait() async -> Bool {
+        let exited = await stopBoundedly()
+        standardOutput.fileHandleForReading.closeFile()
+        standardError.fileHandleForReading.closeFile()
+        return exited
+    }
+
+    private func waitForExit(within timeout: Duration) async throws -> Bool {
+        let deadline = ContinuousClock().now.advanced(by: timeout)
+        while process.isRunning, ContinuousClock().now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return !process.isRunning
+    }
+
+    private func stopBoundedly() async -> Bool {
+        guard process.isRunning else { return true }
+        process.terminate()
+        if await waitForExitIgnoringCancellation(within: Self.terminationGrace) {
+            return true
+        }
+        _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        return await waitForExitIgnoringCancellation(within: Self.killGrace)
+    }
+
+    private func waitForExitIgnoringCancellation(within timeout: Duration) async -> Bool {
+        let process = process
+        return await Task.detached {
+            let deadline = ContinuousClock().now.advanced(by: timeout)
+            while process.isRunning, ContinuousClock().now < deadline {
+                usleep(10_000)
+            }
+            return !process.isRunning
         }.value
     }
 
-    package func terminateAndWait() async {
-        await Task.detached {
-            if self.process.isRunning {
-                self.process.terminate()
-            }
-            self.process.waitUntilExit()
-        }.value
+    private func waitForCollectors(
+        _ stdout: SpiceLivePipeCollector,
+        _ stderr: SpiceLivePipeCollector,
+        within timeout: Duration
+    ) async throws -> Bool {
+        let deadline = ContinuousClock().now.advanced(by: timeout)
+        while !(stdout.isFinished && stderr.isFinished),
+              ContinuousClock().now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return stdout.isFinished && stderr.isFinished
+    }
+
+    private func stopCollectors(
+        _ stdout: SpiceLivePipeCollector,
+        _ stderr: SpiceLivePipeCollector,
+        _ stdoutTask: Task<Void, Never>,
+        _ stderrTask: Task<Void, Never>
+    ) async {
+        // Both collectors use nonblocking reads and a 50 ms poll, so they
+        // observe cancellation within one bounded poll cycle. Close only
+        // afterwards to prevent an in-flight read from racing fd reuse.
+        stdoutTask.cancel()
+        stderrTask.cancel()
+        await stdoutTask.value
+        await stderrTask.value
+        stdout.close()
+        stderr.close()
     }
 
     private static func readLine(
@@ -252,6 +348,70 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
             bytes.append(byte)
         }
         throw SpiceLiveInteractionSupportError.childTimedOut
+    }
+}
+
+private final class SpiceLivePipeCollector: @unchecked Sendable {
+    private struct State: Sendable {
+        var data = Data()
+        var isFinished = false
+    }
+
+    private let handle: FileHandle
+    private let state = Mutex(State())
+
+    init(handle: FileHandle) {
+        self.handle = handle
+    }
+
+    var data: Data {
+        state.withLock(\.data)
+    }
+
+    var isFinished: Bool {
+        state.withLock(\.isFinished)
+    }
+
+    func collect() {
+        defer {
+            state.withLock { $0.isFinished = true }
+        }
+        let descriptor = handle.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0,
+              fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            return
+        }
+
+        var buffer = [UInt8](repeating: 0, count: 16 * 1_024)
+        while !Task.isCancelled {
+            var pollDescriptor = pollfd(
+                fd: descriptor,
+                events: Int16(POLLIN | POLLHUP | POLLERR),
+                revents: 0
+            )
+            let pollResult = Darwin.poll(&pollDescriptor, 1, 50)
+            if pollResult < 0, errno == EINTR { continue }
+            if pollResult < 0 { return }
+            if pollResult == 0 { continue }
+
+            while !Task.isCancelled {
+                let count = Darwin.read(descriptor, &buffer, buffer.count)
+                if count > 0 {
+                    let chunk = Data(buffer.prefix(count))
+                    state.withLock { $0.data.append(chunk) }
+                    continue
+                }
+                if count == 0 { return }
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                return
+            }
+        }
+    }
+
+    func close() {
+        try? handle.close()
     }
 }
 

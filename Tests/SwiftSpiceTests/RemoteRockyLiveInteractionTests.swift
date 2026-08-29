@@ -185,6 +185,94 @@ struct RemoteRockyLiveInteractionTests {
         }
     }
 
+    @Test func finishEscalatesPastIgnoredTERMAndDoesNotWaitForAnInheritedPipeWriter() async throws {
+        let fixture = try SpiceLiveScriptFixture(
+            """
+            trap '' TERM
+            (
+                trap '' TERM
+                while :; do
+                    :
+                done
+            ) &
+            descendant=$!
+            printf 'READY parent=%s descendant=%s\n' "$$" "$descendant"
+            while :; do
+                :
+            done
+            """
+        )
+        defer { fixture.remove() }
+        let child = try SpiceLiveProcessRunner(
+            executableURL: fixture.executableURL
+        ).launch(arguments: [])
+        let identifiers = try processIdentifiers(
+            from: await child.readOutputLine(within: .seconds(1))
+        )
+        defer { forceTerminate(identifiers) }
+        let operationTimeout = Duration.milliseconds(20)
+        let outerLimit = operationTimeout
+            + SpiceLiveChildProcess.terminationGrace
+            + SpiceLiveChildProcess.killGrace
+            + SpiceLiveChildProcess.pipeDrainGrace
+            + .milliseconds(500)
+        let watchdog = terminationWatchdog(
+            processIdentifiers: identifiers,
+            after: outerLimit
+        )
+        let started = ContinuousClock().now
+
+        do {
+            _ = try await child.finish(within: operationTimeout)
+            Issue.record("TERM-ignoring child unexpectedly completed successfully")
+        } catch let error as SpiceLiveInteractionSupportError {
+            #expect(error == .childTimedOut)
+        }
+
+        let elapsed = started.duration(to: ContinuousClock().now)
+        watchdog.cancel()
+        #expect(!(await watchdog.value))
+        #expect(elapsed < outerLimit)
+        #expect(Darwin.kill(try #require(identifiers.first), 0) != 0)
+    }
+
+    @Test func terminateAndWaitEscalatesPastIgnoredTERMWithinItsOuterLimit() async throws {
+        let fixture = try SpiceLiveScriptFixture(
+            """
+            trap '' TERM
+            printf 'READY parent=%s\n' "$$"
+            while :; do
+                :
+            done
+            """
+        )
+        defer { fixture.remove() }
+        let child = try SpiceLiveProcessRunner(
+            executableURL: fixture.executableURL
+        ).launch(arguments: [])
+        let identifiers = try processIdentifiers(
+            from: await child.readOutputLine(within: .seconds(1))
+        )
+        defer { forceTerminate(identifiers) }
+        let outerLimit = SpiceLiveChildProcess.terminationGrace
+            + SpiceLiveChildProcess.killGrace
+            + .milliseconds(500)
+        let watchdog = terminationWatchdog(
+            processIdentifiers: identifiers,
+            after: outerLimit
+        )
+        let started = ContinuousClock().now
+
+        let exited = await child.terminateAndWait()
+
+        let elapsed = started.duration(to: ContinuousClock().now)
+        watchdog.cancel()
+        #expect(!(await watchdog.value))
+        #expect(exited)
+        #expect(elapsed < outerLimit)
+        #expect(Darwin.kill(try #require(identifiers.first), 0) != 0)
+    }
+
     @Test func timeoutFinalizationPreservesTheDerivedFirstMissingStage() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "swiftspice-live-derived-stage-\(UUID().uuidString)",
@@ -285,5 +373,46 @@ private struct SpiceLiveScriptFixture {
 
     func remove() {
         try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+private func processIdentifiers(from readyLine: String) throws -> [pid_t] {
+    let fields = readyLine.split(separator: " ")
+    guard fields.first == "READY" else {
+        throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+    }
+    let identifiers = fields.dropFirst().compactMap { field -> pid_t? in
+        guard let separator = field.firstIndex(of: "=") else { return nil }
+        return pid_t(field[field.index(after: separator)...])
+    }
+    guard identifiers.count == fields.count - 1,
+          identifiers.allSatisfy({ $0 > 1 }) else {
+        throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+    }
+    return identifiers
+}
+
+private func terminationWatchdog(
+    processIdentifiers: [pid_t],
+    after delay: Duration
+) -> Task<Bool, Never> {
+    Task.detached {
+        do {
+            try await Task.sleep(for: delay)
+        } catch {
+            return false
+        }
+        var terminatedProcess = false
+        for identifier in processIdentifiers where Darwin.kill(identifier, 0) == 0 {
+            _ = Darwin.kill(identifier, SIGKILL)
+            terminatedProcess = true
+        }
+        return terminatedProcess
+    }
+}
+
+private func forceTerminate(_ processIdentifiers: [pid_t]) {
+    for identifier in processIdentifiers where Darwin.kill(identifier, 0) == 0 {
+        _ = Darwin.kill(identifier, SIGKILL)
     }
 }
