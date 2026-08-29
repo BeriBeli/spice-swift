@@ -3,6 +3,7 @@ import QuartzCore
 import Synchronization
 @testable import SpiceChannels
 @testable import SpiceIOSurface
+@testable import SpiceLiveInteractionSupport
 @testable import SpiceRenderer
 import Testing
 @testable import SwiftSpice
@@ -862,6 +863,68 @@ struct SpiceInteractionFrameCorrelationTests {
             SpiceInteractionTraceRecord.self,
             from: Data(try #require(lines.first))
         ) == record)
+    }
+
+    @Test func liveTraceOrchestratorFinalizesAnExactPresentedDelivery() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-live-orchestrator-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-live-orchestrator",
+            version: "v0.3.1",
+            runId: "run-live-orchestrator",
+            order: 1,
+            actionClass: .click,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 905)
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        let finalized = try await SpiceLiveTraceOrchestrator(
+            capture: capture,
+            outputURL: output
+        ).completeAfterExactPresentation(timeout: .milliseconds(100))
+
+        #expect(finalized.record.valid)
+        #expect(finalized.record.deliverySequence == frameIdentity.deliverySequence)
+        #expect(finalized.record.presentedNs == ready + 30)
+        #expect(finalized.encodedJSONL.split(separator: 0x0A).count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(finalized.encodedJSONL.split(separator: 0x0A).first))
+        ) == finalized.record)
     }
 
     @Test func captureRetainsPresentedFrameUntilTheSendContinuationCompletes() throws {

@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "SwiftSpice", targets: ["SwiftSpice"]),
         .executable(name: "spice-probe", targets: ["SpiceProbe"]),
         .executable(name: "spice-viewer", targets: ["SpiceViewer"]),
+        .executable(name: "spice-live-interaction", targets: ["SpiceLiveInteraction"]),
     ],
     targets: [
         .target(
@@ -136,6 +137,14 @@ let package = Package(
             name: "SpiceViewer",
             dependencies: ["SpiceRenderer", "SwiftSpice"]
         ),
+        .target(
+            name: "SpiceLiveInteractionSupport",
+            dependencies: ["SwiftSpice"]
+        ),
+        .executableTarget(
+            name: "SpiceLiveInteraction",
+            dependencies: ["SpiceLiveInteractionSupport", "SwiftSpice"]
+        ),
         .executableTarget(
             name: "SpiceProtocolGenerator"
         ),
@@ -218,6 +227,7 @@ let package = Package(
         .testTarget(
             name: "SwiftSpiceTests",
             dependencies: [
+                "SpiceLiveInteractionSupport",
                 "SwiftSpice",
                 "SpiceChannels",
                 "SpiceCore",

@@ -24,15 +24,22 @@ Agent behavior, including system-trusted TLS.
 
 ## Algorithm plan execution
 
-- AIP-00c now has two local harness synchronization seams without changing the
-  Viewer or display pacing: `control.sh trace` streams one strictly correlated
-  guest arm/received/drawn transaction, and a package-only cancellation-safe
-  wait returns only the selected and committed identity accepted by AppKit
-  presented. The isolated `5945`/`5946` run at
+- AIP-00c now has a dedicated `spice-live-interaction` foreground AppKit
+  executable without changing the Viewer or display pacing. It replaces the
+  unsuitable SwiftPM test-host window, requires real visible demand and an
+  initial Metal commit/present before arming, streams one strictly correlated
+  guest arm/received/drawn transaction, and waits only for the selected and
+  committed identity accepted by AppKit presented. Its support target exposes
+  the non-UI timeout, parser, process, and derived-invalid finalization logic
+  for local tests. The isolated `5945`/`5946` run at
   `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T061937Z.9FuYes`
-  remains guest-causal smoke evidence. A real env-gated AppKit capture still
-  must bind its marker pixels and exact presented identity into schema-2 JSONL;
-  no input-to-visible or scheduling conclusion is claimed.
+  remains guest-causal smoke evidence. Release foreground attempts reached a
+  real window but the current Mac WindowServer session kept it occluded, so
+  visible demand remained zero and the harness failed before arm with no guest
+  input or collector bytes. The live gate is therefore environment-blocked
+  until it can run in an interactive, unlocked Mac session. Its direct session
+  click will not measure the AppKit input queue. No input-to-visible or
+  scheduling conclusion is claimed.
 
 - AIP-10 is locally complete. Full-header messages are first validated as one
   owned physical batch, then list submessages are dispatched in wire-list order

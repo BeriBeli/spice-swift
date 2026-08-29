@@ -300,6 +300,49 @@ unrelated in-flight deliveries do not wake it, task cancellation removes the
 waiter, and finishing the capture terminates an outstanding wait without
 finishing or appending on the wait path itself.
 
+Run the exact-presentation gate as its own foreground AppKit process, not from
+the Swift Testing host:
+
+```sh
+ssh -N -L 15945:127.0.0.1:5945 rocky9
+```
+
+In a second terminal:
+
+```sh
+SWIFTSPICE_LIVE_INTERACTION=1 \
+SWIFTSPICE_ROCKY_SSH_HOST=rocky9 \
+SWIFTSPICE_PERF_BASE=/home/USER/swiftspice-aip00b/perf-ab \
+SWIFTSPICE_PERF_CONTAINER=swiftspice-aip00b-qemu \
+SWIFTSPICE_PERF_IMAGE=localhost/swiftspice-qemu-x86:local \
+SWIFTSPICE_PERF_SPICE_PORT=5945 \
+SWIFTSPICE_PERF_CONTROL_PORT=5946 \
+SWIFTSPICE_LIVE_ENDPOINT_HOST=127.0.0.1 \
+SWIFTSPICE_LIVE_ENDPOINT_PORT=15945 \
+swift run -c release spice-live-interaction
+```
+
+`spice-live-interaction` is a regular foreground `NSApplication` with a real
+visible `NSWindow` and `SpiceDesktopView`. It waits for one visible desktop
+subscription and a Metal commit plus actual presented callback before arming.
+It then streams the isolated `control.sh trace` transaction, records host input
+before sending a direct session click, waits for the matching guest pair and
+the exact presented delivery, and sends the resulting schema-2 line to the
+isolated run collector. The five `SWIFTSPICE_PERF_*` identity values and both
+live endpoint values are mandatory; the historical default container, base,
+and `5935`/`5936` endpoint (including its prior `15935` local forward) are
+rejected. SSH stdout and stderr stay separate,
+and the ticket is used only as in-process credentials and is never printed.
+
+On failure, the harness finishes the capture without substituting a coarse
+harness reason, preserving such derived reasons as `missing_display_receive`,
+`missing_selection`, `missing_metal_commit`, or `missing_presented`; it then
+best-effort appends that invalid record and exits nonzero. Only a safe stage,
+non-secret framebuffer-readiness counters, and local record path are reported.
+The direct session click intentionally bypasses the AppKit input queue, so a
+successful run closes marker-to-exact-presented correlation but does not
+measure input-event queue latency.
+
 The host records `scheduledNs`, `hostInputNs`, and `sendStartedNs` before the
 wire send, then records `sendCompletedNs` after its continuation resumes. This
 lets a causally eligible Display frame arriving during the send continuation be
