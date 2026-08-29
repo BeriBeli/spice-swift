@@ -241,6 +241,7 @@ package final class SpiceLiveChildProcess: @unchecked Sendable {
                 within: Self.pipeDrainGrace
             )
             guard drained else {
+                _ = await stopBoundedly()
                 await stopCollectors(
                     stdoutCollector,
                     stderrCollector,

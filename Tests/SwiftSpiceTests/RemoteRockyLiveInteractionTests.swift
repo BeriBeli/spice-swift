@@ -278,6 +278,52 @@ struct RemoteRockyLiveInteractionTests {
         expectNoSurvivingProcesses(identifiers)
     }
 
+    @Test func naturalLeaderExitWithInheritedWriterUsesBoundedDrainTimeoutAndReapsTree() async throws {
+        let fixture = try SpiceLiveScriptFixture(
+            """
+            (
+                trap '' TERM
+                while :; do
+                    :
+                done
+            ) &
+            descendant=$!
+            printf 'READY parent=%s descendant=%s\n' "$$" "$descendant"
+            exit 0
+            """
+        )
+        defer { fixture.remove() }
+        let child = try SpiceLiveProcessRunner(
+            executableURL: fixture.executableURL
+        ).launch(arguments: [])
+        let identifiers = try processIdentifiers(
+            from: await child.readOutputLine(within: .seconds(1))
+        )
+        let outerLimit = SpiceLiveChildProcess.pipeDrainGrace
+            + SpiceLiveChildProcess.terminationGrace
+            + SpiceLiveChildProcess.killGrace
+            + .milliseconds(500)
+        let watchdog = terminationWatchdog(
+            processIdentifiers: identifiers,
+            after: outerLimit
+        )
+        let started = ContinuousClock().now
+
+        do {
+            _ = try await child.finish(within: .seconds(2))
+            Issue.record("inherited writer unexpectedly allowed a successful pipe drain")
+        } catch let error as SpiceLiveInteractionSupportError {
+            #expect(error == .childTimedOut)
+        }
+
+        let elapsed = started.duration(to: ContinuousClock().now)
+        watchdog.cancel()
+        #expect(!(await watchdog.value))
+        #expect(elapsed >= SpiceLiveChildProcess.pipeDrainGrace)
+        #expect(elapsed < outerLimit)
+        expectNoSurvivingProcesses(identifiers)
+    }
+
     @Test func outputLimitsAcceptExactBoundsAndFailClosedOneBytePast() async throws {
         let streamLimit = SpiceLiveChildProcess.maximumOutputBytesPerStream
         let exactFixture = try SpiceLiveScriptFixture(
