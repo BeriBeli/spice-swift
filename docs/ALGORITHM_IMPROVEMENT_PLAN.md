@@ -353,13 +353,17 @@ pinned libXi/libX11 runtime versions. The evidence log below records the native
 helper's exact-source Rocky live closure; it still does not bind marker pixels
 to an exact SwiftSpice frame/delivery and AppKit presented callback.
 
-This is an executable fixture/schema seam, not completion evidence. The live
-collector still must bind the rendered ROI to one exact presented revision and
-populate the per-event JSONL record. Until that Rocky gate succeeds, missing or
+This is an executable fixture/schema seam, not completion evidence. The local
+schema-2 collector now binds a decoded binary-grid marker to one exact frame
+identity and the same delivery's presented callback, and atomically retains
+both valid and attributable-invalid records. A separate Rocky run still must
+exercise that path with real captured pixels and populate its per-event JSONL
+record. Until that live gate succeeds, missing or
 ambiguous marker/presented evidence is invalid, and no input-to-visible latency
 or improvement claim may use these records.
 
-The next slice remains the `input-events.jsonl` collector plus exact marker
+The next gate is an independent Rocky fixture using
+`guest_marker_roi=binary-grid-v1` and schema 2 to prove exact marker
 pixel-to-frame-generation/revision/delivery and AppKit-presented binding,
 followed by paired `v0.2.7`/`v0.3.x` traces. Only those paired results may decide
 whether ready-to-selection should use an interaction-aware immediate path or an
@@ -397,14 +401,15 @@ callback, or missing input remains invalid. Invalid replacement records still
 retain the stages and identity actually selected so a failure can be diagnosed
 without reassigning the older marker.
 
-This slice includes a deterministic package encoder for a proposed
-`binary-grid-v1` marker ROI, but the Rocky guest renderer and run manifest do
-not yet emit that pixel protocol, and the mode-0600 `input-events.jsonl` remains
-unpopulated. The next fixture/collector slice must make the guest and Swift
-codec share one versioned layout, bump the normalized schema for
-`desktop_generation`, `display_channel_id`, `surface_id`, and
-`marker_checksum`, and atomically append both valid and invalid records. Until
-that live gate binds captured pixels to the exact
+The guest renderer and Swift detector now share the versioned
+`binary-grid-v1` layout, and the build manifest makes that capability a startup
+requirement. Normalized schema 2 includes `desktop_generation`,
+`display_channel_id`, `surface_id`, and `marker_checksum`; a bounded
+mode-0600 writer uses a sidecar lock and same-filesystem fsync/replace to append
+both valid and attributable-invalid records without partial lines. The fixture
+container/image/base/ports can be strictly overridden so the AIP-00b gate does
+not inspect, stop, or reuse the established performance endpoint. Until a new
+live gate binds captured pixels to the exact
 presented delivery, this internal seam is not completion evidence and supports
 no input-to-visible latency or scheduling conclusion.
 
@@ -616,3 +621,4 @@ behavior remain separate acceptance gates.
 | 2026-08-28 | AIP-00, AIP-44 | Land a unique guest input-marker state machine and normalized per-event trace schema before scheduling experiments | The fixture can now pre-arm one click/key/motion token, consume it only on a matching real guest input, draw a deterministic high-contrast ROI, and record guest marker evidence. Autonomous animation remains ineligible. This slice does not yet bind captured marker pixels to an exact AppKit presented delivery; that live Rocky correlation remains mandatory before any paired latency artifact or AIP-44 scheduling claim. |
 | 2026-08-29 | AIP-00, AIP-44 | Treat the successful Rocky eudev/Xorg marker run as guest-causal subpath evidence, not an input-to-visible result | Key, motion, and click now reach the guest marker and relative motion produces protocol ACKs, but no collector yet binds those marker pixels to an exact SwiftSpice delivery and AppKit presented callback. Complete that binding and paired `v0.2.7`/`v0.3.x` traces before selecting an immediate or adaptive ready-to-selection policy. |
 | 2026-08-29 | AIP-00 | Land the exact host identity and presented-callback correlation seam before changing the Rocky pixel protocol or collector | Keeping source timing beside the exact emitted Display revision prevents coalesced replacements from inheriting neighboring evidence. The internal BGRA detector and assembler now fail closed across marker, generation, selection, commit, and presented identity, while the separate fixture slice remains responsible for a shared versioned ROI and normalized JSONL artifacts. No pacing behavior or performance conclusion changes in this slice. |
+| 2026-08-29 | AIP-00 | Share `binary-grid-v1` between the guest and Swift, normalize schema 2 through a bounded atomic collector, and reserve a separately named Rocky endpoint for the live gate | The local implementation can retain exact valid and attributable-invalid evidence without partial JSON lines, but it is not live completion evidence. The next run must use an isolated base/container/ports, verify the manifest capability, and bind real marker pixels to the same presented delivery before paired latency work or any AIP-44 scheduling decision. |

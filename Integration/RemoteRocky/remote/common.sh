@@ -6,11 +6,20 @@ readonly PERF_BASE="${SWIFTSPICE_PERF_BASE:-${HOME}/swiftspice-remote-closure/pe
 readonly PERF_ARTIFACTS="${PERF_BASE}/artifacts"
 readonly PERF_STATE="${PERF_BASE}/state"
 readonly PERF_LOGS="${PERF_BASE}/logs"
-readonly PERF_CONTAINER="swiftspice-perf-ab-qemu"
-readonly PERF_IMAGE="localhost/swiftspice-qemu-x86:local"
+readonly PERF_CONTAINER="${SWIFTSPICE_PERF_CONTAINER:-swiftspice-perf-ab-qemu}"
+readonly PERF_IMAGE="${SWIFTSPICE_PERF_IMAGE:-localhost/swiftspice-qemu-x86:local}"
 readonly PERF_SPICE_PORT="${SWIFTSPICE_PERF_SPICE_PORT:-5935}"
 readonly PERF_CONTROL_PORT="${SWIFTSPICE_PERF_CONTROL_PORT:-5936}"
 readonly PERF_LIFECYCLE_LOCK="${PERF_STATE}/lifecycle.lock"
+
+if [[ ! "${PERF_CONTAINER}" =~ ^[a-z0-9][a-z0-9_.-]{0,127}$ ]]; then
+    echo "SWIFTSPICE_PERF_CONTAINER is invalid." >&2
+    exit 2
+fi
+if [[ ! "${PERF_IMAGE}" =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$ ]]; then
+    echo "SWIFTSPICE_PERF_IMAGE is invalid." >&2
+    exit 2
+fi
 
 mkdir -p "${PERF_STATE}" "${PERF_LOGS}"
 chmod 0700 "${PERF_BASE}" "${PERF_STATE}" "${PERF_LOGS}"
@@ -46,7 +55,7 @@ loopback_port_is_listening() {
 }
 
 # The caller must hold PERF_LIFECYCLE_LOCK and must already have established
-# that the fixed container is not running. A persisted PID may have been reused
+# that the configured container is not running. A persisted PID may have been reused
 # by the OS, so inactive-state discard never signals it.
 discard_inactive_state_locked() {
     rm -f \
@@ -57,7 +66,7 @@ discard_inactive_state_locked() {
         "${PERF_STATE}/round-id"
 }
 
-fixed_container_absence_is_confirmed() {
+configured_container_absence_is_confirmed() {
     local status=0
     podman container exists "${PERF_CONTAINER}" >/dev/null 2>&1 || status=$?
     [[ "${status}" == 1 ]]
@@ -69,11 +78,11 @@ teardown_failed() {
 }
 
 # The caller must hold PERF_LIFECYCLE_LOCK and must have observed that the
-# fixed container is not running. Removal is still confirmed before stale
+# configured container is not running. Removal is still confirmed before stale
 # active state is discarded.
 remove_inactive_endpoint_locked() {
     podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-    if ! fixed_container_absence_is_confirmed; then
+    if ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1
     fi
@@ -90,7 +99,7 @@ stop_endpoint_locked() {
     fi
     podman stop --time 10 "${PERF_CONTAINER}" >/dev/null 2>&1 || true
     podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-    if ! fixed_container_absence_is_confirmed; then
+    if ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1
     fi

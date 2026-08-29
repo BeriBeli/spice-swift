@@ -98,6 +98,10 @@ install -m 0755 "${source}/input-diagnostics.sh" "${rootfs}/usr/local/bin/input-
 install -m 0755 "${source}/input-marker-agent.sh" "${rootfs}/usr/local/bin/input-marker-agent.sh"
 install -m 0755 "${source}/input-marker-monitor.sh" "${rootfs}/usr/local/bin/input-marker-monitor.sh"
 install -m 0755 "${source}/input-marker-renderer.sh" "${rootfs}/usr/local/bin/input-marker-renderer.sh"
+cc -std=c11 -Os -Wall -Wextra -Werror \
+    -o "${rootfs}/usr/local/bin/binary-grid-marker" \
+    "${source}/binary-grid-marker.c" \
+    -lX11
 cc -std=c11 -Os -Wall -Wextra -Werror -static \
     -o "${rootfs}/usr/local/bin/monotonic-nanoseconds" \
     "${source}/monotonic-nanoseconds.c"
@@ -141,6 +145,7 @@ fi
 {
     echo 'manifest_version=1'
     echo 'guest_marker_clock=clock_gettime-monotonic-v1'
+    echo 'guest_marker_roi=binary-grid-v1'
     echo 'guest_xi2_monitor=native-xi2-select-sync-v1'
     printf 'guest_kernel=linux-virt-%s\n' "${kernel_version}"
     record_package alpine-base guest_alpine_base
@@ -167,6 +172,7 @@ fi
 
 if [ "$(grep -c '^manifest_version=1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" -ne 1 ] \
+    || [ "$(grep -c '^guest_marker_roi=binary-grid-v1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_xi2_monitor=native-xi2-select-sync-v1$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ] \
     || [ "$(grep -c '^guest_initramfs_sha256=[0-9a-f]\{64\}$' "${manifest}")" -ne 1 ]; then

@@ -42,6 +42,7 @@ fi
 required_manifest_keys=(
     manifest_version
     guest_marker_clock
+    guest_marker_roi
     guest_xi2_monitor
     guest_kernel
     guest_alpine_base
@@ -73,6 +74,7 @@ for key in "${required_manifest_keys[@]}"; do
 done
 if [[ "$(grep -c '^manifest_version=1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_marker_clock=clock_gettime-monotonic-v1$' "${manifest}")" != 1 \
+    || "$(grep -c '^guest_marker_roi=binary-grid-v1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_xi2_monitor=native-xi2-select-sync-v1$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel=linux-virt-[0-9][A-Za-z0-9._+-]*$' "${manifest}")" != 1 \
     || "$(grep -c '^guest_kernel_sha256=[0-9a-f]\{64\}$' "${manifest}")" != 1 \
@@ -113,8 +115,10 @@ jpeg_wan_compression=auto
 zlib_glz_wan_compression=auto
 streaming_video=filter
 playback_compression=on
-interaction_trace_schema=1
+interaction_trace_schema=2
 interaction_trace_path=${run_dir}/input-events.jsonl
+container=${PERF_CONTAINER}
+image=${PERF_IMAGE}
 EOF
 cat "${manifest}" >> "${run_dir}/configuration.txt"
 cp "${manifest}" "${run_dir}/guest-build-manifest.env"

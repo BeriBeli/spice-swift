@@ -16,7 +16,8 @@ struct SpiceInteractionTraceTests {
             return
         }
         let requiredKeys: Set<String> = [
-            "pair_id", "version", "run_id", "order", "action_class", "token",
+            "schema_version", "pair_id", "version", "run_id", "order",
+            "action_class", "token",
             "scheduled_ns", "host_input_ns", "send_started_ns", "send_completed_ns",
             "motion_ack_ns", "guest_received_ns", "guest_marker_drawn_ns",
             "display_receive_ns", "surface_ready_ns", "selected_revision_ready_ns",
@@ -26,6 +27,8 @@ struct SpiceInteractionTraceTests {
             "marker_revision", "marker_checksum", "valid",
         ]
         #expect(Set(object.keys).isSuperset(of: requiredKeys))
+        #expect((object["schema_version"] as? NSNumber)?.uint64Value == 2)
+        #expect(record.schemaVersion == SpiceInteractionTraceRecord.currentSchemaVersion)
         #expect(object["pair_id"] as? String == "pair-0001")
         #expect(object["action_class"] as? String == "motion")
         #expect(object["token"] as? String == "0123456789abcdef")
@@ -149,7 +152,243 @@ struct SpiceInteractionTraceTests {
         }
     }
 
+    @Test func decodingRejectsMissingOrUnsupportedSchemaTwo() throws {
+        let encoded = try JSONEncoder().encode(trace())
+        let canonical = try #require(
+            try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        for schemaMutation in [nil, 1, 3] as [Int?] {
+            var object = canonical
+            object["schema_version"] = schemaMutation
+            let data = try JSONSerialization.data(withJSONObject: object)
+            do {
+                _ = try JSONDecoder().decode(SpiceInteractionTraceRecord.self, from: data)
+                Issue.record("decoded unsupported schema mutation \(String(describing: schemaMutation))")
+            } catch {
+                switch (schemaMutation, error) {
+                case (nil, DecodingError.keyNotFound(_, _)):
+                    // Expected: schema_version is required.
+                    break
+                case (.some, DecodingError.dataCorrupted(_)):
+                    // Expected: only normalized schema 2 is accepted.
+                    break
+                default:
+                    Issue.record("unexpected schema decode error: \(error)")
+                }
+            }
+        }
+    }
+
+    @Test func jsonlWriterPublishesCanonicalValidAndInvalidRecordsAtomically() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-jsonl-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "input-events.jsonl")
+        let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+        let valid = trace()
+        let invalid = trace(presentedNs: nil)
+
+        try writer.append(valid)
+        try writer.append(invalid)
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        #expect((attributes[.posixPermissions] as? Int) == 0o600)
+        let data = try Data(contentsOf: output)
+        #expect(data.last == 0x0A)
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        #expect(lines.count == 2)
+        let records = try lines.map {
+            try JSONDecoder().decode(SpiceInteractionTraceRecord.self, from: Data($0))
+        }
+        #expect(records == [valid, invalid])
+        #expect(records[0].schemaVersion == 2)
+        #expect(records[0].desktopGeneration == 9)
+        #expect(records[0].displayChannelID == 0)
+        #expect(records[0].surfaceID == 1)
+        #expect(records[0].markerChecksum == "9f9f5111")
+        #expect(records[0].valid)
+        #expect(!records[1].valid)
+        #expect(records[1].invalidReason == "missing_presented")
+    }
+
+    @Test func jsonlWriterFailuresCannotModifyExistingEvidence() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-jsonl-failure-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let output = directory.appending(path: "input-events.jsonl")
+        let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+        try writer.append(trace())
+        let original = try Data(contentsOf: output)
+
+        let oversized = SpiceInteractionTraceRecord(
+            pairId: String(repeating: "p", count: SpiceInteractionTraceJSONLWriter.maximumRecordBytes),
+            version: "v0.3.1",
+            runId: "run-0001",
+            order: 2,
+            actionClass: .click,
+            token: "0123456789abcdef",
+            invalidReason: "oversized_fixture"
+        )
+        do {
+            try writer.append(oversized)
+            Issue.record("oversized record was appended")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            guard case .recordTooLarge = error else {
+                Issue.record("unexpected oversized-record error: \(error)")
+                return
+            }
+        }
+        #expect(try Data(contentsOf: output) == original)
+
+        let canonical = try JSONEncoder().encode(trace())
+        var schemaOneObject = try #require(
+            try JSONSerialization.jsonObject(with: canonical) as? [String: Any]
+        )
+        schemaOneObject["schema_version"] = 1
+        var schemaOne = try JSONSerialization.data(withJSONObject: schemaOneObject)
+        schemaOne.append(0x0A)
+        for invalidExisting in [Data("{}\n".utf8), schemaOne] {
+            try invalidExisting.write(to: output)
+            do {
+                try writer.append(trace())
+                Issue.record("writer accepted malformed existing JSONL")
+            } catch let error as SpiceInteractionTraceCollectionError {
+                #expect(error == .invalidExistingJSONL)
+            }
+            #expect(try Data(contentsOf: output) == invalidExisting)
+        }
+
+        let canonicalEncoder = JSONEncoder()
+        canonicalEncoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let baseBoundaryPayload = try canonicalEncoder.encode(trace(pairId: "x"))
+        let addedBytes = SpiceInteractionTraceJSONLWriter.maximumRecordBytes
+            - baseBoundaryPayload.count
+        try #require(addedBytes > 0)
+        var boundaryPayload = try canonicalEncoder.encode(trace(
+            pairId: String(repeating: "x", count: addedBytes + 1)
+        ))
+        try #require(
+            boundaryPayload.count == SpiceInteractionTraceJSONLWriter.maximumRecordBytes
+        )
+        boundaryPayload.append(0x0A)
+        try boundaryPayload.write(to: output)
+        do {
+            try writer.append(trace())
+            Issue.record("writer accepted a 64 KiB payload plus its newline")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .invalidExistingJSONL)
+        }
+        #expect(try Data(contentsOf: output) == boundaryPayload)
+
+        let symlinkTarget = directory.appending(path: "symlink-target")
+        let symlinkOutput = directory.appending(path: "symlink-output.jsonl")
+        try Data("sentinel".utf8).write(to: symlinkTarget)
+        try FileManager.default.createSymbolicLink(
+            atPath: symlinkOutput.path,
+            withDestinationPath: symlinkTarget.path
+        )
+        let symlinkWriter = SpiceInteractionTraceJSONLWriter(outputURL: symlinkOutput)
+        do {
+            try symlinkWriter.append(trace())
+            Issue.record("writer followed an output symlink")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .outputIsSymbolicLink)
+        }
+        #expect(try Data(contentsOf: symlinkTarget) == Data("sentinel".utf8))
+
+        let lockOutput = directory.appending(path: "locked-output.jsonl")
+        let lockSymlink = directory.appending(path: ".locked-output.jsonl.lock")
+        try FileManager.default.createSymbolicLink(
+            atPath: lockSymlink.path,
+            withDestinationPath: symlinkTarget.path
+        )
+        let lockWriter = SpiceInteractionTraceJSONLWriter(outputURL: lockOutput)
+        do {
+            try lockWriter.append(trace())
+            Issue.record("writer followed a lock-file symlink")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .outputIsSymbolicLink)
+        }
+        #expect(!FileManager.default.fileExists(atPath: lockOutput.path))
+        #expect(try Data(contentsOf: symlinkTarget) == Data("sentinel".utf8))
+    }
+
+    @Test func captureRetriesTheSameRecordAfterAnAppendFailure() throws {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-capture-retry-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let missingDirectory = root.appending(path: "not-created", directoryHint: .isDirectory)
+        let output = missingDirectory.appending(path: "input-events.jsonl")
+        let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: writer,
+            pairId: "pair-retry",
+            version: "v0.3.1",
+            runId: "run-retry",
+            order: 9,
+            actionClass: .click,
+            token: "0123456789abcdef",
+            checksum: 0x9f9f_5111
+        )
+        try capture.recordHostEvidence(
+            scheduledNs: 10,
+            hostInputNs: 20,
+            sendStartedNs: 30,
+            sendCompletedNs: 40
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+
+        do {
+            _ = try capture.finish(invalidReason: "missing_presented_fixture")
+            Issue.record("capture unexpectedly wrote into a missing directory")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .outputDirectoryUnavailable)
+        }
+        try FileManager.default.createDirectory(
+            at: missingDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let retried = try capture.finish(invalidReason: "ignored_on_cached_retry")
+        #expect(!retried.valid)
+        #expect(retried.invalidReason == "missing_presented_fixture")
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        let stored = try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        )
+        #expect(stored == retried)
+
+        do {
+            try capture.recordGuestEvidence(receivedNs: 3, drawnNs: 4, markerRevision: 78)
+            Issue.record("late evidence mutated a finished capture")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .captureAlreadyFinished)
+        }
+        do {
+            _ = try capture.finish()
+            Issue.record("finished capture appended a duplicate line")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .captureAlreadyFinished)
+        }
+        #expect(try Data(contentsOf: output).split(separator: 0x0A).count == 1)
+    }
+
     private func trace(
+        pairId: String = "pair-0001",
         sendStartedNs: UInt64? = 30,
         sendCompletedNs: UInt64? = 40,
         motionAckNs: UInt64? = 45,
@@ -157,10 +396,11 @@ struct SpiceInteractionTraceTests {
         guestMarkerDrawnNs: UInt64? = 60,
         displayReceiveNs: UInt64? = 70,
         markerRevision: UInt64? = 77,
+        presentedNs: UInt64? = 120,
         invalidReason: String? = nil
     ) -> SpiceInteractionTraceRecord {
         SpiceInteractionTraceRecord(
-            pairId: "pair-0001",
+            pairId: pairId,
             version: "v0.3.0",
             runId: "run-0001",
             order: 1,
@@ -178,7 +418,7 @@ struct SpiceInteractionTraceTests {
             selectedRevisionReadyNs: 90,
             selectionNs: 100,
             metalCommitNs: 110,
-            presentedNs: 120,
+            presentedNs: presentedNs,
             displayChannelID: 0,
             surfaceID: 1,
             surfaceGeneration: 7,

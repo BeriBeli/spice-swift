@@ -1,11 +1,88 @@
 import Foundation
 import QuartzCore
+import Synchronization
 @testable import SpiceChannels
 import Testing
 @testable import SwiftSpice
 
 @Suite("Interaction frame correlation")
 struct SpiceInteractionFrameCorrelationTests {
+    @Test func guestBinaryGridEncoderMatchesTheSwiftDetector() throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory.appending(
+            path: "binary-grid-marker-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = repositoryRoot.appending(
+            path: "Integration/RemoteRocky/guest/binary-grid-marker.c"
+        )
+        let executable = temporaryDirectory.appending(path: "binary-grid-marker")
+        let compiler = Process()
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/clang")
+        compiler.arguments = [
+            "-std=c11", "-Wall", "-Wextra", "-Werror",
+            "-DBINARY_GRID_MARKER_ENCODE_ONLY",
+            source.path, "-o", executable.path,
+        ]
+        try compiler.run()
+        compiler.waitUntilExit()
+        try #require(compiler.terminationStatus == 0)
+
+        let output = Pipe()
+        let encoder = Process()
+        encoder.executableURL = executable
+        encoder.arguments = [
+            "--encode-bgra", token, "77", String(format: "%08x", checksum),
+        ]
+        encoder.standardOutput = output
+        try encoder.run()
+        let encodedMarker = output.fileHandleForReading.readDataToEndOfFile()
+        encoder.waitUntilExit()
+        try #require(encoder.terminationStatus == 0)
+
+        let markerWidth = 88 * 4
+        let markerHeight = 2 * 4
+        #expect(encodedMarker.count == markerWidth * markerHeight * 4)
+        var pixels = blankPixels
+        let originX = 8
+        let originY = 8
+        for row in 0..<markerHeight {
+            let sourceStart = row * markerWidth * 4
+            let destinationStart = (originY + row) * bytesPerRow + originX * 4
+            pixels.replaceSubrange(
+                destinationStart..<(destinationStart + markerWidth * 4),
+                with: encodedMarker[sourceStart..<(sourceStart + markerWidth * 4)]
+            )
+        }
+        let markedSnapshot = snapshot(
+            identity: identity(deliverySequence: 40),
+            pixels: pixels
+        )
+
+        guard case let .exact(payload, detectedIdentity) =
+            SpiceInteractionMarkerROIDetector.detect(
+                in: markedSnapshot,
+                expectedToken: token,
+                expectedChecksum: checksum
+            )
+        else {
+            Issue.record("guest binary-grid-v1 pixels were not decoded exactly")
+            return
+        }
+        #expect(payload.token == token)
+        #expect(payload.markerRevision == 77)
+        #expect(payload.checksum == checksum)
+        #expect(detectedIdentity == identity(deliverySequence: 40))
+    }
+
     @Test func markerROIDetectorDecodesPayloadFromTheExactFrameIdentity() throws {
         let markedSnapshot = markerSnapshot(
             identity: identity(deliverySequence: 41),
@@ -576,6 +653,97 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(completedBeforeRetirement.finish().valid)
     }
 
+    @Test func presentedCallbackLinearizesBeforeCaptureFinishOrIsDetached() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-presented-race-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-presented-race",
+            version: "v0.3.1",
+            runId: "run-presented-race",
+            order: 1,
+            actionClass: .motion,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let frameIdentity = identity(deliverySequence: 901)
+        try capture.recordHostEvidence(
+            scheduledNs: receive - 40,
+            hostInputNs: receive - 30,
+            sendStartedNs: receive - 20,
+            sendCompletedNs: receive - 10,
+            motionAckNs: receive - 15
+        )
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+
+        let callbackEntered = DispatchSemaphore(value: 0)
+        let releaseCallback = DispatchSemaphore(value: 0)
+        let callbackCount = Mutex(0)
+        diagnostics.setInteractionEvidenceWillCommitForTesting {
+            callbackCount.withLock { $0 += 1 }
+            callbackEntered.signal()
+            releaseCallback.wait()
+        }
+        let presented = Task.detached {
+            diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+        }
+        try #require(await waitForInteractionTraceSemaphore(
+            callbackEntered,
+            timeout: .seconds(1)
+        ) == .success)
+        let finishing = Task.detached {
+            try capture.finish()
+        }
+        releaseCallback.signal()
+
+        await presented.value
+        let record = try await finishing.value
+        #expect(record.valid)
+        #expect(record.presentedNs == ready + 30)
+        #expect(callbackCount.withLock { $0 } == 1)
+
+        // Finish detached the assembler. A subsequent callback neither enters
+        // the commit hook nor mutates the cached record.
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 40)
+        #expect(callbackCount.withLock { $0 } == 1)
+        do {
+            _ = try capture.finish()
+            Issue.record("finished capture rebuilt or appended its cached record")
+        } catch let error as SpiceInteractionTraceCollectionError {
+            #expect(error == .captureAlreadyFinished)
+        }
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        ) == record)
+    }
+
     @Test func coreAnimationPresentedTimeMapsIntoTheHostMonotonicClock() throws {
         let before = SpiceInteractionHostClock.nowNanoseconds()
         let mediaTime = CACurrentMediaTime()
@@ -715,5 +883,16 @@ struct SpiceInteractionFrameCorrelationTests {
             pointerMode: .absolute,
             deliverySequence: identity.deliverySequence
         )
+    }
+}
+
+private func waitForInteractionTraceSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: DispatchTimeInterval
+) async -> DispatchTimeoutResult {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(returning: semaphore.wait(timeout: .now() + timeout))
+        }
     }
 }

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import Testing
+@testable import SwiftSpice
 
 @Suite("Remote Rocky fixture scripts")
 struct RemoteRockyFixtureTests {
@@ -286,6 +287,9 @@ struct RemoteRockyFixtureTests {
         let animationGenerator = try script(
             "Integration/RemoteRocky/guest/animation-generator.sh"
         )
+        let binaryGridMarker = try script(
+            "Integration/RemoteRocky/guest/binary-grid-marker.c"
+        )
         let workloads = [
             try script("Integration/RemoteRocky/guest/static-desktop.sh"),
             try script("Integration/RemoteRocky/guest/animation-load.sh"),
@@ -302,20 +306,35 @@ struct RemoteRockyFixtureTests {
 
         #expect(!renderer.contains("exec xterm"))
         #expect(!guestInit.contains("/usr/local/bin/input-marker-renderer.sh &"))
-        #expect(renderer.contains(#"printf '\033[1;1H"#))
-        #expect(renderer.contains("Rows 1-4 are reserved"))
+        #expect(renderer.contains("/usr/local/bin/binary-grid-marker --draw"))
+        #expect(binaryGridMarker.contains("XSync"))
         #expect(renderer.contains("printf '\\033[2J\\033[6;1H'"))
+        #expect(animationGenerator.contains("Rows 1-4 are the causal marker ROI"))
         #expect(animationGenerator.contains("printf '\\033[6;1H"))
         #expect(!animationGenerator.contains("printf '\\033[1;1H"))
-        let visibleDraw = try #require(renderer.range(of: "CAUSAL INPUT MARKER"))
+        let processMarker = try #require(renderer.range(of: "process_marker() {"))
+        let processMarkerEnd = try #require(renderer.range(
+            of: "\n}\n\ncase ",
+            range: processMarker.upperBound..<renderer.endIndex
+        ))
+        let processMarkerBody = processMarker.upperBound..<processMarkerEnd.lowerBound
+        let resynchronize = try #require(renderer.range(
+            of: "resynchronize_terminal_if_needed",
+            range: processMarkerBody
+        ))
+        let visibleDraw = try #require(renderer.range(
+            of: "draw_marker",
+            range: resynchronize.upperBound..<processMarkerBody.upperBound
+        ))
         let visibilityBarrier = try #require(renderer.range(
             of: "terminal_visibility_barrier",
-            range: visibleDraw.upperBound..<renderer.endIndex
+            range: visibleDraw.upperBound..<processMarkerBody.upperBound
         ))
         let acknowledgment = try #require(renderer.range(
-            of: #"> "${ack_fifo}""#,
-            range: visibilityBarrier.upperBound..<renderer.endIndex
+            of: "acknowledge_marker",
+            range: visibilityBarrier.upperBound..<processMarkerBody.upperBound
         ))
+        #expect(resynchronize.lowerBound < visibleDraw.lowerBound)
         #expect(visibleDraw.lowerBound < visibilityBarrier.lowerBound)
         #expect(visibilityBarrier.lowerBound < acknowledgment.lowerBound)
     }
@@ -1595,6 +1614,32 @@ struct RemoteRockyFixtureTests {
         #expect(startScript.contains("guest_marker_clock"))
     }
 
+    @Test func guestMarkerROIUsesTheVersionedBinaryGridAndExplicitXtermWindow() throws {
+        let markerSource = try script(
+            "Integration/RemoteRocky/guest/binary-grid-marker.c"
+        )
+        let renderer = try script(
+            "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+        )
+        let buildScript = try script("Integration/RemoteRocky/build-guest.sh")
+        let startScript = try script("Integration/RemoteRocky/remote/start.sh")
+
+        #expect(markerSource.contains("MARKER_MAGIC = 0xA5C3"))
+        #expect(markerSource.contains("MARKER_CELL_SIZE = 4"))
+        #expect(markerSource.contains("MARKER_COLUMNS = 88"))
+        #expect(markerSource.contains("MARKER_ROWS = 2"))
+        #expect(markerSource.contains("--encode-bgra"))
+        #expect(markerSource.contains("getenv(\"WINDOWID\")"))
+        #expect(!markerSource.contains("XGetInputFocus"))
+        #expect(renderer.contains("/usr/local/bin/binary-grid-marker"))
+        #expect(renderer.contains("--draw"))
+        #expect(buildScript.contains("binary-grid-marker.c"))
+        #expect(buildScript.contains("guest_marker_roi=binary-grid-v1"))
+        #expect(startScript.contains("guest_marker_roi"))
+        #expect(startScript.contains("guest_marker_roi=binary-grid-v1"))
+        #expect(startScript.contains("interaction_trace_schema=2"))
+    }
+
     @Test func guestMarkerConsumesOnlyTheNextMatchingInputAndRendersItsToken() throws {
         let result = try runGuestMarkerSelfTest([
             "arm action_class=click token=0000000000000001",
@@ -1897,6 +1942,354 @@ struct RemoteRockyFixtureTests {
         #expect((attributes[.posixPermissions] as? Int) == 0o600)
         #expect(traceData.isEmpty)
         #expect(configuration.contains("interaction_trace_path=\(trace.path)"))
+        #expect(configuration.contains("interaction_trace_schema=2"))
+    }
+
+    @Test func collectorAtomicallyAppendsNormalizedValidAndInvalidSchemaTwoRecords() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let start = try fixture.run("remote/start.sh", ssMode: "both")
+        try #require(start.status == 0)
+        let runID = try fixture.currentRunID()
+        let runDirectory = fixture.base.appending(path: "logs/\(runID)")
+        let output = runDirectory.appending(path: "input-events.jsonl")
+
+        let validEvent = Self.collectorEvent(runID: runID, order: 1)
+        let validResult = try runInputCollector(runDirectory: runDirectory, event: validEvent)
+        #expect(validResult.status == 0)
+        #expect(validResult.output.contains(
+            "PERF_INPUT_EVENT_COLLECTED valid=true reason=none"
+        ))
+
+        var missingPresented = Self.collectorEvent(runID: runID, order: 2)
+        missingPresented.removeValue(forKey: "presented_ns")
+        let missingResult = try runInputCollector(
+            runDirectory: runDirectory,
+            event: missingPresented
+        )
+        #expect(missingResult.status == 0)
+        #expect(missingResult.output.contains(
+            "PERF_INPUT_EVENT_COLLECTED valid=false reason=missing_presented"
+        ))
+
+        var ambiguous = Self.collectorEvent(runID: runID, order: 3)
+        ambiguous["invalid_reason"] = "ambiguous_marker"
+        let ambiguousResult = try runInputCollector(runDirectory: runDirectory, event: ambiguous)
+        #expect(ambiguousResult.status == 0)
+        #expect(ambiguousResult.output.contains(
+            "PERF_INPUT_EVENT_COLLECTED valid=false reason=ambiguous_marker"
+        ))
+
+        let firstConcurrent = try launchInputCollector(
+            runDirectory: runDirectory,
+            event: Self.collectorEvent(runID: runID, order: 4)
+        )
+        var secondConcurrentEvent = Self.collectorEvent(runID: runID, order: 5)
+        secondConcurrentEvent.removeValue(forKey: "guest_marker_drawn_ns")
+        let secondConcurrent = try launchInputCollector(
+            runDirectory: runDirectory,
+            event: secondConcurrentEvent
+        )
+        let firstConcurrentResult = firstConcurrent.finish()
+        let secondConcurrentResult = secondConcurrent.finish()
+        #expect(firstConcurrentResult.status == 0)
+        #expect(secondConcurrentResult.status == 0)
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: output.path)
+        #expect((attributes[.posixPermissions] as? Int) == 0o600)
+        let data = try Data(contentsOf: output)
+        #expect(data.last == 0x0A)
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        #expect(lines.count == 5)
+        let records = try lines.map {
+            try JSONDecoder().decode(SpiceInteractionTraceRecord.self, from: Data($0))
+        }
+        #expect(Set(records.map(\.order)) == Set((1...5).map(UInt64.init)))
+        #expect(records.allSatisfy { $0.schemaVersion == 2 })
+        let valid = try #require(records.first { $0.order == 1 })
+        #expect(valid.valid)
+        #expect(valid.desktopGeneration == 9)
+        #expect(valid.displayChannelID == 0)
+        #expect(valid.surfaceID == 1)
+        #expect(valid.markerChecksum == "9f9f5111")
+        #expect(records.first { $0.order == 2 }?.invalidReason == "missing_presented")
+        #expect(records.first { $0.order == 3 }?.invalidReason == "ambiguous_marker")
+        #expect(records.first { $0.order == 5 }?.invalidReason == "missing_guest_marker_drawn")
+
+        let beforeRejectedInput = data
+        let malformed = try runInputCollector(
+            runDirectory: runDirectory,
+            rawInput: Data("{\"schema_version\":".utf8)
+        )
+        #expect(malformed.status != 0)
+        #expect(malformed.output.contains("PERF_INPUT_EVENT_ERROR reason=malformed_json"))
+        #expect(try Data(contentsOf: output) == beforeRejectedInput)
+
+        let unattributable = try runInputCollector(
+            runDirectory: runDirectory,
+            event: ["schema_version": 2, "pair_id": "pair-without-token"]
+        )
+        #expect(unattributable.status != 0)
+        #expect(unattributable.output.contains("PERF_INPUT_EVENT_ERROR reason=unattributable"))
+        #expect(try Data(contentsOf: output) == beforeRejectedInput)
+
+        let schemaOnlyRunID = "schema-rejection-\(UUID().uuidString)"
+        let schemaOnlyDirectory = fixture.base.appending(path: "logs/\(schemaOnlyRunID)")
+        try FileManager.default.createDirectory(
+            at: schemaOnlyDirectory,
+            withIntermediateDirectories: true
+        )
+        let schemaOnlyOutput = schemaOnlyDirectory.appending(path: "input-events.jsonl")
+        let schemaOnlyConfiguration = """
+        interaction_trace_schema=2
+        run_id=\(schemaOnlyRunID)
+        interaction_trace_path=\(schemaOnlyOutput.path)
+
+        """
+        try Data(schemaOnlyConfiguration.utf8).write(
+            to: schemaOnlyDirectory.appending(path: "configuration.txt")
+        )
+        let integerSchemaEvent = String(
+            decoding: try JSONSerialization.data(
+                withJSONObject: Self.collectorEvent(runID: schemaOnlyRunID, order: 6),
+                options: [.sortedKeys]
+            ),
+            as: UTF8.self
+        )
+        try #require(integerSchemaEvent.contains("\"schema_version\":2"))
+        for nonIntegerSchema in ["2.0", "true"] {
+            let rawEvent = integerSchemaEvent.replacingOccurrences(
+                of: "\"schema_version\":2",
+                with: "\"schema_version\":\(nonIntegerSchema)"
+            )
+            let result = try runInputCollector(
+                runDirectory: schemaOnlyDirectory,
+                rawInput: Data(rawEvent.utf8)
+            )
+            #expect(result.status == 2)
+            #expect(result.output.contains(
+                "PERF_INPUT_EVENT_ERROR reason=unsupported_schema_version"
+            ))
+            #expect(!FileManager.default.fileExists(atPath: schemaOnlyOutput.path))
+            #expect(try Data(contentsOf: output) == beforeRejectedInput)
+        }
+    }
+
+    @Test func swiftAndRemoteCollectorsInteroperateOnOneCanonicalSchemaTwoFile() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let start = try fixture.run("remote/start.sh", ssMode: "both")
+        try #require(start.status == 0)
+        let runID = try fixture.currentRunID()
+        let runDirectory = fixture.base.appending(path: "logs/\(runID)")
+        let output = runDirectory.appending(path: "input-events.jsonl")
+        let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+
+        let swiftValid = Self.swiftCollectorRecord(runID: runID, order: 1)
+        let swiftInvalid = Self.swiftCollectorRecord(
+            runID: runID,
+            order: 2,
+            presentedNs: nil
+        )
+        try writer.append(swiftValid)
+        try writer.append(swiftInvalid)
+
+        let pythonAfterSwift = try runInputCollector(
+            runDirectory: runDirectory,
+            event: Self.collectorEvent(runID: runID, order: 3)
+        )
+        #expect(pythonAfterSwift.status == 0)
+
+        var pythonInvalidEvent = Self.collectorEvent(runID: runID, order: 4)
+        pythonInvalidEvent.removeValue(forKey: "presented_ns")
+        let pythonInvalid = try runInputCollector(
+            runDirectory: runDirectory,
+            event: pythonInvalidEvent
+        )
+        #expect(pythonInvalid.status == 0)
+
+        let swiftAfterPython = Self.swiftCollectorRecord(runID: runID, order: 5)
+        try writer.append(swiftAfterPython)
+
+        let data = try Data(contentsOf: output)
+        #expect(data.last == 0x0A)
+        #expect(!data.contains(Data("null".utf8)))
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        #expect(lines.count == 5)
+        let records = try lines.map {
+            try JSONDecoder().decode(SpiceInteractionTraceRecord.self, from: Data($0))
+        }
+        #expect(records == [
+            swiftValid,
+            swiftInvalid,
+            Self.swiftCollectorRecord(runID: runID, order: 3),
+            Self.swiftCollectorRecord(runID: runID, order: 4, presentedNs: nil),
+            swiftAfterPython,
+        ])
+
+        let swiftInvalidObject = try #require(
+            try JSONSerialization.jsonObject(with: Data(lines[1])) as? [String: Any]
+        )
+        let pythonInvalidObject = try #require(
+            try JSONSerialization.jsonObject(with: Data(lines[3])) as? [String: Any]
+        )
+        #expect(swiftInvalidObject["presented_ns"] == nil)
+        #expect(pythonInvalidObject["presented_ns"] == nil)
+        #expect(swiftInvalidObject["invalid_reason"] as? String == "missing_presented")
+        #expect(pythonInvalidObject["invalid_reason"] as? String == "missing_presented")
+    }
+
+    @Test func collectorRejectsNonCanonicalOrBoundarySizedExistingJSONLWithoutMutation() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+
+        for variant in ["valid_integer", "duplicate_key", "whitespace", "maximum_payload"] {
+            let runID = "existing-\(variant)-\(UUID().uuidString)"
+            let runDirectory = fixture.base.appending(path: "logs/\(runID)")
+            try FileManager.default.createDirectory(
+                at: runDirectory,
+                withIntermediateDirectories: true
+            )
+            let output = runDirectory.appending(path: "input-events.jsonl")
+            let configuration = """
+            interaction_trace_schema=2
+            run_id=\(runID)
+            interaction_trace_path=\(output.path)
+
+            """
+            try Data(configuration.utf8).write(
+                to: runDirectory.appending(path: "configuration.txt")
+            )
+            let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+            try writer.append(Self.swiftCollectorRecord(runID: runID, order: 1))
+            let canonical = try Data(contentsOf: output)
+            let canonicalText = String(decoding: canonical, as: UTF8.self)
+            try #require(canonicalText.contains("\"valid\":true"))
+
+            let invalidExisting: Data
+            switch variant {
+            case "valid_integer":
+                invalidExisting = Data(canonicalText.replacingOccurrences(
+                    of: "\"valid\":true",
+                    with: "\"valid\":1"
+                ).utf8)
+            case "duplicate_key":
+                invalidExisting = Data(canonicalText.replacingOccurrences(
+                    of: "\"valid\":true",
+                    with: "\"valid\":true,\"valid\":true"
+                ).utf8)
+            case "whitespace":
+                invalidExisting = Data(" \(canonicalText)".utf8)
+            case "maximum_payload":
+                let baseRecord = Self.swiftCollectorRecord(
+                    runID: runID,
+                    order: 1,
+                    pairId: "x"
+                )
+                let basePayload = try encoder.encode(baseRecord)
+                let addedBytes = SpiceInteractionTraceJSONLWriter.maximumRecordBytes
+                    - basePayload.count
+                try #require(addedBytes > 0)
+                let boundaryRecord = Self.swiftCollectorRecord(
+                    runID: runID,
+                    order: 1,
+                    pairId: String(repeating: "x", count: addedBytes + 1)
+                )
+                var boundaryPayload = try encoder.encode(boundaryRecord)
+                try #require(
+                    boundaryPayload.count == SpiceInteractionTraceJSONLWriter.maximumRecordBytes
+                )
+                boundaryPayload.append(0x0A)
+                invalidExisting = boundaryPayload
+            default:
+                Issue.record("unhandled existing JSONL fixture: \(variant)")
+                continue
+            }
+            try invalidExisting.write(to: output)
+
+            let result = try runInputCollector(
+                runDirectory: runDirectory,
+                event: Self.collectorEvent(runID: runID, order: 2)
+            )
+            #expect(result.status != 0)
+            #expect(result.output.contains("PERF_INPUT_EVENT_ERROR reason=invalid_existing_jsonl"))
+            #expect(try Data(contentsOf: output) == invalidExisting)
+        }
+    }
+
+    @Test func isolatedEndpointOverridesNeverTargetTheDefaultContainer() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+
+        let invalidContainer = try fixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: ["SWIFTSPICE_PERF_CONTAINER": "Invalid/Container"]
+        )
+        #expect(invalidContainer.status != 0)
+        #expect(invalidContainer.output.contains("SWIFTSPICE_PERF_CONTAINER is invalid."))
+        #expect(!fixture.didDetachContainer)
+
+        let invalidImage = try fixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: ["SWIFTSPICE_PERF_IMAGE": "Invalid/Image:latest"]
+        )
+        #expect(invalidImage.status != 0)
+        #expect(invalidImage.output.contains("SWIFTSPICE_PERF_IMAGE is invalid."))
+        #expect(!fixture.didDetachContainer)
+
+        let container = "swiftspice-isolated.test"
+        let image = "registry.example/swiftspice/qemu:test_1"
+        let overrides = [
+            "SWIFTSPICE_PERF_CONTAINER": container,
+            "SWIFTSPICE_PERF_IMAGE": image,
+            "SWIFTSPICE_PERF_SPICE_PORT": "6935",
+            "SWIFTSPICE_PERF_CONTROL_PORT": "6936",
+        ]
+        let start = try fixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        #expect(start.status == 0)
+        let status = try fixture.run(
+            "remote/status.sh",
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        #expect(status.status == 0)
+        let diagnosis = try fixture.run(
+            "remote/control.sh",
+            arguments: ["diagnose-input"],
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        #expect(diagnosis.status == 0)
+
+        let runID = try fixture.currentRunID()
+        let configuration = try String(
+            contentsOf: fixture.base.appending(path: "logs/\(runID)/configuration.txt"),
+            encoding: .utf8
+        )
+        #expect(configuration.contains("spice_listen=127.0.0.1:6935"))
+        #expect(configuration.contains("control_listen=127.0.0.1:6936"))
+        #expect(configuration.contains("container=\(container)"))
+        #expect(configuration.contains("image=\(image)"))
+        #expect(fixture.evidenceOrArgumentsContain(container))
+        #expect(fixture.evidenceOrArgumentsContain(image))
+        #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+
+        let stop = try fixture.run(
+            "remote/stop.sh",
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        #expect(stop.status == 0)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
     }
 
     @Test func concurrentStartsShareOneEndpointWithoutLosingActiveState() throws {
@@ -2023,6 +2416,124 @@ struct RemoteRockyFixtureTests {
         #expect(secondTicket != firstTicket)
         #expect(try fixture.ticketPermissions() == 0o600)
         #expect(!fixture.evidenceOrArgumentsContain(secondTicket))
+    }
+
+    private static func collectorEvent(runID: String, order: UInt64) -> [String: Any] {
+        [
+            "schema_version": 2,
+            "pair_id": "pair-\(order)",
+            "version": "v0.3.1",
+            "run_id": runID,
+            "order": order,
+            "action_class": "click",
+            "token": String(format: "%016llx", order),
+            "scheduled_ns": 10,
+            "host_input_ns": 20,
+            "send_started_ns": 30,
+            "send_completed_ns": 40,
+            "guest_received_ns": 1,
+            "guest_marker_drawn_ns": 2,
+            "display_receive_ns": 50,
+            "surface_ready_ns": 60,
+            "selected_revision_ready_ns": 70,
+            "selection_ns": 80,
+            "metal_commit_ns": 90,
+            "presented_ns": 100,
+            "display_channel_id": 0,
+            "surface_id": 1,
+            "surface_generation": 7,
+            "desktop_generation": 9,
+            "frame_revision": 11,
+            "delivery_sequence": 12,
+            "marker_revision": 13,
+            "marker_checksum": "9f9f5111",
+        ]
+    }
+
+    private static func swiftCollectorRecord(
+        runID: String,
+        order: UInt64,
+        pairId: String? = nil,
+        presentedNs: UInt64? = 100
+    ) -> SpiceInteractionTraceRecord {
+        SpiceInteractionTraceRecord(
+            pairId: pairId ?? "pair-\(order)",
+            version: "v0.3.1",
+            runId: runID,
+            order: order,
+            actionClass: .click,
+            token: String(format: "%016llx", order),
+            scheduledNs: 10,
+            hostInputNs: 20,
+            sendStartedNs: 30,
+            sendCompletedNs: 40,
+            guestReceivedNs: 1,
+            guestMarkerDrawnNs: 2,
+            displayReceiveNs: 50,
+            surfaceReadyNs: 60,
+            selectedRevisionReadyNs: 70,
+            selectionNs: 80,
+            metalCommitNs: 90,
+            presentedNs: presentedNs,
+            displayChannelID: 0,
+            surfaceID: 1,
+            surfaceGeneration: 7,
+            desktopGeneration: 9,
+            frameRevision: 11,
+            deliverySequence: 12,
+            markerRevision: 13,
+            markerChecksum: "9f9f5111"
+        )
+    }
+
+    private func runInputCollector(
+        runDirectory: URL,
+        event: [String: Any]
+    ) throws -> ScriptResult {
+        try runInputCollector(
+            runDirectory: runDirectory,
+            rawInput: JSONSerialization.data(withJSONObject: event)
+        )
+    }
+
+    private func runInputCollector(
+        runDirectory: URL,
+        rawInput: Data
+    ) throws -> ScriptResult {
+        try launchInputCollector(runDirectory: runDirectory, rawInput: rawInput).finish()
+    }
+
+    private func launchInputCollector(
+        runDirectory: URL,
+        event: [String: Any]
+    ) throws -> RunningScript {
+        try launchInputCollector(
+            runDirectory: runDirectory,
+            rawInput: JSONSerialization.data(withJSONObject: event)
+        )
+    }
+
+    private func launchInputCollector(
+        runDirectory: URL,
+        rawInput: Data
+    ) throws -> RunningScript {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [
+            repositoryRoot.appending(
+                path: "Integration/RemoteRocky/remote/collect-input-events.sh"
+            ).path,
+            runDirectory.path,
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        input.fileHandleForWriting.write(rawInput)
+        try input.fileHandleForWriting.close()
+        return RunningScript(process: process, output: output)
     }
 
     private var repositoryRoot: URL {
@@ -2420,6 +2931,7 @@ private struct RemoteRockyFixture {
         "guest_libxi",
         "guest_linux_virt",
         "guest_marker_clock",
+        "guest_marker_roi",
         "guest_openbox",
         "guest_spice_vdagent",
         "guest_spice_webdavd",
@@ -2499,6 +3011,7 @@ private struct RemoteRockyFixture {
             "guest_libxi": "1.8.2-r0",
             "guest_linux_virt": "6.12.107-r0",
             "guest_marker_clock": "clock_gettime-monotonic-v1",
+            "guest_marker_roi": "binary-grid-v1",
             "guest_openbox": "3.6.1-r8",
             "guest_spice_vdagent": "0.22.1-r2",
             "guest_spice_webdavd": "3.0-r4",
@@ -2695,6 +3208,7 @@ private struct RemoteRockyFixture {
         #!/bin/bash
         set -euo pipefail
         state="${MOCK_PODMAN_STATE:?}"
+        container="${SWIFTSPICE_PERF_CONTAINER:-swiftspice-perf-ab-qemu}"
         command="${1:-}"
         shift || true
         printf '%s' "$command" >> "$state/commands"
@@ -2703,12 +3217,12 @@ private struct RemoteRockyFixture {
         case "$command" in
             container)
                 [[ "${1:-}" == exists ]]
-                [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${2:-}" == "$container" ]]
                 [[ $# == 2 ]]
                 [[ -d "$state/container" ]]
                 ;;
             exec)
-                [[ "${1:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${1:-}" == "$container" ]]
                 [[ "${2:-}" == bash ]]
                 [[ "${3:-}" == -c ]]
                 [[ $# == 4 ]]
@@ -2800,7 +3314,7 @@ private struct RemoteRockyFixture {
             inspect)
                 [[ "${1:-}" == --format ]]
                 [[ "${2:-}" == '{{.State.Running}}' ]]
-                [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${3:-}" == "$container" ]]
                 [[ $# == 3 ]]
                 if [[ -n "${MOCK_INSPECT_SIGNAL:-}" ]]; then
                     : > "$state/$MOCK_INSPECT_SIGNAL"
@@ -2809,7 +3323,7 @@ private struct RemoteRockyFixture {
                 ;;
             rm)
                 [[ "${1:-}" == --force ]]
-                [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${2:-}" == "$container" ]]
                 [[ $# == 2 ]]
                 if [[ "${MOCK_FAIL_RM:-}" == 1 && -d "$state/container" ]]; then
                     : > "$state/rm-failed"
@@ -2821,7 +3335,7 @@ private struct RemoteRockyFixture {
             stop)
                 [[ "${1:-}" == --time ]]
                 [[ "${2:-}" == 10 ]]
-                [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
+                [[ "${3:-}" == "$container" ]]
                 [[ $# == 3 ]]
                 if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
                     : > "$state/stop-entered"
@@ -2841,7 +3355,7 @@ private struct RemoteRockyFixture {
                         : > "$state/fd9-inherited-detach"
                         exit 65
                     fi
-                    [[ " $* " == *" --name swiftspice-perf-ab-qemu "* ]]
+                    [[ " $* " == *" --name $container "* ]]
                     [[ " $* " == *" -object secret,id=spice-password,file=/state/ticket "* ]]
                     [[ " $* " != *"0123456789abcdef"* ]]
                     : > "$state/detach-entered"
@@ -2870,7 +3384,7 @@ private struct RemoteRockyFixture {
                 ;;
             logs)
                 if [[ "${1:-}" == --follow ]]; then
-                    [[ "${2:-}" == swiftspice-perf-ab-qemu ]]
+                    [[ "${2:-}" == "$container" ]]
                     [[ $# == 2 ]]
                     if [[ -e /dev/fd/9 ]]; then
                         : > "$state/fd9-inherited-log-follower"
@@ -2880,7 +3394,7 @@ private struct RemoteRockyFixture {
                     trap 'rm -f "$state/log-follower-active"' EXIT
                 elif [[ "${1:-}" == --tail ]]; then
                     [[ "${2:-}" == 12 ]]
-                    [[ "${3:-}" == swiftspice-perf-ab-qemu ]]
+                    [[ "${3:-}" == "$container" ]]
                     [[ $# == 3 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /usr/bin/tail -n "${2}" "${MOCK_CONTAINER_LOG_FILE}"
@@ -2888,7 +3402,7 @@ private struct RemoteRockyFixture {
                         printf 'PERF_READY resolution=1280x720\n'
                     fi
                 else
-                    [[ "${1:-}" == swiftspice-perf-ab-qemu ]]
+                    [[ "${1:-}" == "$container" ]]
                     [[ $# == 1 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /bin/cat "${MOCK_CONTAINER_LOG_FILE}"
@@ -2929,16 +3443,18 @@ private struct RemoteRockyFixture {
         #!/bin/bash
         set -euo pipefail
         [[ "$*" == '-ltnH' ]]
+        spice_port="${SWIFTSPICE_PERF_SPICE_PORT:-5935}"
+        control_port="${SWIFTSPICE_PERF_CONTROL_PORT:-5936}"
         case "${MOCK_SS_MODE:-both}" in
             both)
-                printf 'LISTEN 0 1 127.0.0.1:5935 0.0.0.0:*\n'
-                printf 'LISTEN 0 1 127.0.0.1:5936 0.0.0.0:*\n'
+                printf 'LISTEN 0 1 127.0.0.1:%s 0.0.0.0:*\n' "$spice_port"
+                printf 'LISTEN 0 1 127.0.0.1:%s 0.0.0.0:*\n' "$control_port"
                 ;;
             spice-only)
-                printf 'LISTEN 0 1 127.0.0.1:5935 0.0.0.0:*\n'
+                printf 'LISTEN 0 1 127.0.0.1:%s 0.0.0.0:*\n' "$spice_port"
                 ;;
             control-only)
-                printf 'LISTEN 0 1 127.0.0.1:5936 0.0.0.0:*\n'
+                printf 'LISTEN 0 1 127.0.0.1:%s 0.0.0.0:*\n' "$control_port"
                 ;;
             none) ;;
             *) exit 64 ;;
