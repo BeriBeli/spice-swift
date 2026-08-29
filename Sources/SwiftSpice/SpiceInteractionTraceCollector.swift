@@ -343,6 +343,32 @@ package final class SpiceInteractionTraceCapture: Sendable {
         }
     }
 
+    package func recordHostInput(
+        scheduledNs: UInt64,
+        hostInputNs: UInt64,
+        sendStartedNs: UInt64
+    ) throws {
+        try withActiveCapture {
+            assembler.recordHostInput(
+                scheduledNs: scheduledNs,
+                hostInputNs: hostInputNs,
+                sendStartedNs: sendStartedNs
+            )
+        }
+    }
+
+    package func recordSendCompleted(
+        at nanoseconds: UInt64,
+        motionAckNs: UInt64? = nil
+    ) throws {
+        try withActiveCapture {
+            assembler.recordSendCompleted(
+                at: nanoseconds,
+                motionAckNs: motionAckNs
+            )
+        }
+    }
+
     package func recordMotionAcknowledged(at nanoseconds: UInt64) throws {
         try withActiveCapture {
             assembler.recordMotionAcknowledged(at: nanoseconds)

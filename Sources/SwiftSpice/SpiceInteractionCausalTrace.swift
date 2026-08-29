@@ -417,6 +417,19 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         sendCompletedNs: UInt64,
         motionAckNs: UInt64? = nil
     ) {
+        recordHostInput(
+            scheduledNs: scheduledNs,
+            hostInputNs: hostInputNs,
+            sendStartedNs: sendStartedNs
+        )
+        recordSendCompleted(at: sendCompletedNs, motionAckNs: motionAckNs)
+    }
+
+    package func recordHostInput(
+        scheduledNs: UInt64,
+        hostInputNs: UInt64,
+        sendStartedNs: UInt64
+    ) {
         state.withLock { state in
             if state.hostInputNs != nil {
                 state.invalidReason = state.invalidReason ?? "duplicate_host_evidence"
@@ -425,8 +438,31 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             state.scheduledNs = scheduledNs
             state.hostInputNs = hostInputNs
             state.sendStartedNs = sendStartedNs
-            state.sendCompletedNs = sendCompletedNs
-            state.motionAckNs = motionAckNs
+        }
+    }
+
+    package func recordSendCompleted(
+        at nanoseconds: UInt64,
+        motionAckNs: UInt64? = nil
+    ) {
+        state.withLock { state in
+            guard state.hostInputNs != nil, state.sendStartedNs != nil else {
+                state.invalidReason = state.invalidReason
+                    ?? "send_completion_before_host_evidence"
+                return
+            }
+            guard state.sendCompletedNs == nil else {
+                state.invalidReason = state.invalidReason ?? "duplicate_send_completion"
+                return
+            }
+            state.sendCompletedNs = nanoseconds
+            if let motionAckNs {
+                if let existing = state.motionAckNs, existing != motionAckNs {
+                    state.invalidReason = state.invalidReason ?? "duplicate_motion_ack"
+                } else {
+                    state.motionAckNs = motionAckNs
+                }
+            }
         }
     }
 

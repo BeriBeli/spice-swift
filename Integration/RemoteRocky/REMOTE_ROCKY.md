@@ -34,7 +34,11 @@ dash, beginning with a letter or digit. Image references accept lowercase
 repository path components and an optional OCI-style tag. The selected
 container and image are copied into each run's `configuration.txt`; start,
 stop, status, control, ticket, and round scripts all inherit the same isolated
-base and container values.
+base and container values. The five override variables above are an all-or-none
+identity: a partial environment, including a later shell that retains the base
+or ports but loses the container or image, exits with status 2 before creating
+state or invoking Podman. With all five unset, the historical default lifecycle
+remains unchanged.
 
 Connect one client at a time through an SSH tunnel:
 
@@ -267,6 +271,13 @@ Malformed JSON or a record without a stable pair/version/run/order/action/token
 attribution is rejected without writing. Attributable but incomplete evidence
 is atomically retained with `valid=false` and a deterministic reason. The
 record and whole file are capped at 64 KiB and 16 MiB respectively.
+
+The host records `scheduledNs`, `hostInputNs`, and `sendStartedNs` before the
+wire send, then records `sendCompletedNs` after its continuation resumes. This
+lets a causally eligible Display frame arriving during the send continuation be
+retained instead of being dropped for lack of host evidence. A motion ACK may
+be buffered before send completion; the completion stage may confirm that same
+timestamp, while a different or duplicate completion fails closed.
 
 The state machine can be exercised without X using the same validation and
 renderer call point:

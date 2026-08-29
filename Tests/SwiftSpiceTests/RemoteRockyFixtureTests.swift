@@ -2292,6 +2292,90 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
     }
 
+    @Test func isolatedEndpointRequiresOneCompleteOverrideIdentityAcrossAllCommands() throws {
+        let container = "swiftspice-complete.test"
+        let overrideKeys = [
+            "SWIFTSPICE_PERF_BASE",
+            "SWIFTSPICE_PERF_CONTAINER",
+            "SWIFTSPICE_PERF_IMAGE",
+            "SWIFTSPICE_PERF_SPICE_PORT",
+            "SWIFTSPICE_PERF_CONTROL_PORT",
+        ]
+        for missingKey in overrideKeys {
+            let missingFixture = try RemoteRockyFixture()
+            defer { missingFixture.remove() }
+            let missingOverrides = [
+                "SWIFTSPICE_PERF_BASE": missingFixture.base.path,
+                "SWIFTSPICE_PERF_CONTAINER": container,
+                "SWIFTSPICE_PERF_IMAGE": "registry.example/swiftspice/qemu:complete",
+                "SWIFTSPICE_PERF_SPICE_PORT": "7935",
+                "SWIFTSPICE_PERF_CONTROL_PORT": "7936",
+            ]
+            let result = try missingFixture.run(
+                "remote/start.sh",
+                ssMode: "both",
+                additionalEnvironment: missingOverrides,
+                removingEnvironment: [missingKey]
+            )
+            #expect(result.status == 2)
+            #expect(result.output.contains(
+                "SWIFTSPICE_PERF_* overrides must be set together."
+            ))
+            #expect(!missingFixture.didDetachContainer)
+            #expect(!missingFixture.stateFileExists("current-run"))
+            #expect(!missingFixture.stateFileExists("ticket"))
+            #expect(!missingFixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+        }
+
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let overrides = [
+            "SWIFTSPICE_PERF_BASE": fixture.base.path,
+            "SWIFTSPICE_PERF_CONTAINER": container,
+            "SWIFTSPICE_PERF_IMAGE": "registry.example/swiftspice/qemu:complete",
+            "SWIFTSPICE_PERF_SPICE_PORT": "7935",
+            "SWIFTSPICE_PERF_CONTROL_PORT": "7936",
+        ]
+        let start = try fixture.run(
+            "remote/start.sh",
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        try #require(start.status == 0)
+        #expect(fixture.isContainerRunning)
+
+        for command in ["remote/status.sh", "remote/stop.sh"] {
+            let result = try fixture.run(
+                command,
+                ssMode: "both",
+                additionalEnvironment: overrides,
+                removingEnvironment: ["SWIFTSPICE_PERF_CONTAINER"]
+            )
+            #expect(result.status == 2)
+            #expect(fixture.isContainerRunning)
+            #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+        }
+        let control = try fixture.run(
+            "remote/control.sh",
+            arguments: ["diagnose-input"],
+            ssMode: "both",
+            additionalEnvironment: overrides,
+            removingEnvironment: ["SWIFTSPICE_PERF_CONTAINER"]
+        )
+        #expect(control.status == 2)
+        #expect(fixture.isContainerRunning)
+        #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+
+        let stop = try fixture.run(
+            "remote/stop.sh",
+            ssMode: "both",
+            additionalEnvironment: overrides
+        )
+        #expect(stop.status == 0)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.evidenceOrArgumentsContain("swiftspice-perf-ab-qemu"))
+    }
+
     @Test func concurrentStartsShareOneEndpointWithoutLosingActiveState() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -3058,13 +3142,15 @@ private struct RemoteRockyFixture {
         _ relativePath: String,
         arguments: [String] = [],
         ssMode: String,
-        additionalEnvironment: [String: String] = [:]
+        additionalEnvironment: [String: String] = [:],
+        removingEnvironment: Set<String> = []
     ) throws -> ScriptResult {
         try launch(
             relativePath,
             arguments: arguments,
             ssMode: ssMode,
-            additionalEnvironment: additionalEnvironment
+            additionalEnvironment: additionalEnvironment,
+            removingEnvironment: removingEnvironment
         ).finish()
     }
 
@@ -3072,7 +3158,8 @@ private struct RemoteRockyFixture {
         _ relativePath: String,
         arguments: [String] = [],
         ssMode: String,
-        additionalEnvironment: [String: String] = [:]
+        additionalEnvironment: [String: String] = [:],
+        removingEnvironment: Set<String> = []
     ) throws -> RunningScript {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -3089,10 +3176,17 @@ private struct RemoteRockyFixture {
         environment["PATH"] = "\(mockBin.path):/usr/bin:/bin:/usr/sbin:/sbin"
         environment["HOME"] = root.path
         environment["SWIFTSPICE_PERF_BASE"] = base.path
+        environment["SWIFTSPICE_PERF_CONTAINER"] = "swiftspice-perf-ab-qemu"
+        environment["SWIFTSPICE_PERF_IMAGE"] = "localhost/swiftspice-qemu-x86:local"
+        environment["SWIFTSPICE_PERF_SPICE_PORT"] = "5935"
+        environment["SWIFTSPICE_PERF_CONTROL_PORT"] = "5936"
         environment["MOCK_PODMAN_STATE"] = mockState.path
         environment["MOCK_SS_MODE"] = ssMode
         for (key, value) in additionalEnvironment {
             environment[key] = value
+        }
+        for key in removingEnvironment {
+            environment.removeValue(forKey: key)
         }
         process.environment = environment
         try process.run()

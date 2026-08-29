@@ -250,7 +250,12 @@ Host display receive may be observed after `sendStartedNs` but before the send
 task records `sendCompletedNs`. This overlap remains causal: validation requires
 both observations to be no earlier than send start, while the derived
 post-send-to-display segment is clamped to zero. A display observation earlier
-than send start remains invalid.
+than send start remains invalid. The capture therefore linearizes host input
+and send start before entering the wire send, admits exact frame observations
+from that point, and records send completion separately when the continuation
+resumes. A same-generation motion ACK may be buffered across that boundary;
+the completion stage may confirm the same ACK but cannot substitute a different
+one or complete twice.
 
 The Rocky fixture now provides the first causal-trace slice without changing
 display scheduling. `control.sh arm <click|key|motion> <token>` pre-arms one
@@ -622,3 +627,4 @@ behavior remain separate acceptance gates.
 | 2026-08-29 | AIP-00, AIP-44 | Treat the successful Rocky eudev/Xorg marker run as guest-causal subpath evidence, not an input-to-visible result | Key, motion, and click now reach the guest marker and relative motion produces protocol ACKs, but no collector yet binds those marker pixels to an exact SwiftSpice delivery and AppKit presented callback. Complete that binding and paired `v0.2.7`/`v0.3.x` traces before selecting an immediate or adaptive ready-to-selection policy. |
 | 2026-08-29 | AIP-00 | Land the exact host identity and presented-callback correlation seam before changing the Rocky pixel protocol or collector | Keeping source timing beside the exact emitted Display revision prevents coalesced replacements from inheriting neighboring evidence. The internal BGRA detector and assembler now fail closed across marker, generation, selection, commit, and presented identity, while the separate fixture slice remains responsible for a shared versioned ROI and normalized JSONL artifacts. No pacing behavior or performance conclusion changes in this slice. |
 | 2026-08-29 | AIP-00 | Share `binary-grid-v1` between the guest and Swift, normalize schema 2 through a bounded atomic collector, and reserve a separately named Rocky endpoint for the live gate | The local implementation can retain exact valid and attributable-invalid evidence without partial JSON lines, but it is not live completion evidence. The next run must use an isolated base/container/ports, verify the manifest capability, and bind real marker pixels to the same presented delivery before paired latency work or any AIP-44 scheduling decision. |
+| 2026-08-29 | AIP-00 | Make fixture identity overrides all-or-none and split host send-start from send-completion evidence | A partial later-shell environment must fail before filesystem or Podman effects rather than target the default endpoint. Recording the host-input/send-start boundary before the wire send allows a frame received before the send continuation resumes to remain causally eligible; send completion and a same-generation buffered motion ACK are linearized afterward without changing scheduling. |

@@ -2,22 +2,66 @@
 
 set -euo pipefail
 
-readonly PERF_BASE="${SWIFTSPICE_PERF_BASE:-${HOME}/swiftspice-remote-closure/perf-ab}"
+override_count=0
+for override_presence in \
+    "${SWIFTSPICE_PERF_BASE+x}" \
+    "${SWIFTSPICE_PERF_CONTAINER+x}" \
+    "${SWIFTSPICE_PERF_IMAGE+x}" \
+    "${SWIFTSPICE_PERF_SPICE_PORT+x}" \
+    "${SWIFTSPICE_PERF_CONTROL_PORT+x}"; do
+    if [[ "${override_presence}" == x ]]; then
+        override_count=$((override_count + 1))
+    fi
+done
+if [[ "${override_count}" != 0 && "${override_count}" != 5 ]]; then
+    echo "SWIFTSPICE_PERF_* overrides must be set together." >&2
+    exit 2
+fi
+
+if [[ "${override_count}" == 5 ]]; then
+    readonly PERF_BASE="${SWIFTSPICE_PERF_BASE}"
+    readonly PERF_CONTAINER="${SWIFTSPICE_PERF_CONTAINER}"
+    readonly PERF_IMAGE="${SWIFTSPICE_PERF_IMAGE}"
+    readonly PERF_SPICE_PORT="${SWIFTSPICE_PERF_SPICE_PORT}"
+    readonly PERF_CONTROL_PORT="${SWIFTSPICE_PERF_CONTROL_PORT}"
+else
+    readonly PERF_BASE="${HOME}/swiftspice-remote-closure/perf-ab"
+    readonly PERF_CONTAINER="swiftspice-perf-ab-qemu"
+    readonly PERF_IMAGE="localhost/swiftspice-qemu-x86:local"
+    readonly PERF_SPICE_PORT=5935
+    readonly PERF_CONTROL_PORT=5936
+fi
 readonly PERF_ARTIFACTS="${PERF_BASE}/artifacts"
 readonly PERF_STATE="${PERF_BASE}/state"
 readonly PERF_LOGS="${PERF_BASE}/logs"
-readonly PERF_CONTAINER="${SWIFTSPICE_PERF_CONTAINER:-swiftspice-perf-ab-qemu}"
-readonly PERF_IMAGE="${SWIFTSPICE_PERF_IMAGE:-localhost/swiftspice-qemu-x86:local}"
-readonly PERF_SPICE_PORT="${SWIFTSPICE_PERF_SPICE_PORT:-5935}"
-readonly PERF_CONTROL_PORT="${SWIFTSPICE_PERF_CONTROL_PORT:-5936}"
 readonly PERF_LIFECYCLE_LOCK="${PERF_STATE}/lifecycle.lock"
 
+if [[ ! "${PERF_BASE}" =~ ^/[^[:cntrl:]]+$ \
+    || "${PERF_BASE}" == / \
+    || "${PERF_BASE}" == *'/../'* \
+    || "${PERF_BASE}" == */.. \
+    || "${PERF_BASE}" == *'/./'* \
+    || "${PERF_BASE}" == */. ]]; then
+    echo "SWIFTSPICE_PERF_BASE is invalid." >&2
+    exit 2
+fi
 if [[ ! "${PERF_CONTAINER}" =~ ^[a-z0-9][a-z0-9_.-]{0,127}$ ]]; then
     echo "SWIFTSPICE_PERF_CONTAINER is invalid." >&2
     exit 2
 fi
 if [[ ! "${PERF_IMAGE}" =~ ^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$ ]]; then
     echo "SWIFTSPICE_PERF_IMAGE is invalid." >&2
+    exit 2
+fi
+if [[ ! "${PERF_SPICE_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] \
+    || ((10#${PERF_SPICE_PORT} < 1024 || 10#${PERF_SPICE_PORT} > 65535)); then
+    echo "SWIFTSPICE_PERF_SPICE_PORT is invalid." >&2
+    exit 2
+fi
+if [[ ! "${PERF_CONTROL_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] \
+    || ((10#${PERF_CONTROL_PORT} < 1024 || 10#${PERF_CONTROL_PORT} > 65535)) \
+    || [[ "${PERF_CONTROL_PORT}" == "${PERF_SPICE_PORT}" ]]; then
+    echo "SWIFTSPICE_PERF_CONTROL_PORT is invalid." >&2
     exit 2
 fi
 

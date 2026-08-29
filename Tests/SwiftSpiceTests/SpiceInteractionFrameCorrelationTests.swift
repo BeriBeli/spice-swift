@@ -744,6 +744,158 @@ struct SpiceInteractionFrameCorrelationTests {
         ) == record)
     }
 
+    @Test func captureRetainsPresentedFrameUntilTheSendContinuationCompletes() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-send-completion-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = SpicePresentationDiagnostics()
+        let output = directory.appending(path: "input-events.jsonl")
+        let capture = try SpiceInteractionTraceCapture(
+            presentationDiagnostics: diagnostics,
+            writer: SpiceInteractionTraceJSONLWriter(outputURL: output),
+            pairId: "pair-send-completion",
+            version: "v0.3.1",
+            runId: "run-send-completion",
+            order: 1,
+            actionClass: .motion,
+            token: token,
+            checksum: checksum
+        )
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let earlyMotionAcknowledgment = receive - 5
+        let frameIdentity = identity(deliverySequence: 902)
+
+        try capture.recordHostInput(
+            scheduledNs: receive - 30,
+            hostInputNs: receive - 20,
+            sendStartedNs: receive - 10
+        )
+        try capture.recordMotionAcknowledged(at: earlyMotionAcknowledgment)
+        try capture.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        diagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: frameIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        diagnostics.recordInteractionSelected(
+            identity: frameIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: frameIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: frameIdentity, at: ready + 30)
+
+        // The transport continuation resumes last. Supplying the same ACK is
+        // an idempotent linearization of evidence that arrived during send.
+        try capture.recordSendCompleted(
+            at: receive + 5,
+            motionAckNs: earlyMotionAcknowledgment
+        )
+        let record = try capture.finish()
+
+        #expect(record.valid)
+        #expect(record.sendStartedNs == receive - 10)
+        #expect(record.displayReceiveNs == receive)
+        #expect(record.sendCompletedNs == receive + 5)
+        #expect(record.motionAckNs == earlyMotionAcknowledgment)
+        #expect(record.presentedNs == ready + 30)
+        let lines = try Data(contentsOf: output).split(separator: 0x0A)
+        #expect(lines.count == 1)
+        #expect(try JSONDecoder().decode(
+            SpiceInteractionTraceRecord.self,
+            from: Data(try #require(lines.first))
+        ) == record)
+    }
+
+    @Test func captureRejectsMissingDuplicateOrNonMonotonicSendCompletion() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "interaction-send-failures-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func makeCapture(
+            _ name: String
+        ) throws -> (SpiceInteractionTraceCapture, SpicePresentationDiagnostics) {
+            let diagnostics = SpicePresentationDiagnostics()
+            let capture = try SpiceInteractionTraceCapture(
+                presentationDiagnostics: diagnostics,
+                writer: SpiceInteractionTraceJSONLWriter(
+                    outputURL: directory.appending(path: "\(name).jsonl")
+                ),
+                pairId: "pair-\(name)",
+                version: "v0.3.1",
+                runId: "run-send-failures",
+                order: 1,
+                actionClass: .motion,
+                token: token,
+                checksum: checksum
+            )
+            return (capture, diagnostics)
+        }
+
+        let (missingPrelude, _) = try makeCapture("missing-prelude")
+        try missingPrelude.recordSendCompleted(at: 40)
+        let missingPreludeRecord = try missingPrelude.finish()
+        #expect(missingPreludeRecord.invalidReason == "send_completion_before_host_evidence")
+
+        let (duplicate, _) = try makeCapture("duplicate")
+        try duplicate.recordHostInput(scheduledNs: 10, hostInputNs: 20, sendStartedNs: 30)
+        try duplicate.recordSendCompleted(at: 40)
+        try duplicate.recordSendCompleted(at: 41)
+        let duplicateRecord = try duplicate.finish()
+        #expect(duplicateRecord.invalidReason == "duplicate_send_completion")
+
+        let (nonMonotonic, nonMonotonicDiagnostics) = try makeCapture("non-monotonic")
+        try nonMonotonic.recordHostInput(scheduledNs: 10, hostInputNs: 20, sendStartedNs: 30)
+        try nonMonotonic.recordSendCompleted(at: 29)
+        try nonMonotonic.recordGuestEvidence(receivedNs: 1, drawnNs: 2, markerRevision: 77)
+        let nonMonotonicTiming = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let nonMonotonicReady = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: nonMonotonicTiming.surfaceReadyAt
+        ))
+        let nonMonotonicIdentity = identity(deliverySequence: 903)
+        nonMonotonicDiagnostics.recordInteractionFrameReceived(
+            markerSnapshot(identity: nonMonotonicIdentity, markerRevision: 77),
+            sourceTiming: nonMonotonicTiming
+        )
+        nonMonotonicDiagnostics.recordInteractionSelected(
+            identity: nonMonotonicIdentity,
+            readyNs: nonMonotonicReady,
+            selectionNs: nonMonotonicReady + 10
+        )
+        nonMonotonicDiagnostics.recordInteractionCommitted(
+            identity: nonMonotonicIdentity,
+            at: nonMonotonicReady + 20
+        )
+        nonMonotonicDiagnostics.recordInteractionPresented(
+            identity: nonMonotonicIdentity,
+            at: nonMonotonicReady + 30
+        )
+        let nonMonotonicRecord = try nonMonotonic.finish()
+        #expect(nonMonotonicRecord.invalidReason == "non_monotonic_timestamps")
+
+        let (conflictingAcknowledgment, _) = try makeCapture("conflicting-ack")
+        try conflictingAcknowledgment.recordHostInput(
+            scheduledNs: 10,
+            hostInputNs: 20,
+            sendStartedNs: 30
+        )
+        try conflictingAcknowledgment.recordMotionAcknowledged(at: 35)
+        try conflictingAcknowledgment.recordSendCompleted(at: 40, motionAckNs: 36)
+        let conflictingAcknowledgmentRecord = try conflictingAcknowledgment.finish()
+        #expect(conflictingAcknowledgmentRecord.invalidReason == "duplicate_motion_ack")
+    }
+
     @Test func coreAnimationPresentedTimeMapsIntoTheHostMonotonicClock() throws {
         let before = SpiceInteractionHostClock.nowNanoseconds()
         let mediaTime = CACurrentMediaTime()
