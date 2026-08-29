@@ -366,8 +366,15 @@ package actor DisplayFramePublisher {
         let invalidationGeneration: UInt64
     }
 
+    private struct SnapshotPreparation: Sendable {
+        let requestIndex: Int
+        let frame: FrameSnapshot?
+        let duration: Duration
+    }
+
     private let interval: Duration
     private let maximumPendingSurfaces: Int
+    private let maximumConcurrentSnapshots: Int
     private let requiresExplicitDemand: Bool
     private let waitsForConsumption: Bool
     private let snapshot: Snapshot
@@ -412,6 +419,7 @@ package actor DisplayFramePublisher {
     package init(
         interval: Duration = .milliseconds(16),
         maximumPendingSurfaces: Int = 16,
+        maximumConcurrentSnapshots: Int = 2,
         requiresExplicitDemand: Bool = false,
         waitsForConsumption: Bool = false,
         snapshot: @escaping Snapshot,
@@ -419,6 +427,10 @@ package actor DisplayFramePublisher {
     ) {
         self.interval = interval
         self.maximumPendingSurfaces = max(1, maximumPendingSurfaces)
+        self.maximumConcurrentSnapshots = min(
+            self.maximumPendingSurfaces,
+            max(1, maximumConcurrentSnapshots)
+        )
         self.requiresExplicitDemand = requiresExplicitDemand
         self.waitsForConsumption = waitsForConsumption
         self.snapshot = snapshot
@@ -665,16 +677,18 @@ package actor DisplayFramePublisher {
         order.removeAll { eligibleSet.contains($0) }
         flushTask = nil
 
-        for request in requests {
-            snapshotAttempts &+= 1
-            let snapshotStartedAt = clock.now
-            guard let frame = await snapshot(request.surfaceRevision) else {
-                snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
+        let preparations = await prepareSnapshots(
+            requests,
+            flushGeneration: flushGeneration
+        )
+        guard generation == flushGeneration else { return }
+
+        for preparation in preparations {
+            let request = requests[preparation.requestIndex]
+            guard let frame = preparation.frame else {
                 staleSnapshots &+= 1
                 continue
             }
-            snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
-            guard generation == flushGeneration else { return }
             guard isCurrent(request),
                   canPrepare(request.surfaceRevision.surfaceID),
                   frameCovers(frame, request: request)
@@ -748,6 +762,71 @@ package actor DisplayFramePublisher {
         }
         isFlushing = false
         scheduleFlushIfNeeded()
+    }
+
+    /// Prepares independent Surfaces concurrently without changing their
+    /// publication order. Only `maximumConcurrentSnapshots` child tasks exist
+    /// at once; the remaining work stays in the already-bounded request batch.
+    /// A generation change stops further admission, cancels the admitted
+    /// children, and still drains them before returning ownership to teardown.
+    private func prepareSnapshots(
+        _ requests: [Request],
+        flushGeneration: UInt64
+    ) async -> [SnapshotPreparation] {
+        guard !requests.isEmpty else { return [] }
+        let snapshot = self.snapshot
+        let clock = self.clock
+        var ordered = [SnapshotPreparation?](
+            repeating: nil,
+            count: requests.count
+        )
+
+        await withTaskGroup(of: SnapshotPreparation.self) { group in
+            var nextRequestIndex = 0
+            let initialCount = min(maximumConcurrentSnapshots, requests.count)
+            for _ in 0..<initialCount {
+                let requestIndex = nextRequestIndex
+                let request = requests[requestIndex]
+                nextRequestIndex += 1
+                snapshotAttempts &+= 1
+                group.addTask {
+                    let startedAt = clock.now
+                    let frame = await snapshot(request.surfaceRevision)
+                    return SnapshotPreparation(
+                        requestIndex: requestIndex,
+                        frame: frame,
+                        duration: startedAt.duration(to: clock.now)
+                    )
+                }
+            }
+
+            while let completed = await group.next() {
+                snapshotDuration.record(completed.duration)
+                ordered[completed.requestIndex] = completed
+
+                guard generation == flushGeneration, !isCancelled else {
+                    group.cancelAll()
+                    continue
+                }
+                guard nextRequestIndex < requests.count else { continue }
+
+                let requestIndex = nextRequestIndex
+                let request = requests[requestIndex]
+                nextRequestIndex += 1
+                snapshotAttempts &+= 1
+                group.addTask {
+                    let startedAt = clock.now
+                    let frame = await snapshot(request.surfaceRevision)
+                    return SnapshotPreparation(
+                        requestIndex: requestIndex,
+                        frame: frame,
+                        duration: startedAt.duration(to: clock.now)
+                    )
+                }
+            }
+        }
+
+        return ordered.compactMap { $0 }
     }
 
     private func isCurrent(_ request: Request) -> Bool {
