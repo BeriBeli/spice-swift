@@ -375,7 +375,11 @@ BGRA storage, and the correlation identity contains desktop generation,
 display channel ID, surface ID, Surface lifecycle generation, frame revision,
 and delivery sequence. Selection, the Metal command-buffer commit-call
 boundary, and `CAMetalDrawable` presentation all retain that same identity. A
-GPU-busy or drawable-unavailable retry restores the selected delivery's
+desktop snapshot's envelope delivery sequence orders cursor, pointer-mode, and
+latest-state coalescing independently; only the sequence owned by the retained
+frame publication participates in the frame identity. A control-only merge
+therefore cannot relabel an older frame, while a real frame publication obtains
+a new frame sequence. A GPU-busy or drawable-unavailable retry restores the selected delivery's
 original ready instant and nanoseconds rather than manufacturing a new ready
 event. Surface destruction or direct lifecycle replacement retires that
 display-channel/surface lifecycle, so an old drawable cannot complete a

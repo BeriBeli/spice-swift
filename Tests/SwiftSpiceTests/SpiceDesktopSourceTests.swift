@@ -264,6 +264,94 @@ struct SpiceDesktopSourceTests {
         subscription.cancel()
     }
 
+    @Test func controlStateMergePreservesThePublishedFrameIdentity() throws {
+        let anchor = ContinuousClock().now
+        let timing = DisplayFrameSourceTiming(
+            messageReceivedAt: anchor.advanced(by: .nanoseconds(50)),
+            surfaceReadyAt: anchor.advanced(by: .nanoseconds(60))
+        )
+        let receive = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.messageReceivedAt
+        ))
+        let ready = try #require(SpiceInteractionHostClock.nanoseconds(
+            for: timing.surfaceReadyAt
+        ))
+        let diagnostics = SpicePresentationDiagnostics()
+        let assembler = Self.interactionAssembler()
+        diagnostics.setInteractionTraceAssembler(assembler)
+        Self.recordInteractionEvidence(on: assembler, beforeDisplayReceiveNs: receive)
+
+        let source = SpiceDesktopSource(presentationDiagnostics: diagnostics)
+        source.beginSession(pointerMode: .absolute)
+        let latch = SpiceDesktopReadyLatch()
+        let deliveries = Mutex<[SpiceDesktopSnapshot]>([])
+        let subscription = source.subscribe()
+        defer { subscription.cancel() }
+        subscription.setUpdateHandler { snapshot in
+            deliveries.withLock { $0.append(snapshot) }
+            if snapshot.frame != nil {
+                _ = latch.offer(snapshot)
+            }
+        }
+        subscription.setDemand(.visible)
+
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Self.interactionFrame(
+                    lifecycle: 1,
+                    revision: 1,
+                    containsMarker: true
+                ),
+                sourceTiming: timing
+            ),
+            displayChannelID: 0
+        )
+        let publishedFrame = try #require(deliveries.withLock { snapshots in
+            snapshots.last { $0.frame?.revision.value == 1 }
+        })
+        let publishedIdentity = try #require(publishedFrame.interactionFrameIdentity)
+
+        // These control-state publications are newer desktop snapshots, but
+        // they still carry the exact frame publication already registered by
+        // the interaction assembler.
+        source.updateCursor(SpiceCursorState(
+            x: 23,
+            y: 17,
+            isVisible: true,
+            image: nil
+        ))
+        source.updatePointerMode(.relative)
+        let selected = try #require(latch.take())
+        let selectedIdentity = try #require(selected.interactionFrameIdentity)
+        #expect(selected.deliverySequence > publishedFrame.deliverySequence)
+        #expect(selected.cursor?.x == 23)
+        #expect(selected.pointerMode == .relative)
+        #expect(selectedIdentity == publishedIdentity)
+
+        diagnostics.recordInteractionSelected(
+            identity: selectedIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        diagnostics.recordInteractionCommitted(identity: selectedIdentity, at: ready + 20)
+        diagnostics.recordInteractionPresented(identity: selectedIdentity, at: ready + 30)
+        let record = assembler.finish()
+        #expect(record.valid)
+        #expect(record.deliverySequence == publishedIdentity.deliverySequence)
+
+        // A real frame publication must advance the frame identity rather
+        // than inheriting the preceding frame's sequence through the merge.
+        source.receiveFrame(
+            Self.interactionFrame(lifecycle: 1, revision: 2, containsMarker: false),
+            displayChannelID: 0
+        )
+        let nextFrame = try #require(latch.take())
+        let nextIdentity = try #require(nextFrame.interactionFrameIdentity)
+        #expect(nextIdentity.frameRevision == 2)
+        #expect(nextIdentity.deliverySequence == nextFrame.deliverySequence)
+        #expect(nextIdentity.deliverySequence > publishedIdentity.deliverySequence)
+    }
+
     @Test func destroyAndRecreateCannotLeakOldSurfaceLifecycle() async throws {
         let source = SpiceDesktopSource()
         source.beginSession(pointerMode: .absolute)

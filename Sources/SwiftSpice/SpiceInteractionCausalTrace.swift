@@ -780,14 +780,18 @@ package final class SpiceInteractionTraceAssembler: Sendable {
 
 extension SpiceDesktopSnapshot {
     package var interactionFrameIdentity: SpiceInteractionFrameIdentity? {
-        guard let revision = frame?.revision else { return nil }
+        guard let revision = frame?.revision,
+              let frameDeliverySequence
+        else {
+            return nil
+        }
         return SpiceInteractionFrameIdentity(
             desktopGeneration: generation,
             displayChannelID: revision.surface.displayChannelID,
             surfaceID: revision.surface.surfaceID,
             surfaceGeneration: revision.surface.generation,
             frameRevision: revision.value,
-            deliverySequence: deliverySequence
+            deliverySequence: frameDeliverySequence
         )
     }
 }
