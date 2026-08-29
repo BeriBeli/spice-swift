@@ -145,6 +145,42 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let nativeVideoFallbacks: UInt64
 }
 
+package typealias SurfaceOperationWaiterObserver = @Sendable (
+    _ surfaceID: UInt32,
+    _ reservationID: UInt64
+) async -> Void
+
+package struct SurfaceOperationReservationDiagnostics: Sendable, Equatable {
+    package let activeSurfaceCount: Int
+    package let waitingCount: Int
+    package let grantedWaiterCount: Int
+    package let reservedCount: Int
+
+    package init(
+        activeSurfaceCount: Int = 0,
+        waitingCount: Int = 0,
+        grantedWaiterCount: Int = 0,
+        reservedCount: Int = 0
+    ) {
+        self.activeSurfaceCount = activeSurfaceCount
+        self.waitingCount = waitingCount
+        self.grantedWaiterCount = grantedWaiterCount
+        self.reservedCount = reservedCount
+    }
+}
+
+private final class SurfaceOperationCancellation: Sendable {
+    private let cancelled = Mutex(false)
+
+    var isCancelled: Bool {
+        cancelled.withLock { $0 }
+    }
+
+    func cancel() {
+        cancelled.withLock { $0 = true }
+    }
+}
+
 package final class FramePixelStorage: @unchecked Sendable {
     private struct State {
         var pixels: Data?
@@ -356,6 +392,7 @@ package struct RenderLimits: Sendable, Equatable {
 
 package enum RenderError: Error, Sendable, Equatable {
     case storeClosed
+    case operationCancelled
     case duplicateSurface(UInt32)
     case unknownSurface(UInt32)
     case unsupportedSurfaceFormat(UInt32)
@@ -397,6 +434,20 @@ extension SurfaceVideoCompositionError: CustomStringConvertible {
 }
 
 package actor SurfaceStore {
+    private enum SurfaceOperationWaitOutcome: Sendable {
+        case acquired
+        case cancelled
+    }
+
+    private enum SurfaceOperationReservation {
+        case queued(
+            surfaceID: UInt32,
+            continuation: CheckedContinuation<SurfaceOperationWaitOutcome, Never>
+        )
+        case granted(surfaceID: UInt32)
+        case cancelledAfterGrant(surfaceID: UInt32)
+    }
+
     private enum CanonicalCPUMutation: Sendable {
         case fill(region: PixelRegion, colorBGRA: UInt32)
         case sameSurfaceCopy(
@@ -468,6 +519,8 @@ package actor SurfaceStore {
     private let metalCompositor: SpiceMetalCompositor?
     private let metalCompositorInitializationError: SpiceMetalCompositorError?
     private let compositorFailureForAttempt: @Sendable (Int) -> SpiceMetalCompositorError?
+    private let surfaceOperationWaiterWillRegister: SurfaceOperationWaiterObserver?
+    private let surfaceOperationGrantWillBeClaimed: SurfaceOperationWaiterObserver?
     private var compositorAttempt = 0
     private let materializationMetrics = FrameMaterializationMetrics()
     private var surfaces: [UInt32: Surface] = [:]
@@ -497,7 +550,10 @@ package actor SurfaceStore {
     private var gpuCopyBytes: UInt64 = 0
     private var revisionedGPUErrors: UInt64 = 0
     private var activeSurfaceOperations: Set<UInt32> = []
-    private var surfaceOperationWaiters: [UInt32: [CheckedContinuation<Void, Never>]] = [:]
+    private var surfaceOperationWaiters: [UInt32: [UInt64]] = [:]
+    private var surfaceOperationReservations: [UInt64: SurfaceOperationReservation] = [:]
+    private var reservedSurfaceOperationReservationIDs: Set<UInt64> = []
+    private var nextSurfaceOperationReservationID: UInt64 = 0
     private var rejectsNewOperations = false
     private var closeCompleted = false
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
@@ -507,6 +563,8 @@ package actor SurfaceStore {
         framePool: IOSurfaceFramePool = .shared,
         memoryBudget: SurfaceMemoryBudget? = nil,
         backingPolicy: SurfaceBackingPolicy = .automatic,
+        surfaceOperationWaiterWillRegister: SurfaceOperationWaiterObserver? = nil,
+        surfaceOperationGrantWillBeClaimed: SurfaceOperationWaiterObserver? = nil,
         compositorFailureForAttempt: @escaping @Sendable (Int) -> SpiceMetalCompositorError? = {
             _ in nil
         }
@@ -517,6 +575,8 @@ package actor SurfaceStore {
             maximumBytes: limits.maximumTotalSurfaceBytes
         )
         self.compositorFailureForAttempt = compositorFailureForAttempt
+        self.surfaceOperationWaiterWillRegister = surfaceOperationWaiterWillRegister
+        self.surfaceOperationGrantWillBeClaimed = surfaceOperationGrantWillBeClaimed
         let selectedRevisionedPool: RevisionedIOSurfacePool?
         switch backingPolicy {
         case .automatic:
@@ -1696,6 +1756,9 @@ package actor SurfaceStore {
             throw .storeClosed
         }
         while true {
+            guard !Task.isCancelled else {
+                throw .operationCancelled
+            }
             let surface = try surface(id: surfaceID)
             if let snapshot = await makeSnapshot(
                 from: surface,
@@ -1711,7 +1774,8 @@ package actor SurfaceStore {
     /// display publication uses `snapshot(atLeast:)` so a newer immutable frame
     /// can safely satisfy an older request.
     package func snapshot(matching requested: SurfaceRevision) async -> FrameSnapshot? {
-        guard !rejectsNewOperations,
+        guard !Task.isCancelled,
+              !rejectsNewOperations,
               let surface = surfaces[requested.surfaceID],
               surface.lifecycleGeneration == requested.lifecycleGeneration,
               surface.revision == requested.revision
@@ -1726,7 +1790,8 @@ package actor SurfaceStore {
     /// held while selecting and constructing the candidate, so concurrent
     /// draws cannot make the snapshot chase a moving exact revision.
     package func snapshot(atLeast requested: SurfaceRevision) async -> FrameSnapshot? {
-        guard !rejectsNewOperations,
+        guard !Task.isCancelled,
+              !rejectsNewOperations,
               let eligible = surfaces[requested.surfaceID],
               eligible.lifecycleGeneration == requested.lifecycleGeneration,
               eligible.revision >= requested.revision
@@ -1739,7 +1804,8 @@ package actor SurfaceStore {
             return nil
         }
         defer { releaseSurfaceOperation(surfaceID: requested.surfaceID) }
-        guard let surface = surfaces[requested.surfaceID],
+        guard !Task.isCancelled,
+              let surface = surfaces[requested.surfaceID],
               surface.lifecycleGeneration == requested.lifecycleGeneration,
               surface.revision >= requested.revision
         else {
@@ -1759,7 +1825,8 @@ package actor SurfaceStore {
     package func publicationSnapshot(
         atLeast requested: SurfaceRevision
     ) async -> FrameSnapshot? {
-        guard !rejectsNewOperations,
+        guard !Task.isCancelled,
+              !rejectsNewOperations,
               let eligible = surfaces[requested.surfaceID],
               eligible.lifecycleGeneration == requested.lifecycleGeneration,
               eligible.revision >= requested.revision
@@ -1772,7 +1839,8 @@ package actor SurfaceStore {
             return nil
         }
         defer { releaseSurfaceOperation(surfaceID: requested.surfaceID) }
-        guard let surface = surfaces[requested.surfaceID],
+        guard !Task.isCancelled,
+              let surface = surfaces[requested.surfaceID],
               surface.lifecycleGeneration == requested.lifecycleGeneration,
               surface.revision >= requested.revision
         else {
@@ -1785,6 +1853,7 @@ package actor SurfaceStore {
             matching: publicationRevision,
             surfaceOperationAlreadyAcquired: true
         ),
+            !Task.isCancelled,
             var liveSurface = surfaces[requested.surfaceID],
             liveSurface.lifecycleGeneration == snapshot.lifecycleGeneration,
             liveSurface.revision == snapshot.revision
@@ -1848,11 +1917,45 @@ package actor SurfaceStore {
         )
     }
 
+    package func surfaceOperationReservationDiagnostics()
+        -> SurfaceOperationReservationDiagnostics
+    {
+        var waitingCount = 0
+        var grantedWaiterCount = 0
+        for reservation in surfaceOperationReservations.values {
+            switch reservation {
+            case .queued:
+                waitingCount += 1
+            case .granted, .cancelledAfterGrant:
+                grantedWaiterCount += 1
+            }
+        }
+        return SurfaceOperationReservationDiagnostics(
+            activeSurfaceCount: activeSurfaceOperations.count,
+            waitingCount: waitingCount,
+            grantedWaiterCount: grantedWaiterCount,
+            reservedCount: reservedSurfaceOperationReservationIDs.count
+        )
+    }
+
+    /// Package-only deterministic ownership seam. The production reservation
+    /// path remains unchanged; tests can hold one Surface lease across an
+    /// explicit suspension without relying on renderer or hardware timing.
+    package func withSurfaceOperationForTesting(
+        surfaceID: UInt32,
+        operation: @escaping @Sendable () async -> Void
+    ) async throws(RenderError) {
+        try await acquireSurfaceOperation(surfaceID: surfaceID)
+        defer { releaseSurfaceOperation(surfaceID: surfaceID) }
+        await operation()
+    }
+
     private func makeSnapshot(
         from surface: Surface,
         matching requested: SurfaceRevision,
         surfaceOperationAlreadyAcquired: Bool = false
     ) async -> FrameSnapshot? {
+        guard !Task.isCancelled else { return nil }
         guard let unified = surface.storage.unifiedBacking else {
             guard isCurrent(requested) else {
                 return nil
@@ -1886,7 +1989,8 @@ package actor SurfaceStore {
                 releaseSurfaceOperation(surfaceID: surface.id)
             }
         }
-        guard let operationSurface = surfaces[surface.id],
+        guard !Task.isCancelled,
+              let operationSurface = surfaces[surface.id],
               operationSurface.lifecycleGeneration == requested.lifecycleGeneration,
               operationSurface.revision == requested.revision,
               let operationUnified = operationSurface.storage.unifiedBacking
@@ -1905,7 +2009,8 @@ package actor SurfaceStore {
             return snapshot
         }
 
-        guard let writable = operationUnified.pool.checkoutWritable(
+        guard !Task.isCancelled,
+              let writable = operationUnified.pool.checkoutWritable(
             namespace: operationUnified.namespace,
             surfaceID: operationSurface.id,
             width: operationSurface.width,
@@ -1932,7 +2037,8 @@ package actor SurfaceStore {
         let rectangles = catchUpJournal.copyRectangles.map {
             IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
         }
-        guard let copiedBytes = writable.copyPackedPixels(
+        guard !Task.isCancelled,
+              let copiedBytes = writable.copyPackedPixels(
             operationSurface.pixels,
             sourceBytesPerRow: operationSurface.bytesPerRow,
             rectangles: rectangles
@@ -1945,7 +2051,8 @@ package actor SurfaceStore {
                 pixels: operationSurface.pixels
             )
         }
-        guard isCurrent(requested),
+        guard !Task.isCancelled,
+              isCurrent(requested),
               let committed = writable.finish(revision: operationSurface.revision),
               var liveSurface = surfaces[operationSurface.id],
               liveSurface.lifecycleGeneration == operationSurface.lifecycleGeneration,
@@ -2136,7 +2243,13 @@ package actor SurfaceStore {
         guard !rejectsNewOperations else {
             throw .storeClosed
         }
-        await acquireSurfaceOperationUnconditionally(surfaceID: surfaceID)
+        guard await acquireSurfaceOperationCancellably(surfaceID: surfaceID) else {
+            throw .operationCancelled
+        }
+        guard !Task.isCancelled else {
+            releaseSurfaceOperation(surfaceID: surfaceID)
+            throw .operationCancelled
+        }
         guard !rejectsNewOperations else {
             releaseSurfaceOperation(surfaceID: surfaceID)
             throw .storeClosed
@@ -2147,16 +2260,148 @@ package actor SurfaceStore {
         if activeSurfaceOperations.insert(surfaceID).inserted {
             return
         }
-        await withCheckedContinuation { continuation in
-            surfaceOperationWaiters[surfaceID, default: []].append(continuation)
+        let reservationID = reserveSurfaceOperationReservationID()
+        await surfaceOperationWaiterWillRegister?(surfaceID, reservationID)
+        let outcome = await withCheckedContinuation { continuation in
+            registerSurfaceOperationWaiter(
+                surfaceID: surfaceID,
+                reservationID: reservationID,
+                continuation: continuation,
+                isCancelled: false
+            )
+        }
+        guard case .acquired = outcome else { return }
+        await surfaceOperationGrantWillBeClaimed?(surfaceID, reservationID)
+        _ = claimSurfaceOperationReservation(
+            reservationID,
+            cancellationRequested: false
+        )
+    }
+
+    private func acquireSurfaceOperationCancellably(surfaceID: UInt32) async -> Bool {
+        if activeSurfaceOperations.insert(surfaceID).inserted {
+            guard !Task.isCancelled else {
+                releaseSurfaceOperation(surfaceID: surfaceID)
+                return false
+            }
+            return true
+        }
+
+        let reservationID = reserveSurfaceOperationReservationID()
+        let cancellation = SurfaceOperationCancellation()
+        return await withTaskCancellationHandler {
+            await surfaceOperationWaiterWillRegister?(surfaceID, reservationID)
+            let outcome = await withCheckedContinuation { continuation in
+                registerSurfaceOperationWaiter(
+                    surfaceID: surfaceID,
+                    reservationID: reservationID,
+                    continuation: continuation,
+                    isCancelled: cancellation.isCancelled || Task.isCancelled
+                )
+            }
+            guard case .acquired = outcome else { return false }
+            await surfaceOperationGrantWillBeClaimed?(surfaceID, reservationID)
+            return claimSurfaceOperationReservation(
+                reservationID,
+                cancellationRequested: cancellation.isCancelled || Task.isCancelled
+            )
+        } onCancel: {
+            cancellation.cancel()
+            Task { [weak self] in
+                await self?.cancelSurfaceOperationReservation(reservationID)
+            }
+        }
+    }
+
+    private func registerSurfaceOperationWaiter(
+        surfaceID: UInt32,
+        reservationID: UInt64,
+        continuation: CheckedContinuation<SurfaceOperationWaitOutcome, Never>,
+        isCancelled: Bool
+    ) {
+        guard !isCancelled else {
+            reservedSurfaceOperationReservationIDs.remove(reservationID)
+            continuation.resume(returning: .cancelled)
+            return
+        }
+        surfaceOperationReservations[reservationID] = .queued(
+            surfaceID: surfaceID,
+            continuation: continuation
+        )
+        surfaceOperationWaiters[surfaceID, default: []].append(reservationID)
+    }
+
+    private func cancelSurfaceOperationReservation(_ reservationID: UInt64) {
+        guard let reservation = surfaceOperationReservations[reservationID] else {
+            return
+        }
+        switch reservation {
+        case let .queued(surfaceID, continuation):
+            surfaceOperationReservations.removeValue(forKey: reservationID)
+            reservedSurfaceOperationReservationIDs.remove(reservationID)
+            if var waiters = surfaceOperationWaiters[surfaceID],
+               let index = waiters.firstIndex(of: reservationID)
+            {
+                waiters.remove(at: index)
+                surfaceOperationWaiters[surfaceID] = waiters.isEmpty ? nil : waiters
+            }
+            continuation.resume(returning: .cancelled)
+        case let .granted(surfaceID):
+            surfaceOperationReservations[reservationID] =
+                .cancelledAfterGrant(surfaceID: surfaceID)
+        case .cancelledAfterGrant:
+            break
+        }
+    }
+
+    private func claimSurfaceOperationReservation(
+        _ reservationID: UInt64,
+        cancellationRequested: Bool
+    ) -> Bool {
+        reservedSurfaceOperationReservationIDs.remove(reservationID)
+        guard let reservation = surfaceOperationReservations.removeValue(
+            forKey: reservationID
+        ) else {
+            return false
+        }
+        switch reservation {
+        case .queued:
+            return false
+        case let .granted(surfaceID):
+            guard cancellationRequested else { return true }
+            releaseSurfaceOperation(surfaceID: surfaceID)
+            return false
+        case let .cancelledAfterGrant(surfaceID):
+            releaseSurfaceOperation(surfaceID: surfaceID)
+            return false
+        }
+    }
+
+    private func reserveSurfaceOperationReservationID() -> UInt64 {
+        // Wrapping is deliberate but collision-free: every identifier becomes
+        // visible in this live set before the actor can suspend at a test hook
+        // or continuation. At most the finite in-memory waiter population is
+        // probed, so UInt64 rollover cannot alias an outstanding reservation.
+        while true {
+            let candidate = nextSurfaceOperationReservationID
+            nextSurfaceOperationReservationID &+= 1
+            if reservedSurfaceOperationReservationIDs.insert(candidate).inserted {
+                return candidate
+            }
         }
     }
 
     private func releaseSurfaceOperation(surfaceID: UInt32) {
-        if var waiters = surfaceOperationWaiters[surfaceID], !waiters.isEmpty {
-            let continuation = waiters.removeFirst()
+        while var waiters = surfaceOperationWaiters[surfaceID], !waiters.isEmpty {
+            let reservationID = waiters.removeFirst()
             surfaceOperationWaiters[surfaceID] = waiters.isEmpty ? nil : waiters
-            continuation.resume()
+            guard case let .queued(_, continuation) =
+                surfaceOperationReservations[reservationID]
+            else {
+                continue
+            }
+            surfaceOperationReservations[reservationID] = .granted(surfaceID: surfaceID)
+            continuation.resume(returning: .acquired)
             return
         }
         activeSurfaceOperations.remove(surfaceID)

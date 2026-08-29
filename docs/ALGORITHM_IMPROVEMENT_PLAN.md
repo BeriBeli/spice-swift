@@ -186,8 +186,13 @@ Use exactly one of these values in the work table:
   late result is suppressed. Surface removal and recreation retain their per-ID
   invalidation check. The `SurfaceStore` remains the owner of per-Surface
   operation leases and atomically selects the revision, constructs its
-  immutable snapshot, and transfers publication damage; teardown never
-  abandons an acquired lease.
+  immutable snapshot, and transfers publication damage. Its FIFO reservation
+  wait is cancellation-aware: cancellation before registration never enters
+  the queue, cancellation while queued removes and resumes that exact waiter,
+  and grant racing cancellation is claimed or released exactly once before
+  snapshot materialization. A cancelled publication rechecks cancellation
+  after snapshot preparation and cannot transfer publication damage; teardown
+  never abandons an acquired lease.
 
 ## Measurement and acceptance
 
