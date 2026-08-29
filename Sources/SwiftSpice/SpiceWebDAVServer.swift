@@ -29,6 +29,7 @@ public actor SpiceWebDAVServer {
     /// room while remaining independent from the inbound header limit.
     private static let maximumGeneratedResponseHeaderBytes = 4 * 1_024
     package typealias FileOperationObserver = @Sendable (Int64, UInt64) -> Void
+    package typealias FileBodyReadObserver = @Sendable (URL, UInt64) -> Void
     package typealias ResponseSender = @Sendable (
         Result<[Data], SpiceWebDAVPipelineError>
     ) async -> Bool
@@ -85,10 +86,11 @@ public actor SpiceWebDAVServer {
         let reason: String
         var headers: [String: String] = [:]
         var body = Data()
+        var contentLength: Int? = nil
 
         func encoded(includeBody: Bool = true) -> Data {
             var allHeaders = headers
-            allHeaders["Content-Length"] = String(body.count)
+            allHeaders["Content-Length"] = String(contentLength ?? body.count)
             allHeaders["Connection"] = "keep-alive"
             var text = "HTTP/1.1 \(status) \(reason)\r\n"
             for key in allHeaders.keys.sorted() {
@@ -110,6 +112,7 @@ public actor SpiceWebDAVServer {
     private let maximumQueuedRetainedBytes: Int
     private nonisolated let filesystemExecutor: SpiceFilesystemTaskExecutor
     private nonisolated let fileOperationWillBegin: FileOperationObserver?
+    private nonisolated let fileBodyWillRead: FileBodyReadObserver?
     private var clients: [Int64: ClientState] = [:]
     private var legacyBuffers: [Int64: Data] = [:]
     private var legacyBufferedInputBytes = 0
@@ -159,6 +162,7 @@ public actor SpiceWebDAVServer {
         maximumQueuedRetainedBytes = 256 * 1_024 * 1_024
         filesystemExecutor = SpiceFilesystemTaskExecutor()
         fileOperationWillBegin = nil
+        fileBodyWillRead = nil
     }
 
     package init(
@@ -170,7 +174,8 @@ public actor SpiceWebDAVServer {
         maximumPendingJobs: Int = 64,
         maximumQueuedRetainedBytes: Int = 256 * 1_024 * 1_024,
         filesystemExecutor: SpiceFilesystemTaskExecutor,
-        fileOperationWillBegin: FileOperationObserver? = nil
+        fileOperationWillBegin: FileOperationObserver? = nil,
+        fileBodyWillRead: FileBodyReadObserver? = nil
     ) throws(SpiceWebDAVServerError) {
         let resolved = root.standardizedFileURL.resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
@@ -196,6 +201,7 @@ public actor SpiceWebDAVServer {
         self.maximumQueuedRetainedBytes = maximumQueuedRetainedBytes
         self.filesystemExecutor = filesystemExecutor
         self.fileOperationWillBegin = fileOperationWillBegin
+        self.fileBodyWillRead = fileBodyWillRead
     }
 
     /// Compatibility path preserving the original synchronous actor API.
@@ -860,8 +866,10 @@ public actor SpiceWebDAVServer {
                 )
             case "PROPFIND":
                 return try propfind(request, fileManager: fileManager)
-            case "GET", "HEAD":
-                return try get(request, fileManager: fileManager)
+            case "GET":
+                return try get(request, includeBody: true, fileManager: fileManager)
+            case "HEAD":
+                return try get(request, includeBody: false, fileManager: fileManager)
             case "PUT":
                 return try put(request, fileManager: fileManager)
             case "MKCOL":
@@ -928,6 +936,7 @@ public actor SpiceWebDAVServer {
 
     private nonisolated func get(
         _ request: Request,
+        includeBody: Bool,
         fileManager: FileManager
     ) throws -> Response {
         let url = try resolve(request.target, mayNotExist: false, fileManager: fileManager)
@@ -943,6 +952,22 @@ public actor SpiceWebDAVServer {
         guard size <= UInt64(maximumBodyBytes) else {
             return Response(status: 413, reason: "Content Too Large")
         }
+        guard let contentLength = Int(exactly: size) else {
+            return Response(status: 413, reason: "Content Too Large")
+        }
+        guard includeBody else {
+            // Opening the resolved file preserves GET's access validation
+            // without mapping or copying its contents into retained memory.
+            let file = try FileHandle(forReadingFrom: url)
+            try file.close()
+            return Response(
+                status: 200,
+                reason: "OK",
+                headers: ["Content-Type": "application/octet-stream"],
+                contentLength: contentLength
+            )
+        }
+        fileBodyWillRead?(url, size)
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
         return Response(
             status: 200,
