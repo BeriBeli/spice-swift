@@ -13,6 +13,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
   preallocated rings. Playback now pulls published PCM without callback-side
   packet allocation, while capture reuses bounded conversion storage and
   materializes wire `Data` only on the async sender side.
+- Moved native WebDAV filesystem operations from the Session event path to a
+  width-two Swift task executor. Per-client filesystem and response ordering is
+  preserved, while unrelated clients can make progress independently under
+  explicit pending-job and retained-byte limits.
 
 ### Fixed
 
@@ -20,6 +24,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   publication atomic without copying packet payload under the realtime render
   gate. Queue duration, byte storage, metadata slots, and staging ownership now
   have explicit checked limits.
+- Kept WebDAV close, response failure, cancellation, and same-client-ID reuse
+  generation-safe even when a synchronous filesystem operation cannot be
+  preempted or a response sender is suspended. Late results and queued suffixes
+  are suppressed with exactly-once accounting. `HEAD` now reads metadata only
+  while preserving exact `Content-Length`; depth-one `PROPFIND` lazily enforces
+  its response limit and a 4,096-child metadata cap. The existing public
+  synchronous API remains available.
 
 ## [0.3.2] — 2026-08-29
 
