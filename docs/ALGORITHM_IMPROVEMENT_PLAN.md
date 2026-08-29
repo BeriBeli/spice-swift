@@ -190,9 +190,12 @@ Use exactly one of these values in the work table:
   wait is cancellation-aware: cancellation before registration never enters
   the queue, cancellation while queued removes and resumes that exact waiter,
   and grant racing cancellation is claimed or released exactly once before
-  snapshot materialization. A cancelled publication rechecks cancellation
-  after snapshot preparation and cannot transfer publication damage; teardown
-  never abandons an acquired lease.
+  snapshot materialization. Waiter registration is also its ownership
+  linearization point: after any pre-registration suspension it atomically
+  rechecks the Surface, directly claims it if the previous holder has already
+  released, and otherwise joins the FIFO. A cancelled publication rechecks
+  cancellation after snapshot preparation and cannot transfer publication
+  damage; teardown never abandons an acquired lease.
 
 ## Measurement and acceptance
 

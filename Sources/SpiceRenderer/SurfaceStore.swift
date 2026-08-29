@@ -2324,6 +2324,17 @@ package actor SurfaceStore {
             continuation.resume(returning: .cancelled)
             return
         }
+        // The observer above is an intentional suspension point. The holder
+        // that made this caller wait may have released while the actor was
+        // reentrant, so registration must atomically recheck ownership instead
+        // of appending a waiter that no future release could wake.
+        if activeSurfaceOperations.insert(surfaceID).inserted {
+            surfaceOperationReservations[reservationID] = .granted(
+                surfaceID: surfaceID
+            )
+            continuation.resume(returning: .acquired)
+            return
+        }
         surfaceOperationReservations[reservationID] = .queued(
             surfaceID: surfaceID,
             continuation: continuation
