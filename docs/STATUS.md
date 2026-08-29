@@ -41,6 +41,20 @@ Agent behavior, including system-trusted TLS.
   click will not measure the AppKit input queue. No input-to-visible or
   scheduling conclusion is claimed.
 
+- AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
+  ring and publishes staged packet metadata or an O(1) overflow bank swap under
+  the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
+  completion task per packet. Capture reuses fixed 1,024-frame conversion
+  chunks, supports larger interleaved and planar Core Audio callbacks, and
+  materializes packet `Data` only through a two-phase async dequeue lease.
+  Queue ownership is bounded to 16 MiB and 262,144 slots, with one additional
+  16 MiB playback staging bank. The 38-test focused gate passed in Debug,
+  Release, ThreadSanitizer, and AddressSanitizer; Apple Silicon CI run
+  `33247879206` passed build, public API, full tests, complete AddressSanitizer,
+  and coverage. This closes the deterministic allocation and movement gate
+  without claiming measured audio latency or device performance; real-device
+  behavior remains part of AIP-90.
+
 - AIP-10 is locally complete. Full-header messages are first validated as one
   owned physical batch, then list submessages are dispatched in wire-list order
   before the optional main-message prefix. `SPICE_MSG_LIST` itself is not

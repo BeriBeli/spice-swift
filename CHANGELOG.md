@@ -7,6 +7,20 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced realtime playback and capture packet handoffs with fixed-capacity
+  preallocated rings. Playback now pulls published PCM without callback-side
+  packet allocation, while capture reuses bounded conversion storage and
+  materializes wire `Data` only on the async sender side.
+
+### Fixed
+
+- Kept audio overflow replacement, startup gating, close/reset, and staged
+  publication atomic without copying packet payload under the realtime render
+  gate. Queue duration, byte storage, metadata slots, and staging ownership now
+  have explicit checked limits.
+
 ## [0.3.2] — 2026-08-29
 
 ### Added
