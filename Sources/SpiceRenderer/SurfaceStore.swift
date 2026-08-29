@@ -244,6 +244,56 @@ package final class FrameMaterializationMetrics: Sendable {
     }
 }
 
+private final class SurfacePublicationDamageLease: Sendable {
+    private enum State: Sendable {
+        case pending
+        case committed
+        case restoring(Task<Void, Never>)
+        case restored
+    }
+
+    private let state = Mutex(State.pending)
+    private let restoreOperation: @Sendable () async -> Void
+
+    init(restoreOperation: @escaping @Sendable () async -> Void) {
+        self.restoreOperation = restoreOperation
+    }
+
+    var identifier: ObjectIdentifier {
+        ObjectIdentifier(self)
+    }
+
+    func commit() {
+        state.withLock { state in
+            guard case .pending = state else { return }
+            state = .committed
+        }
+    }
+
+    func restore() async {
+        let task = state.withLock { state -> Task<Void, Never>? in
+            switch state {
+            case .pending:
+                let restoreOperation = self.restoreOperation
+                let task = Task { await restoreOperation() }
+                state = .restoring(task)
+                return task
+            case let .restoring(task):
+                return task
+            case .committed, .restored:
+                return nil
+            }
+        }
+        guard let task else { return }
+        await task.value
+        state.withLock { state in
+            if case .restoring = state {
+                state = .restored
+            }
+        }
+    }
+}
+
 package struct FrameSnapshot: Sendable, Equatable {
     package let surfaceID: UInt32
     package let width: Int
@@ -255,6 +305,7 @@ package struct FrameSnapshot: Sendable, Equatable {
     package let ioSurfaceFrame: IOSurfaceFrame?
     package let publicationDamage: SurfaceDamageJournal
     package let isAdvancedVideoFrame: Bool
+    private let publicationDamageLease: SurfacePublicationDamageLease?
 
     package var pixels: Data {
         pixelStorage.pixels()
@@ -300,6 +351,7 @@ package struct FrameSnapshot: Sendable, Equatable {
             initiallyFull: true
         )
         self.isAdvancedVideoFrame = isAdvancedVideoFrame
+        publicationDamageLease = nil
     }
 
     package init(
@@ -328,25 +380,12 @@ package struct FrameSnapshot: Sendable, Equatable {
             initiallyFull: true
         )
         self.isAdvancedVideoFrame = isAdvancedVideoFrame
+        publicationDamageLease = nil
     }
 
     package func withPublicationDamage(
         _ damage: SurfaceDamageJournal
     ) -> FrameSnapshot {
-        if let ioSurfaceFrame {
-            return FrameSnapshot(
-                surfaceID: surfaceID,
-                width: width,
-                height: height,
-                bytesPerRow: bytesPerRow,
-                lifecycleGeneration: lifecycleGeneration,
-                revision: revision,
-                pixelStorage: pixelStorage,
-                ioSurfaceFrame: ioSurfaceFrame,
-                publicationDamage: damage,
-                isAdvancedVideoFrame: isAdvancedVideoFrame
-            )
-        }
         return FrameSnapshot(
             surfaceID: surfaceID,
             width: width,
@@ -354,11 +393,69 @@ package struct FrameSnapshot: Sendable, Equatable {
             bytesPerRow: bytesPerRow,
             lifecycleGeneration: lifecycleGeneration,
             revision: revision,
-            pixels: pixelStorage.pixels(),
-            ioSurfaceFrame: nil,
+            pixelStorage: pixelStorage,
+            ioSurfaceFrame: ioSurfaceFrame,
             publicationDamage: damage,
-            isAdvancedVideoFrame: isAdvancedVideoFrame
+            isAdvancedVideoFrame: isAdvancedVideoFrame,
+            publicationDamageLease: publicationDamageLease
         )
+    }
+
+    package var publicationDamageLeaseIdentifier: ObjectIdentifier? {
+        publicationDamageLease?.identifier
+    }
+
+    package func commitPublicationDamage() {
+        publicationDamageLease?.commit()
+    }
+
+    package func restorePublicationDamage() async {
+        await publicationDamageLease?.restore()
+    }
+
+    fileprivate func withPublicationDamage(
+        _ damage: SurfaceDamageJournal,
+        lease: SurfacePublicationDamageLease
+    ) -> FrameSnapshot {
+        FrameSnapshot(
+            surfaceID: surfaceID,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            lifecycleGeneration: lifecycleGeneration,
+            revision: revision,
+            pixelStorage: pixelStorage,
+            ioSurfaceFrame: ioSurfaceFrame,
+            publicationDamage: damage,
+            isAdvancedVideoFrame: isAdvancedVideoFrame,
+            publicationDamageLease: lease
+        )
+    }
+
+    private init(
+        surfaceID: UInt32,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        lifecycleGeneration: UInt64,
+        revision: UInt64,
+        pixelStorage: FramePixelStorage,
+        ioSurfaceFrame: IOSurfaceFrame?,
+        publicationDamage: SurfaceDamageJournal,
+        isAdvancedVideoFrame: Bool,
+        publicationDamageLease: SurfacePublicationDamageLease?
+    ) {
+        self.surfaceID = surfaceID
+        self.width = width
+        self.height = height
+        self.bytesPerRow = bytesPerRow
+        self.lifecycleGeneration = lifecycleGeneration
+        self.revision = revision
+        self.pixelStorage = pixelStorage
+        self.ioSurfaceFrame = ioSurfaceFrame
+        self.publicationDamage = publicationDamage
+        self.isAdvancedVideoFrame = isAdvancedVideoFrame
+        self.publicationDamageLease = publicationDamageLease
     }
 
     package static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1862,7 +1959,16 @@ package actor SurfaceStore {
         }
         liveSurface.storage.publicationDamageJournal.clear()
         surfaces[requested.surfaceID] = liveSurface
-        return snapshot.withPublicationDamage(damage)
+        guard !damage.isEmpty else {
+            return snapshot.withPublicationDamage(damage)
+        }
+        let damageLease = SurfacePublicationDamageLease { [weak self] in
+            await self?.restorePublicationDamage(
+                damage,
+                matching: publicationRevision
+            )
+        }
+        return snapshot.withPublicationDamage(damage, lease: damageLease)
     }
 
     package func descriptor(surfaceID: UInt32) throws(RenderError) -> SurfaceDescriptor {
@@ -2083,6 +2189,25 @@ package actor SurfaceStore {
         }
         snapshots &+= 1
         return snapshot
+    }
+
+    private func restorePublicationDamage(
+        _ damage: SurfaceDamageJournal,
+        matching revision: SurfaceRevision
+    ) async {
+        guard !damage.isEmpty else { return }
+        // Restoration owns the same per-Surface serialization as mutation and
+        // close. It is unconditional because cancellation is precisely why the
+        // publication ownership is returning to the store.
+        await acquireSurfaceOperationUnconditionally(surfaceID: revision.surfaceID)
+        defer { releaseSurfaceOperation(surfaceID: revision.surfaceID) }
+        guard var surface = surfaces[revision.surfaceID],
+              surface.lifecycleGeneration == revision.lifecycleGeneration
+        else {
+            return
+        }
+        surface.storage.publicationDamageJournal.merge(damage)
+        surfaces[revision.surfaceID] = surface
     }
 
     private func makeDataBackendSnapshot(from surface: Surface) -> FrameSnapshot {

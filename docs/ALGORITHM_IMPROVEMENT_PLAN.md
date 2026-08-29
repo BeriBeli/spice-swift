@@ -196,6 +196,15 @@ Use exactly one of these values in the work table:
   released, and otherwise joins the FIFO. A cancelled publication rechecks
   cancellation after snapshot preparation and cannot transfer publication
   damage; teardown never abandons an acquired lease.
+- Publication damage transferred into a concurrently prepared snapshot remains
+  under an exactly-once lease until that snapshot's ordered emit returns.
+  Successful emit commits the lease. Cancellation, stale validation, or any
+  other path that skips emit restores it through the same per-Surface operation
+  serialization; restoration merges into later same-lifecycle damage instead
+  of overwriting it and drops only damage belonging to a destroyed lifecycle.
+  Publisher cancellation drains snapshot children and all outstanding damage
+  restorations before returning, including frames prepared behind a suspended
+  earlier emit.
 
 ## Measurement and acceptance
 

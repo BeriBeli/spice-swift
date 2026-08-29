@@ -393,6 +393,7 @@ package actor DisplayFramePublisher {
     private var demandedSurfaces: Set<UInt32> = []
     private var preparedRevisions: [UInt32: SurfaceRevision] = [:]
     private var forceFullDamage: Set<UInt32> = []
+    private var preparedPublicationDamage: [ObjectIdentifier: FrameSnapshot] = [:]
     private var flushTask: Task<Void, Never>?
     private var activeSnapshotPreparation: ActiveSnapshotPreparation?
     private var nextSnapshotPreparationIdentifier: UInt64 = 0
@@ -638,6 +639,7 @@ package actor DisplayFramePublisher {
                 matching: activePreparation.identifier
             )
         }
+        await restoreAllPreparedPublicationDamage()
     }
 
     package func metrics() -> DisplayFramePublisherMetrics {
@@ -708,6 +710,8 @@ package actor DisplayFramePublisher {
                   canPrepare(request.surfaceRevision.surfaceID),
                   frameCovers(frame, request: request)
             else {
+                await restorePreparedPublicationDamage(frame)
+                guard generation == flushGeneration else { return }
                 staleSnapshots &+= 1
                 forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
@@ -718,6 +722,8 @@ package actor DisplayFramePublisher {
                 guard replacement.invalidationGeneration == request.invalidationGeneration,
                       replacementLifecycle == request.surfaceRevision.lifecycleGeneration
                 else {
+                    await restorePreparedPublicationDamage(frame)
+                    guard generation == flushGeneration else { return }
                     staleSnapshots &+= 1
                     continue
                 }
@@ -730,6 +736,8 @@ package actor DisplayFramePublisher {
                 // The surface advanced beyond every revision this publisher
                 // observed. Wait for its commit event instead of publishing a
                 // possible intermediate state from a multi-rectangle command.
+                await restorePreparedPublicationDamage(frame)
+                guard generation == flushGeneration else { return }
                 forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
             }
@@ -755,8 +763,9 @@ package actor DisplayFramePublisher {
             }
             let emitStartedAt = clock.now
             await emit(publishedFrame)
-            emitDuration.record(emitStartedAt.duration(to: clock.now))
+            commitPreparedPublicationDamage(frame)
             guard generation == flushGeneration else { return }
+            emitDuration.record(emitStartedAt.duration(to: clock.now))
             if isCurrent(request) {
                 lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
                 removePendingCovered(
@@ -841,6 +850,7 @@ package actor DisplayFramePublisher {
             while let completed = await group.next() {
                 snapshotDuration.record(completed.duration)
                 ordered[completed.requestIndex] = completed
+                registerPreparedPublicationDamage(completed.frame)
 
                 guard !Task.isCancelled else {
                     group.cancelAll()
@@ -865,6 +875,34 @@ package actor DisplayFramePublisher {
         }
 
         return ordered.compactMap { $0 }
+    }
+
+    private func registerPreparedPublicationDamage(_ frame: FrameSnapshot?) {
+        guard let frame,
+              let identifier = frame.publicationDamageLeaseIdentifier
+        else {
+            return
+        }
+        preparedPublicationDamage[identifier] = frame
+    }
+
+    private func commitPreparedPublicationDamage(_ frame: FrameSnapshot) {
+        guard let identifier = frame.publicationDamageLeaseIdentifier else { return }
+        frame.commitPublicationDamage()
+        preparedPublicationDamage.removeValue(forKey: identifier)
+    }
+
+    private func restorePreparedPublicationDamage(_ frame: FrameSnapshot) async {
+        guard let identifier = frame.publicationDamageLeaseIdentifier else { return }
+        await frame.restorePublicationDamage()
+        preparedPublicationDamage.removeValue(forKey: identifier)
+    }
+
+    private func restoreAllPreparedPublicationDamage() async {
+        let frames = Array(preparedPublicationDamage.values)
+        for frame in frames {
+            await restorePreparedPublicationDamage(frame)
+        }
     }
 
     private func isCurrent(_ request: Request) -> Bool {
