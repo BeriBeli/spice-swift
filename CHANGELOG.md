@@ -34,6 +34,13 @@ and this project uses [Semantic Versioning](https://semver.org/).
   its response limit and a 4,096-child metadata cap. The existing public
   synchronous API remains available.
 
+### Validation
+
+- AIP-42 and AIP-43 close deterministic ownership, movement, concurrency, and
+  retention gates only. This release makes no measured audio/device-performance,
+  WebDAV-throughput, or live-interoperability claim; real audio and WebDAV
+  behavior remains part of the AIP-90 live gates.
+
 ## [0.3.2] — 2026-08-29
 
 ### Added
