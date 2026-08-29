@@ -6,7 +6,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active |
-| Plan version | 1.3 |
+| Plan version | 1.4 |
 | Swift baseline | `v0.2.7` / `2c577d7` |
 | Reference client | spice-gtk `88ad5f1` (v0.43/master) / spice-common `71e4570` (master), reverified 2026-08-27 |
 | Created | 2026-08-26 |
@@ -70,7 +70,7 @@ Use exactly one of these values in the work table:
 | AIP-40 | done | Connect child channels with bounded concurrency | AIP-32 | Concurrency never exceeds four and failure leaves no connected transport behind |
 | AIP-41 | done | Prepare independent Surface snapshots with bounded concurrency | AIP-32 | A blocked Surface does not prevent another from starting and emit order stays stable |
 | AIP-42 | done | Replace realtime audio queues with preallocated rings | — | Realtime callbacks perform no linear queue movement or per-packet allocation |
-| AIP-43 | pending | Move blocking WebDAV filesystem work to a bounded executor | AIP-00 | Slow I/O does not block an unrelated client while per-client order is preserved |
+| AIP-43 | in-progress | Move blocking WebDAV filesystem work to a bounded executor | — | Slow I/O does not block an unrelated client while per-client order is preserved |
 | AIP-44 | pending | Correlate input and display stages, then add interaction-aware low-latency frame selection | AIP-00 | Same-action paired traces reduce click/key/motion-to-visible p50 and p95 without weakening latest-only delivery, idle no-commit, drawable nonblocking, or the two-command GPU bound |
 | AIP-90 | pending | Run final regression, interoperability, and documentation closure | All applicable items | Full tests and fresh live gates pass and final evidence is recorded in `STATUS.md` |
 
@@ -164,6 +164,44 @@ Use exactly one of these values in the work table:
   each failed or pre-start-cancelled transport is closed at its owning boundary.
   Migration rollback leaves the source Session connected and no target
   transport active.
+
+### Bounded WebDAV execution
+
+- WebDAV filesystem work runs on a GCD-backed Swift `TaskExecutor` with width
+  two, at most 64 pending jobs, and at most 256 MiB of server-retained request
+  and response storage. Admission uses checked arithmetic and exposes immutable
+  active, queued, retained-byte, completion, failure, cancellation, and
+  rejection diagnostics.
+- The server actor performs only bounded parsing, admission, generation checks,
+  and per-client queue coordination. Each client has one ordered pump; unrelated
+  clients may use separate executor permits, while one client's filesystem work
+  and complete response send finish before its next request begins. Response
+  transmission never occupies a filesystem permit. Incomplete input, parsed
+  requests, and conservative encoded-response reservations share the retention
+  limit through response-send completion.
+- Session handling quick-submits native-backend work without waiting for
+  filesystem or response I/O, so the WebDAV channel continues demultiplexing
+  other clients. Client close, server close, Session-generation change, and task
+  cancellation invalidate queued work; an active blocking syscall may return,
+  but its late result must not send a response or revive client state.
+- A failed response handoff terminates that generation of the client's pump and
+  cancels its queued suffix. Session revalidates cancellation, supervision
+  generation, and exact server identity after the final awaited response write
+  before acknowledging delivery. The locally generated response-header envelope
+  is reserved independently from the configurable inbound request-header limit.
+- Closing a client cannot preempt a synchronous filesystem syscall. A newly
+  admitted generation for the same client ID therefore retains its accounting
+  but starts no worker until the retired generation's active operation drains;
+  unrelated clients remain independent. The synchronous compatibility API
+  rejects same-ID reuse with its existing `invalidRequest` error during that
+  retirement window because it cannot await the drain.
+- Path resolution and its `FileManager` operation remain in one synchronous
+  executor job with no suspension between them, preserving the existing root
+  and symlink checks. Descriptor-relative filesystem hardening is a separate
+  security item rather than an unrecorded expansion of AIP-43.
+- The original public synchronous actor API remains unchanged through a bounded
+  compatibility path. Session production traffic alone uses the package-only
+  asynchronous pump, so AIP-43 does not expand or alter the public API.
 
 ### Bounded Surface snapshot preparation
 
@@ -693,3 +731,4 @@ behavior remain separate acceptance gates.
 | 2026-08-29 | AIP-00 | Make fixture identity overrides all-or-none and split host send-start from send-completion evidence | A partial later-shell environment must fail before filesystem or Podman effects rather than target the default endpoint. Recording the host-input/send-start boundary before the wire send allows a frame received before the send continuation resumes to remain causally eligible; send completion and a same-generation buffered motion ACK are linearized afterward without changing scheduling. |
 | 2026-08-29 | AIP-00 | Add a streaming guest trace boundary and a cancellation-safe exact-presentation wait before an env-gated live AppKit harness | The guest transaction exposes ARMED before input and accepts one ordered action/token/revision pair under one total budget. The package wait wakes only for the selected, committed identity accepted by AppKit presented; neither seam finishes a trace, changes pacing, or turns the isolated guest-causal smoke run into presented evidence. |
 | 2026-08-29 | AIP-00, AIP-42 | Record the foreground live gate as blocked and resume deterministic AIP-42 work on `main` without making a performance claim | The isolated Rocky endpoint is available, but the current Mac WindowServer session remains occluded and cannot establish visible demand. Preallocated audio ownership, FIFO, overflow, cancellation, allocation-counter, and sanitizer gates are deterministic and independent of that display environment. The earlier reviewed Draft PR #34 is retained only as design/review evidence because its stacked base was not integrated; a clean successor carries the current implementation. AIP-42 may be marked done when its deterministic completion gate and current-head review pass, while live audio-device behavior remains part of AIP-90. |
+| 2026-08-29 | AIP-00, AIP-43 | Resume deterministic AIP-43 work on current `main` and remove its AIP-00 dependency without making a performance or interoperability claim | Bounded admission, retention accounting, per-client ordering, cross-client progress, generation invalidation, and same-ID retirement are deterministic and independent of the occluded WindowServer gate. The earlier reviewed Draft PR #35 is retained as design and review evidence because its stacked base was not integrated; a clean successor will preserve all four resolved review constraints. Live WebDAV interoperability remains an AIP-90 gate. |

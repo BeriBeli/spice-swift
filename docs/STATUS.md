@@ -55,6 +55,13 @@ Agent behavior, including system-trusted TLS.
   without claiming measured audio latency or device performance; real-device
   behavior remains part of AIP-90.
 
+- AIP-43 is active on a clean successor branch from current `main`. Its
+  deterministic gate moves blocking WebDAV filesystem operations to a
+  width-two bounded executor while preserving per-client filesystem/send order,
+  allowing unrelated-client progress, and retaining the existing synchronous
+  public API. Draft PR #35 supplies the previously resolved review constraints;
+  this work makes no performance or live-interoperability claim before AIP-90.
+
 - AIP-10 is locally complete. Full-header messages are first validated as one
   owned physical batch, then list submessages are dispatched in wire-list order
   before the optional main-message prefix. `SPICE_MSG_LIST` itself is not
