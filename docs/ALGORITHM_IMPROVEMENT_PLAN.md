@@ -68,7 +68,7 @@ Use exactly one of these values in the work table:
 | AIP-32 | done | Split GLZ coordination from CPU workers and use a bounded codec `TaskExecutor` | AIP-31 | Independent images overlap execution while dictionary order, cancellation, and limits remain deterministic |
 | AIP-33 | done | Parse Annex-B once and reduce VideoToolbox sample copies | AIP-30 | Copy counters improve and CoreMedia owner-lifetime tests pass on success, cancellation, and teardown |
 | AIP-40 | done | Connect child channels with bounded concurrency | AIP-32 | Concurrency never exceeds four and failure leaves no connected transport behind |
-| AIP-41 | pending | Prepare independent Surface snapshots with bounded concurrency | AIP-32 | A blocked Surface does not prevent another from starting and emit order stays stable |
+| AIP-41 | done | Prepare independent Surface snapshots with bounded concurrency | AIP-32 | A blocked Surface does not prevent another from starting and emit order stays stable |
 | AIP-42 | pending | Replace realtime audio queues with preallocated rings | AIP-00 | Realtime callbacks perform no linear queue movement or per-packet allocation |
 | AIP-43 | pending | Move blocking WebDAV filesystem work to a bounded executor | AIP-00 | Slow I/O does not block an unrelated client while per-client order is preserved |
 | AIP-44 | pending | Correlate input and display stages, then add interaction-aware low-latency frame selection | AIP-00 | Same-action paired traces reduce click/key/motion-to-visible p50 and p95 without weakening latest-only delivery, idle no-commit, drawable nonblocking, or the two-command GPU bound |
@@ -164,6 +164,47 @@ Use exactly one of these values in the work table:
   each failed or pre-start-cancelled transport is closed at its owning boundary.
   Migration rollback leaves the source Session connected and no target
   transport active.
+
+### Bounded Surface snapshot preparation
+
+- `DisplayFramePublisher` prepares independent Surface snapshots with a
+  structured task-group width of two. Each flush captures at most 16 Surface
+  requests, and the actor may coalesce at most 16 requests for the next flush
+  while that batch runs: at most 32 lightweight request records and two active
+  snapshot children exist. A child is admitted only when a previous child
+  completes, so no unbounded task collection is created.
+- Snapshot completion order never changes publication order. Results are
+  restored to the publisher's stable Surface request order before stale,
+  replacement, damage, prepared-frame, and emit state is evaluated; emit
+  remains serial. One Surface returning no snapshot does not cancel independent
+  Surface work.
+- The publisher retains at most one preparation-manager task in addition to its
+  two structured snapshot children. Cancellation invalidates the publisher
+  generation, directly cancels that manager so cancellation propagates to all
+  admitted children without waiting for a natural completion, stops further
+  admission, and awaits the manager's complete drain before returning. Every
+  late result is suppressed. Surface removal and recreation retain their per-ID
+  invalidation check. The `SurfaceStore` remains the owner of per-Surface
+  operation leases and atomically selects the revision, constructs its
+  immutable snapshot, and transfers publication damage. Its FIFO reservation
+  wait is cancellation-aware: cancellation before registration never enters
+  the queue, cancellation while queued removes and resumes that exact waiter,
+  and grant racing cancellation is claimed or released exactly once before
+  snapshot materialization. Waiter registration is also its ownership
+  linearization point: after any pre-registration suspension it atomically
+  rechecks the Surface, directly claims it if the previous holder has already
+  released, and otherwise joins the FIFO. A cancelled publication rechecks
+  cancellation after snapshot preparation and cannot transfer publication
+  damage; teardown never abandons an acquired lease.
+- Publication damage transferred into a concurrently prepared snapshot remains
+  under an exactly-once lease until that snapshot's ordered emit returns.
+  Successful emit commits the lease. Cancellation, stale validation, or any
+  other path that skips emit restores it through the same per-Surface operation
+  serialization; restoration merges into later same-lifecycle damage instead
+  of overwriting it and drops only damage belonging to a destroyed lifecycle.
+  Publisher cancellation drains snapshot children and all outstanding damage
+  restorations before returning, including frames prepared behind a suspended
+  earlier emit.
 
 ## Measurement and acceptance
 
@@ -508,6 +549,7 @@ behavior remain separate acceptance gates.
 | AIP-32 | 2026-08-27 | PR #29 / `36e3805` | Apple Silicon SwiftPM CI run `33069734096`, job `98508596839`: build, generated protocol, C-shim analysis, public API, full tests, AddressSanitizer, and coverage passed; full local Debug warnings-as-errors and AddressSanitizer gates; focused Release and ThreadSanitizer `DisplayChannelTests` 75/75 and `GLZDecoderTests` 25/25; `git diff --check`; four P1 findings fixed in paired source/test commits | One Session-owned FIFO GCD-backed Swift `TaskExecutor` runs stateless JPEG/LZ/QUIC/palette/ZLIB and independent GLZ CPU work at width two, with 64 pending jobs and 256 MiB queued-retention limits; MJPEG remains per-stream serial. GLZ parses at most 1,048,576 operations, waits for immutable dependency snapshots outside worker permits, reserves image IDs, rejects stale clear generations, commits out of order while advancing one deterministic contiguous eviction tail, and checks cancellation inside large copies. Review found and closed four amplification/complexity gaps: wait and executor budgets include parsed programs and dependency snapshots; short-distance overlap uses bounded prefix doubling while the long-distance phase fixture stays bit-exact; Display stateless-codec admission charges the full physical owner; and direct GLZ plus the second ZLIB_GLZ phase add that owner exactly once to internal wait/executor accounting with checked overflow, exact-boundary, cancellation, and zero-accounting tests. Swift 6.3 typed-continuation and `withUnsafeBytes` compatibility is covered by CI. No throughput claim is made before AIP-00. |
 | AIP-33 | 2026-08-27 | PR #30 / `58b6664` | Apple Silicon SwiftPM CI run `33074368881`, job `98524596495`: build, generated protocol, C-shim analysis, public API, full tests, AddressSanitizer, and coverage passed; full local Debug warnings-as-errors and AddressSanitizer gates; focused Debug, Release, and ThreadSanitizer gates 21/21 (`AdvancedVideoDecoderTests` 8 declarations / 9 cases, `VideoToolboxDecoderTests` 6 declarations / 8 cases, `AdvancedVideoCorpusTests` 7/7); strict Debug and Release builds; `git diff --check`; exact-head Codex Review found no major issues and the inline-comment and review-thread audits were empty | Annex-B parsing now performs one bounded scan into checked ranges sharing one immutable payload owner, with zero eager input or NAL payload copies. Parameter-only input allocates no AVCC sample; encoded input uses one exact AVCC allocation, and unchanged parameter sets compare without rematerialization. VideoToolbox lends CoreMedia a stable retained `NSData` owner through `CMBlockBufferCustomBlockSource`, eliminates the explicit `CMBlockBufferReplaceDataBytes` payload copy, and balances retain/release exactly once on success, synchronous block/sample creation failure, decode-submission failure, real task cancellation, teardown, and close. Package-only deterministic seams and immutable diagnostics verify bit-exact bytes, copy counts, retry atomicity, owner activity, and release behavior without changing the public API. No throughput claim is made before AIP-00. |
 | AIP-40 | 2026-08-27 | PR #31 / `2a8dd26` | Apple Silicon SwiftPM CI run `33078422258`, job `98538713848`: build, generated protocol, C-shim analysis, public API, full tests, AddressSanitizer, and coverage passed in 8m48s; full local Debug warnings-as-errors and AddressSanitizer gates; strict Debug and Release builds; complete `SpiceSessionTests` 68/68; focused Debug, Release, and ThreadSanitizer gates 6 declarations / 9 executions; strengthened six-child late-success rollback passed in Debug, Release, and ThreadSanitizer; `git diff --check`; exact-head Codex Review found no major issues and the issue-comment, inline-comment, and review-thread audits were empty | Initial bootstrap and migration-target preparation now share one manual-width-four `TaskGroup<Result>` connector. It validates the entire descriptor inventory before transport creation, creates transports in descriptor order, and restores successful results to descriptor order before ownership transfer. A first failure or cancellation stops admission, cancels remaining tasks, drains the whole group, and closes early and late successes before returning; `ChannelFactory` closes handshake failures and pre-start cancellation closes its precreated transport. Tests cover exact widths four and five, out-of-order completion, duplicate prevalidation, six-child early/active/late/not-started ownership, direct task cancellation, disconnect, migration success/failure/cancellation, and preservation of the source Session. No throughput claim is made before AIP-00. |
+| AIP-41 | 2026-08-29 | PR #43 / `7e75d27` | Apple Silicon SwiftPM CI run `33227372335`, job `99033594956`: build, generated protocol, C-shim analysis, public diagnostics API, full tests, AddressSanitizer, and coverage passed in 9m46s; local full strict and AddressSanitizer suites 659/659; focused Debug, Release, and ThreadSanitizer `DisplayFramePublisherTests` 27/27; PublicAPIConsumer warnings-as-errors build; `git diff --check`; exact-head Codex Review found no major issues; all four P1 threads were fixed, replied to with commit/test evidence, and resolved | Each flush retains at most 16 requests and runs at most two structured snapshot children while preserving stable Surface emit order. Cancellation directly stops and drains the manager, and production SurfaceStore FIFO reservations handle cancellation-before-registration, queued cancellation, grant races, and holder release during actor reentrancy without orphaning a lease or consuming damage. Non-empty publication damage remains under an exactly-once commit/restore lease: ordered emit commits it; cancellation or stale rejection restores and merges it with later same-lifecycle damage. Deterministic real-store tests cover blocked independent progress, bounded refill, direct cancellation, every reservation race, and two prepared Surfaces canceled behind a suspended emit, including partial-damage preservation across a replacement publisher. No throughput or input-latency claim is made before AIP-00. |
 
 ## Decision log
 

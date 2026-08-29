@@ -366,8 +366,20 @@ package actor DisplayFramePublisher {
         let invalidationGeneration: UInt64
     }
 
+    private struct SnapshotPreparation: Sendable {
+        let requestIndex: Int
+        let frame: FrameSnapshot?
+        let duration: Duration
+    }
+
+    private struct ActiveSnapshotPreparation: Sendable {
+        let identifier: UInt64
+        let task: Task<[SnapshotPreparation], Never>
+    }
+
     private let interval: Duration
     private let maximumPendingSurfaces: Int
+    private let maximumConcurrentSnapshots: Int
     private let requiresExplicitDemand: Bool
     private let waitsForConsumption: Bool
     private let snapshot: Snapshot
@@ -381,7 +393,10 @@ package actor DisplayFramePublisher {
     private var demandedSurfaces: Set<UInt32> = []
     private var preparedRevisions: [UInt32: SurfaceRevision] = [:]
     private var forceFullDamage: Set<UInt32> = []
+    private var preparedPublicationDamage: [ObjectIdentifier: FrameSnapshot] = [:]
     private var flushTask: Task<Void, Never>?
+    private var activeSnapshotPreparation: ActiveSnapshotPreparation?
+    private var nextSnapshotPreparationIdentifier: UInt64 = 0
     private var isFlushing = false
     private var isCancelled = false
     private var lastFlushStart: ContinuousClock.Instant?
@@ -412,6 +427,7 @@ package actor DisplayFramePublisher {
     package init(
         interval: Duration = .milliseconds(16),
         maximumPendingSurfaces: Int = 16,
+        maximumConcurrentSnapshots: Int = 2,
         requiresExplicitDemand: Bool = false,
         waitsForConsumption: Bool = false,
         snapshot: @escaping Snapshot,
@@ -419,6 +435,10 @@ package actor DisplayFramePublisher {
     ) {
         self.interval = interval
         self.maximumPendingSurfaces = max(1, maximumPendingSurfaces)
+        self.maximumConcurrentSnapshots = min(
+            self.maximumPendingSurfaces,
+            max(1, maximumConcurrentSnapshots)
+        )
         self.requiresExplicitDemand = requiresExplicitDemand
         self.waitsForConsumption = waitsForConsumption
         self.snapshot = snapshot
@@ -594,11 +614,13 @@ package actor DisplayFramePublisher {
         await flush()
     }
 
-    package func cancel() {
+    package func cancel() async {
         isCancelled = true
         generation &+= 1
         flushTask?.cancel()
         flushTask = nil
+        let activePreparation = activeSnapshotPreparation
+        activePreparation?.task.cancel()
         isFlushing = false
         lastFlushStart = nil
         lastBatchStart = nil
@@ -610,6 +632,14 @@ package actor DisplayFramePublisher {
         demandedSurfaces.removeAll(keepingCapacity: false)
         preparedRevisions.removeAll(keepingCapacity: false)
         forceFullDamage.removeAll(keepingCapacity: false)
+
+        if let activePreparation {
+            _ = await activePreparation.task.value
+            clearActiveSnapshotPreparation(
+                matching: activePreparation.identifier
+            )
+        }
+        await restoreAllPreparedPublicationDamage()
     }
 
     package func metrics() -> DisplayFramePublisherMetrics {
@@ -665,20 +695,23 @@ package actor DisplayFramePublisher {
         order.removeAll { eligibleSet.contains($0) }
         flushTask = nil
 
-        for request in requests {
-            snapshotAttempts &+= 1
-            let snapshotStartedAt = clock.now
-            guard let frame = await snapshot(request.surfaceRevision) else {
-                snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
+        let activePreparation = startSnapshotPreparation(for: requests)
+        let preparations = await activePreparation.task.value
+        clearActiveSnapshotPreparation(matching: activePreparation.identifier)
+        guard generation == flushGeneration else { return }
+
+        for preparation in preparations {
+            let request = requests[preparation.requestIndex]
+            guard let frame = preparation.frame else {
                 staleSnapshots &+= 1
                 continue
             }
-            snapshotDuration.record(snapshotStartedAt.duration(to: clock.now))
-            guard generation == flushGeneration else { return }
             guard isCurrent(request),
                   canPrepare(request.surfaceRevision.surfaceID),
                   frameCovers(frame, request: request)
             else {
+                await restorePreparedPublicationDamage(frame)
+                guard generation == flushGeneration else { return }
                 staleSnapshots &+= 1
                 forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
@@ -689,6 +722,8 @@ package actor DisplayFramePublisher {
                 guard replacement.invalidationGeneration == request.invalidationGeneration,
                       replacementLifecycle == request.surfaceRevision.lifecycleGeneration
                 else {
+                    await restorePreparedPublicationDamage(frame)
+                    guard generation == flushGeneration else { return }
                     staleSnapshots &+= 1
                     continue
                 }
@@ -701,6 +736,8 @@ package actor DisplayFramePublisher {
                 // The surface advanced beyond every revision this publisher
                 // observed. Wait for its commit event instead of publishing a
                 // possible intermediate state from a multi-rectangle command.
+                await restorePreparedPublicationDamage(frame)
+                guard generation == flushGeneration else { return }
                 forceFullDamage.insert(request.surfaceRevision.surfaceID)
                 continue
             }
@@ -726,8 +763,9 @@ package actor DisplayFramePublisher {
             }
             let emitStartedAt = clock.now
             await emit(publishedFrame)
-            emitDuration.record(emitStartedAt.duration(to: clock.now))
+            commitPreparedPublicationDamage(frame)
             guard generation == flushGeneration else { return }
+            emitDuration.record(emitStartedAt.duration(to: clock.now))
             if isCurrent(request) {
                 lastEmittedRevisions[frame.surfaceID] = frame.surfaceRevision
                 removePendingCovered(
@@ -748,6 +786,123 @@ package actor DisplayFramePublisher {
         }
         isFlushing = false
         scheduleFlushIfNeeded()
+    }
+
+    /// Prepares independent Surfaces concurrently without changing their
+    /// publication order. Only `maximumConcurrentSnapshots` child tasks exist
+    /// at once; the remaining work stays in the already-bounded request batch.
+    /// Cancelling the one retained manager immediately cancels the admitted
+    /// children, stops further admission, and still drains them before
+    /// returning ownership to teardown.
+    private func startSnapshotPreparation(
+        for requests: [Request]
+    ) -> ActiveSnapshotPreparation {
+        let identifier = nextSnapshotPreparationIdentifier
+        nextSnapshotPreparationIdentifier &+= 1
+        let task = Task<[SnapshotPreparation], Never> { [weak self] in
+            guard let self else { return [] }
+            return await self.prepareSnapshots(requests)
+        }
+        let preparation = ActiveSnapshotPreparation(
+            identifier: identifier,
+            task: task
+        )
+        activeSnapshotPreparation = preparation
+        return preparation
+    }
+
+    private func clearActiveSnapshotPreparation(matching identifier: UInt64) {
+        guard activeSnapshotPreparation?.identifier == identifier else { return }
+        activeSnapshotPreparation = nil
+    }
+
+    private func prepareSnapshots(
+        _ requests: [Request]
+    ) async -> [SnapshotPreparation] {
+        guard !requests.isEmpty, !Task.isCancelled else { return [] }
+        let snapshot = self.snapshot
+        let clock = self.clock
+        var ordered = [SnapshotPreparation?](
+            repeating: nil,
+            count: requests.count
+        )
+
+        await withTaskGroup(of: SnapshotPreparation.self) { group in
+            var nextRequestIndex = 0
+            let initialCount = min(maximumConcurrentSnapshots, requests.count)
+            for _ in 0..<initialCount {
+                guard !Task.isCancelled else { break }
+                let requestIndex = nextRequestIndex
+                let request = requests[requestIndex]
+                nextRequestIndex += 1
+                snapshotAttempts &+= 1
+                group.addTask {
+                    let startedAt = clock.now
+                    let frame = await snapshot(request.surfaceRevision)
+                    return SnapshotPreparation(
+                        requestIndex: requestIndex,
+                        frame: frame,
+                        duration: startedAt.duration(to: clock.now)
+                    )
+                }
+            }
+
+            while let completed = await group.next() {
+                snapshotDuration.record(completed.duration)
+                ordered[completed.requestIndex] = completed
+                registerPreparedPublicationDamage(completed.frame)
+
+                guard !Task.isCancelled else {
+                    group.cancelAll()
+                    continue
+                }
+                guard nextRequestIndex < requests.count else { continue }
+
+                let requestIndex = nextRequestIndex
+                let request = requests[requestIndex]
+                nextRequestIndex += 1
+                snapshotAttempts &+= 1
+                group.addTask {
+                    let startedAt = clock.now
+                    let frame = await snapshot(request.surfaceRevision)
+                    return SnapshotPreparation(
+                        requestIndex: requestIndex,
+                        frame: frame,
+                        duration: startedAt.duration(to: clock.now)
+                    )
+                }
+            }
+        }
+
+        return ordered.compactMap { $0 }
+    }
+
+    private func registerPreparedPublicationDamage(_ frame: FrameSnapshot?) {
+        guard let frame,
+              let identifier = frame.publicationDamageLeaseIdentifier
+        else {
+            return
+        }
+        preparedPublicationDamage[identifier] = frame
+    }
+
+    private func commitPreparedPublicationDamage(_ frame: FrameSnapshot) {
+        guard let identifier = frame.publicationDamageLeaseIdentifier else { return }
+        frame.commitPublicationDamage()
+        preparedPublicationDamage.removeValue(forKey: identifier)
+    }
+
+    private func restorePreparedPublicationDamage(_ frame: FrameSnapshot) async {
+        guard let identifier = frame.publicationDamageLeaseIdentifier else { return }
+        await frame.restorePublicationDamage()
+        preparedPublicationDamage.removeValue(forKey: identifier)
+    }
+
+    private func restoreAllPreparedPublicationDamage() async {
+        let frames = Array(preparedPublicationDamage.values)
+        for frame in frames {
+            await restorePreparedPublicationDamage(frame)
+        }
     }
 
     private func isCurrent(_ request: Request) -> Bool {
