@@ -447,6 +447,53 @@ struct SpiceLiveRunProtocolTests {
         }
     }
 
+    @Test func collectorRequiresExactRawAcknowledgementFraming() async throws {
+        try await Stage3LiveRunFixture.withTemporaryDirectory { directory in
+            let campaign = try Stage3LiveRunFixture.plan()
+            let run = campaign.runs[0]
+            let configuration = try Stage3LiveRunFixture.configuration(run: run)
+            let runDirectory = Stage3LiveRunFixture.remoteRunDirectory
+            let step = try #require(run.steps.first)
+            let evidenceRunID = try #require(
+                runDirectory.split(separator: "/").last
+            )
+            let record = Stage3LiveRunFixture.validRecord(
+                for: step,
+                runID: String(evidenceRunID)
+            )
+            let acknowledgement =
+                "PERF_INPUT_EVENT_COLLECTED valid=true reason=none"
+
+            try await appendToCollectorRawFixture(
+                configuration: configuration,
+                record: record,
+                runDirectory: runDirectory,
+                standardOutput: "\(acknowledgement)\n",
+                standardError: "",
+                capturedAt: directory.appending(path: "exact-ack.jsonl")
+            )
+
+            let malformedResponses: [(stdout: String, stderr: String)] = [
+                ("\(acknowledgement)\n\n", ""),
+                ("\n\(acknowledgement)\n", ""),
+                ("\(acknowledgement)\n", "collector diagnostic\n"),
+                ("\(acknowledgement)\nunexpected output\n", ""),
+            ]
+            for (index, response) in malformedResponses.enumerated() {
+                await #expect(throws: SpiceLiveInteractionSupportError.childFailed) {
+                    try await appendToCollectorRawFixture(
+                        configuration: configuration,
+                        record: record,
+                        runDirectory: runDirectory,
+                        standardOutput: response.stdout,
+                        standardError: response.stderr,
+                        capturedAt: directory.appending(path: "malformed-ack-\(index).jsonl")
+                    )
+                }
+            }
+        }
+    }
+
     @Test func readinessPermitIsRequiredBeforeTheFirstActionOnly() throws {
         let baseline: UInt64 = 11
         let blockedStates = [
@@ -748,6 +795,37 @@ private func appendToCollectorFixture(
     let runner = SpiceLiveProcessRunner(
         executableURL: fixture.executableURL,
         argumentPrefix: [output.path, acknowledgement]
+    )
+    try await configuration.appendRecord(
+        Stage3LiveRunFixture.canonicalRecordLine(record),
+        runDirectory: runDirectory,
+        runner: runner
+    )
+}
+
+private func appendToCollectorRawFixture(
+    configuration: SpiceRemoteLiveConfiguration,
+    record: SpiceInteractionTraceRecord,
+    runDirectory: String,
+    standardOutput: String,
+    standardError: String,
+    capturedAt output: URL
+) async throws {
+    let fixture = try Stage3RunScriptFixture(
+        """
+        output="$1"
+        stdout="$2"
+        stderr="$3"
+        shift 3
+        /bin/cat > "$output"
+        printf '%s' "$stdout"
+        printf '%s' "$stderr" >&2
+        """
+    )
+    defer { fixture.remove() }
+    let runner = SpiceLiveProcessRunner(
+        executableURL: fixture.executableURL,
+        argumentPrefix: [output.path, standardOutput, standardError]
     )
     try await configuration.appendRecord(
         Stage3LiveRunFixture.canonicalRecordLine(record),
