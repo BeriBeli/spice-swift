@@ -80,9 +80,7 @@ struct SpiceLiveCampaignDriverTests {
 
     @Test func completeCanonicalArtifactInvokesStrictEvaluator() throws {
         let campaign = try Self.plan()
-        let fixture = try SpicePairedInteractionArtifactTests.makeFixture(
-            pointerMode: .absolute
-        )
+        let fixture = try Self.campaignFixture()
         var accumulator = SpiceLiveCampaignArtifactAccumulator(
             plan: campaign,
             pointerMode: .absolute
@@ -95,20 +93,19 @@ struct SpiceLiveCampaignDriverTests {
         #expect(report.runCount == 20)
         #expect(report.observations.count == 60)
         #expect(report.resourceGuardrails.observations.count == 20)
+        #expect(Set(fixture.resources.map(\.runId)).count == 20)
         for runIndex in campaign.runs.indices {
             let evidenceID = fixture.records[runIndex * 3].runId
             #expect(accumulator.evidenceRunID(
                 forLogicalRunID: campaign.runs[runIndex].runID
-            ) == evidenceID)
+            )?.rawValue == evidenceID)
             #expect(evidenceID != campaign.runs[runIndex].runID)
         }
     }
 
     @Test func artifactRequiresMatchingCompletedSuccessfulExecution() throws {
         let campaign = try Self.plan()
-        let fixture = try SpicePairedInteractionArtifactTests.makeFixture(
-            pointerMode: .absolute
-        )
+        let fixture = try Self.campaignFixture()
         var accumulator = SpiceLiveCampaignArtifactAccumulator(
             plan: campaign,
             pointerMode: .absolute
@@ -143,9 +140,7 @@ struct SpiceLiveCampaignDriverTests {
     @Test func incompleteDuplicateReorderedOrExtraArtifactsFailClosed() throws {
         for failure in ArtifactFailure.allCases {
             let campaign = try Self.plan()
-            let fixture = try SpicePairedInteractionArtifactTests.makeFixture(
-                pointerMode: .absolute
-            )
+            let fixture = try Self.campaignFixture()
             #expect(throws: (any Error).self) {
                 try Self.exerciseFailure(
                     failure,
@@ -153,6 +148,31 @@ struct SpiceLiveCampaignDriverTests {
                     fixture: fixture
                 )
             }
+        }
+    }
+
+    @Test func evidenceRunIDUsesExactRemoteRockyBasenameGrammar() throws {
+        let rawValue = "20260830T120000Z.aB09Zz"
+        #expect(rawValue.utf8.count == 23)
+        #expect(try SpiceLiveEvidenceRunID(rawValue).rawValue == rawValue)
+    }
+
+    @Test(arguments: [
+        "",
+        " ",
+        "20260830T120000Z.ABC123\n",
+        "20260830T120000Z/ABC123",
+        "a10000000000000f",
+        "20260830T120000Z.ABC12",
+        "2026A830T120000Z.ABC123",
+        "20260830-120000Z.ABC123",
+        "20260830T120000X.ABC123",
+        "20260830T120000Z,ABC123",
+        "20260830T120000Z.éBC123",
+    ])
+    func evidenceRunIDRejectsNoncanonicalSpelling(_ rawValue: String) {
+        #expect(throws: (any Error).self) {
+            _ = try SpiceLiveEvidenceRunID(rawValue)
         }
     }
 }
@@ -194,6 +214,36 @@ private extension SpiceLiveCampaignDriverTests {
         try SpicePairedInteractionArtifactTests.makeFixture(
             pointerMode: .absolute
         ).specification
+    }
+
+    static func campaignFixture()
+        throws -> SpicePairedInteractionArtifactTests.Fixture
+    {
+        var fixture = try SpicePairedInteractionArtifactTests.makeFixture(
+            pointerMode: .absolute
+        )
+        for runIndex in fixture.resources.indices {
+            let evidenceRunID = String(
+                format: "20260830T120000Z.%06d",
+                runIndex
+            )
+            let recordOffset = runIndex * 3
+            for recordIndex in recordOffset..<(recordOffset + 3) {
+                fixture.records[recordIndex] = try
+                    SpicePairedInteractionArtifactTests.replacing(
+                        fixture.records[recordIndex],
+                        key: "run_id",
+                        value: evidenceRunID
+                    )
+            }
+            let sample = fixture.resources[runIndex]
+            fixture.resources[runIndex] = SpicePairedInteractionResourceSample(
+                runId: evidenceRunID,
+                cpuPercent: sample.cpuPercent,
+                peakRSSBytes: sample.peakRSSBytes
+            )
+        }
+        return fixture
     }
 
     static func fill(
@@ -253,7 +303,9 @@ private extension SpiceLiveCampaignDriverTests {
             let secondRecords = Array(fixture.records[3..<6])
             try accumulator.recordRun(
                 logicalRunID: campaign.runs[1].runID,
-                evidenceRunID: fixture.records[0].runId,
+                evidenceRunID: try SpiceLiveEvidenceRunID(
+                    fixture.records[0].runId
+                ),
                 canonicalRecords: try secondRecords.map(canonicalLine)
             )
         case .reorderedRun:
@@ -263,7 +315,7 @@ private extension SpiceLiveCampaignDriverTests {
             records.append(records[0])
             try accumulator.recordRun(
                 logicalRunID: campaign.runs[0].runID,
-                evidenceRunID: records[0].runId,
+                evidenceRunID: try SpiceLiveEvidenceRunID(records[0].runId),
                 canonicalRecords: try records.map(canonicalLine)
             )
         case .noncanonicalRecord:
@@ -271,7 +323,9 @@ private extension SpiceLiveCampaignDriverTests {
             lines[0].insert(0x20, at: 0)
             try accumulator.recordRun(
                 logicalRunID: campaign.runs[0].runID,
-                evidenceRunID: fixture.records[0].runId,
+                evidenceRunID: try SpiceLiveEvidenceRunID(
+                    fixture.records[0].runId
+                ),
                 canonicalRecords: lines
             )
         case .missingResource:
@@ -280,7 +334,7 @@ private extension SpiceLiveCampaignDriverTests {
                 let records = Array(fixture.records[offset..<(offset + 3)])
                 try accumulator.recordRun(
                     logicalRunID: campaign.runs[runIndex].runID,
-                    evidenceRunID: records[0].runId,
+                    evidenceRunID: try SpiceLiveEvidenceRunID(records[0].runId),
                     canonicalRecords: try records.map(canonicalLine)
                 )
             }
@@ -316,7 +370,7 @@ private extension SpiceLiveCampaignDriverTests {
         let records = Array(fixture.records[offset..<(offset + 3)])
         try accumulator.recordRun(
             logicalRunID: campaign.runs[runIndex].runID,
-            evidenceRunID: records[0].runId,
+            evidenceRunID: try SpiceLiveEvidenceRunID(records[0].runId),
             canonicalRecords: try records.map(canonicalLine)
         )
         try accumulator.recordResourceSample(
