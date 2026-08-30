@@ -178,7 +178,16 @@ package struct SpiceLiveCampaignManifestRun: Codable, Sendable, Equatable {
 }
 
 package struct SpiceLiveCampaignManifest: Codable, Sendable, Equatable {
-    package static let currentSchemaVersion: UInt64 = 1
+    private enum ExecutionIdentity: Sendable, Equatable {
+        case legacySchema1
+        case current(
+            contract: SpiceLiveCampaignExecutionContract,
+            digest: String
+        )
+    }
+
+    package static let currentSchemaVersion: UInt64 = 2
+    static let legacySchemaVersion: UInt64 = 1
 
     package let schemaVersion: UInt64
     package var generation: UInt64
@@ -188,12 +197,24 @@ package struct SpiceLiveCampaignManifest: Codable, Sendable, Equatable {
     package let baselineVersion: String
     package let candidateVersion: String
     package let metadata: SpiceLiveCampaignManifestMetadata
+    private let executionIdentity: ExecutionIdentity
     package var runs: [SpiceLiveCampaignManifestRun]
     package var stages: [SpiceLiveAttemptLedgerEntry]
 
+    package var executionContract: SpiceLiveCampaignExecutionContract? {
+        guard case let .current(contract, _) = executionIdentity else { return nil }
+        return contract
+    }
+
+    package var executionContractDigest: String? {
+        guard case let .current(_, digest) = executionIdentity else { return nil }
+        return digest
+    }
+
     package init(
         plan: SpiceLiveCampaignPlan,
-        metadata: SpiceLiveCampaignManifestMetadata
+        metadata: SpiceLiveCampaignManifestMetadata,
+        executionContract: SpiceLiveCampaignExecutionContract
     ) {
         schemaVersion = Self.currentSchemaVersion
         generation = 0
@@ -203,6 +224,10 @@ package struct SpiceLiveCampaignManifest: Codable, Sendable, Equatable {
         baselineVersion = plan.baselineVersion
         candidateVersion = plan.candidateVersion
         self.metadata = metadata
+        executionIdentity = .current(
+            contract: executionContract,
+            digest: executionContract.digest
+        )
         runs = plan.runs.map(SpiceLiveCampaignManifestRun.init)
         stages = []
         stages.reserveCapacity(260)
@@ -221,7 +246,86 @@ package struct SpiceLiveCampaignManifest: Codable, Sendable, Equatable {
             && baselineVersion == other.baselineVersion
             && candidateVersion == other.candidateVersion
             && metadata == other.metadata
+            && executionContract == other.executionContract
+            && executionContractDigest == other.executionContractDigest
             && runs.map(Self.runIdentity) == other.runs.map(Self.runIdentity)
+    }
+
+    var isLegacySchemaOne: Bool {
+        schemaVersion == Self.legacySchemaVersion
+            && executionIdentity == .legacySchema1
+    }
+
+    package init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let schemaVersion = try container.decode(UInt64.self, forKey: .schemaVersion)
+        let executionIdentity: ExecutionIdentity
+        switch schemaVersion {
+        case Self.legacySchemaVersion:
+            guard !container.contains(.executionContract),
+                  !container.contains(.executionContractDigest) else {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+            executionIdentity = .legacySchema1
+        case Self.currentSchemaVersion:
+            let contract = try container.decode(
+                SpiceLiveCampaignExecutionContract.self,
+                forKey: .executionContract
+            )
+            let contractDigest = try container.decode(
+                String.self,
+                forKey: .executionContractDigest
+            )
+            guard contractDigest == contract.digest else {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+            executionIdentity = .current(
+                contract: contract,
+                digest: contractDigest
+            )
+        default:
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        self.schemaVersion = schemaVersion
+        generation = try container.decode(UInt64.self, forKey: .generation)
+        state = try container.decode(SpiceLiveCampaignManifestState.self, forKey: .state)
+        campaignID = try container.decode(String.self, forKey: .campaignID)
+        planDigest = try container.decode(String.self, forKey: .planDigest)
+        baselineVersion = try container.decode(String.self, forKey: .baselineVersion)
+        candidateVersion = try container.decode(String.self, forKey: .candidateVersion)
+        metadata = try container.decode(
+            SpiceLiveCampaignManifestMetadata.self,
+            forKey: .metadata
+        )
+        self.executionIdentity = executionIdentity
+        runs = try container.decode([SpiceLiveCampaignManifestRun].self, forKey: .runs)
+        stages = try container.decode([SpiceLiveAttemptLedgerEntry].self, forKey: .stages)
+    }
+
+    package func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(generation, forKey: .generation)
+        try container.encode(state, forKey: .state)
+        try container.encode(campaignID, forKey: .campaignID)
+        try container.encode(planDigest, forKey: .planDigest)
+        try container.encode(baselineVersion, forKey: .baselineVersion)
+        try container.encode(candidateVersion, forKey: .candidateVersion)
+        try container.encode(metadata, forKey: .metadata)
+        switch (schemaVersion, executionIdentity) {
+        case (Self.legacySchemaVersion, .legacySchema1):
+            break
+        case let (Self.currentSchemaVersion, .current(executionContract, digest)):
+            guard digest == executionContract.digest else {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+            try container.encode(executionContract, forKey: .executionContract)
+            try container.encode(digest, forKey: .executionContractDigest)
+        default:
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        try container.encode(runs, forKey: .runs)
+        try container.encode(stages, forKey: .stages)
     }
 
     private static func runIdentity(
@@ -269,6 +373,8 @@ package struct SpiceLiveCampaignManifest: Codable, Sendable, Equatable {
         case baselineVersion = "baseline_version"
         case candidateVersion = "candidate_version"
         case metadata
+        case executionContract = "execution_contract"
+        case executionContractDigest = "execution_contract_digest"
         case runs
         case stages
     }

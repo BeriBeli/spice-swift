@@ -30,9 +30,14 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
     package init(
         plan: SpiceLiveCampaignPlan,
         metadata: SpiceLiveCampaignManifestMetadata,
+        executionContract: SpiceLiveCampaignExecutionContract,
         manifestWriter: SpiceLiveCampaignManifestWriter
     ) throws {
-        let manifest = SpiceLiveCampaignManifest(plan: plan, metadata: metadata)
+        let manifest = SpiceLiveCampaignManifest(
+            plan: plan,
+            metadata: metadata,
+            executionContract: executionContract
+        )
         try manifestWriter.create(manifest, validating: plan)
         self.plan = plan
         self.manifestWriter = manifestWriter
@@ -55,6 +60,7 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
     package static func resume(
         plan: SpiceLiveCampaignPlan,
         metadata: SpiceLiveCampaignManifestMetadata,
+        expectedExecutionContract: SpiceLiveCampaignExecutionContract,
         manifestWriter: SpiceLiveCampaignManifestWriter
     ) throws -> SpiceLiveRealtimeStageRecorder {
         guard var manifest = try manifestWriter.load() else {
@@ -63,7 +69,8 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
         _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
             manifest: manifest,
             plan: plan,
-            expectedMetadata: metadata
+            expectedMetadata: metadata,
+            expectedExecutionContract: expectedExecutionContract
         )
         if manifest.state == .recording {
             let (nextGeneration, overflow) = manifest.generation
@@ -254,11 +261,33 @@ enum SpiceLiveCampaignManifestValidator {
     static func validateAndReplay(
         manifest: SpiceLiveCampaignManifest,
         plan: SpiceLiveCampaignPlan,
-        expectedMetadata: SpiceLiveCampaignManifestMetadata? = nil
+        expectedMetadata: SpiceLiveCampaignManifestMetadata? = nil,
+        expectedExecutionContract: SpiceLiveCampaignExecutionContract? = nil
     ) throws -> SpiceLiveCampaignExecution {
         let metadata = expectedMetadata ?? manifest.metadata
-        let expected = SpiceLiveCampaignManifest(plan: plan, metadata: metadata)
-        guard manifest.hasSameImmutableIdentity(as: expected),
+        guard manifest.schemaVersion == SpiceLiveCampaignManifest.currentSchemaVersion,
+              let manifestContract = manifest.executionContract,
+              manifest.executionContractDigest == manifestContract.digest else {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        do {
+            try manifestContract.validate(plan: plan, metadata: metadata)
+        } catch {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        let contract = expectedExecutionContract ?? manifestContract
+        do {
+            try contract.validate(plan: plan, metadata: metadata)
+        } catch {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        let expected = SpiceLiveCampaignManifest(
+            plan: plan,
+            metadata: metadata,
+            executionContract: contract
+        )
+        guard manifestContract == contract,
+              manifest.hasSameImmutableIdentity(as: expected),
               manifest.runs.count == plan.runs.count,
               manifest.stages.count <= 260 else {
             throw SpiceLiveCampaignManifestError.invalidManifest
