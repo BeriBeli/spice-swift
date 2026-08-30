@@ -122,7 +122,14 @@ struct SpiceLiveDurableStageGateTests {
         malformed.append(Data(" \(String(decoding: canonical, as: UTF8.self))".utf8))
         malformed.append(Data(canonical.dropLast()))
         malformed.append(canonical + Data("\n".utf8))
-        malformed.append(Data(repeating: 0x20, count: 4_097))
+        let oversizedEvent = try Self.oversizedCanonicalFrame(object)
+        let oversizedEventObject = try JSONSerialization.jsonObject(
+            with: oversizedEvent
+        )
+        #expect(oversizedEvent.count > SpiceLiveStageProtocolCodec.maximumFrameBytes)
+        #expect(oversizedEvent.last == 0x0a)
+        #expect(oversizedEventObject is [String: Any])
+        malformed.append(oversizedEvent)
 
         for frame in malformed {
             #expect(throws: (any Error).self) {
@@ -163,7 +170,19 @@ struct SpiceLiveDurableStageGateTests {
         )
         malformedAcknowledgements.append(Data(acknowledgementFrame.dropLast()))
         malformedAcknowledgements.append(acknowledgementFrame + Data("\n".utf8))
-        malformedAcknowledgements.append(Data(repeating: 0x20, count: 4_097))
+        let oversizedAcknowledgement = try Self.oversizedCanonicalFrame(
+            acknowledgementObject
+        )
+        let oversizedAcknowledgementObject = try JSONSerialization.jsonObject(
+            with: oversizedAcknowledgement
+        )
+        #expect(
+            oversizedAcknowledgement.count
+                > SpiceLiveStageProtocolCodec.maximumFrameBytes
+        )
+        #expect(oversizedAcknowledgement.last == 0x0a)
+        #expect(oversizedAcknowledgementObject is [String: Any])
+        malformedAcknowledgements.append(oversizedAcknowledgement)
         for frame in malformedAcknowledgements {
             #expect(throws: (any Error).self) {
                 _ = try SpiceLiveStageProtocolCodec.decodeAcknowledgement(frame)
@@ -364,7 +383,8 @@ struct SpiceLiveDurableStageGateTests {
         ]
 
         for makeInvalidEvent in cases {
-            let fixture = try Self.gateFixture()
+            let counted = try Self.countedGateFixture()
+            let fixture = counted.fixture
             defer { Self.removeOutput(fixture.output) }
             let invalid = try makeInvalidEvent(fixture)
             #expect(throws: (any Error).self) {
@@ -375,9 +395,22 @@ struct SpiceLiveDurableStageGateTests {
             let persisted = try #require(loadedManifest)
             #expect(persisted.state == .failed)
             #expect(persisted.stages.count == 3)
+            let terminalBytes = try Data(contentsOf: fixture.output)
+            let terminalGeneration = persisted.generation
+            let terminalPersistCalls = counted.syncCalls.value
+
+            #expect(throws: (any Error).self) {
+                _ = try fixture.gate.accept(invalid)
+            }
+            let repeatedBytes = try Data(contentsOf: fixture.output)
+            let repeatedManifest = try fixture.writer.load()
+            #expect(repeatedBytes == terminalBytes)
+            #expect(repeatedManifest?.generation == terminalGeneration)
+            #expect(counted.syncCalls.value == terminalPersistCalls)
         }
 
-        let replayFixture = try Self.gateFixture()
+        let countedReplay = try Self.countedGateFixture()
+        let replayFixture = countedReplay.fixture
         defer { Self.removeOutput(replayFixture.output) }
         let event = try Self.event(
             fixture: replayFixture,
@@ -395,16 +428,26 @@ struct SpiceLiveDurableStageGateTests {
         let replayPersisted = try #require(loadedReplayManifest)
         #expect(replayPersisted.state == .failed)
         #expect(replayPersisted.stages.filter { $0.stage == .preArm }.count == 1)
+        let replayTerminalBytes = try Data(contentsOf: replayFixture.output)
+        let replayTerminalGeneration = replayPersisted.generation
+        let replayTerminalPersistCalls = countedReplay.syncCalls.value
+        #expect(throws: (any Error).self) {
+            _ = try replayFixture.gate.accept(event)
+        }
+        let repeatedReplayBytes = try Data(contentsOf: replayFixture.output)
+        let repeatedReplayManifest = try replayFixture.writer.load()
+        #expect(repeatedReplayBytes == replayTerminalBytes)
+        #expect(repeatedReplayManifest?.generation == replayTerminalGeneration)
+        #expect(
+            countedReplay.syncCalls.value
+                == replayTerminalPersistCalls
+        )
     }
 
     @Test func acknowledgementDeliveryRequiresTheExactPendingIdentity() throws {
-        for mutatedKey in [
-            "campaign_id",
-            "token",
-            "previous_manifest_generation",
-            "durable_manifest_generation",
-        ] {
-            let fixture = try Self.gateFixture()
+        for mutatedKey in Self.acknowledgementRequiredKeys {
+            let counted = try Self.countedGateFixture()
+            let fixture = counted.fixture
             defer { Self.removeOutput(fixture.output) }
             let event = try Self.event(
                 fixture: fixture,
@@ -419,24 +462,39 @@ struct SpiceLiveDurableStageGateTests {
             guard var object = decoded as? [String: Any] else {
                 throw SpiceLiveCampaignManifestError.invalidManifest
             }
-            switch mutatedKey {
-            case "campaign_id": object[mutatedKey] = "b10000000000000f"
-            case "token": object[mutatedKey] = "0000000000000000"
-            case "previous_manifest_generation": object[mutatedKey] = 2
-            case "durable_manifest_generation": object[mutatedKey] = 5
-            default: throw SpiceLiveCampaignManifestError.invalidManifest
-            }
-            let wrong = try SpiceLiveStageProtocolCodec.decodeAcknowledgement(
-                Self.canonicalFrame(object)
+            object[mutatedKey] = try Self.alternateAcknowledgementValue(
+                for: mutatedKey
             )
-
-            #expect(throws: (any Error).self) {
-                try fixture.gate.acknowledgementDelivered(wrong)
+            let wrongFrame = try Self.canonicalFrame(object)
+            if mutatedKey == "protocol_version" {
+                #expect(throws: (any Error).self) {
+                    _ = try SpiceLiveStageProtocolCodec.decodeAcknowledgement(
+                        wrongFrame
+                    )
+                }
+                try fixture.gate.acknowledgementDeliveryFailed(pending)
+            } else {
+                let wrong = try SpiceLiveStageProtocolCodec.decodeAcknowledgement(
+                    wrongFrame
+                )
+                #expect(throws: (any Error).self) {
+                    try fixture.gate.acknowledgementDelivered(wrong)
+                }
             }
+
             #expect(fixture.gate.isTerminal)
+            let terminalBytes = try Data(contentsOf: fixture.output)
+            let loadedTerminalManifest = try fixture.writer.load()
+            let terminalManifest = try #require(loadedTerminalManifest)
+            let terminalPersistCalls = counted.syncCalls.value
             #expect(throws: (any Error).self) {
                 try fixture.gate.acknowledgementDelivered(pending)
             }
+            let repeatedBytes = try Data(contentsOf: fixture.output)
+            let repeatedManifest = try fixture.writer.load()
+            #expect(repeatedBytes == terminalBytes)
+            #expect(repeatedManifest?.generation == terminalManifest.generation)
+            #expect(counted.syncCalls.value == terminalPersistCalls)
         }
     }
 
@@ -549,9 +607,72 @@ struct SpiceLiveDurableStageGateTests {
             }
         }
     }
+
+    @Test func eofAndCancellationWithoutAPendingACKAreDurableOnce() throws {
+        for termination in Self.NonPendingTermination.allCases {
+            for afterDeliveredAcknowledgement in [false, true] {
+                let counted = try Self.countedGateFixture()
+                let fixture = counted.fixture
+                defer { Self.removeOutput(fixture.output) }
+
+                if afterDeliveredAcknowledgement {
+                    let event = try Self.event(
+                        fixture: fixture,
+                        stage: .preArm,
+                        sequence: 1,
+                        previousGeneration: 3
+                    )
+                    let acknowledgement = try fixture.gate.accept(event)
+                    try fixture.gate.acknowledgementDelivered(acknowledgement)
+                    #expect(fixture.gate.pendingAcknowledgement == nil)
+                    #expect(!fixture.gate.isCompleted)
+                } else {
+                    #expect(fixture.gate.pendingAcknowledgement == nil)
+                }
+
+                let loadedBeforeTermination = try fixture.writer.load()
+                let manifestBeforeTermination = try #require(
+                    loadedBeforeTermination
+                )
+                try termination.apply(to: fixture.gate)
+                #expect(fixture.gate.isTerminal)
+                let terminalBytes = try Data(contentsOf: fixture.output)
+                let loadedTerminalManifest = try fixture.writer.load()
+                let terminalManifest = try #require(loadedTerminalManifest)
+                #expect(terminalManifest.state == .failed)
+                #expect(
+                    terminalManifest.generation
+                        == manifestBeforeTermination.generation + 1
+                )
+                let terminalPersistCalls = counted.syncCalls.value
+
+                #expect(throws: (any Error).self) {
+                    try termination.apply(to: fixture.gate)
+                }
+                let repeatedBytes = try Data(contentsOf: fixture.output)
+                let repeatedManifest = try fixture.writer.load()
+                #expect(repeatedBytes == terminalBytes)
+                #expect(repeatedManifest?.generation == terminalManifest.generation)
+                #expect(
+                    counted.syncCalls.value
+                        == terminalPersistCalls
+                )
+            }
+        }
+    }
 }
 
 private extension SpiceLiveDurableStageGateTests {
+    final class PersistenceCounter: Sendable {
+        private let storage = Mutex(0)
+
+        var value: Int { storage.withLock { $0 } }
+
+        func increment() {
+            storage.withLock { $0 += 1 }
+        }
+    }
+
     struct GateFixture {
         let plan: SpiceLiveCampaignPlan
         let run: SpiceLiveCampaignRun
@@ -578,6 +699,18 @@ private extension SpiceLiveDurableStageGateTests {
                 try gate.childReachedEOF()
             case .cancellation:
                 try gate.cancel()
+            }
+        }
+    }
+
+    enum NonPendingTermination: CaseIterable {
+        case endOfFile
+        case cancellation
+
+        func apply(to gate: SpiceLiveDurableStageGate) throws {
+            switch self {
+            case .endOfFile: try gate.childReachedEOF()
+            case .cancellation: try gate.cancel()
             }
         }
     }
@@ -664,6 +797,23 @@ private extension SpiceLiveDurableStageGateTests {
             gate: gate,
             output: output
         )
+    }
+
+    static func countedGateFixture() throws -> (
+        fixture: GateFixture,
+        syncCalls: PersistenceCounter
+    ) {
+        let syncCalls = PersistenceCounter()
+        let fixture = try gateFixture(directorySync: { descriptor in
+            syncCalls.increment()
+            guard Darwin.fsync(descriptor) == 0 else {
+                throw SpiceLiveCampaignManifestError.fileOperationFailed(
+                    operation: "fsync_directory",
+                    code: errno
+                )
+            }
+        })
+        return (fixture, syncCalls)
     }
 
     static func event(
@@ -781,6 +931,35 @@ private extension SpiceLiveDurableStageGateTests {
         )
         data.append(0x0a)
         return data
+    }
+
+    static func oversizedCanonicalFrame(
+        _ object: [String: Any]
+    ) throws -> Data {
+        var oversized = object
+        oversized["version"] = "v1\(String(repeating: "0", count: 4_096)).0.0"
+        return try canonicalFrame(oversized)
+    }
+
+    static func alternateAcknowledgementValue(for key: String) throws -> Any {
+        switch key {
+        case "protocol_version": "v2"
+        case "campaign_id": "b10000000000000f"
+        case "run_id": "0000000000000000"
+        case "version": "v0.3.4"
+        case "cluster_id": "0000000000000001"
+        case "evidence_run_id": "20260831T000000Z.Z9y8X7"
+        case "action_class": "key"
+        case "order": UInt64(2)
+        case "token": "0000000000000000"
+        case "checksum": UInt32(0)
+        case "stage": "arm"
+        case "outcome": "failed"
+        case "event_sequence": UInt64(2)
+        case "previous_manifest_generation": UInt64(2)
+        case "durable_manifest_generation": UInt64(5)
+        default: throw SpiceLiveCampaignManifestError.invalidManifest
+        }
     }
 
     static func duplicateField(_ key: String, in frame: Data) throws -> Data {
