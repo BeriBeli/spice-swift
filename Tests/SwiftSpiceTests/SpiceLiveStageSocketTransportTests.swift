@@ -20,26 +20,33 @@ struct SpiceLiveStageSocketTransportTests {
         let outbound = Data("outbound-ack\n".utf8)
         let inboundWire = first + second
 
-        try await withSpiceLiveTimeout(.seconds(2)) {
-            async let peerWrite: Void = Self.onIOQueue {
-                try Self.writeAll(inboundWire, to: pair.peerDescriptor)
-            }
-            async let peerRead: Data = Self.onIOQueue {
-                try Self.readExactly(outbound.count, from: pair.peerDescriptor)
-            }
-            async let send: Void = transport.sendFrame(outbound)
-            async let receivedFirst: Data? = transport.receiveFrame(
-                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
-            )
+        do {
+            try await withSpiceLiveTimeout(.seconds(2)) {
+                async let peerWrite: Void = Self.onIOQueue {
+                    try Self.writeAll(inboundWire, to: pair.peerDescriptor)
+                }
+                async let peerRead: Data = Self.onIOQueue {
+                    try Self.readExactly(outbound.count, from: pair.peerDescriptor)
+                }
+                async let send: Void = transport.sendFrame(outbound)
+                async let receivedFirst: Data? = transport.receiveFrame(
+                    maximumBytes:
+                        SpiceLiveStageProtocolCodec.maximumFrameBytes
+                )
 
-            try await peerWrite
-            #expect(try await receivedFirst == first)
-            try await send
-            #expect(try await peerRead == outbound)
-            let receivedSecond = try await transport.receiveFrame(
-                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
-            )
-            #expect(receivedSecond == second)
+                try await peerWrite
+                #expect(try await receivedFirst == first)
+                try await send
+                #expect(try await peerRead == outbound)
+                let receivedSecond = try await transport.receiveFrame(
+                    maximumBytes:
+                        SpiceLiveStageProtocolCodec.maximumFrameBytes
+                )
+                #expect(receivedSecond == second)
+            }
+        } catch {
+            await transport.close()
+            throw error
         }
         await transport.close()
     }
