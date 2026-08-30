@@ -32,6 +32,32 @@ struct SpiceInteractionTraceJSONLWriterTests {
         }
     }
 
+    @Test func firstAppendRejectsAReservedEvidenceFailureBeforeItCanPoisonTheFile() throws {
+        try withTemporaryTraceDirectory { directory in
+            let output = directory.appending(path: "input-events.jsonl")
+            let writer = SpiceInteractionTraceJSONLWriter(outputURL: output)
+            let reserved = WriterFixture.record(invalidReason: "missing_presented")
+            let encoded = WriterFixture.line(reserved).dropLast()
+
+            #expect(!reserved.valid)
+            #expect(reserved.invalidReason == "missing_presented")
+            #expect(throws: (any Error).self) {
+                _ = try JSONDecoder().decode(
+                    SpiceInteractionTraceRecord.self,
+                    from: encoded
+                )
+            }
+            #expect(throws: SpiceInteractionTraceCollectionError.invalidRecord) {
+                try writer.append(reserved)
+            }
+            #expect(!FileManager.default.fileExists(atPath: output.path))
+
+            let valid = WriterFixture.record(runID: "valid-after-rejection")
+            try writer.append(valid)
+            #expect(try WriterFixture.decodeLines(at: output) == [valid])
+        }
+    }
+
     @Test func pathAndExistingFileValidationFailsClosedWithoutMutation() throws {
         try withTemporaryTraceDirectory { directory in
             let record = WriterFixture.record()
