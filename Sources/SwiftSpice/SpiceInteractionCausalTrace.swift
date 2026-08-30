@@ -607,11 +607,13 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             }
             if state.metalCommitNs != nil,
                previousSelectedIdentity == identity {
-                if state.droppedPresentationIdentity == identity {
+                if state.droppedPresentationIdentity == identity
+                    || previousSelectedMarker == nil {
                     // An authoritative redraw republishes the same frame
-                    // identity. Keep the first attempt's commit evidence until
-                    // this new selection actually begins, then let the retry
-                    // contribute its own selection and commit timestamps.
+                    // identity. A known drop makes the target retryable; an
+                    // unrelated markerless redraw must likewise not poison a
+                    // later target capture. Rebind this non-target stage when
+                    // the new selection actually begins.
                     state.committedIdentity = nil
                     state.metalCommitNs = nil
                     state.droppedPresentationIdentity = nil
@@ -730,13 +732,14 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             guard state.presentedNs == nil,
                   state.selectedIdentity == identity,
                   state.committedIdentity == identity,
-                  state.metalCommitNs != nil,
-                  let marker = state.selectedFrame?.payload,
-                  marker.token == token,
-                  marker.checksum == checksum
+                  state.metalCommitNs != nil
             else {
                 return
             }
+            // Drawable outcome belongs to the selected committed identity even
+            // when that frame is markerless. Recording it prevents an earlier
+            // unrelated redraw from contaminating a later marker selection;
+            // presented acceptance remains strict about the expected payload.
             state.droppedPresentationIdentity = identity
         }
     }

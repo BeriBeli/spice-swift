@@ -320,18 +320,23 @@ SWIFTSPICE_PERF_CONTROL_PORT=5946 \
 SWIFTSPICE_LIVE_ENDPOINT_HOST=127.0.0.1 \
 SWIFTSPICE_LIVE_ENDPOINT_PORT=15945 \
 SWIFTSPICE_LIVE_VERSION=v0.3.3 \
+SWIFTSPICE_LIVE_CLUSTER_ID=0000000000000001 \
 swift run -c release spice-live-interaction
 ```
 
 `spice-live-interaction` is a regular foreground `NSApplication` with a real
 visible `NSWindow` and `SpiceDesktopView`. It waits for one visible desktop
 subscription and a Metal commit plus actual presented callback before arming.
-It then streams the isolated `control.sh trace` transaction, records host input
-before sending a direct session click, waits for the matching guest pair and
-the exact presented delivery, and sends the resulting schema-2 line to the
-isolated run collector. The five `SWIFTSPICE_PERF_*` identity values, both live
-endpoint values, and a canonical
-`SWIFTSPICE_LIVE_VERSION=vMAJOR.MINOR.PATCH` are mandatory; the historical
+It then runs exactly one serialized click/key/motion cluster in the same
+Session. Each action streams an isolated `control.sh trace` transaction,
+records host input before the direct Session send, waits for the matching guest
+pair and exact presented delivery, and appends only that action's schema-2 line
+before the next arm. Relative `mouseMotion` additionally requires a clean-epoch
+SPICE ACK; absolute tablet `mousePosition` does not produce that ACK and remains
+validated by the guest marker and exact presented identity. The five
+`SWIFTSPICE_PERF_*` identity values, both live endpoint values, a canonical
+`SWIFTSPICE_LIVE_VERSION=vMAJOR.MINOR.PATCH`, and a canonical 16-digit lowercase
+hex `SWIFTSPICE_LIVE_CLUSTER_ID` are mandatory; the historical
 default container, base, and `5935`/`5936` endpoint (including its prior
 `15935` local forward) are rejected. SSH stdout and stderr stay separate,
 and the ticket is used only as in-process credentials and is never printed.
@@ -341,9 +346,9 @@ harness reason, preserving such derived reasons as `missing_display_receive`,
 `missing_selection`, `missing_metal_commit`, or `missing_presented`; it then
 best-effort appends that invalid record and exits nonzero. Only a safe stage,
 non-secret framebuffer-readiness counters, and local record path are reported.
-The direct session click intentionally bypasses the AppKit input queue, so a
-successful run closes marker-to-exact-presented correlation but does not
-measure input-event queue latency.
+The direct Session inputs intentionally bypass the AppKit input queue, so a
+successful run closes click/key/motion marker-to-exact-presented correlation
+but does not measure AppKit input-event queue latency.
 
 The drawable callback treats `CAMetalDrawable.presentedTime == 0` as dropped,
 not as a host timestamp. When the dropped identity is still the latest selected

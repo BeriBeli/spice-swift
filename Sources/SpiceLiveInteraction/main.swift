@@ -1,5 +1,4 @@
 import AppKit
-import CryptoKit
 import Darwin
 import QuartzCore
 import SpiceLiveInteractionSupport
@@ -35,12 +34,28 @@ private final class SpiceLiveInteractionHarness {
         var runDirectory: String?
         var traceProcess: SpiceLiveChildProcess?
         var orchestrator: SpiceLiveTraceOrchestrator?
+        var clusterPlan: SpiceLiveInteractionClusterPlan?
+        var sessionEventTask: Task<Void, Never>?
         let session = SpiceSession()
+        let motionAcknowledgements = SpiceLiveMotionAcknowledgementMonitor()
         let outputURL = makeOutputURL()
 
         do {
             let parsed = try SpiceRemoteLiveConfiguration(environment: environment)
             configuration = parsed
+            clusterPlan = try SpiceLiveInteractionClusterPlan(
+                clusterID: parsed.clusterID
+            )
+            sessionEventTask = Task {
+                for await event in session.events {
+                    guard !Task.isCancelled else { return }
+                    if case .mouseMotionAcknowledged = event {
+                        await motionAcknowledgements.recordAcknowledgement(
+                            at: SpiceInteractionHostClock.nowNanoseconds()
+                        )
+                    }
+                }
+            }
 
             stage = .remoteStatus
             let status = try await parsed.runRemoteScript("status.sh", runner: runner)
@@ -86,82 +101,133 @@ private final class SpiceLiveInteractionHarness {
                 timeout: .seconds(20)
             )
 
-            let token = String(format: "%016llx", UInt64.random(in: 1...UInt64.max))
-            let checksum = markerChecksum(token: token)
             let writer = SpiceInteractionTraceJSONLWriter(outputURL: outputURL)
-            let activeCapture = try SpiceInteractionTraceCapture(
-                session: session,
-                writer: writer,
-                pairId: "live-\(token)",
-                version: parsed.version,
-                runId: URL(fileURLWithPath: evidenceDirectory).lastPathComponent,
-                order: 1,
-                actionClass: .click,
-                token: token,
-                checksum: checksum
-            )
-            let activeOrchestrator = SpiceLiveTraceOrchestrator(
-                capture: activeCapture,
-                outputURL: outputURL
-            )
-            orchestrator = activeOrchestrator
+            for _ in 0..<3 {
+                guard var plan = clusterPlan else {
+                    throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                }
+                let step = try plan.beginNextStep()
+                clusterPlan = plan
 
-            stage = .arm
-            let trace = try parsed.launchControlTrace(
-                actionClass: "click",
-                token: token,
-                runner: runner
-            )
-            traceProcess = trace
-            let armed = try await trace.readOutputLine(within: .seconds(15))
-            guard armed == "PERF_ARMED action_class=click token=\(token)" else {
-                throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                let activeCapture = try SpiceInteractionTraceCapture(
+                    session: session,
+                    writer: writer,
+                    pairId: step.pairID,
+                    version: parsed.version,
+                    runId: URL(fileURLWithPath: evidenceDirectory).lastPathComponent,
+                    order: step.order,
+                    actionClass: step.actionClass,
+                    token: step.token,
+                    checksum: step.checksum
+                )
+                let activeOrchestrator = SpiceLiveTraceOrchestrator(
+                    capture: activeCapture,
+                    outputURL: outputURL
+                )
+                orchestrator = activeOrchestrator
+
+                stage = .arm
+                let trace = try parsed.launchControlTrace(
+                    actionClass: step.remoteActionClass,
+                    token: step.token,
+                    runner: runner
+                )
+                traceProcess = trace
+                let armed = try await trace.readOutputLine(within: .seconds(15))
+                guard armed == "PERF_ARMED action_class=\(step.remoteActionClass) token=\(step.token)" else {
+                    throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                }
+
+                stage = .inputSend
+                // Use one pointer-mode observation for both the concrete SPICE
+                // input and its acknowledgement contract. Only relative
+                // mouseMotion produces a SPICE motion acknowledgement;
+                // absolute mousePosition remains causal through guest marker
+                // evidence and the exact presented-frame chain.
+                let pointerMode = session.desktop.currentPointerMode()
+                let motionEpoch = step.requiresMotionAcknowledgement(
+                    for: pointerMode
+                )
+                    ? try await motionAcknowledgements.beginCleanEpoch()
+                    : nil
+                let scheduled = SpiceInteractionHostClock.nowNanoseconds()
+                let hostInput = SpiceInteractionHostClock.nowNanoseconds()
+                let sendStarted = SpiceInteractionHostClock.nowNanoseconds()
+                try activeCapture.recordHostInput(
+                    scheduledNs: scheduled,
+                    hostInputNs: hostInput,
+                    sendStartedNs: sendStarted
+                )
+                let inputs = step.inputs(for: pointerMode)
+                guard !inputs.isEmpty else {
+                    throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                }
+                // This harness timestamps a direct SPICE Session send. It does
+                // not claim observation of an AppKit input-queue receipt.
+                for (index, input) in inputs.enumerated() {
+                    try await session.send(input)
+                    if index == 0 {
+                        try activeCapture.recordSendCompleted(
+                            at: SpiceInteractionHostClock.nowNanoseconds()
+                        )
+                    }
+                }
+                if let motionEpoch {
+                    let motionAcknowledgedAt = try await withSpiceLiveTimeout(
+                        .seconds(15)
+                    ) {
+                        try await motionAcknowledgements.waitForAcknowledgement(
+                            after: motionEpoch,
+                            notBefore: sendStarted
+                        )
+                    }
+                    try activeCapture.recordMotionAcknowledged(
+                        at: motionAcknowledgedAt
+                    )
+                }
+
+                stage = .guestEvidence
+                let traceResult = try await trace.finish(within: .seconds(15))
+                guard traceResult.status == 0 else {
+                    throw SpiceLiveInteractionSupportError.childFailed
+                }
+                let guest = try SpiceRemoteGuestTrace(
+                    lines: [armed] + traceResult.outputLines,
+                    actionClass: step.remoteActionClass,
+                    token: step.token
+                )
+                try activeCapture.recordGuestEvidence(
+                    receivedNs: guest.receivedNanoseconds,
+                    drawnNs: guest.drawnNanoseconds,
+                    markerRevision: guest.markerRevision
+                )
+
+                stage = .exactPresentation
+                let finalized = try await activeOrchestrator.completeAfterExactPresentation(
+                    timeout: .seconds(15)
+                )
+                guard var plan = clusterPlan else {
+                    throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                }
+                try plan.recordExactPresentation(order: step.order)
+                clusterPlan = plan
+
+                stage = .remoteCollector
+                try await parsed.appendRecord(
+                    finalized.encodedJSONL,
+                    runDirectory: evidenceDirectory,
+                    runner: runner
+                )
+                guard var appendedPlan = clusterPlan else {
+                    throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+                }
+                try appendedPlan.recordAppendCompleted(order: step.order)
+                clusterPlan = appendedPlan
+                await trace.terminateAndWait()
+                traceProcess = nil
+                orchestrator = nil
             }
-
-            stage = .inputSend
-            let scheduled = SpiceInteractionHostClock.nowNanoseconds()
-            let hostInput = SpiceInteractionHostClock.nowNanoseconds()
-            let sendStarted = SpiceInteractionHostClock.nowNanoseconds()
-            try activeCapture.recordHostInput(
-                scheduledNs: scheduled,
-                hostInputNs: hostInput,
-                sendStartedNs: sendStarted
-            )
-            try await session.send(.mousePress(.left))
-            try activeCapture.recordSendCompleted(
-                at: SpiceInteractionHostClock.nowNanoseconds()
-            )
-            try await session.send(.mouseRelease(.left))
-
-            stage = .guestEvidence
-            let traceResult = try await trace.finish(within: .seconds(15))
-            guard traceResult.status == 0 else {
-                throw SpiceLiveInteractionSupportError.childFailed
-            }
-            let guest = try SpiceRemoteGuestTrace(
-                lines: [armed] + traceResult.outputLines,
-                actionClass: "click",
-                token: token
-            )
-            try activeCapture.recordGuestEvidence(
-                receivedNs: guest.receivedNanoseconds,
-                drawnNs: guest.drawnNanoseconds,
-                markerRevision: guest.markerRevision
-            )
-
-            stage = .exactPresentation
-            let finalized = try await activeOrchestrator.completeAfterExactPresentation(
-                timeout: .seconds(15)
-            )
-
-            stage = .remoteCollector
-            try await parsed.appendRecord(
-                finalized.encodedJSONL,
-                runDirectory: evidenceDirectory,
-                runner: runner
-            )
-            await trace.terminateAndWait()
-            traceProcess = nil
+            sessionEventTask?.cancel()
             await tearDownWindow(diagnostics: session.presentationDiagnostics)
             await session.disconnect()
             return SpiceLiveOutcome(
@@ -171,6 +237,7 @@ private final class SpiceLiveInteractionHarness {
                 diagnostics: nil
             )
         } catch {
+            clusterPlan?.failCurrentStep()
             let finalized = try? orchestrator?.finishDerivedInvalid()
             if let configuration,
                let runDirectory,
@@ -182,6 +249,7 @@ private final class SpiceLiveInteractionHarness {
                 )
             }
             await traceProcess?.terminateAndWait()
+            sessionEventTask?.cancel()
             await tearDownWindow(diagnostics: session.presentationDiagnostics)
             await session.disconnect()
             return SpiceLiveOutcome(
@@ -365,10 +433,6 @@ private final class SpiceLiveInteractionHarness {
         return directory.appending(path: "input-events.jsonl")
     }
 
-    private func markerChecksum(token: String) -> UInt32 {
-        let digest = SHA256.hash(data: Data(token.utf8))
-        return digest.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-    }
 }
 
 @MainActor

@@ -25,6 +25,7 @@ struct RemoteRockyLiveInteractionTests {
         #expect(configuration.endpointHost == "127.0.0.1")
         #expect(configuration.endpointPort == 6_235)
         #expect(configuration.version == "v0.3.3")
+        #expect(configuration.clusterID == "0123456789abcdef")
     }
 
     @Test func configurationRequiresACanonicalExplicitLiveVersion() throws {
@@ -49,6 +50,197 @@ struct RemoteRockyLiveInteractionTests {
             environment["SWIFTSPICE_LIVE_VERSION"] = invalidVersion
             expectConfigurationError(environment, .invalidLiveVersion)
         }
+    }
+
+    @Test func configurationRequiresACanonicalExplicitClusterIdentity() {
+        var missing = validEnvironment
+        missing.removeValue(forKey: "SWIFTSPICE_LIVE_CLUSTER_ID")
+        expectConfigurationError(missing, .incompleteIsolatedConfiguration)
+
+        for invalidClusterID in [
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789abcdeF",
+            "0123456789abcdeg",
+            "0123456789abcdef\n",
+            "cluster-000000001",
+        ] {
+            var environment = validEnvironment
+            environment["SWIFTSPICE_LIVE_CLUSTER_ID"] = invalidClusterID
+            expectConfigurationError(environment, .invalidIsolatedConfiguration)
+            #expect(throws: SpiceLiveInteractionSupportError.invalidIsolatedConfiguration) {
+                _ = try SpiceLiveInteractionClusterPlan(clusterID: invalidClusterID)
+            }
+        }
+    }
+
+    @Test func clusterPlanFixesCanonicalActionsInputsAndPairedIdentities() throws {
+        let currentVersion = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        var adjacentEnvironment = validEnvironment
+        adjacentEnvironment["SWIFTSPICE_LIVE_VERSION"] = "v0.3.4"
+        let adjacentVersion = try SpiceRemoteLiveConfiguration(
+            environment: adjacentEnvironment
+        )
+        #expect(currentVersion.version != adjacentVersion.version)
+        #expect(currentVersion.clusterID == adjacentVersion.clusterID)
+
+        let firstCluster = try completedClusterSteps(currentVersion.clusterID)
+        let pairedVersionCluster = try completedClusterSteps(adjacentVersion.clusterID)
+        let differentCluster = try completedClusterSteps("fedcba9876543210")
+
+        #expect(firstCluster.map(\.order) == [1, 2, 3])
+        #expect(firstCluster.map(\.actionClass) == [.click, .key, .motion])
+        #expect(firstCluster.map(\.remoteActionClass) == ["click", "key", "motion"])
+        #expect(firstCluster.map {
+            $0.requiresMotionAcknowledgement(for: .relative)
+        } == [false, false, true])
+        #expect(firstCluster.map {
+            $0.requiresMotionAcknowledgement(for: .absolute)
+        } == [false, false, false])
+        #expect(Set(firstCluster.map(\.token)).count == 3)
+        #expect(Set(firstCluster.map(\.pairID)).count == 3)
+        #expect(firstCluster.allSatisfy { step in
+            step.token.utf8.count == 16 && step.token.utf8.allSatisfy {
+                ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+            }
+        })
+
+        // Cluster identity, action, and order—not version—define the paired
+        // capture intent. Adjacent version runs therefore use the exact same
+        // pair IDs and tokens, while a different cluster cannot collide.
+        #expect(firstCluster.map(\.pairID) == pairedVersionCluster.map(\.pairID))
+        #expect(firstCluster.map(\.token) == pairedVersionCluster.map(\.token))
+        #expect(Set(firstCluster.map(\.pairID)).isDisjoint(
+            with: Set(differentCluster.map(\.pairID))
+        ))
+        #expect(Set(firstCluster.map(\.token)).isDisjoint(
+            with: Set(differentCluster.map(\.token))
+        ))
+
+        #expect(firstCluster[0].inputs(for: .relative) == [
+            .mousePress(.left), .mouseRelease(.left),
+        ])
+        #expect(firstCluster[1].inputs(for: .relative) == [
+            .keyDown(scanCode: 0x1e), .keyUp(scanCode: 0x1e),
+        ])
+        #expect(firstCluster[2].inputs(for: .relative) == [
+            .mouseMotion(dx: 1, dy: 1),
+        ])
+        let absoluteInputs = firstCluster[2].inputs(for: .absolute)
+        #expect(absoluteInputs.count == 1)
+        let absoluteMotion = try #require(absoluteInputs.first)
+        guard case let .mousePosition(x, y, displayID) = absoluteMotion else {
+            Issue.record("absolute motion step did not use one deterministic position")
+            return
+        }
+        #expect(displayID == 0)
+        #expect(x > 0)
+        #expect(y > 0)
+    }
+
+    @Test func clusterPlanAdvancesOnlyAfterExactPresentationAndAppend() throws {
+        var plan = try SpiceLiveInteractionClusterPlan(
+            clusterID: "0123456789abcdef"
+        )
+        let click = try plan.beginNextStep()
+        try plan.recordExactPresentation(order: click.order)
+        try plan.recordAppendCompleted(order: click.order)
+        let key = try plan.beginNextStep()
+        #expect(key.order == 2)
+        try plan.recordExactPresentation(order: key.order)
+        try plan.recordAppendCompleted(order: key.order)
+        let motion = try plan.beginNextStep()
+        #expect(motion.order == 3)
+        #expect(motion.requiresMotionAcknowledgement(for: .relative))
+        #expect(!motion.requiresMotionAcknowledgement(for: .absolute))
+        try plan.recordExactPresentation(order: motion.order)
+        try plan.recordAppendCompleted(order: motion.order)
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try plan.beginNextStep()
+        }
+
+        var armBeforePresentation = try SpiceLiveInteractionClusterPlan(
+            clusterID: "0123456789abcdef"
+        )
+        _ = try armBeforePresentation.beginNextStep()
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try armBeforePresentation.beginNextStep()
+        }
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            try armBeforePresentation.recordExactPresentation(order: 1)
+        }
+
+        var armBeforeAppend = try SpiceLiveInteractionClusterPlan(
+            clusterID: "0123456789abcdef"
+        )
+        let unappended = try armBeforeAppend.beginNextStep()
+        try armBeforeAppend.recordExactPresentation(order: unappended.order)
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try armBeforeAppend.beginNextStep()
+        }
+
+        var appendBeforePresentation = try SpiceLiveInteractionClusterPlan(
+            clusterID: "0123456789abcdef"
+        )
+        _ = try appendBeforePresentation.beginNextStep()
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            try appendBeforePresentation.recordAppendCompleted(order: 1)
+        }
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try appendBeforePresentation.beginNextStep()
+        }
+
+        var failed = try SpiceLiveInteractionClusterPlan(
+            clusterID: "0123456789abcdef"
+        )
+        let failedClick = try failed.beginNextStep()
+        try failed.recordExactPresentation(order: failedClick.order)
+        // A remote/local append failure after presentation is terminal. It
+        // cannot arm key while the click record is absent from the artifact.
+        failed.failCurrentStep()
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try failed.beginNextStep()
+        }
+    }
+
+    @Test func motionAcknowledgementRequiresTheCurrentCleanEpochAndSendBoundary() async throws {
+        let monitor = SpiceLiveMotionAcknowledgementMonitor()
+
+        // An ACK already present when the clean epoch begins belongs to prior
+        // traffic and cannot satisfy this motion probe.
+        await monitor.recordAcknowledgement(at: 10)
+        let cleanEpoch = try await monitor.beginCleanEpoch()
+        await #expect(throws: SpiceLiveInteractionSupportError.operationTimedOut) {
+            _ = try await withSpiceLiveTimeout(.milliseconds(20)) {
+                try await monitor.waitForAcknowledgement(
+                    after: cleanEpoch,
+                    notBefore: 0
+                )
+            }
+        }
+
+        // An ACK from this epoch but before the send-start boundary is
+        // likewise ineligible and is never clamped or rewritten to that bound.
+        let boundedEpoch = try await monitor.beginCleanEpoch()
+        await monitor.recordAcknowledgement(at: 15)
+        await #expect(throws: SpiceLiveInteractionSupportError.operationTimedOut) {
+            _ = try await withSpiceLiveTimeout(.milliseconds(20)) {
+                try await monitor.waitForAcknowledgement(
+                    after: boundedEpoch,
+                    notBefore: 20
+                )
+            }
+        }
+
+        // Both timed-out waits were fully removed. A fresh epoch can buffer and
+        // return exactly one later qualifying ACK without leaking a waiter.
+        let acceptedEpoch = try await monitor.beginCleanEpoch()
+        await monitor.recordAcknowledgement(at: 25)
+        let accepted = try await monitor.waitForAcknowledgement(
+            after: acceptedEpoch,
+            notBefore: 20
+        )
+        #expect(accepted == 25)
     }
 
     @Test func configurationRejectsHistoricalDefaultsAndSSHOptionInjection() {
@@ -535,6 +727,21 @@ struct RemoteRockyLiveInteractionTests {
         #expect(decoded == record)
     }
 
+    private func completedClusterSteps(
+        _ clusterID: String
+    ) throws -> [SpiceLiveInteractionClusterPlan.Step] {
+        var plan = try SpiceLiveInteractionClusterPlan(clusterID: clusterID)
+        var steps: [SpiceLiveInteractionClusterPlan.Step] = []
+        for expectedOrder: UInt64 in 1...3 {
+            let step = try plan.beginNextStep()
+            #expect(step.order == expectedOrder)
+            steps.append(step)
+            try plan.recordExactPresentation(order: step.order)
+            try plan.recordAppendCompleted(order: step.order)
+        }
+        return steps
+    }
+
     private var validEnvironment: [String: String] {
         [
             "SWIFTSPICE_LIVE_INTERACTION": "1",
@@ -547,6 +754,7 @@ struct RemoteRockyLiveInteractionTests {
             "SWIFTSPICE_LIVE_ENDPOINT_HOST": "127.0.0.1",
             "SWIFTSPICE_LIVE_ENDPOINT_PORT": "6235",
             "SWIFTSPICE_LIVE_VERSION": "v0.3.3",
+            "SWIFTSPICE_LIVE_CLUSTER_ID": "0123456789abcdef",
         ]
     }
 
