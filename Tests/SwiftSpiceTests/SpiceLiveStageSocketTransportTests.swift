@@ -13,7 +13,11 @@ struct SpiceLiveStageSocketTransportTests {
             takingDescriptor: pair.takeTransportDescriptor()
         )
         let transport = socket.stageTransport
-        defer { pair.closePeer() }
+        let watchdog = Self.socketPairWatchdog(
+            pair: pair,
+            transport: transport,
+            after: .seconds(2)
+        )
 
         let first = Data("first-inbound\n".utf8)
         let second = Data("second-inbound\n".utf8)
@@ -21,34 +25,44 @@ struct SpiceLiveStageSocketTransportTests {
         let inboundWire = first + second
 
         do {
-            try await withSpiceLiveTimeout(.seconds(2)) {
-                async let peerWrite: Void = Self.onIOQueue {
-                    try Self.writeAll(inboundWire, to: pair.peerDescriptor)
-                }
-                async let peerRead: Data = Self.onIOQueue {
-                    try Self.readExactly(outbound.count, from: pair.peerDescriptor)
-                }
-                async let send: Void = transport.sendFrame(outbound)
-                async let receivedFirst: Data? = transport.receiveFrame(
-                    maximumBytes:
-                        SpiceLiveStageProtocolCodec.maximumFrameBytes
-                )
-
-                try await peerWrite
-                #expect(try await receivedFirst == first)
-                try await send
-                #expect(try await peerRead == outbound)
-                let receivedSecond = try await transport.receiveFrame(
-                    maximumBytes:
-                        SpiceLiveStageProtocolCodec.maximumFrameBytes
-                )
-                #expect(receivedSecond == second)
+            async let peerWrite: Void = Self.onIOQueue {
+                try Self.writeAll(inboundWire, to: pair.peerDescriptor)
             }
+            async let peerRead: Data = Self.onIOQueue {
+                try Self.readExactly(outbound.count, from: pair.peerDescriptor)
+            }
+            async let send: Void = transport.sendFrame(outbound)
+            async let receivedFirst: Data? = transport.receiveFrame(
+                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
+            )
+
+            try await peerWrite
+            #expect(try await receivedFirst == first)
+            try await send
+            #expect(try await peerRead == outbound)
+            let receivedSecond = try await transport.receiveFrame(
+                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
+            )
+            #expect(receivedSecond == second)
         } catch {
-            await transport.close()
+            let timedOut = await Self.finishSocketPairWatchdog(
+                watchdog,
+                pair: pair,
+                transport: transport
+            )
+            if timedOut {
+                throw SpiceLiveInteractionSupportError.operationTimedOut
+            }
             throw error
         }
-        await transport.close()
+        let timedOut = await Self.finishSocketPairWatchdog(
+            watchdog,
+            pair: pair,
+            transport: transport
+        )
+        if timedOut {
+            throw SpiceLiveInteractionSupportError.operationTimedOut
+        }
     }
 
     @Test(
@@ -229,7 +243,8 @@ struct SpiceLiveStageSocketTransportTests {
     fileprivate func outboundFramePreflightUsesZeroSyscallsOnFailure(
         _ scenario: OutboundBoundaryScenario
     ) async throws {
-        let maximum = SpiceLiveStageProtocolCodec.maximumFrameBytes
+        let maximum = 4_096
+        #expect(SpiceLiveStageProtocolCodec.maximumFrameBytes == maximum)
         let frame: Data
         switch scenario {
         case .exactMaximum:
@@ -281,7 +296,8 @@ struct SpiceLiveStageSocketTransportTests {
     fileprivate func inboundBoundsFailClosed(
         _ scenario: InboundBoundaryScenario
     ) async throws {
-        let maximum = SpiceLiveStageProtocolCodec.maximumFrameBytes
+        let maximum = 4_096
+        #expect(SpiceLiveStageProtocolCodec.maximumFrameBytes == maximum)
         let reads: [ScriptedSocketCalls.ReadDirective]
         switch scenario {
         case .exactMaximum:
@@ -362,12 +378,19 @@ struct SpiceLiveStageSocketTransportTests {
                 try? await transport.sendFrame(Data("first\n".utf8))
             }
         }
-        try await Self.waitUntil {
-            let snapshot = calls.snapshot
-            switch scenario {
-            case .receive: return snapshot.activeReads == 1
-            case .send: return snapshot.activeWrites == 1
+        do {
+            try await Self.waitUntil {
+                let snapshot = calls.snapshot
+                switch scenario {
+                case .receive: return snapshot.activeReads == 1
+                case .send: return snapshot.activeWrites == 1
+                }
             }
+        } catch {
+            calls.emergencyReleaseForTestCleanup()
+            await first.value
+            await transport.close()
+            throw error
         }
 
         let completion = OperationCompletion()
@@ -450,9 +473,18 @@ struct SpiceLiveStageSocketTransportTests {
                 Issue.record("unexpected closed-send error: \(error)")
             }
         }
-        try await Self.waitUntil {
-            let snapshot = calls.snapshot
-            return snapshot.activeReads == 1 && snapshot.activeWrites == 1
+        do {
+            try await Self.waitUntil {
+                let snapshot = calls.snapshot
+                return snapshot.activeReads == 1
+                    && snapshot.activeWrites == 1
+            }
+        } catch {
+            calls.emergencyReleaseForTestCleanup()
+            await receive.value
+            await send.value
+            await transport.close()
+            throw error
         }
 
         let close = Task { await transport.close() }
@@ -677,6 +709,35 @@ private extension SpiceLiveStageSocketTransportTests {
                 continuation.resume(with: Result { try operation() })
             }
         }
+    }
+
+    static func socketPairWatchdog(
+        pair: SocketPair,
+        transport: SpiceLiveStageTransport,
+        after timeout: Duration
+    ) -> Task<Bool, Never> {
+        Task {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return false
+            }
+            pair.closePeer()
+            await transport.close()
+            return true
+        }
+    }
+
+    static func finishSocketPairWatchdog(
+        _ watchdog: Task<Bool, Never>,
+        pair: SocketPair,
+        transport: SpiceLiveStageTransport
+    ) async -> Bool {
+        watchdog.cancel()
+        let timedOut = await watchdog.value
+        pair.closePeer()
+        await transport.close()
+        return timedOut
     }
 
     static func waitUntil(
