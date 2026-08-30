@@ -422,8 +422,8 @@ package extension SpiceRemoteLiveConfiguration {
         let child = try runner.launch(arguments: command.arguments, standardInput: record)
         let result = try await child.finish(within: .seconds(20))
         guard result.status == 0,
-              result.outputLines.count == 1,
-              result.outputLines[0] == expectedAcknowledgement else {
+              result.standardOutput == "\(expectedAcknowledgement)\n",
+              result.standardError.isEmpty else {
             throw SpiceLiveInteractionSupportError.childFailed
         }
     }
