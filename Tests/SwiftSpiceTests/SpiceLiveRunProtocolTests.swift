@@ -375,7 +375,7 @@ struct SpiceLiveRunProtocolTests {
                     capturedAt: directory.appending(path: "valid-mismatch.jsonl")
                 )
                 try execution.recordRemoteAppend(frozen)
-            } catch SpiceLiveInteractionSupportError.invalidTraceProtocol {
+            } catch SpiceLiveInteractionSupportError.childFailed {
                 collectorRejected = true
                 execution.fail()
             }
@@ -426,7 +426,7 @@ struct SpiceLiveRunProtocolTests {
                 acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=false reason=\(reason)",
                 capturedAt: directory.appending(path: "invalid-exact.jsonl")
             )
-            await #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            await #expect(throws: SpiceLiveInteractionSupportError.childFailed) {
                 try await appendToCollectorFixture(
                     configuration: configuration,
                     record: frozen,
@@ -435,7 +435,7 @@ struct SpiceLiveRunProtocolTests {
                     capturedAt: directory.appending(path: "invalid-reason-mismatch.jsonl")
                 )
             }
-            await #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            await #expect(throws: SpiceLiveInteractionSupportError.childFailed) {
                 try await appendToCollectorFixture(
                     configuration: configuration,
                     record: frozen,
@@ -650,7 +650,7 @@ struct SpiceLiveRunProtocolTests {
             )
             let frozen = try capture.finish()
             #expect(!frozen.valid)
-            #expect(frozen.invalidReason != nil)
+            let invalidReason = try #require(frozen.invalidReason)
 
             let localOutput = directory.appending(path: "input-events.jsonl")
             try SpiceInteractionTraceJSONLWriter(outputURL: localOutput).append(frozen)
@@ -662,24 +662,13 @@ struct SpiceLiveRunProtocolTests {
             #expect(!execution.completed)
 
             let remoteInput = directory.appending(path: "remote-input.jsonl")
-            let fixture = try Stage3RunScriptFixture(
-                """
-                input="$1"
-                shift
-                /bin/cat > "$input"
-                printf '%s\n' 'PERF_INPUT_EVENT_COLLECTED valid=false reason=derived'
-                """
-            )
-            defer { fixture.remove() }
-            let runner = SpiceLiveProcessRunner(
-                executableURL: fixture.executableURL,
-                argumentPrefix: [remoteInput.path]
-            )
             let encoded = Stage3LiveRunFixture.canonicalRecordLine(frozen)
-            try await configuration.appendRecord(
-                encoded,
+            try await appendToCollectorFixture(
+                configuration: configuration,
+                record: frozen,
                 runDirectory: runDirectory,
-                runner: runner
+                acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=false reason=\(invalidReason)",
+                capturedAt: remoteInput
             )
             #expect(try Data(contentsOf: remoteInput) == encoded)
             #expect(
