@@ -407,11 +407,23 @@ package extension SpiceRemoteLiveConfiguration {
         guard decoded.runId == evidenceRunID else {
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
+        let expectedAcknowledgement: String
+        if decoded.valid {
+            guard decoded.invalidReason == nil else {
+                throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+            }
+            expectedAcknowledgement = "PERF_INPUT_EVENT_COLLECTED valid=true reason=none"
+        } else {
+            guard let invalidReason = decoded.invalidReason else {
+                throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+            }
+            expectedAcknowledgement = "PERF_INPUT_EVENT_COLLECTED valid=false reason=\(invalidReason)"
+        }
         let child = try runner.launch(arguments: command.arguments, standardInput: record)
         let result = try await child.finish(within: .seconds(20))
         guard result.status == 0,
               result.outputLines.count == 1,
-              result.outputLines[0].hasPrefix("PERF_INPUT_EVENT_COLLECTED ") else {
+              result.outputLines[0] == expectedAcknowledgement else {
             throw SpiceLiveInteractionSupportError.childFailed
         }
     }
