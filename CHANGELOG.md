@@ -7,6 +7,41 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added a deterministic live click/key/motion cluster and paired-artifact
+  evaluator. The evaluator accepts only the complete counterbalanced
+  10-cluster, two-version, 60-record matrix, reports Hyndman-Fan type-7 p50/p95
+  and same-cluster signed deltas, and keeps CPU/RSS as independent guardrails.
+
+### Changed
+
+- Publish the guest binary-grid marker atomically with one `XPutImage`, and
+  serialize each live action behind the preceding exact presentation and
+  remote collector acknowledgment.
+- Allow the foreground measurement harness one pre-arm authoritative-latest
+  request when a visible post-baseline Metal commit still has no presentation
+  after exactly 250 ms. Readiness still requires a real presented callback and
+  retains the original fail-closed timeout.
+
+### Fixed
+
+- Treat `CAMetalDrawable.presentedTime == 0` as a dropped drawable and permit
+  only one authoritative latest-only recovery for that selected revision,
+  without idle commits or exceeding the existing GPU in-flight bound.
+- Keep markerless retries out of the active target trace, preserve the
+  selected and committed identity through recovery, and apply
+  pointer-mode-aware motion ACK requirements so absolute tablet motion does not
+  wait for a relative-motion protocol acknowledgment.
+
+### Validation
+
+- Live Rocky evidence closes exact current-version click/key/motion marker to
+  presented-callback correlation, and deterministic tests close the paired
+  artifact admission rules. The required adjacent `v0.2.7`/current 10-cluster
+  artifact is still pending, so this release makes no AIP-00 completion or
+  interaction-latency improvement claim.
+
 ## [0.3.3] — 2026-08-29
 
 ### Changed
