@@ -87,6 +87,21 @@ Agent behavior, including system-trusted TLS.
   still time out fail-closed. A new campaign identity will not start until that
   deterministic gate and exact-head review pass.
 
+- AIP-00g is now merged on PRs #59-#60 as main commit `21ed862`. The pure
+  package gate fixes ten adjacent paired clusters, 20 fresh-boot runs with a
+  five/five counterbalanced version order, 13 successful stages per run and a
+  260-entry ledger, exactly 60 canonical valid records, 20 finite CPU/RSS
+  samples, and 20 unique typed RemoteRocky evidence IDs. Any failed,
+  incomplete, missing, duplicate, reordered, noncanonical, mismatched, or extra
+  input is terminal; there is no automatic retry or evidence replacement.
+  Focused Debug, Release, and AddressSanitizer gates passed 8/8, and Apple
+  Silicon CI run `33306335910` passed build, full tests, AddressSanitizer, and
+  coverage with no exact-head review findings. This is structural validation,
+  not live evidence. AIP-00h must still persist real-time stages and an atomic
+  artifact manifest, sequence the immutable plan, and own RemoteRocky/process
+  effects before a new 20-run campaign starts. AIP-00 and AIP-44 remain open;
+  no latency improvement is claimed.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
