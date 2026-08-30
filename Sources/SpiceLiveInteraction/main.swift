@@ -29,6 +29,8 @@ private struct LiveOutcome: Sendable {
 
 @MainActor
 private final class SpiceLiveInteractionHarness {
+    private static let initialPresentationRecoveryGrace: Duration = .milliseconds(250)
+
     private let environment: [String: String]
     private let runner: SpiceLiveProcessRunner
     private var window: NSWindow?
@@ -353,26 +355,75 @@ private final class SpiceLiveInteractionHarness {
         baseline: SpicePresentationMetrics,
         timeout: Duration
     ) async throws -> SpiceLiveReadinessPermit {
-        let deadline = ContinuousClock().now.advanced(by: timeout)
-        while ContinuousClock().now < deadline {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var firstCommitObservedAt: ContinuousClock.Instant?
+        var recoveryPolicy = SpiceLiveInitialPresentationRecoveryPolicy(
+            graceInterval: Self.initialPresentationRecoveryGrace
+        )
+        var recoveryTriggered = false
+        var recoveryRequestAccepted = false
+        while clock.now < deadline {
             hostingView?.layoutSubtreeIfNeeded()
             window?.displayIfNeeded()
             let metrics = diagnostics.snapshot()
-            if metrics.metalCommandBuffersCommitted > baseline.metalCommandBuffersCommitted,
-               let permit = readinessState(desktop: desktop).permit(
+            let readiness = readinessState(desktop: desktop)
+            let committedDelta = delta(
+                metrics.metalCommandBuffersCommitted,
+                baseline.metalCommandBuffersCommitted
+            )
+            let presentedDelta = delta(
+                metrics.metalPresentedFrames,
+                baseline.metalPresentedFrames
+            )
+            let observedAt = clock.now
+            if committedDelta > 0, firstCommitObservedAt == nil {
+                firstCommitObservedAt = observedAt
+            }
+            if committedDelta > 0,
+               let permit = readiness.permit(
                    since: baseline.metalPresentedFrames
                ) {
                 return permit
             }
+            let elapsedSinceFirstCommit = firstCommitObservedAt.map {
+                $0.duration(to: observedAt)
+            } ?? .zero
+            let foregroundFramebufferVisible = readiness.windowVisible
+                && !readiness.windowOccluded
+                && readiness.hostingVisible
+            if recoveryPolicy.observe(.init(
+                windowVisible: foregroundFramebufferVisible,
+                subscriptionVisible: readiness.visibleSubscriptions == 1,
+                committedDelta: committedDelta,
+                presentedDelta: presentedDelta,
+                elapsedSinceFirstCommit: elapsedSinceFirstCommit
+            )) == .requestAuthoritativeLatest {
+                recoveryTriggered = true
+                recoveryRequestAccepted = findFramebuffer(
+                    in: hostingView
+                )?.requestAuthoritativeLatestForInitialPresentation() == true
+            }
             try await Task.sleep(for: .milliseconds(20))
         }
-        recordReadinessDiagnostics(desktop: desktop, baseline: baseline)
+        recordReadinessDiagnostics(
+            desktop: desktop,
+            baseline: baseline,
+            initialRecoveryTriggered: recoveryTriggered,
+            initialRecoveryRequestAccepted: recoveryRequestAccepted,
+            firstCommitObservedAt: firstCommitObservedAt,
+            clock: clock
+        )
         throw SpiceLiveInteractionSupportError.operationTimedOut
     }
 
     private func recordReadinessDiagnostics(
         desktop: SpiceDesktopSource,
-        baseline: SpicePresentationMetrics?
+        baseline: SpicePresentationMetrics?,
+        initialRecoveryTriggered: Bool = false,
+        initialRecoveryRequestAccepted: Bool = false,
+        firstCommitObservedAt: ContinuousClock.Instant? = nil,
+        clock: ContinuousClock = ContinuousClock()
     ) {
         let state = readinessState(desktop: desktop)
         let metrics = desktop.presentationDiagnostics.snapshot()
@@ -387,6 +438,10 @@ private final class SpiceLiveInteractionHarness {
             "drawable_miss=\(metrics.metalDrawableMisses)",
             "gpu_busy=\(metrics.metalGPUBusySkips)",
             "metal_error=\(metrics.metalPresentationErrors)",
+            "initial_recovery_triggered=\(initialRecoveryTriggered)",
+            "initial_recovery_request_accepted=\(initialRecoveryRequestAccepted)",
+            "first_commit_observed=\(firstCommitObservedAt != nil)",
+            "first_commit_to_timeout=\(firstCommitObservedAt.map { String(describing: $0.duration(to: clock.now)) } ?? "none")",
         ].joined(separator: ",")
     }
 
