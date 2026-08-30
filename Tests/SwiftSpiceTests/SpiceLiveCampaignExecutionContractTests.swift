@@ -106,7 +106,25 @@ struct SpiceLiveCampaignExecutionContractTests {
         #expect(original == repeated)
         #expect(original.digest == repeated.digest)
 
+        let changedBaselinePlan = try Self.plan(
+            fixture: fixture,
+            baselineVersion: "v0.2.8"
+        )
+        let changedCandidatePlan = try Self.plan(
+            fixture: fixture,
+            candidateVersion: "v0.3.4"
+        )
+        let changedBaselineMetadata = try Self.metadata(
+            baselineSourceCommit: Self.commit("d")
+        )
+        let changedCandidateMetadata = try Self.metadata(
+            candidateSourceCommit: Self.commit("d")
+        )
         let variants = try [
+            Self.contract(plan: changedBaselinePlan, metadata: metadata),
+            Self.contract(plan: changedCandidatePlan, metadata: metadata),
+            Self.contract(plan: plan, metadata: changedBaselineMetadata),
+            Self.contract(plan: plan, metadata: changedCandidateMetadata),
             Self.contract(plan: plan, metadata: metadata, baselineReleaseBinarySHA256: Self.hash("8")),
             Self.contract(plan: plan, metadata: metadata, candidateReleaseBinarySHA256: Self.hash("8")),
             Self.contract(plan: plan, metadata: metadata, runnerSourceCommit: Self.commit("d")),
@@ -120,17 +138,6 @@ struct SpiceLiveCampaignExecutionContractTests {
         ]
         #expect(variants.allSatisfy { $0.digest != original.digest })
         #expect(Set(variants.map(\.digest)).count == variants.count)
-
-        let changedPlan = try Self.plan(
-            fixture: fixture,
-            candidateVersion: "v0.3.4"
-        )
-        let changedMetadata = try Self.metadata(candidateSourceCommit: Self.commit("d"))
-        let changedVersionAndCommit = try Self.contract(
-            plan: changedPlan,
-            metadata: changedMetadata
-        )
-        #expect(changedVersionAndCommit.digest != original.digest)
     }
 
     @Test func recorderRejectsContractMismatchBeforeCreatingOrReplacingOutput() throws {
@@ -309,11 +316,13 @@ private extension SpiceLiveCampaignExecutionContractTests {
 
     static func plan(
         fixture: SpicePairedInteractionArtifactTests.Fixture,
+        baselineVersion: String? = nil,
         candidateVersion: String? = nil
     ) throws -> SpiceLiveCampaignPlan {
         try SpiceLiveCampaignPlan(
             campaignID: "a20000000000000f",
-            baselineVersion: fixture.specification.baselineVersion,
+            baselineVersion: baselineVersion
+                ?? fixture.specification.baselineVersion,
             candidateVersion: candidateVersion
                 ?? fixture.specification.candidateVersion,
             clusterIDs: fixture.specification.clusterIDs
