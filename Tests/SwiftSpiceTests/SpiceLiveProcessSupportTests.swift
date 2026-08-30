@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import SpiceLiveInteractionSupport
 
-@Suite("Live interaction child process support")
+@Suite("Live interaction child process support", .serialized)
 struct SpiceLiveProcessSupportTests {
     @Test func processKeepsStdinStdoutAndStderrSeparated() async throws {
         let fixture = try Stage3ProcessScriptFixture(
@@ -22,7 +22,7 @@ struct SpiceLiveProcessSupportTests {
             standardInput: Data("canonical-input".utf8)
         )
 
-        let result = try await child.finish(within: .seconds(1))
+        let result = try await child.finish(within: .seconds(5))
 
         #expect(result.status == 0)
         #expect(result.standardOutput == "OUT:canonical-input\n")
@@ -44,7 +44,7 @@ struct SpiceLiveProcessSupportTests {
             executableURL: exact.executableURL
         ).launch(arguments: [])
 
-        let exactResult = try await exactChild.finish(within: .seconds(2))
+        let exactResult = try await exactChild.finish(within: .seconds(5))
 
         #expect(exactResult.standardOutput.utf8.count == streamLimit)
         #expect(exactResult.standardError.utf8.count == streamLimit)

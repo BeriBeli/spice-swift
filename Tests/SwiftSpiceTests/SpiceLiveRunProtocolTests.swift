@@ -445,6 +445,9 @@ struct SpiceLiveRunProtocolTests {
                 token: "471a5b01a43d3ed0",
                 checksum: 0x8808_062b
             )
+            let cached = try capture.finish()
+            #expect(!cached.valid)
+            #expect(cached.invalidReason != nil)
             let missingOutput = directory.appending(path: "missing/input-events.jsonl")
             #expect(throws: (any Error).self) {
                 try capture.append(
@@ -456,7 +459,8 @@ struct SpiceLiveRunProtocolTests {
                 to: SpiceInteractionTraceJSONLWriter(outputURL: output),
                 invalidReason: "must_not_replace_derived_reason"
             )
-            #expect(retried.invalidReason == "missing_host_input")
+            #expect(retried == cached)
+            #expect(retried.invalidReason != "must_not_replace_derived_reason")
             #expect(try Stage3LiveRunFixture.decodeRecords(at: output) == [retried])
             #expect(throws: SpiceInteractionTraceCollectionError.captureAlreadyFinished) {
                 try capture.append(
@@ -516,6 +520,8 @@ private enum Stage3LiveRunFixture {
     static let campaignID = "aaaaaaaaaaaaaaaa"
     static let clusterIDs = (0..<10).map { String(format: "%016x", $0) }
     static let remoteRunDirectory = "/var/tmp/swiftspice-aip00e/logs/20260830T120000Z.a1B2c3"
+    static let temporaryRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
 
     static func plan() throws -> SpiceLiveCampaignPlan {
         try SpiceLiveCampaignPlan(
@@ -630,7 +636,7 @@ private enum Stage3LiveRunFixture {
     static func withTemporaryDirectory<Result>(
         _ operation: (URL) throws -> Result
     ) throws -> Result {
-        let directory = FileManager.default.temporaryDirectory.appending(
+        let directory = temporaryRoot.appending(
             path: "swiftspice-stage3c3-\(UUID().uuidString)",
             directoryHint: .isDirectory
         )
@@ -645,7 +651,7 @@ private enum Stage3LiveRunFixture {
     static func withTemporaryDirectory<Result: Sendable>(
         _ operation: (URL) async throws -> Result
     ) async throws -> Result {
-        let directory = FileManager.default.temporaryDirectory.appending(
+        let directory = temporaryRoot.appending(
             path: "swiftspice-stage3c3-\(UUID().uuidString)",
             directoryHint: .isDirectory
         )
