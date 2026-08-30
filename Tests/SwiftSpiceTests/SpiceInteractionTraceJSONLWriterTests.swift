@@ -162,19 +162,30 @@ struct SpiceInteractionTraceJSONLWriterTests {
         }
     }
 
-    @Test func writerForcesPrivateDirectoryAndOutputPermissions() throws {
+    @Test func writerPreservesCallerDirectoryPermissionsAndProtectsOwnedFiles() throws {
         try withTemporaryTraceDirectory { directory in
+            let callerDirectory = directory.appending(
+                path: "caller-owned",
+                directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(
+                at: callerDirectory,
+                withIntermediateDirectories: false
+            )
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o755],
-                ofItemAtPath: directory.path
+                ofItemAtPath: callerDirectory.path
             )
-            let output = directory.appending(path: "input-events.jsonl")
+            let output = callerDirectory.appending(path: "input-events.jsonl")
             try SpiceInteractionTraceJSONLWriter(outputURL: output).append(
                 WriterFixture.record()
             )
 
-            #expect(try posixPermissions(directory) == 0o700)
+            #expect(try posixPermissions(callerDirectory) == 0o755)
             #expect(try posixPermissions(output) == 0o600)
+            #expect(try posixPermissions(
+                callerDirectory.appending(path: ".input-events.jsonl.lock")
+            ) == 0o600)
         }
     }
 
