@@ -254,6 +254,118 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(assembler.finish().invalidReason == "duplicate_presented")
     }
 
+    @Test func presentedCallbackPublishesItsCapturedIdentityBeforeReturning() async throws {
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: capture)
+        let identity = Stage3InteractionFixture.identity(revision: 9, sequence: 40)
+        let presenter = SpiceInteractionPresenterID()
+        diagnostics.recordInteractionFrameReceived(
+            Stage3InteractionFixture.snapshot(identity: identity, marker: true),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+        )
+        diagnostics.recordInteractionSelected(.init(
+            identity: identity,
+            readyNanoseconds: Stage3InteractionFixture.ns(50),
+            selectionNanoseconds: Stage3InteractionFixture.ns(60),
+            presenterID: presenter
+        ))
+        diagnostics.recordInteractionCommitted(
+            identity: identity,
+            presenterID: presenter,
+            at: Stage3InteractionFixture.ns(70)
+        )
+
+        let callbackReturned = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            diagnostics.recordInteractionPresented(
+                identity: identity,
+                presenterID: presenter,
+                at: Stage3InteractionFixture.ns(80)
+            )
+            callbackReturned.signal()
+        }
+        #expect(await waitForCorrelationSemaphore(callbackReturned) == .success)
+
+        let record = try capture.finish()
+        #expect(record.valid)
+        #expect(record.presentedNs == Stage3InteractionFixture.ns(80))
+        #expect(record.frameRevision == identity.frameRevision)
+        #expect(record.deliverySequence == identity.deliverySequence)
+    }
+
+    @Test func onePresenterOwnsCaptureEvidenceWhileSiblingIsIgnored() async throws {
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: capture)
+        let identity = Stage3InteractionFixture.identity(revision: 9, sequence: 40)
+        let owner = SpiceInteractionPresenterID()
+        let sibling = SpiceInteractionPresenterID()
+        diagnostics.recordInteractionFrameReceived(
+            Stage3InteractionFixture.snapshot(identity: identity, marker: true),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+        )
+        let ownerContext = SpiceInteractionPresentationContext(
+            identity: identity,
+            readyNanoseconds: Stage3InteractionFixture.ns(50),
+            selectionNanoseconds: Stage3InteractionFixture.ns(60),
+            presenterID: owner
+        )
+        diagnostics.recordInteractionSelected(ownerContext)
+        diagnostics.recordInteractionCommitted(
+            identity: identity,
+            presenterID: owner,
+            at: Stage3InteractionFixture.ns(70)
+        )
+
+        diagnostics.recordInteractionSelected(.init(
+            identity: identity,
+            readyNanoseconds: Stage3InteractionFixture.ns(51),
+            selectionNanoseconds: Stage3InteractionFixture.ns(61),
+            presenterID: sibling
+        ))
+        diagnostics.recordInteractionCommitted(
+            identity: identity,
+            presenterID: sibling,
+            at: Stage3InteractionFixture.ns(71)
+        )
+        diagnostics.recordInteractionPresented(
+            identity: identity,
+            presenterID: sibling,
+            at: Stage3InteractionFixture.ns(79)
+        )
+        diagnostics.recordInteractionPresented(
+            identity: identity,
+            presenterID: owner,
+            at: Stage3InteractionFixture.ns(80)
+        )
+        #expect(try capture.finish().valid)
+
+        let duplicateDiagnostics = SpicePresentationDiagnostics()
+        let duplicate = try Stage3InteractionFixture.capture(
+            diagnostics: duplicateDiagnostics,
+            runID: "same-owner-duplicate"
+        )
+        try Stage3InteractionFixture.recordPrelude(on: duplicate)
+        duplicateDiagnostics.recordInteractionFrameReceived(
+            Stage3InteractionFixture.snapshot(identity: identity, marker: true),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+        )
+        duplicateDiagnostics.recordInteractionSelected(ownerContext)
+        duplicateDiagnostics.recordInteractionCommitted(
+            identity: identity,
+            presenterID: owner,
+            at: Stage3InteractionFixture.ns(70)
+        )
+        duplicateDiagnostics.recordInteractionSelected(ownerContext)
+        duplicateDiagnostics.recordInteractionPresented(
+            identity: identity,
+            presenterID: owner,
+            at: Stage3InteractionFixture.ns(80)
+        )
+        #expect(try duplicate.finish().invalidReason == "duplicate_selection_after_commit")
+    }
+
     @Test func exactPresentationWaiterHandlesEarlyLateUnrelatedAndCancellation() async throws {
         let diagnostics = SpicePresentationDiagnostics()
         let early = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
