@@ -390,10 +390,7 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
     ) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let encoded = try encoder.encode(manifest)
-        guard manifest.isLegacySchemaOne else { return encoded }
-        let object = try JSONSerialization.jsonObject(with: encoded)
-        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return try encoder.encode(manifest)
     }
 
     private static func encodedAndValidated(
