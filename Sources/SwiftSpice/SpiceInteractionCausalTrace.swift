@@ -421,6 +421,13 @@ package enum SpiceInteractionTraceCollectionError: Error, Sendable, Equatable {
     case captureAlreadyActive
     case captureAlreadyFinished
     case presentationWaitAlreadyRegistered
+    case invalidOutputPath
+    case outputDirectoryUnavailable
+    case outputIsSymbolicLink
+    case invalidExistingJSONL
+    case recordTooLarge(actual: Int, maximum: Int)
+    case outputTooLarge(actual: Int, maximum: Int)
+    case fileOperationFailed(operation: String, code: Int32)
 }
 
 /// A single cancellation-safe, non-polling wait for the exact presentation
@@ -1037,18 +1044,21 @@ package final class SpiceInteractionTraceAssembler: Sendable {
     }
 }
 
-/// An in-memory capture only. Stage3b deliberately does not perform file I/O;
-/// a later overlay layer owns serialization and process orchestration.
+/// A capture whose evidence mutation remains entirely in memory. Explicit
+/// append performs file I/O only after the capture has atomically detached
+/// from presentation diagnostics and cached its final record.
 package final class SpiceInteractionTraceCapture: Sendable {
     private enum Phase: Sendable {
         case active
-        case finished
+        case pending(SpiceInteractionTraceRecord)
+        case appended(SpiceInteractionTraceRecord)
     }
 
     private let presentationDiagnostics: SpicePresentationDiagnostics
     private let assembler: SpiceInteractionTraceAssembler
     private let presentationWaiter: SpiceInteractionPresentationWaiter
     private let phase = Mutex<Phase>(.active)
+    private let appendLock = Mutex<Void>(())
 
     package convenience init(
         session: SpiceSession,
@@ -1186,11 +1196,59 @@ package final class SpiceInteractionTraceCapture: Sendable {
             // callback; after this returns no callback can enter the assembler.
             presentationDiagnostics.removeInteractionTraceAssembler(assembler)
             let record = assembler.finish(invalidReason: invalidReason)
-            phase = .finished
+            phase = .pending(record)
             return (record, presentationWaiter.prepareFinish())
         }
         resumption?.resume()
         return record
+    }
+
+    /// Finalizes if necessary and appends the cached record. A failed append
+    /// leaves the exact record pending so a later call can retry it; no later
+    /// evidence can enter the detached assembler or rebuild the record.
+    @discardableResult
+    package func append(
+        to writer: SpiceInteractionTraceJSONLWriter,
+        invalidReason: String? = nil
+    ) throws -> SpiceInteractionTraceRecord {
+        let (record, resumption) = try phase.withLock { phase in
+            switch phase {
+            case .active:
+                presentationDiagnostics.removeInteractionTraceAssembler(assembler)
+                let record = assembler.finish(invalidReason: invalidReason)
+                phase = .pending(record)
+                return (record, presentationWaiter.prepareFinish())
+            case let .pending(record):
+                return (record, nil)
+            case .appended:
+                throw SpiceInteractionTraceCollectionError.captureAlreadyFinished
+            }
+        }
+        resumption?.resume()
+
+        return try appendLock.withLock { _ in
+            let pendingRecord = try phase.withLock { phase in
+                switch phase {
+                case let .pending(pendingRecord):
+                    return pendingRecord
+                case .active:
+                    preconditionFailure("an append cannot reactivate a capture")
+                case .appended:
+                    throw SpiceInteractionTraceCollectionError.captureAlreadyFinished
+                }
+            }
+            // Every retry must serialize the record captured by the first
+            // finalization, even if a caller supplies a different reason.
+            precondition(pendingRecord == record)
+            try writer.append(pendingRecord)
+            phase.withLock { phase in
+                guard case .pending = phase else {
+                    preconditionFailure("serialized append phase changed unexpectedly")
+                }
+                phase = .appended(pendingRecord)
+            }
+            return pendingRecord
+        }
     }
 
     private func withActiveCapture(_ body: () -> Void) throws {
