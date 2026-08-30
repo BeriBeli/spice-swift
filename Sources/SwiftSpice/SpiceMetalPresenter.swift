@@ -658,6 +658,15 @@ package final class SpiceMetalFrameView: MTKView {
                         epoch: presentationEpoch
                     )
                 }
+                if completion == .failed, let interactionIdentity {
+                    // A failed command cannot produce a drawable presentation.
+                    // Linearize that exact committed identity as retryable
+                    // before the view's failure recovery republishes the
+                    // authoritative revision.
+                    presentationDiagnostics?.recordInteractionPresentationDropped(
+                        identity: interactionIdentity
+                    )
+                }
                 onCompletion(completion)
             }
         }
