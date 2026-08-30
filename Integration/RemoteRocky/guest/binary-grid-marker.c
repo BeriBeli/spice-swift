@@ -2,6 +2,7 @@
 
 #ifndef BINARY_GRID_MARKER_ENCODE_ONLY
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #endif
 
 #include <errno.h>
@@ -132,6 +133,175 @@ static int aligned_root_origin(int window_origin) {
     return origin;
 }
 
+static int marker_fits_window_at_root_origin(
+    Display *display,
+    Window window,
+    Window root,
+    int marker_root_x,
+    int marker_root_y,
+    int *marker_x,
+    int *marker_y
+) {
+    XWindowAttributes attributes;
+    if (!XGetWindowAttributes(display, window, &attributes)
+        || attributes.class != InputOutput
+        || attributes.map_state != IsViewable) {
+        return 0;
+    }
+    Window child = None;
+    int window_root_x = 0;
+    int window_root_y = 0;
+    if (!XTranslateCoordinates(
+            display,
+            window,
+            root,
+            0,
+            0,
+            &window_root_x,
+            &window_root_y,
+            &child
+        )) {
+        return 0;
+    }
+    int local_x = marker_root_x - window_root_x;
+    int local_y = marker_root_y - window_root_y;
+    if (local_x < 0 || local_y < 0
+        || local_x + MARKER_WIDTH > attributes.width
+        || local_y + MARKER_HEIGHT > attributes.height) {
+        return 0;
+    }
+    *marker_x = local_x;
+    *marker_y = local_y;
+    return 1;
+}
+
+static int select_visible_marker_window(
+    Display *display,
+    Window window,
+    Window root,
+    int marker_root_x,
+    int marker_root_y,
+    Window *selected_window,
+    int *marker_x,
+    int *marker_y
+) {
+    int local_x = 0;
+    int local_y = 0;
+    if (!marker_fits_window_at_root_origin(
+            display,
+            window,
+            root,
+            marker_root_x,
+            marker_root_y,
+            &local_x,
+            &local_y
+        )) {
+        return 0;
+    }
+
+    Window query_root = None;
+    Window parent = None;
+    Window *children = NULL;
+    unsigned int child_count = 0;
+    if (XQueryTree(
+            display,
+            window,
+            &query_root,
+            &parent,
+            &children,
+            &child_count
+        )) {
+        /* XQueryTree returns children from bottom to top stacking order. */
+        for (unsigned int offset = 0; offset < child_count; offset += 1) {
+            unsigned int index = child_count - offset - 1;
+            if (select_visible_marker_window(
+                    display,
+                    children[index],
+                    root,
+                    marker_root_x,
+                    marker_root_y,
+                    selected_window,
+                    marker_x,
+                    marker_y
+                )) {
+                XFree(children);
+                return 1;
+            }
+        }
+    }
+    if (children != NULL) {
+        XFree(children);
+    }
+
+    *selected_window = window;
+    *marker_x = local_x;
+    *marker_y = local_y;
+    return 1;
+}
+
+static XImage *create_marker_image(
+    Display *display,
+    Visual *visual,
+    unsigned int depth,
+    const uint8_t payload[MARKER_PAYLOAD_BYTES]
+) {
+    if (display == NULL || visual == NULL || depth == 0
+        || visual->class != TrueColor
+        || visual->red_mask == 0
+        || visual->green_mask == 0
+        || visual->blue_mask == 0) {
+        return NULL;
+    }
+
+    XImage *image = XCreateImage(
+        display,
+        visual,
+        depth,
+        ZPixmap,
+        0,
+        NULL,
+        MARKER_WIDTH,
+        MARKER_HEIGHT,
+        BitmapPad(display),
+        0
+    );
+    if (image == NULL || image->bytes_per_line <= 0) {
+        if (image != NULL) {
+            XDestroyImage(image);
+        }
+        return NULL;
+    }
+    size_t row_bytes = (size_t)image->bytes_per_line;
+    if (row_bytes > SIZE_MAX / MARKER_HEIGHT) {
+        XDestroyImage(image);
+        return NULL;
+    }
+    image->data = calloc(row_bytes, MARKER_HEIGHT);
+    if (image->data == NULL) {
+        XDestroyImage(image);
+        return NULL;
+    }
+
+    unsigned long black = 0;
+    unsigned long white = visual->red_mask
+        | visual->green_mask
+        | visual->blue_mask;
+    for (int index = 0; index < MARKER_BITS; index += 1) {
+        unsigned long pixel = payload_bit(payload, index) ? black : white;
+        int cell_x = (index % MARKER_COLUMNS) * MARKER_CELL_SIZE;
+        int cell_y = (index / MARKER_COLUMNS) * MARKER_CELL_SIZE;
+        for (int y = 0; y < MARKER_CELL_SIZE; y += 1) {
+            for (int x = 0; x < MARKER_CELL_SIZE; x += 1) {
+                if (XPutPixel(image, cell_x + x, cell_y + y, pixel) == 0) {
+                    XDestroyImage(image);
+                    return NULL;
+                }
+            }
+        }
+    }
+    return image;
+}
+
 static int draw_marker(const uint8_t payload[MARKER_PAYLOAD_BYTES]) {
     const char *window_id_text = getenv("WINDOWID");
     if (window_id_text == NULL || *window_id_text == '\0') {
@@ -176,37 +346,59 @@ static int draw_marker(const uint8_t payload[MARKER_PAYLOAD_BYTES]) {
         || marker_root_y > MARKER_MAXIMUM_ORIGIN) {
         goto finish;
     }
-    int marker_x = marker_root_x - root_x;
-    int marker_y = marker_root_y - root_y;
-
-    XWindowAttributes attributes;
-    if (!XGetWindowAttributes(display, target, &attributes)
-        || marker_x < 0 || marker_y < 0
-        || marker_x + MARKER_WIDTH > attributes.width
-        || marker_y + MARKER_HEIGHT > attributes.height) {
-        goto finish;
-    }
-
-    GC graphics = XCreateGC(display, target, 0, NULL);
-    if (graphics == NULL) {
-        goto finish;
-    }
-    unsigned long black = BlackPixel(display, screen);
-    unsigned long white = WhitePixel(display, screen);
-    for (int index = 0; index < MARKER_BITS; index += 1) {
-        XSetForeground(display, graphics, payload_bit(payload, index) ? black : white);
-        XFillRectangle(
+    Window draw_target = None;
+    int marker_x = 0;
+    int marker_y = 0;
+    if (!select_visible_marker_window(
             display,
             target,
-            graphics,
-            marker_x + (index % MARKER_COLUMNS) * MARKER_CELL_SIZE,
-            marker_y + (index / MARKER_COLUMNS) * MARKER_CELL_SIZE,
-            MARKER_CELL_SIZE,
-            MARKER_CELL_SIZE
-        );
+            root,
+            marker_root_x,
+            marker_root_y,
+            &draw_target,
+            &marker_x,
+            &marker_y
+        )) {
+        goto finish;
     }
-    XFreeGC(display, graphics);
+
+    XWindowAttributes attributes;
+    if (!XGetWindowAttributes(display, draw_target, &attributes)
+        || attributes.class != InputOutput
+        || attributes.map_state != IsViewable
+        || attributes.visual == NULL
+        || attributes.depth <= 0) {
+        goto finish;
+    }
+    XImage *image = create_marker_image(
+        display,
+        attributes.visual,
+        (unsigned int)attributes.depth,
+        payload
+    );
+    if (image == NULL) {
+        goto finish;
+    }
+    GC graphics = XCreateGC(display, draw_target, 0, NULL);
+    if (graphics == NULL) {
+        XDestroyImage(image);
+        goto finish;
+    }
+    XPutImage(
+        display,
+        draw_target,
+        graphics,
+        image,
+        0,
+        0,
+        marker_x,
+        marker_y,
+        MARKER_WIDTH,
+        MARKER_HEIGHT
+    );
     XSync(display, False);
+    XFreeGC(display, graphics);
+    XDestroyImage(image);
     status = 0;
 
 finish:
