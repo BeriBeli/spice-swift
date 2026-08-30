@@ -1,4 +1,6 @@
+import Darwin
 import Foundation
+import Synchronization
 import Testing
 @testable import SpiceLiveInteractionSupport
 @testable import SwiftSpice
@@ -100,6 +102,113 @@ struct SpiceLiveCampaignManifestTests {
         #expect(persisted.generation == 0)
         #expect(persisted.state == .recording)
         #expect(persisted.stages.isEmpty)
+    }
+
+    @Test func terminalResumeClosesAnUncertainDirectorySyncBeforeReturning() throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let metadata = try Self.metadata()
+        let output = try Self.outputURL()
+        defer { Self.removeOutput(output) }
+        let syncCalls = Mutex(0)
+        let writer = try SpiceLiveCampaignManifestWriter(
+            outputURL: output,
+            directorySync: { descriptor in
+                let call = syncCalls.withLock { count in
+                    count += 1
+                    return count
+                }
+                if call == 2 {
+                    throw SpiceLiveCampaignManifestError.fileOperationFailed(
+                        operation: "fsync_directory",
+                        code: EIO
+                    )
+                }
+                guard Darwin.fsync(descriptor) == 0 else {
+                    throw SpiceLiveCampaignManifestError.fileOperationFailed(
+                        operation: "fsync_directory",
+                        code: errno
+                    )
+                }
+            }
+        )
+        let recorder = try SpiceLiveRealtimeStageRecorder(
+            plan: plan,
+            metadata: metadata,
+            manifestWriter: writer
+        )
+        let callsAfterCreate = syncCalls.withLock { $0 }
+        #expect(callsAfterCreate == 1)
+
+        #expect(throws: (any Error).self) {
+            try recorder.record(
+                run: plan.runs[0],
+                stage: .fixtureStop,
+                outcome: .failed
+            )
+        }
+        let callsAfterFailedRecord = syncCalls.withLock { $0 }
+        #expect(callsAfterFailedRecord == 2)
+        let loadedTerminal = try writer.load()
+        let persistedTerminal = try #require(loadedTerminal)
+        #expect(persistedTerminal.generation == 1)
+        #expect(persistedTerminal.state == .failed)
+        #expect(persistedTerminal.stages.count == 1)
+        #expect(persistedTerminal.stages.last?.outcome == .failed)
+
+        let recovered = try SpiceLiveRealtimeStageRecorder.resume(
+            plan: plan,
+            metadata: metadata,
+            manifestWriter: writer
+        )
+        let callsAfterResume = syncCalls.withLock { $0 }
+        #expect(callsAfterResume == 3)
+        #expect(recovered.snapshot == persistedTerminal)
+        #expect(throws: (any Error).self) {
+            try recovered.record(
+                run: plan.runs[0],
+                stage: .fixtureStart,
+                outcome: .succeeded,
+                evidenceRunID: Self.evidenceID(0)
+            )
+        }
+        #expect(throws: (any Error).self) { _ = try recovered.finalize() }
+    }
+
+    @Test func writerRejectsAValidlyEncodedLedgerEntryFromAnotherCampaign() throws {
+        let fixture = try Self.fixture()
+        let planA = try Self.plan(fixture: fixture)
+        let planB = try SpiceLiveCampaignPlan(
+            campaignID: "b10000000000000f",
+            baselineVersion: fixture.specification.baselineVersion,
+            candidateVersion: fixture.specification.candidateVersion,
+            clusterIDs: fixture.specification.clusterIDs
+        )
+        let resultA = try Self.recorder(plan: planA)
+        defer { Self.removeOutput(resultA.output) }
+        let resultB = try Self.recorder(plan: planB)
+        defer { Self.removeOutput(resultB.output) }
+
+        try resultB.recorder.record(
+            run: planB.runs[0],
+            stage: .fixtureStop,
+            outcome: .succeeded
+        )
+        let foreignEntry = try #require(resultB.recorder.snapshot.stages.last)
+        var foreignCandidate = resultA.recorder.snapshot
+        foreignCandidate.generation = 1
+        foreignCandidate.state = .recording
+        foreignCandidate.stages = [foreignEntry]
+
+        #expect(throws: (any Error).self) {
+            try resultA.writer.persist(foreignCandidate, validating: planA)
+        }
+        let loadedA = try resultA.writer.load()
+        let persistedA = try #require(loadedA)
+        #expect(persistedA == resultA.recorder.snapshot)
+        #expect(persistedA.generation == 0)
+        #expect(persistedA.state == .recording)
+        #expect(persistedA.stages.isEmpty)
     }
 
     @Test func everyStageFailureIncludingTeardownPersistsAndIsTerminal() throws {
