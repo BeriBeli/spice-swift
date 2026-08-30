@@ -150,6 +150,49 @@ struct SpiceLiveStageDriverTests {
         #expect(terminal.maximumConcurrentReaders == 1)
     }
 
+    @Test func taskCancellationClosesANoncooperativeSuspendedReceive() async throws {
+        let fixture = try Self.fixture()
+        defer { Self.removeOutput(fixture.output) }
+        let probe = TransportProbe(
+            inbound: [.noncooperativeSuspend],
+            sendBehavior: .succeed,
+            manifestURL: fixture.output
+        )
+        let driver = SpiceLiveStageDriver(
+            gate: fixture.gate,
+            transport: Self.transport(probe)
+        )
+        let run = Task { try await driver.run() }
+        try await Self.waitUntil {
+            await probe.snapshot().activeReaders == 1
+        }
+
+        run.cancel()
+        let cancellationClosedTransport: Void? = try? await Self.waitUntil {
+            await probe.snapshot().closeCalls == 1
+        }
+        let beforeCleanup = await probe.snapshot()
+        #expect(cancellationClosedTransport != nil)
+        #expect(beforeCleanup.closeCalls == 1)
+        #expect(beforeCleanup.receiveCalls == 1)
+        #expect(beforeCleanup.sendAttempts.isEmpty)
+
+        await probe.emergencyReleaseSuspendedReceiveForTestCleanup()
+        await #expect(throws: (any Error).self) {
+            try await run.value
+        }
+        try await Self.assertTerminalOnce(
+            driver: driver,
+            probe: probe,
+            fixture: fixture,
+            expectedReceiveCalls: 1,
+            expectedSendAttempts: 0
+        )
+        let terminal = await probe.snapshot()
+        #expect(terminal.activeReaders == 0)
+        #expect(terminal.maximumConcurrentReaders == 1)
+    }
+
     @Test func cancellationPersistenceFailureStillClosesSuspendedReceiveOnce() async throws {
         let fixture = try Self.fixture(failingDirectorySyncCall: 5)
         defer { Self.removeOutput(fixture.output) }
@@ -506,6 +549,55 @@ struct SpiceLiveStageDriverTests {
         #expect(fixture.gate.pendingAcknowledgement == acknowledgement)
     }
 
+    @Test func taskCancellationClosesANoncooperativeSuspendedSend() async throws {
+        let fixture = try Self.fixture()
+        defer { Self.removeOutput(fixture.output) }
+        let firstFrame = try #require(Self.frames(fixture: fixture).first)
+        let probe = TransportProbe(
+            inbound: [.frame(firstFrame)],
+            sendBehavior: .noncooperativeSuspend,
+            manifestURL: fixture.output
+        )
+        let driver = SpiceLiveStageDriver(
+            gate: fixture.gate,
+            transport: Self.transport(probe)
+        )
+        let run = Task { try await driver.run() }
+        try await Self.waitUntil {
+            await probe.snapshot().sendAttempts.count == 1
+        }
+        let sent = await probe.snapshot()
+        let acknowledgement = try SpiceLiveStageProtocolCodec
+            .decodeAcknowledgement(sent.sendAttempts[0])
+        #expect(fixture.gate.pendingAcknowledgement == acknowledgement)
+
+        run.cancel()
+        let cancellationClosedTransport: Void? = try? await Self.waitUntil {
+            await probe.snapshot().closeCalls == 1
+        }
+        let beforeCleanup = await probe.snapshot()
+        #expect(cancellationClosedTransport != nil)
+        #expect(beforeCleanup.closeCalls == 1)
+        #expect(beforeCleanup.receiveCalls == 1)
+        #expect(beforeCleanup.sendAttempts.count == 1)
+        #expect(beforeCleanup.completedFrames.isEmpty)
+
+        await probe.emergencyReleaseSuspendedSendForTestCleanup()
+        await #expect(throws: (any Error).self) {
+            try await run.value
+        }
+        try await Self.assertTerminalOnce(
+            driver: driver,
+            probe: probe,
+            fixture: fixture,
+            expectedReceiveCalls: 1,
+            expectedSendAttempts: 1
+        )
+        let terminal = await probe.snapshot()
+        #expect(terminal.completedFrames.isEmpty)
+        #expect(fixture.gate.pendingAcknowledgement == acknowledgement)
+    }
+
     @Test func cancelWinningASendRaceCannotAdvanceTheGate() async throws {
         let fixture = try Self.fixture()
         defer { Self.removeOutput(fixture.output) }
@@ -706,6 +798,7 @@ private extension SpiceLiveStageDriverTests {
             case endOfFile
             case failure(ProbeFailure)
             case suspend
+            case noncooperativeSuspend
         }
 
         enum SendBehavior: Sendable {
@@ -713,6 +806,7 @@ private extension SpiceLiveStageDriverTests {
             case failBeforeWrite
             case partialWrite(byteCount: Int)
             case suspend(resumeSuccessfullyWhenClosed: Bool)
+            case noncooperativeSuspend
         }
 
         struct Snapshot: Sendable {
@@ -794,6 +888,10 @@ private extension SpiceLiveStageDriverTests {
                         Task { await self.cancelSuspendedReceive() }
                     }
                 )
+            case .noncooperativeSuspend:
+                return try await withCheckedThrowingContinuation {
+                    suspendedReceive = $0
+                }
             }
         }
 
@@ -855,6 +953,10 @@ private extension SpiceLiveStageDriverTests {
                 } catch {
                     throw error
                 }
+            case .noncooperativeSuspend:
+                try await withCheckedThrowingContinuation {
+                    suspendedSend = $0
+                }
             }
         }
 
@@ -869,7 +971,8 @@ private extension SpiceLiveStageDriverTests {
                 switch sendBehavior {
                 case .suspend(resumeSuccessfullyWhenClosed: true):
                     continuation.resume()
-                case .suspend, .succeed, .failBeforeWrite, .partialWrite:
+                case .suspend, .noncooperativeSuspend,
+                     .succeed, .failBeforeWrite, .partialWrite:
                     continuation.resume(throwing: CancellationError())
                 }
             }
@@ -977,6 +1080,7 @@ private extension SpiceLiveStageDriverTests {
     ) async throws {
         try await withSpiceLiveTimeout(.seconds(2)) {
             while !(await condition()) {
+                try Task.checkCancellation()
                 await Task.yield()
             }
         }
