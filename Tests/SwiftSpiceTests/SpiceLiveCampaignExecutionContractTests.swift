@@ -238,6 +238,11 @@ struct SpiceLiveCampaignExecutionContractTests {
         defer { Self.removeOutput(legacyOutput) }
         let schemaTwo = try Self.canonicalData(current.recorder.snapshot)
         let legacyBytes = try Self.schemaOneBytes(fromSchemaTwo: schemaTwo)
+        guard let legacySource = String(data: legacyBytes, encoding: .utf8) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        #expect(legacySource.contains("Swift 6.3 / Xcode 27 beta"))
+        #expect(!legacySource.contains(#"Swift 6.3 \/ Xcode 27 beta"#))
         try Self.writePrivate(legacyBytes, to: legacyOutput)
         let legacyWriter = try SpiceLiveCampaignManifestWriter(outputURL: legacyOutput)
         let beforeClassification = try Self.outputState(legacyOutput)
@@ -480,7 +485,10 @@ private extension SpiceLiveCampaignExecutionContractTests {
         object["schema_version"] = 1
         object.removeValue(forKey: "execution_contract")
         object.removeValue(forKey: "execution_contract_digest")
-        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
     }
 
     static func removing(key: String, from data: Data) throws -> Data {
