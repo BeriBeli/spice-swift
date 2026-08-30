@@ -488,19 +488,28 @@ struct SpiceLiveStageSocketTransportTests {
         }
 
         let close = Task { await transport.close() }
-        let closeFinished: Void? = try? await Self.waitUntil {
-            calls.snapshot.rawCloseCalls == 1
+        do {
+            try await Self.waitUntil {
+                calls.shutdownWasObserved
+            }
+        } catch {
+            calls.emergencyReleaseForTestCleanup()
+            await receive.value
+            await send.value
+            await close.value
+            await transport.close()
+            throw error
         }
-        let beforeEmergencyCleanup = calls.snapshot
-        #expect(closeFinished != nil)
-        #expect(beforeEmergencyCleanup.shutdownCalls == 1)
-        #expect(beforeEmergencyCleanup.rawCloseCalls == 1)
-        #expect(!beforeEmergencyCleanup.rawCloseObservedActiveWorker)
+        let beforeWorkerRelease = calls.snapshot
+        #expect(beforeWorkerRelease.shutdownCalls == 1)
+        #expect(beforeWorkerRelease.activeReads == 1)
+        #expect(beforeWorkerRelease.activeWrites == 1)
+        #expect(beforeWorkerRelease.rawCloseCalls == 0)
 
-        calls.emergencyReleaseForTestCleanup()
-        await close.value
+        calls.releaseWorkersForTest()
         await receive.value
         await send.value
+        await close.value
         let terminal = calls.snapshot
         #expect(receiveError.error == .closed)
         #expect(sendError.error == .closed)
@@ -510,6 +519,7 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(terminal.maximumActiveWrites == 1)
         #expect(terminal.shutdownCalls == 1)
         #expect(terminal.rawCloseCalls == 1)
+        #expect(!terminal.rawCloseObservedActiveWorker)
     }
 
     @Test func repeatedCloseCannotAffectAReusedDescriptor() async throws {
@@ -917,6 +927,7 @@ private final class BlockingSocketCalls: Sendable {
     }
 
     private let state = Mutex(State())
+    private let shutdownObserved = ObservationLatch()
     private let releaseRead = DispatchSemaphore(value: 0)
     private let releaseWrite = DispatchSemaphore(value: 0)
 
@@ -951,8 +962,7 @@ private final class BlockingSocketCalls: Sendable {
             },
             shutdown: { [self] _ in
                 state.withLock { $0.shutdownCalls += 1 }
-                releaseRead.signal()
-                releaseWrite.signal()
+                shutdownObserved.signal()
             },
             close: { [self] _ in
                 state.withLock { storage in
@@ -981,11 +991,32 @@ private final class BlockingSocketCalls: Sendable {
         }
     }
 
+    var shutdownWasObserved: Bool {
+        shutdownObserved.isSignaled
+    }
+
+    func releaseWorkersForTest() {
+        releaseRead.signal()
+        releaseWrite.signal()
+    }
+
     func emergencyReleaseForTestCleanup() {
         for _ in 0..<4 {
             releaseRead.signal()
             releaseWrite.signal()
         }
+    }
+}
+
+private final class ObservationLatch: Sendable {
+    private let state = Mutex(false)
+
+    var isSignaled: Bool {
+        state.withLock { $0 }
+    }
+
+    func signal() {
+        state.withLock { $0 = true }
     }
 }
 
