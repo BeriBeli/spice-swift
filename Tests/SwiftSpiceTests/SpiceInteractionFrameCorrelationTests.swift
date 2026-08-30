@@ -22,6 +22,29 @@ struct SpiceInteractionFrameCorrelationTests {
         let record = assembler.finish()
         #expect(record.valid)
         #expect(record.invalidReason == nil)
+        #expect(record.schemaVersion == 2)
+        #expect(record.pairId == "pair-click")
+        #expect(record.version == "v0.2.7")
+        #expect(record.runId == "run-1")
+        #expect(record.order == 1)
+        #expect(record.actionClass == .click)
+        #expect(record.token == Stage3InteractionFixture.token)
+        #expect(record.scheduledNs == Stage3InteractionFixture.ns(0))
+        #expect(record.hostInputNs == Stage3InteractionFixture.ns(10))
+        #expect(record.sendStartedNs == Stage3InteractionFixture.ns(20))
+        #expect(record.sendCompletedNs == Stage3InteractionFixture.ns(25))
+        #expect(record.guestReceivedNs == 1)
+        #expect(record.guestMarkerDrawnNs == 2)
+        #expect(record.displayReceiveNs == Stage3InteractionFixture.ns(30))
+        #expect(record.surfaceReadyNs == Stage3InteractionFixture.ns(40))
+        #expect(record.selectedRevisionReadyNs == Stage3InteractionFixture.ns(50))
+        #expect(record.selectionNs == Stage3InteractionFixture.ns(60))
+        #expect(record.metalCommitNs == Stage3InteractionFixture.ns(70))
+        #expect(record.presentedNs == Stage3InteractionFixture.ns(80))
+        #expect(record.desktopGeneration == marker.desktopGeneration)
+        #expect(record.displayChannelID == marker.displayChannelID)
+        #expect(record.surfaceID == marker.surfaceID)
+        #expect(record.surfaceGeneration == marker.surfaceGeneration)
         #expect(record.deliverySequence == marker.deliverySequence)
         #expect(record.frameRevision == marker.frameRevision)
         #expect(record.markerRevision == Stage3InteractionFixture.payload.markerRevision)
@@ -90,10 +113,27 @@ struct SpiceInteractionFrameCorrelationTests {
             )
             assembler.observeSelected(identity: identity, readyNs: Stage3InteractionFixture.ns(50), selectionNs: Stage3InteractionFixture.ns(60))
             assembler.observeCommitted(identity: identity, at: Stage3InteractionFixture.ns(70))
+            _ = assembler.observePresented(identity: identity, at: Stage3InteractionFixture.ns(80))
+            let missingTiming = assembler.finish()
+            #expect(!missingTiming.valid)
+            #expect(missingTiming.invalidReason == "missing_display_receive")
+            #expect(missingTiming.displayReceiveNs == nil)
+        }
+        do {
+            let assembler = Stage3InteractionFixture.assembler()
+            Stage3InteractionFixture.recordPrelude(on: assembler)
+            let identity = Stage3InteractionFixture.identity(revision: 9, sequence: 40)
+            assembler.observeFrame(
+                snapshot: Stage3InteractionFixture.snapshot(identity: identity, marker: true),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+            )
+            assembler.observeSelected(identity: identity, readyNs: Stage3InteractionFixture.ns(50), selectionNs: Stage3InteractionFixture.ns(60))
+            assembler.observeCommitted(identity: identity, at: Stage3InteractionFixture.ns(70))
             assembler.observePresentationDropped(identity: identity)
             let dropped = assembler.finish()
             #expect(!dropped.valid)
-            #expect(dropped.invalidReason == "missing_display_receive")
+            #expect(dropped.invalidReason == "missing_presented")
+            #expect(dropped.displayReceiveNs == Stage3InteractionFixture.ns(30))
             #expect(dropped.presentedNs == nil)
         }
         do {
@@ -111,6 +151,26 @@ struct SpiceInteractionFrameCorrelationTests {
     }
 
     @Test func observationBudgetAcceptsSixteenAndRejectsTheSeventeenth() {
+        let withinBudget = Stage3InteractionFixture.assembler()
+        Stage3InteractionFixture.recordPrelude(on: withinBudget)
+        for sequence in 1...15 {
+            let identity = Stage3InteractionFixture.identity(
+                revision: UInt64(sequence),
+                sequence: UInt64(sequence)
+            )
+            withinBudget.observeFrame(
+                snapshot: Stage3InteractionFixture.snapshot(identity: identity, marker: false),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+            )
+        }
+        let target = Stage3InteractionFixture.identity(revision: 16, sequence: 16)
+        withinBudget.observeFrame(
+            snapshot: Stage3InteractionFixture.snapshot(identity: target, marker: true),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+        )
+        Stage3InteractionFixture.present(target, on: withinBudget)
+        #expect(withinBudget.finish().valid)
+
         let assembler = Stage3InteractionFixture.assembler()
         Stage3InteractionFixture.recordPrelude(on: assembler)
         for sequence in 1...17 {
@@ -215,9 +275,16 @@ struct SpiceInteractionFrameCorrelationTests {
         }
         #expect(await waitForCorrelationSemaphore(registered) == .success)
         let unrelated = Stage3InteractionFixture.identity(revision: 10, sequence: 41)
+        diagnostics.recordInteractionFrameReceived(
+            Stage3InteractionFixture.snapshot(identity: unrelated, marker: false),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 31, ready: 41)
+        )
         diagnostics.recordInteractionSelected(.init(identity: unrelated, readyNanoseconds: Stage3InteractionFixture.ns(50), selectionNanoseconds: Stage3InteractionFixture.ns(60)))
         diagnostics.recordInteractionCommitted(identity: unrelated, at: Stage3InteractionFixture.ns(70))
         diagnostics.recordInteractionPresented(identity: unrelated, at: Stage3InteractionFixture.ns(80))
+        await #expect(throws: SpiceInteractionTraceCollectionError.presentationWaitAlreadyRegistered) {
+            try await late.waitForExactPresentation()
+        }
         diagnostics.recordInteractionFrameReceived(
             Stage3InteractionFixture.snapshot(identity: target, marker: true),
             sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
@@ -236,11 +303,21 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(await waitForCorrelationSemaphore(cancellationRegistered) == .success)
         cancelledWait.cancel()
         await #expect(throws: CancellationError.self) { try await cancelledWait.value }
-        let replacementWait = Task { try await cancelled.waitForExactPresentation() }
-        _ = try cancelled.finish()
-        await #expect(throws: SpiceInteractionTraceCollectionError.captureAlreadyFinished) {
-            try await replacementWait.value
+        let replacementRegistered = DispatchSemaphore(value: 0)
+        let replacementWait = Task {
+            try await cancelled.waitForExactPresentation {
+                replacementRegistered.signal()
+            }
         }
+        #expect(await waitForCorrelationSemaphore(replacementRegistered) == .success)
+        try Stage3InteractionFixture.recordPrelude(on: cancelled)
+        diagnostics.recordInteractionFrameReceived(
+            Stage3InteractionFixture.snapshot(identity: target, marker: true),
+            sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+        )
+        Stage3InteractionFixture.present(target, using: diagnostics)
+        #expect(try await replacementWait.value == target)
+        #expect(try cancelled.finish().valid)
     }
 
     @Test func finishAndPresentedCallbackAreLinearizedWithoutLateMutation() async throws {
