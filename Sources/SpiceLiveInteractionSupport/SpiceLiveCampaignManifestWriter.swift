@@ -23,10 +23,30 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
     private let directoryPath: String
     private let outputName: String
     private let maximumBytes: Int
+    private let directorySync: @Sendable (Int32) throws -> Void
 
-    package init(
+    package convenience init(
         outputURL: URL,
         maximumBytes: Int = SpiceLiveCampaignManifestWriter.defaultMaximumBytes
+    ) throws {
+        try self.init(
+            outputURL: outputURL,
+            maximumBytes: maximumBytes,
+            directorySync: { descriptor in
+                guard Darwin.fsync(descriptor) == 0 else {
+                    throw SpiceLiveCampaignManifestError.fileOperationFailed(
+                        operation: "fsync_directory",
+                        code: errno
+                    )
+                }
+            }
+        )
+    }
+
+    init(
+        outputURL: URL,
+        maximumBytes: Int = SpiceLiveCampaignManifestWriter.defaultMaximumBytes,
+        directorySync: @escaping @Sendable (Int32) throws -> Void
     ) throws {
         let path = outputURL.path
         guard outputURL.isFileURL,
@@ -54,6 +74,7 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         directoryPath = canonicalParent
         outputName = outputURL.lastPathComponent
         self.maximumBytes = maximumBytes
+        self.directorySync = directorySync
 
         let descriptor = try Self.openDirectory(path: canonicalParent)
         defer { Darwin.close(descriptor) }
@@ -71,7 +92,14 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         }
     }
 
-    package func create(_ manifest: SpiceLiveCampaignManifest) throws {
+    func create(
+        _ manifest: SpiceLiveCampaignManifest,
+        validating plan: SpiceLiveCampaignPlan
+    ) throws {
+        _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
+            manifest: manifest,
+            plan: plan
+        )
         let encoded = try Self.encodedAndValidated(manifest, maximumBytes: maximumBytes)
         guard manifest.generation == 0,
               manifest.state == .recording,
@@ -79,28 +107,39 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
             throw SpiceLiveCampaignManifestError.invalidTransition
         }
         try withTransaction { directoryDescriptor in
-            guard case nil = try readManifest(
-                directoryDescriptor: directoryDescriptor
-            ) else {
+            if let existing = try readManifest(directoryDescriptor: directoryDescriptor) {
+                _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
+                    manifest: existing.manifest,
+                    plan: plan
+                )
                 throw SpiceLiveCampaignManifestError.invalidTransition
             }
             try replace(encoded, directoryDescriptor: directoryDescriptor)
         }
     }
 
-    package func persist(_ manifest: SpiceLiveCampaignManifest) throws {
+    func persist(
+        _ manifest: SpiceLiveCampaignManifest,
+        validating plan: SpiceLiveCampaignPlan
+    ) throws {
+        _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
+            manifest: manifest,
+            plan: plan
+        )
         let encoded = try Self.encodedAndValidated(manifest, maximumBytes: maximumBytes)
 
         try withTransaction { directoryDescriptor in
             let existing = try readManifest(directoryDescriptor: directoryDescriptor)
-            if existing?.data == encoded {
-                guard fsync(directoryDescriptor) == 0 else {
-                    throw operationError("fsync_directory")
-                }
-                return
-            }
             guard let existing else {
                 throw SpiceLiveCampaignManifestError.invalidTransition
+            }
+            _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
+                manifest: existing.manifest,
+                plan: plan
+            )
+            if existing.data == encoded {
+                try directorySync(directoryDescriptor)
+                return
             }
             let (nextGeneration, overflow) = existing.manifest.generation
                 .addingReportingOverflow(1)
@@ -240,9 +279,7 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         }
         guard renameResult == 0 else { throw operationError("replace_output") }
         removeTemporary = false
-        guard fsync(directoryDescriptor) == 0 else {
-            throw operationError("fsync_directory")
-        }
+        try directorySync(directoryDescriptor)
     }
 
     private func readAll(from descriptor: Int32, count: Int) throws -> Data {

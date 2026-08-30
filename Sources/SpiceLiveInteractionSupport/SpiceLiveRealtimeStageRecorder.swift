@@ -33,7 +33,7 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
         manifestWriter: SpiceLiveCampaignManifestWriter
     ) throws {
         let manifest = SpiceLiveCampaignManifest(plan: plan, metadata: metadata)
-        try manifestWriter.create(manifest)
+        try manifestWriter.create(manifest, validating: plan)
         self.plan = plan
         self.manifestWriter = manifestWriter
         state = Mutex(.active(
@@ -60,10 +60,10 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
         guard var manifest = try manifestWriter.load() else {
             throw SpiceLiveCampaignManifestError.invalidManifest
         }
-        _ = try validateAndReplay(
+        _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
             manifest: manifest,
             plan: plan,
-            metadata: metadata
+            expectedMetadata: metadata
         )
         if manifest.state == .recording {
             let (nextGeneration, overflow) = manifest.generation
@@ -73,8 +73,12 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
             }
             manifest.generation = nextGeneration
             manifest.state = .interrupted
-            try manifestWriter.persist(manifest)
         }
+        // Even an unchanged terminal manifest may be the result of a prior
+        // successful rename followed by an uncertain directory fsync. The
+        // exact-byte persist closes that durability window before resume
+        // returns a terminal recorder.
+        try manifestWriter.persist(manifest, validating: plan)
         return SpiceLiveRealtimeStageRecorder(
             plan: plan,
             manifestWriter: manifestWriter,
@@ -112,7 +116,7 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
             }
 
             do {
-                try manifestWriter.persist(candidate.manifest)
+                try manifestWriter.persist(candidate.manifest, validating: plan)
             } catch {
                 state = .poisoned(manifest)
                 throw error
@@ -153,7 +157,7 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
             candidate.generation = nextGeneration
             candidate.state = .finalized
             do {
-                try manifestWriter.persist(candidate)
+                try manifestWriter.persist(candidate, validating: plan)
             } catch {
                 state = .poisoned(manifest)
                 throw error
@@ -237,19 +241,22 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
         failed.generation = nextGeneration
         failed.state = .failed
         do {
-            try manifestWriter.persist(failed)
+            try manifestWriter.persist(failed, validating: plan)
             state = .terminal(failed)
         } catch {
             state = .poisoned(manifest)
             throw error
         }
     }
+}
 
-    private static func validateAndReplay(
+enum SpiceLiveCampaignManifestValidator {
+    static func validateAndReplay(
         manifest: SpiceLiveCampaignManifest,
         plan: SpiceLiveCampaignPlan,
-        metadata: SpiceLiveCampaignManifestMetadata
+        expectedMetadata: SpiceLiveCampaignManifestMetadata? = nil
     ) throws -> SpiceLiveCampaignExecution {
+        let metadata = expectedMetadata ?? manifest.metadata
         let expected = SpiceLiveCampaignManifest(plan: plan, metadata: metadata)
         guard manifest.hasSameImmutableIdentity(as: expected),
               manifest.runs.count == plan.runs.count,
@@ -262,19 +269,25 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
             throw SpiceLiveCampaignManifestError.invalidManifest
         }
 
-        var execution = SpiceLiveCampaignExecution(plan: plan)
-        for (index, persisted) in manifest.stages.enumerated() {
-            if index.isMultiple(of: 13) {
-                _ = try execution.beginNextRun()
+        let execution: SpiceLiveCampaignExecution
+        do {
+            var replay = SpiceLiveCampaignExecution(plan: plan)
+            for (index, persisted) in manifest.stages.enumerated() {
+                if index.isMultiple(of: 13) {
+                    _ = try replay.beginNextRun()
+                }
+                try replay.record(stage: persisted.stage, outcome: persisted.outcome)
+                guard replay.entries.last == persisted else {
+                    throw SpiceLiveCampaignManifestError.invalidManifest
+                }
+                if persisted.outcome == .failed,
+                   index != manifest.stages.index(before: manifest.stages.endIndex) {
+                    throw SpiceLiveCampaignManifestError.invalidManifest
+                }
             }
-            try execution.record(stage: persisted.stage, outcome: persisted.outcome)
-            guard execution.entries.last == persisted else {
-                throw SpiceLiveCampaignManifestError.invalidManifest
-            }
-            if persisted.outcome == .failed,
-               index != manifest.stages.index(before: manifest.stages.endIndex) {
-                throw SpiceLiveCampaignManifestError.invalidManifest
-            }
+            execution = replay
+        } catch {
+            throw SpiceLiveCampaignManifestError.invalidManifest
         }
 
         for runIndex in plan.runs.indices {
@@ -301,11 +314,13 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
             let appendedFailure = manifest.stages.last?.outcome == .failed
             let expectedGeneration = UInt64(manifest.stages.count)
                 + (appendedFailure ? 0 : 1)
-            guard manifest.generation == expectedGeneration else {
+            guard manifest.generation == expectedGeneration,
+                  appendedFailure == execution.campaignFailed else {
                 throw SpiceLiveCampaignManifestError.invalidManifest
             }
         case .interrupted:
-            guard manifest.stages.allSatisfy({ $0.outcome == .succeeded }),
+            guard !execution.campaignFailed,
+                  manifest.stages.allSatisfy({ $0.outcome == .succeeded }),
                   manifest.generation == UInt64(manifest.stages.count + 1) else {
                 throw SpiceLiveCampaignManifestError.invalidManifest
             }
