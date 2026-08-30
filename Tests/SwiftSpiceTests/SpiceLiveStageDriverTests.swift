@@ -193,6 +193,49 @@ struct SpiceLiveStageDriverTests {
         #expect(terminal.maximumConcurrentReaders == 1)
     }
 
+    @Test func cancellationReturningNilIsNotMisclassifiedAsEOF() async throws {
+        let fixture = try Self.fixture()
+        defer { Self.removeOutput(fixture.output) }
+        let probe = TransportProbe(
+            inbound: [.returnNilOnTaskCancellation],
+            sendBehavior: .succeed,
+            manifestURL: fixture.output
+        )
+        let driver = SpiceLiveStageDriver(
+            gate: fixture.gate,
+            transport: Self.transport(probe)
+        )
+        let run = Task { try await driver.run() }
+        try await Self.waitUntil {
+            await probe.snapshot().activeReaders == 1
+        }
+
+        run.cancel()
+        let driverError: SpiceLiveStageDriver.DriverError
+        do {
+            try await run.value
+            Issue.record("cancelled receive unexpectedly completed")
+            return
+        } catch let error as SpiceLiveStageDriver.DriverError {
+            driverError = error
+        } catch {
+            Issue.record("unexpected cancellation error: \(error)")
+            return
+        }
+        #expect(driverError == .cancelled)
+
+        try await Self.assertTerminalOnce(
+            driver: driver,
+            probe: probe,
+            fixture: fixture,
+            expectedReceiveCalls: 1,
+            expectedSendAttempts: 0
+        )
+        let terminal = await probe.snapshot()
+        #expect(terminal.activeReaders == 0)
+        #expect(terminal.maximumConcurrentReaders == 1)
+    }
+
     @Test func cancellationPersistenceFailureStillClosesSuspendedReceiveOnce() async throws {
         let fixture = try Self.fixture(failingDirectorySyncCall: 5)
         defer { Self.removeOutput(fixture.output) }
@@ -344,6 +387,50 @@ struct SpiceLiveStageDriverTests {
             snapshot.requestedMaximumBytes
                 == [SpiceLiveStageProtocolCodec.maximumFrameBytes]
         )
+    }
+
+    @Test(
+        "Transport-originated DriverErrors are receive failures",
+        arguments: TransportDriverFailure.allCases
+    )
+    fileprivate func transportDriverErrorsCannotEscapeTheTerminalTransition(
+        _ failure: TransportDriverFailure
+    ) async throws {
+        let fixture = try Self.fixture()
+        defer { Self.removeOutput(fixture.output) }
+        let probe = TransportProbe(
+            inbound: [.driverFailure(failure.error)],
+            sendBehavior: .succeed,
+            manifestURL: fixture.output
+        )
+        let driver = SpiceLiveStageDriver(
+            gate: fixture.gate,
+            transport: Self.transport(probe)
+        )
+
+        let driverError: SpiceLiveStageDriver.DriverError
+        do {
+            try await driver.run()
+            Issue.record("transport DriverError unexpectedly completed")
+            return
+        } catch let error as SpiceLiveStageDriver.DriverError {
+            driverError = error
+        } catch {
+            Issue.record("unexpected receive error: \(error)")
+            return
+        }
+        #expect(driverError == .receiveFailed)
+
+        try await Self.assertTerminalOnce(
+            driver: driver,
+            probe: probe,
+            fixture: fixture,
+            expectedReceiveCalls: 1,
+            expectedSendAttempts: 0
+        )
+        let terminal = await probe.snapshot()
+        #expect(terminal.activeReaders == 0)
+        #expect(terminal.maximumConcurrentReaders == 1)
     }
 
     @Test func childStagePersistenceFailureSendsNoACKAndIsTerminalOnce() async throws {
@@ -748,6 +835,47 @@ private extension SpiceLiveStageDriverTests {
         }
     }
 
+    enum TransportDriverFailure: CaseIterable, CustomTestStringConvertible {
+        case alreadyRunning
+        case terminal
+        case unexpectedEndOfFile
+        case cancelled
+        case receiveFailed
+        case invalidEventFrame
+        case acknowledgementEncodingFailed
+        case acknowledgementSendFailed
+        case childReportedFailure
+
+        var testDescription: String {
+            switch self {
+            case .alreadyRunning: "already running"
+            case .terminal: "terminal"
+            case .unexpectedEndOfFile: "unexpected EOF"
+            case .cancelled: "cancelled"
+            case .receiveFailed: "receive failed"
+            case .invalidEventFrame: "invalid event frame"
+            case .acknowledgementEncodingFailed: "ACK encoding failed"
+            case .acknowledgementSendFailed: "ACK send failed"
+            case .childReportedFailure: "child reported failure"
+            }
+        }
+
+        var error: SpiceLiveStageDriver.DriverError {
+            switch self {
+            case .alreadyRunning: .alreadyRunning
+            case .terminal: .terminal
+            case .unexpectedEndOfFile: .unexpectedEndOfFile
+            case .cancelled: .cancelled
+            case .receiveFailed: .receiveFailed
+            case .invalidEventFrame: .invalidEventFrame
+            case .acknowledgementEncodingFailed:
+                .acknowledgementEncodingFailed
+            case .acknowledgementSendFailed: .acknowledgementSendFailed
+            case .childReportedFailure: .childReportedFailure
+            }
+        }
+    }
+
     enum SendFailure: CaseIterable, CustomTestStringConvertible {
         case throwBeforeWrite
         case partialWrite
@@ -797,8 +925,10 @@ private extension SpiceLiveStageDriverTests {
             case frame(Data)
             case endOfFile
             case failure(ProbeFailure)
+            case driverFailure(SpiceLiveStageDriver.DriverError)
             case suspend
             case noncooperativeSuspend
+            case returnNilOnTaskCancellation
         }
 
         enum SendBehavior: Sendable {
@@ -839,6 +969,7 @@ private extension SpiceLiveStageDriverTests {
         private var suspendedSend: CheckedContinuation<Void, any Error>?
         private var receiveCancellationRequested = false
         private var sendCancellationRequested = false
+        private let cancellationReturningNil = CancellationReturningNil()
 
         init(
             inbound: [Inbound],
@@ -863,6 +994,8 @@ private extension SpiceLiveStageDriverTests {
             case .endOfFile:
                 return nil
             case let .failure(error):
+                throw error
+            case let .driverFailure(error):
                 throw error
             case .suspend:
                 return try await withTaskCancellationHandler(
@@ -892,6 +1025,8 @@ private extension SpiceLiveStageDriverTests {
                 return try await withCheckedThrowingContinuation {
                     suspendedReceive = $0
                 }
+            case .returnNilOnTaskCancellation:
+                return await cancellationReturningNil.receive()
             }
         }
 
@@ -962,6 +1097,7 @@ private extension SpiceLiveStageDriverTests {
 
         func close() {
             closeCalls += 1
+            cancellationReturningNil.release()
             if let continuation = suspendedReceive {
                 suspendedReceive = nil
                 continuation.resume(throwing: CancellationError())
@@ -994,6 +1130,7 @@ private extension SpiceLiveStageDriverTests {
         }
 
         func emergencyReleaseSuspendedReceiveForTestCleanup() {
+            cancellationReturningNil.release()
             guard let continuation = suspendedReceive else { return }
             suspendedReceive = nil
             continuation.resume(throwing: CancellationError())
@@ -1022,6 +1159,48 @@ private extension SpiceLiveStageDriverTests {
             }
             suspendedSend = nil
             continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    final class CancellationReturningNil: Sendable {
+        private struct Storage {
+            var continuation: CheckedContinuation<Data?, Never>?
+            var cancellationObserved = false
+        }
+
+        private let storage = Mutex(Storage())
+
+        func receive() async -> Data? {
+            await withTaskCancellationHandler(
+                operation: {
+                    await withCheckedContinuation { continuation in
+                        let resumeImmediately = storage.withLock { storage in
+                            if storage.cancellationObserved {
+                                storage.cancellationObserved = false
+                                return true
+                            }
+                            storage.continuation = continuation
+                            return false
+                        }
+                        if resumeImmediately {
+                            continuation.resume(returning: nil)
+                        }
+                    }
+                },
+                onCancel: { release() }
+            )
+        }
+
+        func release() {
+            let continuation = storage.withLock { storage in
+                guard let continuation = storage.continuation else {
+                    storage.cancellationObserved = true
+                    return nil as CheckedContinuation<Data?, Never>?
+                }
+                storage.continuation = nil
+                return continuation
+            }
+            continuation?.resume(returning: nil)
         }
     }
 
