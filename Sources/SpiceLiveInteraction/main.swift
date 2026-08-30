@@ -14,6 +14,8 @@ private struct SpiceLiveOutcome: Sendable {
 
 @MainActor
 private final class SpiceLiveInteractionHarness {
+    private static let initialPresentationRecoveryGrace: Duration = .milliseconds(250)
+
     private let environment: [String: String]
     private let runner: SpiceLiveProcessRunner
     private var window: NSWindow?
@@ -298,23 +300,53 @@ private final class SpiceLiveInteractionHarness {
         sourceBaseline: SpiceDesktopSourceMetrics,
         timeout: Duration
     ) async throws {
-        let deadline = ContinuousClock().now.advanced(by: timeout)
-        while ContinuousClock().now < deadline {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var firstCommitObservedAt: ContinuousClock.Instant?
+        var recoveryPolicy = SpiceLiveInitialPresentationRecoveryPolicy(
+            graceInterval: Self.initialPresentationRecoveryGrace
+        )
+        var recoveryTriggered = false
+        var recoveryRequestAccepted = false
+        while clock.now < deadline {
             hostingView?.layoutSubtreeIfNeeded()
             window?.displayIfNeeded()
             let metrics = diagnostics.snapshot()
-            if let window,
-               let hostingView,
-               window.isVisible,
-               window.occlusionState.contains(.visible),
-               hostingView.bounds.width > 0,
-               hostingView.bounds.height > 0,
-               hostingView.visibleRect.width > 0,
-               hostingView.visibleRect.height > 0,
-               desktop.metrics().visibleSubscriptions == 1,
-               metrics.metalCommandBuffersCommitted > baseline.metalCommandBuffersCommitted,
-               metrics.metalPresentedFrames > baseline.metalPresentedFrames {
+            let sourceMetrics = desktop.metrics()
+            let windowVisible = isForegroundFramebufferVisible
+            let subscriptionVisible = sourceMetrics.visibleSubscriptions == 1
+            let committedDelta = delta(
+                metrics.metalCommandBuffersCommitted,
+                from: baseline.metalCommandBuffersCommitted
+            )
+            let presentedDelta = delta(
+                metrics.metalPresentedFrames,
+                from: baseline.metalPresentedFrames
+            )
+            let observedAt = clock.now
+            if committedDelta > 0, firstCommitObservedAt == nil {
+                firstCommitObservedAt = observedAt
+            }
+            if windowVisible,
+               subscriptionVisible,
+               committedDelta > 0,
+               presentedDelta > 0 {
                 return
+            }
+            let elapsedSinceFirstCommit = firstCommitObservedAt.map {
+                $0.duration(to: observedAt)
+            } ?? .zero
+            if recoveryPolicy.observe(.init(
+                windowVisible: windowVisible,
+                subscriptionVisible: subscriptionVisible,
+                committedDelta: committedDelta,
+                presentedDelta: presentedDelta,
+                elapsedSinceFirstCommit: elapsedSinceFirstCommit
+            )) == .requestAuthoritativeLatest {
+                recoveryTriggered = true
+                recoveryRequestAccepted = findFramebuffer(
+                    in: hostingView
+                )?.requestAuthoritativeLatestForInitialPresentation() == true
             }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -347,8 +379,24 @@ private final class SpiceLiveInteractionHarness {
             "drawable_miss_delta=\(delta(metrics.metalDrawableMisses, from: baseline.metalDrawableMisses))",
             "gpu_busy_delta=\(delta(metrics.metalGPUBusySkips, from: baseline.metalGPUBusySkips))",
             "metal_error_delta=\(delta(metrics.metalPresentationErrors, from: baseline.metalPresentationErrors))",
+            "initial_recovery_triggered=\(recoveryTriggered)",
+            "initial_recovery_request_accepted=\(recoveryRequestAccepted)",
+            "first_commit_observed=\(firstCommitObservedAt != nil)",
+            "first_commit_to_timeout=\(firstCommitObservedAt.map { String(describing: $0.duration(to: clock.now)) } ?? "none")",
         ].joined(separator: ",")
         throw SpiceLiveInteractionSupportError.operationTimedOut
+    }
+
+    private var isForegroundFramebufferVisible: Bool {
+        guard let window,
+              let hostingView else { return false }
+        return window.isVisible
+            && window.occlusionState.contains(.visible)
+            && !hostingView.isHiddenOrHasHiddenAncestor
+            && hostingView.bounds.width > 0
+            && hostingView.bounds.height > 0
+            && hostingView.visibleRect.width > 0
+            && hostingView.visibleRect.height > 0
     }
 
     private func waitForVisibleSubscription(

@@ -1179,6 +1179,19 @@ package final class SpiceFramebufferView: NSView {
         }
     }
 
+    /// Requests one authoritative publication through this view's existing
+    /// visible subscription. Selection and Metal submission remain governed by
+    /// the normal ready latch and presentation pacing paths.
+    @discardableResult
+    package func requestAuthoritativeLatestForInitialPresentation() -> Bool {
+        guard subscriptionDemand == .visible,
+              selectedRevision != nil,
+              let subscription else { return false }
+        requiresFrameRedraw = true
+        subscription.requestLatest()
+        return true
+    }
+
     private func accept(_ revision: SpiceFrameRevision) {
         if let selectedRevision,
            selectedRevision.surface == revision.surface,
