@@ -747,6 +747,136 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(record.selectionNs == retryReady + 10)
     }
 
+    @Test func markerlessDropAndFailureRetriesCannotPolluteTheExactMarkerTarget() {
+        let anchor = ContinuousClock().now
+        let markerlessTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 50,
+            readyOffset: 60
+        )
+        let exactTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 80,
+            readyOffset: 90
+        )
+        let markerlessReceive = SpiceInteractionHostClock.nanoseconds(
+            for: markerlessTiming.messageReceivedAt
+        )!
+        let markerlessReady = SpiceInteractionHostClock.nanoseconds(
+            for: markerlessTiming.surfaceReadyAt
+        )!
+        let exactReady = SpiceInteractionHostClock.nanoseconds(
+            for: exactTiming.surfaceReadyAt
+        )!
+        let markerlessIdentity = identity(frameRevision: 13, deliverySequence: 651)
+        let unrelatedIdentity = identity(frameRevision: 14, deliverySequence: 652)
+        let exactIdentity = identity(frameRevision: 23, deliverySequence: 653)
+        let assembler = makeAssembler()
+        recordInputAndGuest(on: assembler, beforeDisplayReceiveNs: markerlessReceive)
+        assembler.observeFrame(
+            snapshot: snapshot(identity: markerlessIdentity, pixels: blankPixels),
+            sourceTiming: markerlessTiming
+        )
+        assembler.observeSelected(
+            identity: markerlessIdentity,
+            readyNs: markerlessReady,
+            selectionNs: markerlessReady + 1
+        )
+        assembler.observeCommitted(identity: markerlessIdentity, at: markerlessReady + 2)
+
+        // A drawable drop ends the markerless commit even though it cannot
+        // complete this capture. Its same-identity authoritative retry must be
+        // accepted without manufacturing duplicate-selection evidence.
+        assembler.observePresentationDropped(identity: markerlessIdentity)
+        assembler.observeSelected(
+            identity: markerlessIdentity,
+            readyNs: markerlessReady,
+            selectionNs: markerlessReady + 3
+        )
+        assembler.observeCommitted(identity: markerlessIdentity, at: markerlessReady + 4)
+
+        // Metal command failure uses the same exact-attempt boundary. A second
+        // retry remains markerless and still cannot poison a later target.
+        assembler.observePresentationDropped(identity: markerlessIdentity)
+        assembler.observeSelected(
+            identity: markerlessIdentity,
+            readyNs: markerlessReady,
+            selectionNs: markerlessReady + 5
+        )
+        assembler.observeCommitted(identity: markerlessIdentity, at: markerlessReady + 6)
+
+        // Markerless selection is never the capture target. If its explicit
+        // outcome callback has not linearized before another authoritative
+        // delivery, the same identity may still rebind without poisoning the
+        // later exact marker evidence.
+        assembler.observeSelected(
+            identity: markerlessIdentity,
+            readyNs: markerlessReady,
+            selectionNs: markerlessReady + 7
+        )
+        assembler.observeCommitted(identity: markerlessIdentity, at: markerlessReady + 8)
+
+        assembler.observeFrame(
+            snapshot: markerSnapshot(identity: exactIdentity, markerRevision: 77),
+            sourceTiming: exactTiming
+        )
+        assembler.observeSelected(
+            identity: exactIdentity,
+            readyNs: exactReady,
+            selectionNs: exactReady + 10
+        )
+        assembler.observeCommitted(identity: exactIdentity, at: exactReady + 20)
+
+        // Late outcomes from either the old markerless identity or a wholly
+        // unrelated identity cannot clear the exact target's current commit.
+        assembler.observePresentationDropped(identity: markerlessIdentity)
+        assembler.observePresentationDropped(identity: unrelatedIdentity)
+        _ = assembler.observePresented(identity: exactIdentity, at: exactReady + 30)
+        let record = assembler.finish()
+
+        #expect(record.valid)
+        #expect(record.invalidReason == nil)
+        #expect(record.frameRevision == exactIdentity.frameRevision)
+        #expect(record.deliverySequence == exactIdentity.deliverySequence)
+        #expect(record.selectedRevisionReadyNs == exactReady)
+        #expect(record.selectionNs == exactReady + 10)
+        #expect(record.metalCommitNs == exactReady + 20)
+        #expect(record.presentedNs == exactReady + 30)
+    }
+
+    @Test func exactMarkerCannotRetryAfterCommitWithoutAnExplicitOutcome() {
+        let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
+        let receive = SpiceInteractionHostClock.nanoseconds(for: timing.messageReceivedAt)!
+        let ready = SpiceInteractionHostClock.nanoseconds(for: timing.surfaceReadyAt)!
+        let exactIdentity = identity(deliverySequence: 654)
+        let assembler = makeAssembler()
+        recordInputAndGuest(on: assembler, beforeDisplayReceiveNs: receive)
+        assembler.observeFrame(
+            snapshot: markerSnapshot(identity: exactIdentity, markerRevision: 77),
+            sourceTiming: timing
+        )
+        assembler.observeSelected(
+            identity: exactIdentity,
+            readyNs: ready,
+            selectionNs: ready + 10
+        )
+        assembler.observeCommitted(identity: exactIdentity, at: ready + 20)
+
+        assembler.observeSelected(
+            identity: exactIdentity,
+            readyNs: ready,
+            selectionNs: ready + 30
+        )
+        _ = assembler.observePresented(identity: exactIdentity, at: ready + 40)
+        let record = assembler.finish()
+
+        #expect(!record.valid)
+        #expect(record.invalidReason == "duplicate_selection_after_commit")
+        #expect(record.selectionNs == ready + 10)
+        #expect(record.metalCommitNs == ready + 20)
+        #expect(record.presentedNs == ready + 40)
+    }
+
     @Test func presentationOrderingFailsClosedButOtherInFlightIdentityIsIgnored() {
         let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
         let receive = SpiceInteractionHostClock.nanoseconds(for: timing.messageReceivedAt)!
