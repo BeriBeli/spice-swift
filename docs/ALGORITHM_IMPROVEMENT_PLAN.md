@@ -519,6 +519,23 @@ are resolved. This closes only local execution-identity admission. It performs
 no process, SSH, GUI, Rocky, or external SPICE effect and produces no latency,
 CPU/RSS, release, or AIP-44 claim.
 
+AIP-00h2b1 is merged on PRs #68-#69 as main commit `1d3674f`. A bounded
+canonical v1 child event now binds the exact campaign, run, evidence, action,
+stage, sequence, and previous manifest generation; its acknowledgement copies
+that full identity and adds the durably persisted generation. The local gate
+accepts only the fixed `(preArm, arm, postArm) x 3` order, constructs no ACK
+until synchronous manifest publication succeeds, and will not advance until
+that exact ACK delivery is confirmed. Wrong, replayed, reordered, stale,
+uncertain, EOF, cancellation, and ACK-delivery paths become terminal at most
+once with zero retry. Four Tests review findings expanded full ACK mutation,
+meaningful over-4-KiB JSON, repeated terminal no-op proof, and no-pending-ACK
+EOF/cancel windows; all were fixed test-first, replied to, and resolved.
+Combined CI run `33326178174` passed build, public API, full tests,
+AddressSanitizer, and coverage in 17m49s, and exact combined-head review found
+no issue. This is a local codec and persistence gate only. It performs no
+transport, process, fixture, SSH, RemoteRocky, artifact, or live SPICE effect
+and produces no latency, CPU/RSS, release, or AIP-44 claim.
+
 AIP-00h2 proceeds in four reviewable layers before any new real campaign:
 
 1. **h2a execution contract:** move the live manifest to a new schema that
@@ -917,3 +934,4 @@ behavior remain separate acceptance gates.
 | 2026-08-30 | AIP-00 | Keep AIP-00g deterministic and side-effect-free; place real-time stage persistence, artifact manifests, campaign orchestration, and RemoteRocky effects in AIP-00h | The strict evaluator must remain independent of process, UI, and fixture behavior. AIP-00g therefore accepts only a complete canonical plan, ledger, record, resource, and typed evidence-identity set. AIP-00h must persist outcomes as effects occur so tests or post-processing cannot substitute a synthesized successful ledger for actual execution. |
 | 2026-08-30 | AIP-00 | Merge the AIP-00h1 persistence boundary before runner effects, then require a typed execution contract before any new Rocky campaign | Exclusive create, persist-before-swap, terminal recovery, full plan replay, and atomic publication prevent a synthesized or replayed success. Source commits alone do not prove which Release binaries, runner, guest image, or fixture sources executed, so AIP-00h2 must bind those hashes in a new manifest schema before SSH/process effects begin. |
 | 2026-08-31 | AIP-00 | Close AIP-00h2a before implementing any stage transport, and keep AIP-00h2b local and ACK-gated | The new schema-2 execution identity prevents a campaign from starting with ambiguous binaries, runner, image, guest build, fixture, pointer mode, or protocol. The next layer may add only canonical bounded child events, synchronous recorder persistence, and exact-generation ACKs; actual duplex processes, SSH/RemoteRocky effects, resource collection, artifact publication, and paired execution remain later layers. |
+| 2026-08-31 | AIP-00 | Split AIP-00h2b into a synchronous durable gate and a later asynchronous driver | Canonical event identity, persist-before-ACK, exact ACK delivery, and durable-once terminal behavior can be proven without an async transport. AIP-00h2b1 therefore closes that synchronous state machine first; h2b2 may add only a Sendable transport abstraction and single-reader driver, while actual file descriptors, child processes, SSH/RemoteRocky, resources, and artifacts remain h2c. |
