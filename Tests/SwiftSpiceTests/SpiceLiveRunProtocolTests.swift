@@ -51,6 +51,12 @@ struct SpiceLiveRunProtocolTests {
         ) + "spice=127.0.0.1:15945\n")
         invalidProtocolOutputs.append(Stage3LiveRunFixture.statusOutput(
             runDirectory: runDirectory
+        ) + "spice_listener=ready\n")
+        invalidProtocolOutputs.append(Stage3LiveRunFixture.statusOutput(
+            runDirectory: runDirectory
+        ) + "control_listener=not-ready\n")
+        invalidProtocolOutputs.append(Stage3LiveRunFixture.statusOutput(
+            runDirectory: runDirectory
         ) + "run_evidence=\(runDirectory)\n")
         let validLines = Stage3LiveRunFixture.statusOutput(
             runDirectory: runDirectory
@@ -64,6 +70,12 @@ struct SpiceLiveRunProtocolTests {
         )
         invalidProtocolOutputs.append(
             (Array(validLines.prefix(3)) + Array(validLines.dropFirst(4))).joined(separator: "\n")
+        )
+        invalidProtocolOutputs.append(
+            (Array(validLines.prefix(6)) + Array(validLines.dropFirst(7))).joined(separator: "\n")
+        )
+        invalidProtocolOutputs.append(
+            (Array(validLines.prefix(7)) + Array(validLines.dropFirst(8))).joined(separator: "\n")
         )
         for output in invalidProtocolOutputs {
             #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
@@ -281,11 +293,15 @@ struct SpiceLiveRunProtocolTests {
                 Data(line.dropLast()),
                 Data((" " + String(decoding: line, as: UTF8.self)).utf8),
                 line + line,
-                Data(repeating: 0x61, count: 64 * 1_024 + 1),
+                Data(
+                    repeating: 0x61,
+                    count: SpiceRemoteLiveConfiguration.maximumCollectorRecordBytes + 1
+                ),
                 Data(String(decoding: line, as: UTF8.self).replacingOccurrences(
                     of: "\"schema_version\":2",
                     with: "\"schema_version\":1"
                 ).utf8),
+                Stage3LiveRunFixture.canonicalRecordLine(runID: configuration.runID),
             ]
             for malformed in malformedInputs {
                 await #expect(throws: (any Error).self) {
@@ -383,6 +399,9 @@ struct SpiceLiveRunProtocolTests {
         }
         #expect(success.completed)
         #expect(!success.failed)
+        #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+            _ = try SpiceLiveSingleRunExecution(steps: Array(steps.dropLast()))
+        }
     }
 
     @Test func singleRunAppendFailuresAreTerminalAndCaptureRetryIsExact() throws {
@@ -547,6 +566,8 @@ private enum Stage3LiveRunFixture {
         control=\(control)
         resolution=1280x720
         run_evidence=\(runDirectory)
+        spice_listener=ready
+        control_listener=ready
         LISTEN diagnostic may follow required lines
 
         """

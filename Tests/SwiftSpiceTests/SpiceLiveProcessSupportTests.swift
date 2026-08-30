@@ -269,7 +269,7 @@ private enum Stage3ProcessFixture {
 
     static func withTemporaryDirectory<Result: Sendable>(
         _ operation: (URL) async throws -> Result
-    ) async rethrows -> Result {
+    ) async throws -> Result {
         let directory = FileManager.default.temporaryDirectory.appending(
             path: "swiftspice-stage3-process-output-\(UUID().uuidString)",
             directoryHint: .isDirectory
