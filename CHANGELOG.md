@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-08-30
+
 ### Added
 
 - Added a deterministic live click/key/motion cluster and paired-artifact
@@ -385,7 +387,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/BeriBeli/spice-swift/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/BeriBeli/spice-swift/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/BeriBeli/spice-swift/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/BeriBeli/spice-swift/compare/v0.3.0...v0.3.1
