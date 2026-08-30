@@ -73,6 +73,35 @@ struct SpiceLiveCampaignManifestTests {
         #expect(recorder.snapshot.runs[0].evidenceRunID == expectedEvidenceID)
     }
 
+    @Test func onlyOneActiveRecorderMayOwnARecordingManifest() throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let metadata = try Self.metadata()
+        let output = try Self.outputURL()
+        defer { Self.removeOutput(output) }
+        let writer = try SpiceLiveCampaignManifestWriter(outputURL: output)
+        let firstRecorder = try SpiceLiveRealtimeStageRecorder(
+            plan: plan,
+            metadata: metadata,
+            manifestWriter: writer
+        )
+
+        #expect(throws: (any Error).self) {
+            _ = try SpiceLiveRealtimeStageRecorder(
+                plan: plan,
+                metadata: metadata,
+                manifestWriter: writer
+            )
+        }
+
+        let loadedManifest = try writer.load()
+        let persisted = try #require(loadedManifest)
+        #expect(persisted == firstRecorder.snapshot)
+        #expect(persisted.generation == 0)
+        #expect(persisted.state == .recording)
+        #expect(persisted.stages.isEmpty)
+    }
+
     @Test func everyStageFailureIncludingTeardownPersistsAndIsTerminal() throws {
         for failureOffset in Self.stages.indices {
             let fixture = try Self.fixture()
