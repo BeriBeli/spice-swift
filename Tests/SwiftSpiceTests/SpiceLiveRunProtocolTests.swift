@@ -380,7 +380,9 @@ struct SpiceLiveRunProtocolTests {
         let click = try execution.beginNextStep(readiness: permit)
         #expect(click.actionClass == .click)
         try execution.recordExactPresentation(order: click.order)
-        try execution.recordLocalAppend(order: click.order)
+        try execution.recordLocalAppend(
+            Stage3LiveRunFixture.validRecord(for: click)
+        )
         #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
             _ = try execution.beginNextStep(readiness: nil)
         }
@@ -394,8 +396,9 @@ struct SpiceLiveRunProtocolTests {
             )
             #expect(step.actionClass == expectedAction)
             try success.recordExactPresentation(order: step.order)
-            try success.recordLocalAppend(order: step.order)
-            try success.recordRemoteAppend(order: step.order)
+            let record = Stage3LiveRunFixture.validRecord(for: step)
+            try success.recordLocalAppend(record)
+            try success.recordRemoteAppend(record)
         }
         #expect(success.completed)
         #expect(!success.failed)
@@ -422,7 +425,9 @@ struct SpiceLiveRunProtocolTests {
         )
         try remoteBeforeLocal.recordExactPresentation(order: remoteBeforeLocalStep.order)
         #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
-            try remoteBeforeLocal.recordRemoteAppend(order: remoteBeforeLocalStep.order)
+            try remoteBeforeLocal.recordRemoteAppend(
+                Stage3LiveRunFixture.validRecord(for: remoteBeforeLocalStep)
+            )
         }
         #expect(remoteBeforeLocal.failed)
 
@@ -708,6 +713,40 @@ private enum Stage3LiveRunFixture {
             markerChecksum: "8808062b"
         )
         return canonicalRecordLine(record)
+    }
+
+    static func validRecord(
+        for step: SpiceLiveInteractionClusterPlan.Step,
+        runID: String = "valid-run"
+    ) -> SpiceInteractionTraceRecord {
+        SpiceInteractionTraceRecord(
+            pairId: step.pairID,
+            version: "v0.2.7",
+            runId: runID,
+            order: step.order,
+            actionClass: step.actionClass,
+            token: step.token,
+            scheduledNs: 1,
+            hostInputNs: 2,
+            sendStartedNs: 3,
+            sendCompletedNs: 4,
+            guestReceivedNs: 1,
+            guestMarkerDrawnNs: 2,
+            displayReceiveNs: 5,
+            surfaceReadyNs: 6,
+            selectedRevisionReadyNs: 7,
+            selectionNs: 8,
+            metalCommitNs: 9,
+            presentedNs: 10,
+            displayChannelID: 0,
+            surfaceID: 1,
+            surfaceGeneration: 2,
+            desktopGeneration: 3,
+            frameRevision: 4,
+            deliverySequence: 5,
+            markerRevision: 6,
+            markerChecksum: String(format: "%08x", step.checksum)
+        )
     }
 
     static func canonicalRecordLine(_ record: SpiceInteractionTraceRecord) -> Data {
