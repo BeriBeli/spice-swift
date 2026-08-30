@@ -140,6 +140,16 @@ struct SpiceLiveCampaignExecutionContractTests {
         #expect(Set(variants.map(\.digest)).count == variants.count)
     }
 
+    @Test func canonicalFixtureContractHasExactKnownDigest() throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let metadata = try Self.metadata()
+        let contract = try Self.contract(plan: plan, metadata: metadata)
+
+        #expect(contract.stageProtocolVersion == .v1)
+        #expect(contract.digest == Self.canonicalContractDigest)
+    }
+
     @Test func recorderRejectsContractMismatchBeforeCreatingOrReplacingOutput() throws {
         let fixture = try Self.fixture()
         let plan = try Self.plan(fixture: fixture)
@@ -233,6 +243,8 @@ struct SpiceLiveCampaignExecutionContractTests {
         let beforeClassification = try Self.outputState(legacyOutput)
         let legacyClassification = try legacyWriter.classification()
         #expect(legacyClassification == .legacySchema1)
+        let bytesAfterClassification = try Data(contentsOf: legacyOutput)
+        #expect(bytesAfterClassification == legacyBytes)
         let afterClassification = try Self.outputState(legacyOutput)
         #expect(afterClassification == beforeClassification)
 
@@ -275,7 +287,7 @@ struct SpiceLiveCampaignExecutionContractTests {
         )
         defer { Self.removeOutput(seed.output) }
         let canonical = try Self.canonicalData(seed.recorder.snapshot)
-        let malformedInputs = try [
+        var malformedInputs = try [
             Self.removing(key: "execution_contract", from: canonical),
             Self.removing(key: "execution_contract_digest", from: canonical),
             Self.replacing(
@@ -283,9 +295,28 @@ struct SpiceLiveCampaignExecutionContractTests {
                 with: Self.hash("0"),
                 in: canonical
             ),
+            Self.duplicatingTopLevel(key: "execution_contract", in: canonical),
+            Self.duplicatingTopLevel(key: "execution_contract_digest", in: canonical),
+            Self.duplicatingExecutionContractField(
+                key: "baseline_version",
+                in: canonical
+            ),
+            Self.duplicatingExecutionContractField(
+                key: "stage_protocol_version",
+                in: canonical
+            ),
             Self.duplicatingSchemaVersion(in: canonical),
             Self.addingUnexpectedIdentity(in: canonical),
         ]
+        for key in Self.executionContractRequiredKeys {
+            malformedInputs.append(
+                try Self.removingExecutionContractField(key: key, from: canonical)
+            )
+            malformedInputs.append(
+                try Self.nullingExecutionContractField(key: key, in: canonical)
+            )
+        }
+        #expect(malformedInputs.count == 39)
 
         for bytes in malformedInputs {
             let output = try Self.outputURL()
@@ -293,6 +324,8 @@ struct SpiceLiveCampaignExecutionContractTests {
             try Self.writePrivate(bytes, to: output)
             let writer = try SpiceLiveCampaignManifestWriter(outputURL: output)
             #expect(throws: (any Error).self) { _ = try writer.classification() }
+            let bytesAfterClassification = try Data(contentsOf: output)
+            #expect(bytesAfterClassification == bytes)
             #expect(throws: (any Error).self) {
                 _ = try SpiceLiveRealtimeStageRecorder.resume(
                     plan: plan,
@@ -308,7 +341,26 @@ struct SpiceLiveCampaignExecutionContractTests {
 }
 
 private extension SpiceLiveCampaignExecutionContractTests {
+    static let canonicalContractDigest =
+        "dda67088a3dc4c61e906d344d0bec264bf85099f163d9b47aa83f2cd4fa1999d"
     static let remoteImageReference = "registry.example/swiftspice/perf:v0.3.4"
+    static let executionContractRequiredKeys = [
+        "baseline_version",
+        "candidate_version",
+        "baseline_source_commit",
+        "candidate_source_commit",
+        "baseline_release_binary_sha256",
+        "candidate_release_binary_sha256",
+        "runner_source_commit",
+        "runner_release_binary_sha256",
+        "remote_image_reference",
+        "remote_image_digest",
+        "guest_build_manifest_sha256",
+        "fixture_sources_sha256",
+        "control_source_sha256",
+        "pointer_mode",
+        "stage_protocol_version",
+    ]
 
     static func fixture() throws -> SpicePairedInteractionArtifactTests.Fixture {
         try SpicePairedInteractionArtifactTests.makeFixture(pointerMode: .absolute)
@@ -443,6 +495,99 @@ private extension SpiceLiveCampaignExecutionContractTests {
         var object = try #require(decodedObject as? [String: Any])
         object[key] = value
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+
+    static func removingExecutionContractField(
+        key: String,
+        from data: Data
+    ) throws -> Data {
+        let decodedObject = try JSONSerialization.jsonObject(with: data)
+        var object = try #require(decodedObject as? [String: Any])
+        var contract = try #require(object["execution_contract"] as? [String: Any])
+        contract.removeValue(forKey: key)
+        object["execution_contract"] = contract
+        return try canonicalJSONObjectData(object)
+    }
+
+    static func nullingExecutionContractField(
+        key: String,
+        in data: Data
+    ) throws -> Data {
+        let decodedObject = try JSONSerialization.jsonObject(with: data)
+        var object = try #require(decodedObject as? [String: Any])
+        var contract = try #require(object["execution_contract"] as? [String: Any])
+        contract[key] = NSNull()
+        object["execution_contract"] = contract
+        return try canonicalJSONObjectData(object)
+    }
+
+    static func duplicatingTopLevel(key: String, in data: Data) throws -> Data {
+        let decodedObject = try JSONSerialization.jsonObject(with: data)
+        let object = try #require(decodedObject as? [String: Any])
+        let value = try #require(object[key])
+        return try duplicating(
+            key: key,
+            value: value,
+            in: data
+        )
+    }
+
+    static func duplicatingExecutionContractField(
+        key: String,
+        in data: Data
+    ) throws -> Data {
+        let decodedObject = try JSONSerialization.jsonObject(with: data)
+        let object = try #require(decodedObject as? [String: Any])
+        let contract = try #require(object["execution_contract"] as? [String: Any])
+        let value = try #require(contract[key])
+        let canonicalContract = try canonicalJSONObjectData(contract)
+        let duplicatedContract = try duplicating(
+            key: key,
+            value: value,
+            in: canonicalContract
+        )
+        let source = try #require(String(data: data, encoding: .utf8))
+        let contractSource = try #require(
+            String(data: canonicalContract, encoding: .utf8)
+        )
+        let duplicateSource = try #require(
+            String(data: duplicatedContract, encoding: .utf8)
+        )
+        guard let range = source.range(of: contractSource) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var duplicate = source
+        duplicate.replaceSubrange(range, with: duplicateSource)
+        return Data(duplicate.utf8)
+    }
+
+    static func duplicating(key: String, value: Any, in data: Data) throws -> Data {
+        let source = try #require(String(data: data, encoding: .utf8))
+        let wrapped = try canonicalJSONObjectData(["value": value])
+        let wrappedSource = try #require(String(data: wrapped, encoding: .utf8))
+        let prefix = "{\"value\":"
+        guard wrappedSource.hasPrefix(prefix), wrappedSource.last == "}" else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let valueStart = wrappedSource.index(
+            wrappedSource.startIndex,
+            offsetBy: prefix.count
+        )
+        let valueSource = wrappedSource[valueStart..<wrappedSource.index(before: wrappedSource.endIndex)]
+        let field = "\"\(key)\":\(valueSource)"
+        guard let range = source.range(of: field) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var duplicate = source
+        duplicate.replaceSubrange(range, with: "\(field),\(field)")
+        return Data(duplicate.utf8)
+    }
+
+    static func canonicalJSONObjectData(_ object: Any) throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
     }
 
     static func duplicatingSchemaVersion(in data: Data) throws -> Data {
