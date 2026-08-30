@@ -207,16 +207,23 @@ struct SpiceLiveStageSocketTransportTests {
         _ scenario: InvalidWriteScenario
     ) async throws {
         let frame = Data("ack\n".utf8)
-        let result: SpiceLiveStageSocketSystemCalls.WriteResult
+        let writes: [SpiceLiveStageSocketSystemCalls.WriteResult]
+        let expectedOffsets: [Int]
         switch scenario {
         case .brokenPipe:
-            result = .failed(errno: EPIPE)
+            writes = [.failed(errno: EPIPE)]
+            expectedOffsets = [0]
         case .zeroProgress:
-            result = .written(0)
+            writes = [.written(0)]
+            expectedOffsets = [0]
         case .overCount:
-            result = .written(frame.count + 1)
+            writes = [.written(frame.count + 1)]
+            expectedOffsets = [0]
+        case .partialProgressOverCount:
+            writes = [.written(2), .written(3)]
+            expectedOffsets = [0, 2]
         }
-        let calls = ScriptedSocketCalls(writes: [result])
+        let calls = ScriptedSocketCalls(writes: writes)
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 44,
             systemCalls: calls.systemCalls
@@ -229,10 +236,10 @@ struct SpiceLiveStageSocketTransportTests {
         switch scenario {
         case .brokenPipe:
             #expect(error == .sendFailed(EPIPE))
-        case .zeroProgress, .overCount:
+        case .zeroProgress, .overCount, .partialProgressOverCount:
             #expect(error == .invalidSystemCallResult)
         }
-        #expect(calls.snapshot.writeOffsets == [0])
+        #expect(calls.snapshot.writeOffsets == expectedOffsets)
         await transport.close()
     }
 
@@ -441,8 +448,14 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(calls.snapshot.rawCloseCalls == 1)
     }
 
-    @Test func closeUnblocksWorkersBeforeRawDescriptorClose() async throws {
-        let calls = BlockingSocketCalls()
+    @Test(
+        "Close maps both failed and EOF wakeups after worker retirement",
+        arguments: BlockingReceiveOutcome.allCases
+    )
+    fileprivate func closeUnblocksWorkersBeforeRawDescriptorClose(
+        _ receiveOutcome: BlockingReceiveOutcome
+    ) async throws {
+        let calls = BlockingSocketCalls(receiveOutcome: receiveOutcome)
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 47,
             systemCalls: calls.systemCalls
@@ -523,17 +536,91 @@ struct SpiceLiveStageSocketTransportTests {
     }
 
     @Test func repeatedCloseCannotAffectAReusedDescriptor() async throws {
-        let firstCalls = ScriptedSocketCalls()
+        let firstCalls = BlockingSocketCalls()
         let first = try SpiceLiveStageSocketTransport(
             takingDescriptor: 48,
-            systemCalls: firstCalls.systemCalls
+            systemCalls: firstCalls.systemCalls,
+            closeCallDidEnter: {
+                firstCalls.recordCloseCallDidEnter()
+            }
         )
         let firstTransport = first.stageTransport
-        await firstTransport.close()
-        await firstTransport.close()
-        await firstTransport.close()
-        #expect(firstCalls.snapshot.shutdownCalls == 1)
-        #expect(firstCalls.snapshot.rawCloseCalls == 1)
+        let receiveError = SocketErrorCapture()
+        let receive = Task {
+            do {
+                _ = try await firstTransport.receiveFrame(
+                    maximumBytes:
+                        SpiceLiveStageProtocolCodec.maximumFrameBytes
+                )
+                Issue.record("closed receive unexpectedly succeeded")
+            } catch let error as SpiceLiveStageSocketTransport.SocketError {
+                receiveError.record(error)
+            } catch {
+                Issue.record("unexpected closed-receive error: \(error)")
+            }
+        }
+        do {
+            try await Self.waitUntil {
+                firstCalls.snapshot.activeReads == 1
+            }
+        } catch {
+            firstCalls.emergencyReleaseForTestCleanup()
+            await receive.value
+            await firstTransport.close()
+            throw error
+        }
+
+        let firstClose = Task { await firstTransport.close() }
+        do {
+            try await Self.waitUntil {
+                firstCalls.shutdownWasObserved
+            }
+        } catch {
+            firstCalls.emergencyReleaseForTestCleanup()
+            await receive.value
+            await firstClose.value
+            await firstTransport.close()
+            throw error
+        }
+
+        let secondClose = Task {
+            await firstTransport.close()
+        }
+        let thirdClose = Task {
+            await firstTransport.close()
+        }
+        do {
+            try await Self.waitUntil {
+                firstCalls.snapshot.closeCallEntries == 3
+            }
+        } catch {
+            firstCalls.emergencyReleaseForTestCleanup()
+            await receive.value
+            await firstClose.value
+            await secondClose.value
+            await thirdClose.value
+            await firstTransport.close()
+            throw error
+        }
+
+        let overlapping = firstCalls.snapshot
+        #expect(overlapping.closeCallEntries == 3)
+        #expect(overlapping.activeReads == 1)
+        #expect(overlapping.shutdownCalls == 1)
+        #expect(overlapping.rawCloseCalls == 0)
+
+        firstCalls.releaseWorkersForTest()
+        await receive.value
+        await firstClose.value
+        await secondClose.value
+        await thirdClose.value
+        let firstTerminal = firstCalls.snapshot
+        #expect(receiveError.error == .closed)
+        #expect(firstTerminal.activeReads == 0)
+        #expect(firstTerminal.closeCallEntries == 3)
+        #expect(firstTerminal.shutdownCalls == 1)
+        #expect(firstTerminal.rawCloseCalls == 1)
+        #expect(!firstTerminal.rawCloseObservedActiveWorker)
 
         let reusedCalls = ScriptedSocketCalls()
         let reused = try SpiceLiveStageSocketTransport(
@@ -543,6 +630,7 @@ struct SpiceLiveStageSocketTransportTests {
         let reusedTransport = reused.stageTransport
         try await reusedTransport.sendFrame(Data("new-owner\n".utf8))
         await firstTransport.close()
+        #expect(firstCalls.snapshot.closeCallEntries == 4)
         #expect(firstCalls.snapshot.rawCloseCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 0)
         #expect(reusedCalls.snapshot.writeOffsets == [0])
@@ -903,6 +991,7 @@ private final class ScriptedSocketCalls: Sendable {
 
 private final class BlockingSocketCalls: Sendable {
     struct Snapshot: Sendable {
+        var closeCallEntries: Int
         var readCalls: Int
         var writeCalls: Int
         var activeReads: Int
@@ -915,6 +1004,7 @@ private final class BlockingSocketCalls: Sendable {
     }
 
     private struct State: Sendable {
+        var closeCallEntries = 0
         var readCalls = 0
         var writeCalls = 0
         var activeReads = 0
@@ -927,9 +1017,14 @@ private final class BlockingSocketCalls: Sendable {
     }
 
     private let state = Mutex(State())
+    private let receiveOutcome: BlockingReceiveOutcome
     private let shutdownObserved = ObservationLatch()
     private let releaseRead = DispatchSemaphore(value: 0)
     private let releaseWrite = DispatchSemaphore(value: 0)
+
+    init(receiveOutcome: BlockingReceiveOutcome = .failed) {
+        self.receiveOutcome = receiveOutcome
+    }
 
     var systemCalls: SpiceLiveStageSocketSystemCalls {
         SpiceLiveStageSocketSystemCalls(
@@ -945,7 +1040,12 @@ private final class BlockingSocketCalls: Sendable {
                 }
                 releaseRead.wait()
                 state.withLock { $0.activeReads -= 1 }
-                return .failed(errno: ECANCELED)
+                switch receiveOutcome {
+                case .failed:
+                    return .failed(errno: ECANCELED)
+                case .endOfFile:
+                    return .endOfFile
+                }
             },
             send: { [self] _, _, _ in
                 state.withLock { storage in
@@ -977,6 +1077,7 @@ private final class BlockingSocketCalls: Sendable {
     var snapshot: Snapshot {
         state.withLock { storage in
             Snapshot(
+                closeCallEntries: storage.closeCallEntries,
                 readCalls: storage.readCalls,
                 writeCalls: storage.writeCalls,
                 activeReads: storage.activeReads,
@@ -993,6 +1094,10 @@ private final class BlockingSocketCalls: Sendable {
 
     var shutdownWasObserved: Bool {
         shutdownObserved.isSignaled
+    }
+
+    func recordCloseCallDidEnter() {
+        state.withLock { $0.closeCallEntries += 1 }
     }
 
     func releaseWorkersForTest() {
@@ -1100,12 +1205,26 @@ private enum InvalidWriteScenario: CaseIterable, CustomTestStringConvertible {
     case brokenPipe
     case zeroProgress
     case overCount
+    case partialProgressOverCount
 
     var testDescription: String {
         switch self {
         case .brokenPipe: "EPIPE"
         case .zeroProgress: "zero progress"
         case .overCount: "over-count"
+        case .partialProgressOverCount: "over-count after partial progress"
+        }
+    }
+}
+
+private enum BlockingReceiveOutcome: CaseIterable, CustomTestStringConvertible {
+    case failed
+    case endOfFile
+
+    var testDescription: String {
+        switch self {
+        case .failed: "shutdown wakes receive with ECANCELED"
+        case .endOfFile: "shutdown wakes receive with EOF"
         }
     }
 }
