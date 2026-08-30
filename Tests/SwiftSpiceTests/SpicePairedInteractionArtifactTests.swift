@@ -437,6 +437,9 @@ extension SpicePairedInteractionArtifactTests {
         case nonCanonicalCluster
         case duplicateCluster
         case incompleteRunSequence
+        case allBaselineThenCandidate
+        case adjacentPairUsesDifferentClusters
+        case imbalancedVersionDirection
 
         var testDescription: String { String(describing: self) }
 
@@ -447,7 +450,10 @@ extension SpicePairedInteractionArtifactTests {
                 result[0] = "ABCDEF0123456789"
             case .duplicateCluster:
                 result[9] = result[0]
-            case .incompleteRunSequence:
+            case .incompleteRunSequence,
+                 .allBaselineThenCandidate,
+                 .adjacentPairUsesDifferentClusters,
+                 .imbalancedVersionDirection:
                 break
             }
             return result
@@ -458,13 +464,37 @@ extension SpicePairedInteractionArtifactTests {
             baselineVersion: String,
             candidateVersion: String
         ) -> [SpicePairedInteractionRunKey] {
-            var result = clusterIDs.flatMap { clusterID in
-                [baselineVersion, candidateVersion].map {
+            var result: [SpicePairedInteractionRunKey] = []
+            for (offset, clusterID) in clusterIDs.enumerated() {
+                let versions = offset < 5
+                    ? [baselineVersion, candidateVersion]
+                    : [candidateVersion, baselineVersion]
+                result.append(contentsOf: versions.map {
                     SpicePairedInteractionRunKey(clusterID: clusterID, version: $0)
-                }
+                })
             }
-            if self == .incompleteRunSequence {
+
+            switch self {
+            case .incompleteRunSequence:
                 result.removeLast()
+            case .allBaselineThenCandidate:
+                result = clusterIDs.map {
+                    SpicePairedInteractionRunKey(
+                        clusterID: $0,
+                        version: baselineVersion
+                    )
+                } + clusterIDs.map {
+                    SpicePairedInteractionRunKey(
+                        clusterID: $0,
+                        version: candidateVersion
+                    )
+                }
+            case .adjacentPairUsesDifferentClusters:
+                result.swapAt(1, 2)
+            case .imbalancedVersionDirection:
+                result.swapAt(10, 11)
+            case .nonCanonicalCluster, .duplicateCluster:
+                break
             }
             return result
         }
