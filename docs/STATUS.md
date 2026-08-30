@@ -102,6 +102,28 @@ Agent behavior, including system-trusted TLS.
   effects before a new 20-run campaign starts. AIP-00 and AIP-44 remain open;
   no latency improvement is claimed.
 
+- AIP-00h1 is now merged on PRs #62-#63 as main commit `c508718`. The
+  real-time recorder owns one exclusive recording manifest, validates each
+  candidate through the existing campaign state machine, synchronously writes
+  exactly one canonical generation, and only then swaps its in-memory state.
+  Persistence uncertainty poisons the recorder; reopen converts a durable
+  recording prefix to a terminal interruption, while failed, interrupted, and
+  finalized manifests are re-synced before recovery returns. The writer uses a
+  private mode-0600 regular file, bounded canonical JSON, in-process and
+  cross-process locking, generation CAS, component-wise `openat`/
+  `O_NOFOLLOW`, and temp-fsync/rename/directory-fsync publication. Two review
+  P2s were fixed test-first: uncertain terminal recovery now closes the
+  directory-sync window, and full plan replay rejects a foreign campaign
+  ledger entry before replacement. Focused strict Debug, Release, and
+  AddressSanitizer passed 10/10; final CI run `33314950299` passed build,
+  public API, full tests, AddressSanitizer, and coverage, and exact-head review
+  found no issues. This is local persistence closure, not live evidence.
+  AIP-00h2 must next bind Release binaries, runner, remote image/guest build,
+  fixture/control sources, pointer mode, and stage protocol in a typed
+  execution contract; then add the ACK-gated runner, atomic artifact index,
+  structured RemoteRocky adapter, baseline overlay, and real paired campaign.
+  AIP-00 and AIP-44 remain open, with no latency improvement claimed.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
