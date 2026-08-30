@@ -124,6 +124,26 @@ Agent behavior, including system-trusted TLS.
   structured RemoteRocky adapter, baseline overlay, and real paired campaign.
   AIP-00 and AIP-44 remain open, with no latency improvement claimed.
 
+- AIP-00h2a is now merged on PRs #65-#66 as main commit `381e31e`. Manifest
+  schema 2 requires an immutable 15-field execution contract covering both
+  Release binaries and source commits, the runner, remote image and guest
+  build, fixture and control inputs, pointer mode, and typed stage protocol.
+  Missing, null, duplicate, aliased, conflicting, or noncanonical identities
+  fail closed. Historical schema-1 classification is read-only and preserves
+  bytes, inode, mode, size, mtime, and directory entries, including the prior
+  writer's literal-slash encoding. The slash compatibility defect found in
+  review was fixed test-first. Strict local Debug and Release passed 17/17,
+  the AddressSanitizer contract suite passed 7/7, and the Release live product
+  built. Combined Apple Silicon CI run `33321040969` passed build, public API,
+  full tests, AddressSanitizer, and coverage in 16m21s; exact combined-head
+  review found no issue, all three historical threads are resolved, and none
+  remain unresolved. This is local identity/admission closure only. AIP-00h2b
+  must next add bounded canonical stage events and persist-before-ACK gating;
+  duplex processes, RemoteRocky, resource samples, atomic artifacts, baseline
+  overlay, and the real paired campaign remain h2c/h2d. AIP-00 and AIP-44
+  remain open, with no Rocky, external-SPICE, latency, CPU/RSS, or release
+  improvement claimed.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
