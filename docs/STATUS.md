@@ -81,9 +81,11 @@ Agent behavior, including system-trusted TLS.
   zero presented callbacks, no armed input, and an empty remote JSONL file.
   This is a pre-arm reliability failure, not latency data. AIP-00f therefore
   adds only a once-bounded authoritative-latest request after visible demand,
-  a real commit, and a grace interval; it remains outside trace creation and
-  must still time out fail-closed. A new campaign identity will not start until
-  that deterministic gate and exact-head review pass.
+  a real post-baseline commit, and still-zero presentations 250 ms after the
+  harness first observes that commit. Baseline and candidate use the same
+  duration and start event. The request remains outside trace creation and must
+  still time out fail-closed. A new campaign identity will not start until that
+  deterministic gate and exact-head review pass.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
