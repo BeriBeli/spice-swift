@@ -470,6 +470,93 @@ struct SpiceLiveRunProtocolTests {
         }
     }
 
+    @Test func invalidFrozenRecordIsPreservedButCannotAdvanceOrCompleteTheRun() async throws {
+        try await Stage3LiveRunFixture.withTemporaryDirectory { directory in
+            let plan = try SpiceLiveInteractionClusterPlan(
+                clusterID: Stage3LiveRunFixture.clusterIDs[0]
+            )
+            let step = plan.steps[0]
+            let readiness = try #require(SpiceLiveReadinessState(
+                windowVisible: true,
+                windowOccluded: false,
+                hostingVisible: true,
+                visibleSubscriptions: 1,
+                metalPresentedFrames: 2
+            ).permit(since: 1))
+            var execution = try SpiceLiveSingleRunExecution(steps: plan.steps)
+            #expect(try execution.beginNextStep(readiness: readiness) == step)
+            try execution.recordExactPresentation(order: step.order)
+
+            let campaign = try Stage3LiveRunFixture.plan()
+            let configuration = try Stage3LiveRunFixture.configuration(
+                run: campaign.runs[0]
+            )
+            let runDirectory = Stage3LiveRunFixture.remoteRunDirectory
+            let status = try SpiceRemoteRunStatus(
+                result: SpiceLiveProcessResult(
+                    status: 0,
+                    standardOutput: Stage3LiveRunFixture.statusOutput(
+                        runDirectory: runDirectory
+                    ),
+                    standardError: ""
+                ),
+                configuration: configuration
+            )
+            let capture = try SpiceInteractionTraceCapture(
+                presentationDiagnostics: SpicePresentationDiagnostics(),
+                pairId: step.pairID,
+                version: campaign.runs[0].version,
+                runId: status.evidenceRunID,
+                order: step.order,
+                actionClass: step.actionClass,
+                token: step.token,
+                checksum: step.checksum
+            )
+            let frozen = try capture.finish()
+            #expect(!frozen.valid)
+            #expect(frozen.invalidReason != nil)
+
+            let localOutput = directory.appending(path: "input-events.jsonl")
+            try SpiceInteractionTraceJSONLWriter(outputURL: localOutput).append(frozen)
+            #expect(try Stage3LiveRunFixture.decodeRecords(at: localOutput) == [frozen])
+            #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+                try execution.recordLocalAppend(frozen)
+            }
+            #expect(execution.failed)
+            #expect(!execution.completed)
+
+            let remoteInput = directory.appending(path: "remote-input.jsonl")
+            let fixture = try Stage3RunScriptFixture(
+                """
+                input="$1"
+                shift
+                /bin/cat > "$input"
+                printf '%s\n' 'PERF_INPUT_EVENT_COLLECTED valid=false reason=derived'
+                """
+            )
+            defer { fixture.remove() }
+            let runner = SpiceLiveProcessRunner(
+                executableURL: fixture.executableURL,
+                argumentPrefix: [remoteInput.path]
+            )
+            let encoded = Stage3LiveRunFixture.canonicalRecordLine(frozen)
+            try await configuration.appendRecord(
+                encoded,
+                runDirectory: runDirectory,
+                runner: runner
+            )
+            #expect(try Data(contentsOf: remoteInput) == encoded)
+            #expect(
+                try JSONDecoder().decode(
+                    SpiceInteractionTraceRecord.self,
+                    from: encoded.dropLast()
+                ) == frozen
+            )
+            #expect(execution.failed)
+            #expect(!execution.completed)
+        }
+    }
+
     @Test func localOutputResolvesCanonicalPrivatePathAndRejectsInvalidRun() throws {
         try Stage3LiveRunFixture.withTemporaryDirectory { directory in
             let realBase = directory.appending(path: "real", directoryHint: .isDirectory)
@@ -620,6 +707,10 @@ private enum Stage3LiveRunFixture {
             markerRevision: 6,
             markerChecksum: "8808062b"
         )
+        return canonicalRecordLine(record)
+    }
+
+    static func canonicalRecordLine(_ record: SpiceInteractionTraceRecord) -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var line = try! encoder.encode(record)
