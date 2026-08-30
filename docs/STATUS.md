@@ -55,11 +55,13 @@ Agent behavior, including system-trusted TLS.
   still in progress: direct Session inputs bypass AppKit receipt, and ten
   paired click/key/motion clusters for `v0.2.7` and current `v0.3.x` remain
   required. AIP-00e now rejects the paired artifact unless it contains exactly
-  ten canonical clusters, two exact versions, 20 unique counterbalanced runs,
-  and 60 valid plan-derived click/key/motion records. It reports Hyndman-Fan
-  type-7 p50/p95 plus same-cluster signed deltas; complete CPU/RSS samples are
+  ten canonical clusters, two exact versions, 20 unique runs arranged as
+  adjacent same-cluster pairs with exactly five baseline-first and five
+  candidate-first pairs, and 60 valid plan-derived click/key/motion records. It
+  reports Hyndman-Fan type-7 p50/p95 plus same-cluster signed deltas; complete
+  CPU/RSS samples are
   independent guardrails and never filter latency records. The strict focused
-  gate passed 11 tests / 26 parameterized cases. An unchanged `v0.2.7`
+  gate passed 11 tests / 29 parameterized cases. An unchanged `v0.2.7`
   `2c577d7` worktree also completed a Release build under the current Swift 6.3
   toolchain. Its exact-correlation measurement overlay and the live paired
   collection are the next AIP-00 gates; no AIP-44 pacing change is admitted.
