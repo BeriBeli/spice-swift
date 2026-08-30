@@ -424,6 +424,7 @@ package enum SpiceInteractionTraceCollectionError: Error, Sendable, Equatable {
     case invalidOutputPath
     case outputDirectoryUnavailable
     case outputIsSymbolicLink
+    case invalidRecord
     case invalidExistingJSONL
     case recordTooLarge(actual: Int, maximum: Int)
     case outputTooLarge(actual: Int, maximum: Int)

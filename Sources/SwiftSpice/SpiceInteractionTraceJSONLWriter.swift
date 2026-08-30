@@ -29,6 +29,17 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
         _ record: SpiceInteractionTraceRecord
     ) throws {
         var encoded = try JSONEncoder.interactionTrace.encode(record)
+        do {
+            let decoded = try JSONDecoder().decode(
+                SpiceInteractionTraceRecord.self,
+                from: encoded
+            )
+            guard decoded == record else {
+                throw SpiceInteractionTraceCollectionError.invalidRecord
+            }
+        } catch {
+            throw SpiceInteractionTraceCollectionError.invalidRecord
+        }
         encoded.append(0x0A)
         guard encoded.count <= Self.maximumRecordBytes else {
             throw SpiceInteractionTraceCollectionError.recordTooLarge(
