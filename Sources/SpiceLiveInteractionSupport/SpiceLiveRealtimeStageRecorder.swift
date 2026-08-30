@@ -93,12 +93,13 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
         )
     }
 
+    @discardableResult
     package func record(
         run: SpiceLiveCampaignRun,
         stage: SpiceLiveAttemptStage,
         outcome: SpiceLiveAttemptOutcome,
         evidenceRunID: SpiceLiveEvidenceRunID? = nil
-    ) throws {
+    ) throws -> UInt64 {
         try state.withLock { state in
             guard case let .active(execution, manifest) = state else {
                 throw SpiceLiveCampaignManifestError.recorderTerminal
@@ -134,6 +135,18 @@ package final class SpiceLiveRealtimeStageRecorder: Sendable {
                     execution: candidate.execution,
                     manifest: candidate.manifest
                 )
+            return candidate.manifest.generation
+        }
+    }
+
+    @discardableResult
+    package func failClosedAfterExternalBoundary() throws -> UInt64 {
+        try state.withLock { state in
+            guard case let .active(_, manifest) = state else {
+                throw SpiceLiveCampaignManifestError.recorderTerminal
+            }
+            try persistInvalidTransition(from: manifest, state: &state)
+            return state.manifest.generation
         }
     }
 
