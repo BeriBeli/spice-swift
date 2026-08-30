@@ -1,6 +1,26 @@
 import Foundation
 import QuartzCore
 
+/// Identifies one AppKit framebuffer presenter without becoming part of the
+/// wire-format frame identity. A capture binds presentation evidence to the
+/// first eligible presenter so sibling views cannot contribute duplicate
+/// selection or Metal evidence for the same surface frame.
+package struct SpiceInteractionPresenterID: Sendable, Hashable {
+    private let rawValue: UUID
+
+    package init() {
+        rawValue = UUID()
+    }
+
+    private init(rawValue: UUID) {
+        self.rawValue = rawValue
+    }
+
+    package static let unspecified = Self(
+        rawValue: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    )
+}
+
 package struct SpiceInteractionFrameIdentity: Sendable, Hashable, Codable {
     package let desktopGeneration: UInt64
     package let displayChannelID: UInt8
@@ -30,15 +50,18 @@ package struct SpiceInteractionPresentationContext: Sendable, Equatable {
     package let identity: SpiceInteractionFrameIdentity
     package let readyNanoseconds: UInt64
     package let selectionNanoseconds: UInt64
+    package let presenterID: SpiceInteractionPresenterID
 
     package init(
         identity: SpiceInteractionFrameIdentity,
         readyNanoseconds: UInt64,
-        selectionNanoseconds: UInt64
+        selectionNanoseconds: UInt64,
+        presenterID: SpiceInteractionPresenterID = .unspecified
     ) {
         self.identity = identity
         self.readyNanoseconds = readyNanoseconds
         self.selectionNanoseconds = selectionNanoseconds
+        self.presenterID = presenterID
     }
 }
 

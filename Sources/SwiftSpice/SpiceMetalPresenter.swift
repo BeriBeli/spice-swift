@@ -586,7 +586,7 @@ package final class SpiceMetalFrameView: MTKView {
         let completionMetrics = presenter.completionMetrics
         let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
         let requestToPresentedStartedAt = pending.requestedAt
-        let interactionIdentity = pending.interactionContext?.identity
+        let interactionContext = pending.interactionContext
         drawable.addPresentedHandler { [presentationDiagnostics] presentedDrawable in
             let mediaTimeNow = CACurrentMediaTime()
             let continuousNanosecondsNow = SpiceInteractionHostClock.nowNanoseconds()
@@ -615,22 +615,18 @@ package final class SpiceMetalFrameView: MTKView {
                     isAdvancedVideo: isAdvancedVideoFrame,
                     epoch: presentationEpoch
                 )
-                Task { @MainActor in
-                    if let interactionIdentity {
-                        presentationDiagnostics?.recordInteractionPresented(
-                            identity: interactionIdentity,
-                            at: presentedNanoseconds
-                        )
-                    }
+                if let interactionContext {
+                    presentationDiagnostics?.recordInteractionPresented(
+                        identity: interactionContext.identity,
+                        presenterID: interactionContext.presenterID,
+                        at: presentedNanoseconds
+                    )
                 }
-            } else {
-                Task { @MainActor in
-                    if let interactionIdentity {
-                        presentationDiagnostics?.recordInteractionPresentationDropped(
-                            identity: interactionIdentity
-                        )
-                    }
-                }
+            } else if let interactionContext {
+                presentationDiagnostics?.recordInteractionPresentationDropped(
+                    identity: interactionContext.identity,
+                    presenterID: interactionContext.presenterID
+                )
             }
         }
         commandBuffer.present(drawable)
@@ -643,12 +639,13 @@ package final class SpiceMetalFrameView: MTKView {
         presentationDiagnostics?.recordViewUpdateToMetalCommit(
             pending.requestedAt.duration(to: commitCallBoundary)
         )
-        if let interactionIdentity,
+        if let interactionContext,
            let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(
                for: commitCallBoundary
            ) {
             presentationDiagnostics?.recordInteractionCommitted(
-                identity: interactionIdentity,
+                identity: interactionContext.identity,
+                presenterID: interactionContext.presenterID,
                 at: committedNanoseconds
             )
         }

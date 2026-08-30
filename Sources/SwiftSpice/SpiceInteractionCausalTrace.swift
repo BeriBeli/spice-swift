@@ -842,6 +842,16 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         }
     }
 
+    package func canBindPresentationOwner(
+        identity: SpiceInteractionFrameIdentity
+    ) -> Bool {
+        state.withLock { state in
+            state.hostInputNs != nil
+                && state.presentedNs == nil
+                && state.frames[identity] != nil
+        }
+    }
+
     package func observeCommitted(
         identity: SpiceInteractionFrameIdentity,
         at nanoseconds: UInt64

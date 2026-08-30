@@ -371,7 +371,8 @@ package final class SpiceDesktopReadyLatch: Sendable {
         fileprivate let frameReadyNanoseconds: UInt64?
 
         package func interactionContext(
-            selectionNanoseconds: UInt64
+            selectionNanoseconds: UInt64,
+            presenterID: SpiceInteractionPresenterID = .unspecified
         ) -> SpiceInteractionPresentationContext? {
             guard let frameReadyIdentity,
                   let frameReadyNanoseconds,
@@ -380,7 +381,8 @@ package final class SpiceDesktopReadyLatch: Sendable {
             return SpiceInteractionPresentationContext(
                 identity: frameReadyIdentity,
                 readyNanoseconds: frameReadyNanoseconds,
-                selectionNanoseconds: selectionNanoseconds
+                selectionNanoseconds: selectionNanoseconds,
+                presenterID: presenterID
             )
         }
     }
@@ -594,6 +596,7 @@ package final class SpiceFramebufferView: NSView {
     private let displayLinkTarget = SpiceDisplayLinkTarget()
     private var desktopDisplayLink: CADisplayLink?
     private let clock = ContinuousClock()
+    private let interactionPresenterID = SpiceInteractionPresenterID()
 
     private var desktopGeneration: UInt64?
     private var selectedRevision: SpiceFrameRevision?
@@ -844,7 +847,8 @@ package final class SpiceFramebufferView: NSView {
 
         let selectedAt = clock.now
         let interactionContext = ready.interactionContext(
-            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds(),
+            presenterID: interactionPresenterID
         )
         switch apply(
             ready.snapshot,
@@ -917,7 +921,8 @@ package final class SpiceFramebufferView: NSView {
 
         let selectedAt = clock.now
         let interactionContext = ready.interactionContext(
-            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds()
+            selectionNanoseconds: SpiceInteractionHostClock.nowNanoseconds(),
+            presenterID: interactionPresenterID
         )
         switch apply(
             snapshot,

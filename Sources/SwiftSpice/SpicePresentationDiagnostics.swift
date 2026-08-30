@@ -81,8 +81,13 @@ public final class SpicePresentationDiagnostics: Sendable {
         case assembler(SpiceInteractionTraceAssembler)
     }
 
+    private struct InstalledInteractionSink: Sendable {
+        let sink: InteractionSink
+        var presenterID: SpiceInteractionPresenterID? = nil
+    }
+
     private let state = Mutex(State())
-    private let interactionSink = Mutex<InteractionSink?>(nil)
+    private let interactionSink = Mutex<InstalledInteractionSink?>(nil)
 
     public init() {}
 
@@ -99,7 +104,7 @@ public final class SpicePresentationDiagnostics: Sendable {
     ) -> Bool {
         interactionSink.withLock { current in
             guard current == nil else { return false }
-            current = .observer(observer)
+            current = InstalledInteractionSink(sink: .observer(observer))
             return true
         }
     }
@@ -108,7 +113,7 @@ public final class SpicePresentationDiagnostics: Sendable {
         _ observer: any SpiceInteractionPresentationObserver
     ) {
         interactionSink.withLock { installed in
-            guard case let .observer(current) = installed,
+            guard case let .observer(current) = installed?.sink,
                   ObjectIdentifier(current) == ObjectIdentifier(observer) else { return }
             installed = nil
         }
@@ -119,7 +124,7 @@ public final class SpicePresentationDiagnostics: Sendable {
     ) -> Bool {
         interactionSink.withLock { current in
             guard current == nil else { return false }
-            current = .assembler(assembler)
+            current = InstalledInteractionSink(sink: .assembler(assembler))
             return true
         }
     }
@@ -128,7 +133,7 @@ public final class SpicePresentationDiagnostics: Sendable {
         _ assembler: SpiceInteractionTraceAssembler
     ) {
         interactionSink.withLock { installed in
-            guard case let .assembler(current) = installed,
+            guard case let .assembler(current) = installed?.sink,
                   current === assembler else { return }
             installed = nil
         }
@@ -139,7 +144,7 @@ public final class SpicePresentationDiagnostics: Sendable {
         sourceTiming: DisplayFrameSourceTiming?
     ) {
         interactionSink.withLock { sink in
-            guard case let .assembler(assembler) = sink else { return }
+            guard case let .assembler(assembler) = sink?.sink else { return }
             assembler.observeFrame(snapshot: snapshot, sourceTiming: sourceTiming)
         }
     }
@@ -147,11 +152,21 @@ public final class SpicePresentationDiagnostics: Sendable {
     package func recordInteractionSelected(
         _ context: SpiceInteractionPresentationContext
     ) {
-        let observer = interactionSink.withLock { sink -> (
+        let observer = interactionSink.withLock { installedState -> (
             any SpiceInteractionPresentationObserver
         )? in
-            switch sink {
+            guard var installed = installedState else { return nil }
+            switch installed.sink {
             case let .assembler(assembler):
+                if let owner = installed.presenterID {
+                    guard owner == context.presenterID else { return nil }
+                } else {
+                    guard assembler.canBindPresentationOwner(
+                        identity: context.identity
+                    ) else { return nil }
+                    installed.presenterID = context.presenterID
+                    installedState = installed
+                }
                 assembler.observeSelected(
                     identity: context.identity,
                     readyNs: context.readyNanoseconds,
@@ -160,8 +175,6 @@ public final class SpicePresentationDiagnostics: Sendable {
                 return nil
             case let .observer(observer):
                 return observer
-            case nil:
-                return nil
             }
         }
         observer?.observeSelected(context)
@@ -169,19 +182,20 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func recordInteractionCommitted(
         identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified,
         at nanoseconds: UInt64
     ) {
-        let observer = interactionSink.withLock { sink -> (
+        let observer = interactionSink.withLock { installed -> (
             any SpiceInteractionPresentationObserver
         )? in
-            switch sink {
+            guard let installed else { return nil }
+            switch installed.sink {
             case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return nil }
                 assembler.observeCommitted(identity: identity, at: nanoseconds)
                 return nil
             case let .observer(observer):
                 return observer
-            case nil:
-                return nil
             }
         }
         observer?.observeCommitted(identity: identity, at: nanoseconds)
@@ -189,19 +203,20 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func recordInteractionPresented(
         identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified,
         at nanoseconds: UInt64
     ) {
-        let result = interactionSink.withLock { sink -> (
+        let result = interactionSink.withLock { installed -> (
             observer: (any SpiceInteractionPresentationObserver)?,
             resumption: SpiceInteractionPresentationWaiter.Resumption?
         ) in
-            switch sink {
+            guard let installed else { return (nil, nil) }
+            switch installed.sink {
             case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return (nil, nil) }
                 return (nil, assembler.observePresented(identity: identity, at: nanoseconds))
             case let .observer(observer):
                 return (observer, nil)
-            case nil:
-                return (nil, nil)
             }
         }
         result.observer?.observePresented(identity: identity, at: nanoseconds)
@@ -209,19 +224,20 @@ public final class SpicePresentationDiagnostics: Sendable {
     }
 
     package func recordInteractionPresentationDropped(
-        identity: SpiceInteractionFrameIdentity
+        identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified
     ) {
-        let observer = interactionSink.withLock { sink -> (
+        let observer = interactionSink.withLock { installed -> (
             any SpiceInteractionPresentationObserver
         )? in
-            switch sink {
+            guard let installed else { return nil }
+            switch installed.sink {
             case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return nil }
                 assembler.observePresentationDropped(identity: identity)
                 return nil
             case let .observer(observer):
                 return observer
-            case nil:
-                return nil
             }
         }
         observer?.observePresentationDropped(identity: identity)
@@ -229,7 +245,7 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func retireInteractionDesktopGeneration(_ generation: UInt64) {
         interactionSink.withLock { sink in
-            guard case let .assembler(assembler) = sink else { return }
+            guard case let .assembler(assembler) = sink?.sink else { return }
             assembler.retireDesktopGeneration(generation)
         }
     }
@@ -240,7 +256,7 @@ public final class SpicePresentationDiagnostics: Sendable {
         generation: UInt64
     ) {
         interactionSink.withLock { sink in
-            guard case let .assembler(assembler) = sink else { return }
+            guard case let .assembler(assembler) = sink?.sink else { return }
             assembler.retireSurfaceLifecycle(
                 displayChannelID: displayChannelID,
                 surfaceID: surfaceID,
