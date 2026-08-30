@@ -504,6 +504,21 @@ replacement, so a valid entry copied from another campaign cannot corrupt the
 durable prefix. This is filesystem and state-machine closure only. It performs
 no process, SSH, GUI, or Rocky effect and produces no live latency evidence.
 
+AIP-00h2a is merged on PRs #65-#66 as main commit `381e31e`. Manifest schema
+2 now requires a versioned execution contract that independently binds all 15
+Release-binary, source, runner, image, guest-build, fixture/control, pointer,
+and stage-protocol identity fields. Missing, null, duplicate, aliased,
+conflicting, or noncanonical identities fail closed; schema-1 manifests remain
+read-only without changing bytes, inode, mode, size, mtime, or directory
+entries. A review-found legacy slash-canonicalization defect was reproduced
+test-first and fixed by preserving the previous writer's `sortedKeys +
+withoutEscapingSlashes` representation. Combined CI run `33321040969` passed
+build, public API, full tests, AddressSanitizer, and coverage in 16m21s; exact
+combined-head review found no issue and all three historical inline threads
+are resolved. This closes only local execution-identity admission. It performs
+no process, SSH, GUI, Rocky, or external SPICE effect and produces no latency,
+CPU/RSS, release, or AIP-44 claim.
+
 AIP-00h2 proceeds in four reviewable layers before any new real campaign:
 
 1. **h2a execution contract:** move the live manifest to a new schema that
@@ -901,3 +916,4 @@ behavior remain separate acceptance gates.
 | 2026-08-30 | AIP-00 | Repair pre-arm cold-start reliability without weakening exact presentation or changing interaction pacing | A fresh baseline run produced one real Metal commit but no presented callback and correctly sent no input. AIP-00f may request one authoritative latest redraw only after visible demand, at least one post-baseline commit, and zero presentations 250 ms after the harness first observes that commit; baseline and candidate use the exact same duration and start event. The request is exhausted once, remains before arm and trace creation, and cannot fabricate a timestamp, append an invalid sample, alter frame-clock selection, submit idle work, or bypass the existing timeout. |
 | 2026-08-30 | AIP-00 | Keep AIP-00g deterministic and side-effect-free; place real-time stage persistence, artifact manifests, campaign orchestration, and RemoteRocky effects in AIP-00h | The strict evaluator must remain independent of process, UI, and fixture behavior. AIP-00g therefore accepts only a complete canonical plan, ledger, record, resource, and typed evidence-identity set. AIP-00h must persist outcomes as effects occur so tests or post-processing cannot substitute a synthesized successful ledger for actual execution. |
 | 2026-08-30 | AIP-00 | Merge the AIP-00h1 persistence boundary before runner effects, then require a typed execution contract before any new Rocky campaign | Exclusive create, persist-before-swap, terminal recovery, full plan replay, and atomic publication prevent a synthesized or replayed success. Source commits alone do not prove which Release binaries, runner, guest image, or fixture sources executed, so AIP-00h2 must bind those hashes in a new manifest schema before SSH/process effects begin. |
+| 2026-08-31 | AIP-00 | Close AIP-00h2a before implementing any stage transport, and keep AIP-00h2b local and ACK-gated | The new schema-2 execution identity prevents a campaign from starting with ambiguous binaries, runner, image, guest build, fixture, pointer mode, or protocol. The next layer may add only canonical bounded child events, synchronous recorder persistence, and exact-generation ACKs; actual duplex processes, SSH/RemoteRocky effects, resource collection, artifact publication, and paired execution remain later layers. |
