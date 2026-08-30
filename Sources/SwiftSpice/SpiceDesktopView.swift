@@ -244,6 +244,52 @@ package struct SpiceMetalFailureRecoveryPolicy {
     }
 }
 
+/// Bounded recovery for a command buffer that completed but whose drawable was
+/// explicitly reported as not presented. Recovery republishes the currently
+/// selected authoritative revision at most once until that revision is either
+/// successfully presented or replaced by a different revision.
+package struct SpiceDrawablePresentationDropRecoveryPolicy {
+    package enum Action: Sendable, Equatable {
+        case none
+        case requestAuthoritativeRedraw
+    }
+
+    private var trackedRevision: SpiceFrameRevision?
+    private var requestedRedraw = false
+
+    package mutating func revisionSelected(_ revision: SpiceFrameRevision) {
+        guard trackedRevision != revision else { return }
+        trackedRevision = revision
+        requestedRedraw = false
+    }
+
+    package mutating func presentationDropped(
+        revision: SpiceFrameRevision,
+        selectedRevision: SpiceFrameRevision?,
+        isVisibleDemand: Bool
+    ) -> Action {
+        guard isVisibleDemand,
+              selectedRevision == revision,
+              trackedRevision == revision
+        else {
+            return .none
+        }
+        guard !requestedRedraw else { return .none }
+        requestedRedraw = true
+        return .requestAuthoritativeRedraw
+    }
+
+    package mutating func presentationSucceeded(revision: SpiceFrameRevision) {
+        guard trackedRevision == revision else { return }
+        requestedRedraw = false
+    }
+
+    package mutating func reset() {
+        trackedRevision = nil
+        requestedRedraw = false
+    }
+}
+
 @MainActor
 package final class SpicePointerCaptureController {
     private let disconnectCursor: () -> Bool
@@ -601,6 +647,7 @@ package final class SpiceFramebufferView: NSView {
     private var pointerMode: SpicePointerMode = .absolute
     private var requiresFrameRedraw = true
     private var metalFailureRecovery = SpiceMetalFailureRecoveryPolicy()
+    private var drawableDropRecovery = SpiceDrawablePresentationDropRecoveryPolicy()
     private var forcedCPUFallbackRevision: SpiceFrameRevision?
     private var presentationDiagnostics: SpicePresentationDiagnostics?
 
@@ -708,6 +755,7 @@ package final class SpiceFramebufferView: NSView {
         pointerMode = .absolute
         requiresFrameRedraw = true
         metalFailureRecovery.reset()
+        drawableDropRecovery.reset()
         forcedCPUFallbackRevision = nil
         isUsingMetal = false
         metalView?.discardPresentedContent()
@@ -958,6 +1006,7 @@ package final class SpiceFramebufferView: NSView {
             cpuFrame = nil
             requiresFrameRedraw = true
             metalFailureRecovery.reset()
+            drawableDropRecovery.reset()
             forcedCPUFallbackRevision = nil
             isUsingMetal = false
             metalView?.discardPresentedContent()
@@ -977,6 +1026,7 @@ package final class SpiceFramebufferView: NSView {
             cpuFrame = nil
             requiresFrameRedraw = false
             metalFailureRecovery.reset()
+            drawableDropRecovery.reset()
             forcedCPUFallbackRevision = nil
             isUsingMetal = false
             metalView?.discardPresentedContent()
@@ -1023,6 +1073,7 @@ package final class SpiceFramebufferView: NSView {
                 let attempt = self.metalFailureRecovery.beginAttempt(
                     for: update.revision
                 )
+                let revision = update.revision
                 let result = metalView.present(
                     update.frame,
                     requestedAt: requestedAt,
@@ -1037,6 +1088,11 @@ package final class SpiceFramebufferView: NSView {
                     self?.metalCommandCompleted(
                         attempt,
                         completion: completion
+                    )
+                } onDrawablePresentation: { [weak self] outcome in
+                    self?.metalDrawablePresentationCompleted(
+                        revision: revision,
+                        outcome: outcome
                     )
                 }
                 if result != .committed {
@@ -1104,20 +1160,38 @@ package final class SpiceFramebufferView: NSView {
         }
     }
 
+    private func metalDrawablePresentationCompleted(
+        revision: SpiceFrameRevision,
+        outcome: SpiceMetalDrawablePresentationOutcome
+    ) {
+        switch outcome {
+        case .presented:
+            drawableDropRecovery.presentationSucceeded(revision: revision)
+        case .dropped:
+            let action = drawableDropRecovery.presentationDropped(
+                revision: revision,
+                selectedRevision: selectedRevision,
+                isVisibleDemand: subscriptionDemand == .visible
+            )
+            guard action == .requestAuthoritativeRedraw else { return }
+            requiresFrameRedraw = true
+            subscription?.requestLatest()
+        }
+    }
+
     private func accept(_ revision: SpiceFrameRevision) {
         if let selectedRevision,
            selectedRevision.surface == revision.surface,
            revision.value > selectedRevision.value {
             let revisionDelta = revision.value - selectedRevision.value
-            guard revisionDelta > 1 else {
-                self.selectedRevision = revision
-                return
+            if revisionDelta > 1 {
+                presentationDiagnostics?.recordMetalFramesSupersededBeforeDraw(
+                    revisionDelta - 1
+                )
             }
-            presentationDiagnostics?.recordMetalFramesSupersededBeforeDraw(
-                revisionDelta - 1
-            )
         }
         selectedRevision = revision
+        drawableDropRecovery.revisionSelected(revision)
     }
 
     package override func layout() {

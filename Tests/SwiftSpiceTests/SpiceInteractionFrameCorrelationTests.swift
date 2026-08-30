@@ -408,6 +408,117 @@ struct SpiceInteractionFrameCorrelationTests {
         #expect(record.deliverySequence == replacementIdentity.deliverySequence)
     }
 
+    @Test func laterExactMarkerDeliveryRecoversOnlyWithItsOwnCompletePresentationChain() {
+        let anchor = ContinuousClock().now
+        let droppedTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 50,
+            readyOffset: 60
+        )
+        let replacementTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 70,
+            readyOffset: 80
+        )
+        let finalTiming = sourceTiming(
+            anchor: anchor,
+            receivedOffset: 90,
+            readyOffset: 100
+        )
+        let droppedReceive = SpiceInteractionHostClock.nanoseconds(
+            for: droppedTiming.messageReceivedAt
+        )!
+        let droppedReady = SpiceInteractionHostClock.nanoseconds(
+            for: droppedTiming.surfaceReadyAt
+        )!
+        let replacementReady = SpiceInteractionHostClock.nanoseconds(
+            for: replacementTiming.surfaceReadyAt
+        )!
+        let finalReceive = SpiceInteractionHostClock.nanoseconds(
+            for: finalTiming.messageReceivedAt
+        )!
+        let finalReady = SpiceInteractionHostClock.nanoseconds(
+            for: finalTiming.surfaceReadyAt
+        )!
+        let foreignMarkerPixels = SpiceInteractionMarkerROIDetector.renderForTesting(
+            placements: [SpiceInteractionMarkerPlacement(
+                payload: SpiceInteractionMarkerPayload(
+                    token: "fedcba9876543210",
+                    markerRevision: 77,
+                    checksum: 0x1234_5678
+                ),
+                originX: markerOriginX,
+                originY: markerOriginY
+            )],
+            frameWidth: width,
+            frameHeight: height,
+            bytesPerRow: bytesPerRow
+        )
+
+        for replacementPixels in [blankPixels, foreignMarkerPixels] {
+            let droppedIdentity = identity(frameRevision: 10, deliverySequence: 801)
+            let replacementIdentity = identity(frameRevision: 11, deliverySequence: 802)
+            let finalIdentity = identity(frameRevision: 12, deliverySequence: 803)
+            let assembler = makeAssembler()
+            recordInputAndGuest(on: assembler, beforeDisplayReceiveNs: droppedReceive)
+
+            assembler.observeFrame(
+                snapshot: markerSnapshot(identity: droppedIdentity, markerRevision: 77),
+                sourceTiming: droppedTiming
+            )
+            assembler.observeSelected(
+                identity: droppedIdentity,
+                readyNs: droppedReady,
+                selectionNs: droppedReady + 5
+            )
+            assembler.observeCommitted(identity: droppedIdentity, at: droppedReady + 10)
+
+            assembler.observeFrame(
+                snapshot: snapshot(identity: replacementIdentity, pixels: replacementPixels),
+                sourceTiming: replacementTiming
+            )
+            assembler.observeSelected(
+                identity: replacementIdentity,
+                readyNs: replacementReady,
+                selectionNs: replacementReady + 5
+            )
+            assembler.observeCommitted(
+                identity: replacementIdentity,
+                at: replacementReady + 10
+            )
+            #expect(assembler.observePresented(
+                identity: replacementIdentity,
+                at: replacementReady + 15
+            ) == nil)
+
+            assembler.observeFrame(
+                snapshot: markerSnapshot(identity: finalIdentity, markerRevision: 77),
+                sourceTiming: finalTiming
+            )
+            assembler.observeSelected(
+                identity: finalIdentity,
+                readyNs: finalReady,
+                selectionNs: finalReady + 5
+            )
+            assembler.observeCommitted(identity: finalIdentity, at: finalReady + 10)
+            _ = assembler.observePresented(identity: finalIdentity, at: finalReady + 15)
+
+            let record = assembler.finish()
+            #expect(record.valid)
+            #expect(record.invalidReason == nil)
+            #expect(record.frameRevision == finalIdentity.frameRevision)
+            #expect(record.deliverySequence == finalIdentity.deliverySequence)
+            #expect(record.displayReceiveNs == finalReceive)
+            #expect(record.surfaceReadyNs == finalReady)
+            #expect(record.selectedRevisionReadyNs == finalReady)
+            #expect(record.selectionNs == finalReady + 5)
+            #expect(record.metalCommitNs == finalReady + 10)
+            #expect(record.presentedNs == finalReady + 15)
+            #expect(record.markerRevision == 77)
+            #expect(record.markerChecksum == "9f9f5111")
+        }
+    }
+
     @Test func staleGenerationDuplicateAndMissingDrawablePresentationStayInvalid() {
         let frameIdentity = identity(deliverySequence: 71)
         let timing = sourceTiming(receivedOffset: 50, readyOffset: 60)
@@ -1410,9 +1521,9 @@ struct SpiceInteractionFrameCorrelationTests {
             forCoreAnimationTime: mediaTime
         ))
         let after = SpiceInteractionHostClock.nowNanoseconds()
-        // CACurrentMediaTime and CLOCK_MONOTONIC are sampled separately when
-        // the one-time conversion anchor is established. Permit only a small
-        // calibration bracket while keeping later deltas exact.
+        // The single-argument overload samples both clocks for this callback.
+        // Permit a small bracketing tolerance and only require that it cannot
+        // manufacture a timestamp meaningfully after the callback.
         let calibrationTolerance: UInt64 = 1_000_000
         let (lowerCandidate, lowerUnderflow) = before.subtractingReportingOverflow(
             calibrationTolerance
@@ -1424,16 +1535,99 @@ struct SpiceInteractionFrameCorrelationTests {
         let upperBound = upperOverflow ? UInt64.max : upperCandidate
         #expect((lowerBound...upperBound).contains(mapped))
 
-        let earlier = try #require(SpiceInteractionHostClock.nanoseconds(
-            forCoreAnimationTime: mediaTime - 0.125
+        let explicitNow = try #require(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTime,
+            mediaTimeNow: mediaTime,
+            continuousNanosecondsNow: after
         ))
-        let delta = mapped - earlier
+        let explicitEarlier = try #require(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTime - 0.125,
+            mediaTimeNow: mediaTime,
+            continuousNanosecondsNow: after
+        ))
+        let delta = explicitNow - explicitEarlier
         #expect((124_999_998...125_000_002).contains(delta))
         #expect(SpiceInteractionHostClock.nanoseconds(
             forCoreAnimationTime: .nan
         ) == nil)
         #expect(SpiceInteractionHostClock.nanoseconds(
             forCoreAnimationTime: .infinity
+        ) == nil)
+    }
+
+    @Test func coreAnimationPresentedTimeUsesCallbackLocalCalibrationAcrossSleepOffsets() throws {
+        // Core Animation media time and ContinuousClock may acquire a large
+        // absolute offset while the machine sleeps. Only the elapsed interval
+        // sampled inside this callback is portable between the two domains.
+        let mediaTimeNow = 610_600.0
+        let continuousNanosecondsNow: UInt64 = 127_495_000_000_000
+        let mapped = try #require(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTimeNow - 0.0125,
+            mediaTimeNow: mediaTimeNow,
+            continuousNanosecondsNow: continuousNanosecondsNow
+        ))
+        #expect(mapped == continuousNanosecondsNow - 12_500_000)
+        #expect(mapped <= continuousNanosecondsNow)
+
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: mediaTimeNow,
+            mediaTimeNow: mediaTimeNow,
+            continuousNanosecondsNow: continuousNanosecondsNow
+        ) == continuousNanosecondsNow)
+
+        // A positive sub-nanosecond age rounds to zero rather than producing
+        // a timestamp after the callback's ContinuousClock sample.
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: 100,
+            mediaTimeNow: 100 + 0.4e-9,
+            continuousNanosecondsNow: 7
+        ) == 7)
+    }
+
+    @Test func coreAnimationPresentedTimeConversionFailsClosedAtDomainBoundaries() {
+        let callbackMediaTime = 100.0
+        let callbackContinuousTime: UInt64 = 1_000_000_000
+
+        // A zero CAMetalDrawable.presentedTime means Core Animation did not
+        // publish an actual presentation timestamp. Give the conversion more
+        // than enough subtraction budget so nil cannot be an underflow side
+        // effect or a fabricated machine-sleep offset.
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: 0,
+            mediaTimeNow: callbackMediaTime,
+            continuousNanosecondsNow: 200_000_000_000
+        ) == nil)
+
+        for invalid in [
+            -0.001,
+            Double.nan,
+            Double.infinity,
+            -Double.infinity,
+            callbackMediaTime + 0.001,
+        ] {
+            #expect(SpiceInteractionHostClock.nanoseconds(
+                forCoreAnimationTime: invalid,
+                mediaTimeNow: callbackMediaTime,
+                continuousNanosecondsNow: callbackContinuousTime
+            ) == nil)
+        }
+        for invalidNow in [Double.nan, Double.infinity, -Double.infinity, -1] {
+            #expect(SpiceInteractionHostClock.nanoseconds(
+                forCoreAnimationTime: 0,
+                mediaTimeNow: invalidNow,
+                continuousNanosecondsNow: callbackContinuousTime
+            ) == nil)
+        }
+
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: 0,
+            mediaTimeNow: Double.greatestFiniteMagnitude,
+            continuousNanosecondsNow: UInt64.max
+        ) == nil)
+        #expect(SpiceInteractionHostClock.nanoseconds(
+            forCoreAnimationTime: 0,
+            mediaTimeNow: 2,
+            continuousNanosecondsNow: callbackContinuousTime
         ) == nil)
     }
 

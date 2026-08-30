@@ -179,6 +179,16 @@ public final class SpicePresentationDiagnostics: Sendable {
         resumption?.resume()
     }
 
+    package func recordInteractionPresentationDropped(
+        identity: SpiceInteractionFrameIdentity
+    ) {
+        interactionState.withLock { state in
+            guard let assembler = state.interactionTraceAssembler else { return }
+            state.interactionEvidenceWillCommitForTesting?()
+            assembler.observePresentationDropped(identity: identity)
+        }
+    }
+
     package func retireInteractionDesktopGeneration(_ generation: UInt64) {
         interactionState.withLock { state in
             guard let assembler = state.interactionTraceAssembler else { return }

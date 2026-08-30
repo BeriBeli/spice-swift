@@ -288,29 +288,9 @@ package enum SpiceInteractionMarkerROIDetector {
 }
 
 package enum SpiceInteractionHostClock {
-    private struct CoreAnimationAnchor: Sendable {
-        let mediaTime: TimeInterval
-        let monotonicNanoseconds: UInt64
-    }
-
     private static let anchor: (instant: ContinuousClock.Instant, nanoseconds: UInt64) = {
         let nanoseconds = monotonicNanoseconds()
         return (ContinuousClock().now, nanoseconds)
-    }()
-
-    /// Maps Core Animation's media-time domain into the interaction trace's
-    /// CLOCK_MONOTONIC domain. Bracketing the media-time sample bounds the
-    /// one-time anchor error without substituting callback execution time for
-    /// a drawable's actual `presentedTime`.
-    private static let coreAnimationAnchor: CoreAnimationAnchor = {
-        let before = monotonicNanoseconds()
-        let mediaTime = CACurrentMediaTime()
-        let after = monotonicNanoseconds()
-        let midpoint = before + ((after - before) / 2)
-        return CoreAnimationAnchor(
-            mediaTime: mediaTime,
-            monotonicNanoseconds: midpoint
-        )
     }()
 
     private static func monotonicNanoseconds() -> UInt64 {
@@ -345,23 +325,44 @@ package enum SpiceInteractionHostClock {
     package static func nanoseconds(
         forCoreAnimationTime mediaTime: TimeInterval
     ) -> UInt64? {
-        guard mediaTime.isFinite else { return nil }
-        let deltaSeconds = mediaTime - coreAnimationAnchor.mediaTime
-        let deltaNanoseconds = (deltaSeconds * 1_000_000_000).rounded()
-        guard deltaNanoseconds.isFinite,
-              let delta = Int64(exactly: deltaNanoseconds)
+        let mediaTimeNow = CACurrentMediaTime()
+        let continuousNanosecondsNow = nowNanoseconds()
+        return nanoseconds(
+            forCoreAnimationTime: mediaTime,
+            mediaTimeNow: mediaTimeNow,
+            continuousNanosecondsNow: continuousNanosecondsNow
+        )
+    }
+
+    /// Calibrates a drawable's Core Animation timestamp into the interaction
+    /// trace clock using samples captured by the same presented callback.
+    /// A process-lifetime offset is invalid after sleep because Core Animation
+    /// media time and `ContinuousClock` do not advance through sleep identically.
+    package static func nanoseconds(
+        forCoreAnimationTime mediaTime: TimeInterval,
+        mediaTimeNow: TimeInterval,
+        continuousNanosecondsNow: UInt64
+    ) -> UInt64? {
+        guard mediaTime.isFinite,
+              mediaTimeNow.isFinite,
+              // CAMetalDrawable uses zero when no actual presentation time is
+              // available. It is not the Core Animation media-clock epoch.
+              mediaTime > 0,
+              mediaTimeNow >= mediaTime
         else {
             return nil
         }
-        if delta >= 0 {
-            let (value, overflow) = coreAnimationAnchor.monotonicNanoseconds
-                .addingReportingOverflow(UInt64(delta))
-            return overflow ? nil : value
+        let elapsedNanosecondsValue = (
+            (mediaTimeNow - mediaTime) * 1_000_000_000
+        ).rounded()
+        guard elapsedNanosecondsValue.isFinite,
+              elapsedNanosecondsValue >= 0,
+              let elapsedNanoseconds = UInt64(exactly: elapsedNanosecondsValue),
+              elapsedNanoseconds <= continuousNanosecondsNow
+        else {
+            return nil
         }
-        guard delta != Int64.min else { return nil }
-        let magnitude = UInt64(-delta)
-        guard magnitude <= coreAnimationAnchor.monotonicNanoseconds else { return nil }
-        return coreAnimationAnchor.monotonicNanoseconds - magnitude
+        return continuousNanosecondsNow - elapsedNanoseconds
     }
 }
 
@@ -393,7 +394,9 @@ package final class SpiceInteractionTraceAssembler: Sendable {
         var selectionNs: UInt64?
         var committedIdentity: SpiceInteractionFrameIdentity?
         var metalCommitNs: UInt64?
+        var droppedPresentationIdentity: SpiceInteractionFrameIdentity?
         var presentedNs: UInt64?
+        var markerReplacementObserved = false
         var invalidReason: String?
         var retiredDesktopGeneration: UInt64?
         var retiredSurfaceGenerations: [SurfaceLifecycleKey: UInt64] = [:]
@@ -604,13 +607,24 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             }
             if state.metalCommitNs != nil,
                previousSelectedIdentity == identity {
-                state.invalidReason = state.invalidReason
-                    ?? "duplicate_selection_after_commit"
-                return
+                if state.droppedPresentationIdentity == identity {
+                    // An authoritative redraw republishes the same frame
+                    // identity. Keep the first attempt's commit evidence until
+                    // this new selection actually begins, then let the retry
+                    // contribute its own selection and commit timestamps.
+                    state.committedIdentity = nil
+                    state.metalCommitNs = nil
+                    state.droppedPresentationIdentity = nil
+                } else {
+                    state.invalidReason = state.invalidReason
+                        ?? "duplicate_selection_after_commit"
+                    return
+                }
             }
             if previousSelectedIdentity != nil, previousSelectedIdentity != identity {
                 state.committedIdentity = nil
                 state.metalCommitNs = nil
+                state.droppedPresentationIdentity = nil
             }
             state.selectedIdentity = identity
             state.selectedRevisionReadyNs = readyNs
@@ -631,8 +645,7 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 state.selectedFrame = nil
                 if previousSelectedMarker != nil
                     || state.frames.values.contains(where: { $0.payload != nil }) {
-                    state.invalidReason = state.invalidReason
-                        ?? "marker_replaced_before_presented"
+                    state.markerReplacementObserved = true
                 }
                 return
             }
@@ -640,13 +653,12 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             if previousSelectedMarker != nil,
                selectedFrame.payload == nil,
                previousSelectedIdentity != identity {
-                state.invalidReason = state.invalidReason ?? "marker_replaced_before_presented"
+                state.markerReplacementObserved = true
                 return
             }
             if selectedFrame.payload == nil,
                state.frames.values.contains(where: { $0.payload != nil }) {
-                state.invalidReason = state.invalidReason
-                    ?? "marker_replaced_before_presented"
+                state.markerReplacementObserved = true
             }
         }
     }
@@ -699,10 +711,34 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 return false
             }
             state.presentedNs = nanoseconds
+            state.droppedPresentationIdentity = nil
+            // An independently observed later delivery carrying the same
+            // expected payload may recover from an intervening markerless
+            // selection. Its own receive/ready/select/commit/present evidence
+            // is already bound above; no evidence crosses identities.
+            state.markerReplacementObserved = false
             return true
         }
         guard accepted else { return nil }
         return presentationWaiter?.prepareCompletion(identity)
+    }
+
+    package func observePresentationDropped(
+        identity: SpiceInteractionFrameIdentity
+    ) {
+        state.withLock { state in
+            guard state.presentedNs == nil,
+                  state.selectedIdentity == identity,
+                  state.committedIdentity == identity,
+                  state.metalCommitNs != nil,
+                  let marker = state.selectedFrame?.payload,
+                  marker.token == token,
+                  marker.checksum == checksum
+            else {
+                return
+            }
+            state.droppedPresentationIdentity = identity
+        }
     }
 
     package func retireSurfaceLifecycle(
@@ -815,6 +851,9 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 markerRevision = candidatePayload?.markerRevision ?? state.guestMarkerRevision
             }
             let missingInputReason = state.hostInputNs == nil ? "missing_input_event" : nil
+            let replacementReason = state.markerReplacementObserved
+                ? "marker_replaced_before_presented"
+                : nil
             return SpiceInteractionTraceRecord(
                 pairId: pairId,
                 version: version,
@@ -845,7 +884,10 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 markerChecksum: candidatePayload.map {
                     String(format: "%08x", $0.checksum)
                 },
-                invalidReason: invalidReason ?? state.invalidReason ?? missingInputReason
+                invalidReason: invalidReason
+                    ?? state.invalidReason
+                    ?? replacementReason
+                    ?? missingInputReason
             )
         }
     }

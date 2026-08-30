@@ -192,6 +192,74 @@ struct SpiceDesktopSourceTests {
         subscription.cancel()
     }
 
+    @Test func droppedDrawableRecoveryUsesLatestOnlyDisplayPacing() throws {
+        let source = SpiceDesktopSource()
+        source.beginSession(pointerMode: .absolute)
+        let delivered = Mutex<[SpiceDesktopSnapshot]>([])
+        let subscription = source.subscribe()
+        subscription.setUpdateHandler { snapshot in
+            delivered.withLock { $0.append(snapshot) }
+        }
+        subscription.setDemand(.visible)
+        source.receiveFrame(Self.frame(revision: 7), displayChannelID: 0)
+
+        let initial = try #require(delivered.withLock { $0.last })
+        let initialRevision = try #require(initial.frame?.revision)
+        let latch = SpiceDesktopReadyLatch()
+        var pacing = SpiceDesktopPresentationPacingPolicy()
+        var recovery = SpiceDrawablePresentationDropRecoveryPolicy()
+
+        #expect(latch.offer(initial))
+        #expect(pacing.readyBecameAvailable() == .selectImmediately)
+        #expect(try #require(latch.take()).frame?.revision == initialRevision)
+        recovery.revisionSelected(initialRevision)
+
+        delivered.withLock { $0.removeAll(keepingCapacity: true) }
+        let action = recovery.presentationDropped(
+            revision: initialRevision,
+            selectedRevision: initialRevision,
+            isVisibleDemand: true
+        )
+        if action == .requestAuthoritativeRedraw {
+            // This is the same production subscription path used by the view;
+            // it creates a fresh delivery rather than directly resubmitting a
+            // stale drawable or bypassing publisher demand.
+            subscription.requestLatest()
+        }
+        let redraw = try #require(delivered.withLock { $0.only })
+        #expect(redraw.frame?.revision == initialRevision)
+        #expect(redraw.frame?.damage == .full)
+        #expect(redraw.deliverySequence > initial.deliverySequence)
+        #expect(latch.offer(redraw))
+        #expect(pacing.readyBecameAvailable() == .waitForDisplayLink)
+
+        // A newer real frame can replace the recovery snapshot before the
+        // pacing fence. Only that latest delivery becomes eligible to draw.
+        source.receiveFrame(Self.frame(revision: 8), displayChannelID: 0)
+        let newer = try #require(delivered.withLock { snapshots in
+            snapshots.last { $0.frame?.revision.value == 8 }
+        })
+        #expect(!latch.offer(newer))
+        #expect(
+            pacing.displayLinkFired(hasReadySnapshot: !latch.isEmpty)
+                == .selectOnDisplayLink
+        )
+        let selected = try #require(latch.take())
+        #expect(selected.frame?.revision.value == 8)
+        #expect(selected.deliverySequence == newer.deliverySequence)
+        #expect(latch.isEmpty)
+
+        // The first drop already spent revision 7's bounded request. A late
+        // duplicate cannot add another authoritative delivery.
+        #expect(recovery.presentationDropped(
+            revision: initialRevision,
+            selectedRevision: selected.frame?.revision,
+            isVisibleDemand: true
+        ) == .none)
+        #expect(delivered.withLock { $0.count } == 2)
+        subscription.cancel()
+    }
+
     @Test func secondVisibleSubscriberImmediatelyReceivesRetainedLatestAsFull() async throws {
         let source = SpiceDesktopSource()
         source.beginSession(pointerMode: .absolute)
