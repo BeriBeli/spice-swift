@@ -536,26 +536,54 @@ no issue. This is a local codec and persistence gate only. It performs no
 transport, process, fixture, SSH, RemoteRocky, artifact, or live SPICE effect
 and produces no latency, CPU/RSS, release, or AIP-44 claim.
 
-AIP-00h2 proceeds in four reviewable layers before any new real campaign:
+AIP-00h2b2 is merged on PRs #71-#72 as main commit `3e69c03`. A Sendable
+closure-backed transport and single-reader actor driver now execute receive,
+synchronous durable gate acceptance, exact ACK send, and delivery
+confirmation. Run-task cancellation closes receive/send operations that do
+not otherwise respond to cancellation; cancellation is resolved before a
+simultaneous nil receive can be classified as EOF, and every
+transport-originated error is treated as an external receive failure even when
+its dynamic type matches the driver's own error enum. The focused gate passed
+16 tests / 28 executions in strict Debug, strict Release, and
+AddressSanitizer. The cancellation-to-nil race passed 20/20 repetitions, and
+all nine attempted driver-error impersonation cases failed closed. Three
+Sources review findings were reproduced test-first, fixed, replied to, and
+resolved. Combined Apple Silicon CI run `33337686652`, job `99327451720`,
+passed build, public API, full tests, AddressSanitizer, and coverage in 17m9s;
+exact combined-head review of `3ab4a2e` found no issue and unresolved threads
+are zero. This closes only the local transport abstraction and driver control
+flow. It adds no OS file descriptor, child process, process group, `wait4`,
+SSH/RemoteRocky effect, artifact ownership, live interaction, latency,
+CPU/RSS, release, or AIP-44 improvement evidence.
 
-1. **h2a execution contract:** move the live manifest to a new schema that
-   immutably binds baseline/candidate Release binary hashes, runner identity,
-   remote image and guest-build manifests, fixture/control sources, pointer
-   mode, and stage-protocol version. A schema-1 recording is rejected before
-   any effect; it is never upgraded or reused.
-2. **h2b stage protocol and runner:** a long-lived parent owns the recorder;
-   each child `preArm`, `arm`, and `postArm` effect sends one bounded canonical
-   event and cannot continue until the parent has persisted and ACKed its exact
-   generation. Missing persistence receives no ACK and terminates the process
-   tree with zero retry.
-3. **h2c artifact/process/RemoteRocky boundary:** atomically bind records,
-   `wait4` resource samples, reports, and the final artifact index; use explicit
-   argv/environment and structured RemoteRocky commands. Teardown succeeds only
-   after the child, three records, resource sample, tunnel, and remote fixture
-   are all closed.
-4. **h2d paired execution:** port the same protocol to the isolated `v0.2.7`
-   overlay, then run the real 20-fresh-boot/60-action Rocky campaign. Only the
-   completed AIP-00g report can admit an AIP-44 scheduling experiment.
+AIP-00h2 proceeds through the remaining reviewable local boundaries before any
+new real campaign:
+
+1. **h2a execution contract — closed:** schema 2 immutably binds the
+   baseline/candidate Release binaries, source and runner identities, remote
+   image and guest build, fixture/control sources, pointer mode, and stage
+   protocol. Schema-1 recordings remain read-only and cannot be reused.
+2. **h2b stage protocol and local driver — closed:** bounded canonical events,
+   synchronous persist-before-ACK gating, a Sendable transport abstraction,
+   and one single-reader actor close every local ordering, cancellation, EOF,
+   delivery, and persistence-uncertainty path. No actual file descriptor or
+   child process is part of this layer.
+3. **h2c local execution boundary**, split into three independently reviewed
+   slices:
+   - **h2c-1 Darwin socket/FD framing:** implement bounded duplex framing,
+     write-all semantics, EOF/error classification, and close-unblocks-I/O
+     ownership without starting a child process.
+   - **h2c-2 local process ownership:** add one child process group, bounded
+     cancellation/teardown, one authoritative reap, and one unique `wait4`
+     resource sample without SSH or Rocky.
+   - **h2c-3 atomic artifact ownership/index:** bind the exact three records,
+     resource sample, manifest state, teardown result, reports, and final
+     artifact index without retroactively synthesizing success.
+4. **h2d paired RemoteRocky execution:** add structured SSH, tunnel, and
+   fixture ownership; port the same protocol to the isolated `v0.2.7`
+   measurement overlay; then run the real 20-fresh-boot/60-action paired Rocky
+   campaign. Only the completed AIP-00g report can admit an AIP-44 scheduling
+   experiment.
 
 The live Rocky marker also requires the pinned guest Xorg input driver
 `xf86-input-libinput=1.5.0-r0`. A guest image without that driver may accept
@@ -882,6 +910,7 @@ behavior remain separate acceptance gates.
 | AIP-00 | 2026-08-30 | AIP-00e baseline cold-start smoke | Campaign `2aacf4a6e32fb809` stopped before executable launch after a forward-readiness false negative. Fresh campaign `322ad5e20a210030`, evidence `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260830T060900Z.ubf9oi`, verified the container and visible foreground path but stopped at `initial_presentation` with `visible_subscriptions=1`, `commit_delta=1`, `presented_delta=0`, and zero input/JSONL records. | Both campaigns are permanently failed and are not retried under the same identity. They contain no interaction sample and cannot enter latency statistics. A bounded pre-arm reliability seam is required before a new campaign ID; AIP-00 and AIP-44 remain open. |
 | AIP-00 | 2026-08-30 | AIP-00g paired campaign structural gate / PRs #59-#60 / `21ed862` | Focused Debug, Release, and AddressSanitizer gates each passed 8/8. The matrix additionally covers all 13 stage-failure positions, nine artifact mutations, three execution-linkage rejection cases, and 11 malformed evidence-ID spellings. Apple Silicon CI run `33306335910`, job `99243450554`, passed build, public API, full tests, AddressSanitizer, and coverage; exact-head Codex review found no issues. | Pure package validation only. The gate fixes the 20-run counterbalance, 260-entry successful ledger, 60 canonical records, 20 resource samples, and typed actual-evidence mapping without executing Rocky or producing a paired live artifact. It contains no latency observation; AIP-00 and AIP-44 remain open. |
 | AIP-00 | 2026-08-30 | AIP-00h1 real-time manifest boundary / PRs #62-#63 / `c508718` | Focused strict Debug, Release, and AddressSanitizer gates each passed 10/10, plus a strict Release support build. Final Apple Silicon CI run `33314950299`, job `99266536122`, passed build, public API, full tests, AddressSanitizer, and coverage. Exact-head review of `4a1bb50` found no issues. Two earlier P2 findings were fixed test-first: terminal recovery re-syncs an uncertain directory entry, and full plan replay rejects a foreign but validly encoded ledger entry; both threads were replied to and resolved. | Persists one canonical generation per actual stage result, prevents a second active recorder, and makes failed/interrupted/finalized state terminal without replay. This is deterministic local persistence evidence only: no runner, RemoteRocky effect, live paired artifact, latency result, or AIP-44 scheduling change is included. |
+| AIP-00 | 2026-08-31 | AIP-00h2b2 local stage driver / PRs #71-#72 / `3e69c03` | The focused driver gate passed 16 tests / 28 executions in strict Debug, strict Release, and AddressSanitizer. Cancellation returning nil passed 20/20 repeated executions, and all nine transport attempts to throw the driver's own error cases were classified as external receive failures. Three Sources review findings were reproduced and fixed test-first. Combined Apple Silicon CI run `33337686652`, job `99327451720`, passed build, public API, full tests, AddressSanitizer, and coverage in 17m9s; exact combined-head review of `3ab4a2e` found no issue and unresolved threads are zero. | Deterministic local transport-abstraction and actor-state evidence only. No OS FD, process, process group, `wait4`, SSH/RemoteRocky, artifact, live SPICE, latency, CPU/RSS, release, or AIP-44 claim is included. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
@@ -935,3 +964,4 @@ behavior remain separate acceptance gates.
 | 2026-08-30 | AIP-00 | Merge the AIP-00h1 persistence boundary before runner effects, then require a typed execution contract before any new Rocky campaign | Exclusive create, persist-before-swap, terminal recovery, full plan replay, and atomic publication prevent a synthesized or replayed success. Source commits alone do not prove which Release binaries, runner, guest image, or fixture sources executed, so AIP-00h2 must bind those hashes in a new manifest schema before SSH/process effects begin. |
 | 2026-08-31 | AIP-00 | Close AIP-00h2a before implementing any stage transport, and keep AIP-00h2b local and ACK-gated | The new schema-2 execution identity prevents a campaign from starting with ambiguous binaries, runner, image, guest build, fixture, pointer mode, or protocol. The next layer may add only canonical bounded child events, synchronous recorder persistence, and exact-generation ACKs; actual duplex processes, SSH/RemoteRocky effects, resource collection, artifact publication, and paired execution remain later layers. |
 | 2026-08-31 | AIP-00 | Split AIP-00h2b into a synchronous durable gate and a later asynchronous driver | Canonical event identity, persist-before-ACK, exact ACK delivery, and durable-once terminal behavior can be proven without an async transport. AIP-00h2b1 therefore closes that synchronous state machine first; h2b2 may add only a Sendable transport abstraction and single-reader driver, while actual file descriptors, child processes, SSH/RemoteRocky, resources, and artifacts remain h2c. |
+| 2026-08-31 | AIP-00 | Close the local h2b driver before introducing OS resources, and split h2c into FD, process, and artifact ownership slices | The Sendable transport abstraction proves durable-before-ACK ordering, single-reader cancellation, EOF, delivery failure, and close-once behavior without conflating them with descriptor reuse, child reaping, resource collection, or artifact publication. AIP-00h2c-1 therefore owns only Darwin socket/FD framing, h2c-2 owns the local process group and unique `wait4`, and h2c-3 owns atomic artifact/index publication. SSH/RemoteRocky, the baseline overlay, and the real paired campaign remain exclusively h2d. |
