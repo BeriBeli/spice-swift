@@ -65,6 +65,27 @@ Agent behavior, including system-trusted TLS.
   `2c577d7` worktree also completed a Release build under the current Swift 6.3
   toolchain. Its exact-correlation measurement overlay and the live paired
   collection are the next AIP-00 gates; no AIP-44 pacing change is admitted.
+  That isolated overlay is now split across stacked PRs #53-#55: exact
+  presenter-owned correlation, canonical JSONL/campaign planning, and the
+  foreground `v0.2.7` executable. Their combined review-fix gate passed the
+  four focused suites 33/33 in strict Debug, strict Release, and
+  AddressSanitizer, plus the strict Release product build. The stack remains
+  measurement-only and does not import current scheduling or drawable-recovery
+  algorithms into the baseline.
+
+- Two subsequent baseline smoke campaigns produced no admissible interaction
+  observation. Campaign `2aacf4a6e32fb809` stopped before executable launch
+  after the readiness probe rejected an otherwise bindable SSH forward. Fresh
+  campaign `322ad5e20a210030` verified the Rocky container and visible AppKit
+  subscription, then stopped at `initial_presentation` with one Metal commit,
+  zero presented callbacks, no armed input, and an empty remote JSONL file.
+  This is a pre-arm reliability failure, not latency data. AIP-00f therefore
+  adds only a once-bounded authoritative-latest request after visible demand,
+  a real post-baseline commit, and still-zero presentations 250 ms after the
+  harness first observes that commit. Baseline and candidate use the same
+  duration and start event. The request remains outside trace creation and must
+  still time out fail-closed. A new campaign identity will not start until that
+  deterministic gate and exact-head review pass.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
