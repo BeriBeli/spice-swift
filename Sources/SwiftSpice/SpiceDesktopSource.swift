@@ -246,6 +246,10 @@ private final class WeakSpiceDesktopSource: @unchecked Sendable {
 /// snapshots, while cursor and pointer-mode changes remain lightweight.
 public final class SpiceDesktopSource: Sendable {
     private let state = Mutex(SpiceDesktopSourceState())
+
+    package var currentPointerMode: SpicePointerMode {
+        state.withLock(\.pointerMode)
+    }
     package let frameDemandCoordinator: DisplayFrameDemandCoordinator
     package let presentationDiagnostics: SpicePresentationDiagnostics
 

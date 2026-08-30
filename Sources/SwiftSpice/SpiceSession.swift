@@ -156,6 +156,9 @@ public actor SpiceSession {
     private let mjpegDecodeLimiter = SpiceMJPEGDecodeLimiter(maximumConcurrent: 2)
     package nonisolated let presentationDiagnostics: SpicePresentationDiagnostics
     public nonisolated let desktop: SpiceDesktopSource
+    package nonisolated var currentPointerMode: SpicePointerMode {
+        desktop.currentPointerMode
+    }
     public nonisolated let events: AsyncStream<SpiceSessionEvent>
     private let eventMailbox: SpiceSessionEventMailbox
     public nonisolated let playbackEvents: AsyncStream<SpicePlaybackEvent>
