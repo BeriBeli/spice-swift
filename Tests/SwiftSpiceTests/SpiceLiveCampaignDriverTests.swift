@@ -182,7 +182,7 @@ private extension SpiceLiveCampaignDriverTests {
 
     static func plan() throws -> SpiceLiveCampaignPlan {
         let specification = try pairedSpecification()
-        try SpiceLiveCampaignPlan(
+        return try SpiceLiveCampaignPlan(
             campaignID: campaignID,
             baselineVersion: specification.baselineVersion,
             candidateVersion: specification.candidateVersion,
