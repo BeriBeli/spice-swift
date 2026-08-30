@@ -419,7 +419,7 @@ private func concurrentlyAppend(
 private func withTemporaryTraceDirectory<Result>(
     _ operation: (URL) throws -> Result
 ) throws -> Result {
-    let directory = FileManager.default.temporaryDirectory.appending(
+    let directory = writerTemporaryRoot.appending(
         path: "interaction-writer-\(UUID().uuidString)",
         directoryHint: .isDirectory
     )
@@ -431,7 +431,7 @@ private func withTemporaryTraceDirectory<Result>(
 private func withTemporaryTraceDirectory<Result: Sendable>(
     _ operation: (URL) async throws -> Result
 ) async throws -> Result {
-    let directory = FileManager.default.temporaryDirectory.appending(
+    let directory = writerTemporaryRoot.appending(
         path: "interaction-writer-\(UUID().uuidString)",
         directoryHint: .isDirectory
     )
@@ -439,6 +439,9 @@ private func withTemporaryTraceDirectory<Result: Sendable>(
     defer { try? FileManager.default.removeItem(at: directory) }
     return try await operation(directory)
 }
+
+private let writerTemporaryRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
 
 private func posixPermissions(_ url: URL) throws -> Int {
     let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
