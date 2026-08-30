@@ -31,8 +31,11 @@ struct SpiceLiveCampaignManifestTests {
         #expect(manifest.metadata.startedAtUTC == "2026-08-30T10:00:00Z")
         #expect(manifest.planDigest.utf8.count == 64)
         #expect(manifest.planDigest.utf8.allSatisfy(Self.isLowerHex))
-        #expect(try Data(contentsOf: result.output) == Self.canonicalData(manifest))
-        #expect(try result.writer.load() == manifest)
+        let persistedBytes = try Data(contentsOf: result.output)
+        let canonicalBytes = try Self.canonicalData(manifest)
+        let loadedManifest = try result.writer.load()
+        #expect(persistedBytes == canonicalBytes)
+        #expect(loadedManifest == manifest)
 
         for invalidMetadata in Self.invalidMetadata() {
             #expect(throws: (any Error).self) { _ = try invalidMetadata() }
@@ -55,8 +58,10 @@ struct SpiceLiveCampaignManifestTests {
                 evidenceRunID: stage == .fixtureStart ? Self.evidenceID(0) : nil
             )
             let bytes = try Data(contentsOf: result.output)
-            let persisted = try #require(result.writer.load())
-            #expect(bytes == Self.canonicalData(persisted))
+            let loadedManifest = try result.writer.load()
+            let persisted = try #require(loadedManifest)
+            let canonicalBytes = try Self.canonicalData(persisted)
+            #expect(bytes == canonicalBytes)
             #expect(bytes.last != 0x0a)
             #expect(persisted == recorder.snapshot)
             #expect(persisted.generation == UInt64(offset + 1))
@@ -64,7 +69,8 @@ struct SpiceLiveCampaignManifestTests {
             #expect(persisted.stages.map(\.stage) == Array(Self.stages.prefix(offset + 1)))
         }
         #expect(recorder.snapshot.runs[0].logicalRunID == run.runID)
-        #expect(recorder.snapshot.runs[0].evidenceRunID == Self.evidenceID(0))
+        let expectedEvidenceID = try Self.evidenceID(0)
+        #expect(recorder.snapshot.runs[0].evidenceRunID == expectedEvidenceID)
     }
 
     @Test func everyStageFailureIncludingTeardownPersistsAndIsTerminal() throws {
@@ -92,7 +98,8 @@ struct SpiceLiveCampaignManifestTests {
                 evidenceRunID: nil
             )
 
-            let persisted = try #require(result.writer.load())
+            let loadedManifest = try result.writer.load()
+            let persisted = try #require(loadedManifest)
             #expect(persisted.state == .failed)
             #expect(persisted.generation == UInt64(failureOffset + 1))
             #expect(persisted.stages.count == failureOffset + 1)
@@ -111,7 +118,8 @@ struct SpiceLiveCampaignManifestTests {
         defer { Self.removeOutput(seed.output) }
         let run = plan.runs[0]
         try seed.recorder.record(run: run, stage: .fixtureStop, outcome: .succeeded)
-        let durablePrefix = try #require(seed.writer.load())
+        let loadedPrefix = try seed.writer.load()
+        let durablePrefix = try #require(loadedPrefix)
         #expect(durablePrefix.stages.count == 1)
 
         let recovered = try SpiceLiveRealtimeStageRecorder.resume(
@@ -119,7 +127,8 @@ struct SpiceLiveCampaignManifestTests {
             metadata: Self.metadata(),
             manifestWriter: seed.writer
         )
-        let interrupted = try #require(seed.writer.load())
+        let loadedInterrupted = try seed.writer.load()
+        let interrupted = try #require(loadedInterrupted)
         #expect(recovered.snapshot == interrupted)
         #expect(interrupted.state == .interrupted)
         #expect(interrupted.generation == durablePrefix.generation + 1)
@@ -156,7 +165,8 @@ struct SpiceLiveCampaignManifestTests {
         #expect(finalized.generation == 261)
         #expect(finalized.stages.count == 260)
         #expect(Set(finalized.runs.compactMap(\.evidenceRunID)).count == 20)
-        #expect(try complete.writer.load() == finalized)
+        let loadedFinalized = try complete.writer.load()
+        #expect(loadedFinalized == finalized)
     }
 
     @Test func missingDuplicateReorderedExtraAndMismatchFailClosed() throws {
@@ -252,7 +262,8 @@ struct SpiceLiveCampaignManifestTests {
         #expect(attributes[.type] as? FileAttributeType == .typeRegular)
         #expect((attributes[.posixPermissions] as? NSNumber)?.uint16Value == 0o600)
         let initialBytes = try Data(contentsOf: seed.output)
-        #expect(initialBytes.count == Self.canonicalData(seed.recorder.snapshot).count)
+        let canonicalInitialBytes = try Self.canonicalData(seed.recorder.snapshot)
+        #expect(initialBytes.count == canonicalInitialBytes.count)
 
         let boundedOutput = try Self.outputURL()
         defer { Self.removeOutput(boundedOutput) }
@@ -273,7 +284,8 @@ struct SpiceLiveCampaignManifestTests {
                 outcome: .succeeded
             )
         }
-        #expect(try Data(contentsOf: boundedOutput) == beforeFailedReplacement)
+        let afterFailedReplacement = try Data(contentsOf: boundedOutput)
+        #expect(afterFailedReplacement == beforeFailedReplacement)
         #expect(boundedRecorder.snapshot.stages.isEmpty)
 
         let target = parent.appending(path: "sentinel")
@@ -286,7 +298,8 @@ struct SpiceLiveCampaignManifestTests {
         #expect(throws: (any Error).self) {
             _ = try SpiceLiveCampaignManifestWriter(outputURL: symlink)
         }
-        #expect(try Data(contentsOf: target) == Data("sentinel".utf8))
+        let targetBytes = try Data(contentsOf: target)
+        #expect(targetBytes == Data("sentinel".utf8))
 
         let directoryOutput = parent.appending(path: "directory-output")
         try FileManager.default.createDirectory(at: directoryOutput, withIntermediateDirectories: false)
@@ -301,7 +314,8 @@ struct SpiceLiveCampaignManifestTests {
             let writer = try SpiceLiveCampaignManifestWriter(outputURL: noncanonical)
             _ = try writer.load()
         }
-        #expect(try Data(contentsOf: noncanonical) == noncanonicalBytes)
+        let preservedNoncanonicalBytes = try Data(contentsOf: noncanonical)
+        #expect(preservedNoncanonicalBytes == noncanonicalBytes)
 
         let oversized = parent.appending(path: "oversized.json")
         let oversizedBytes = Data(repeating: 0x61, count: 1_025)
@@ -313,7 +327,8 @@ struct SpiceLiveCampaignManifestTests {
             )
             _ = try writer.load()
         }
-        #expect(try Data(contentsOf: oversized) == oversizedBytes)
+        let preservedOversizedBytes = try Data(contentsOf: oversized)
+        #expect(preservedOversizedBytes == oversizedBytes)
     }
 }
 
