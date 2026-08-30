@@ -316,6 +316,54 @@ struct SpiceDesktopSourceTests {
         ]))
     }
 
+    @Test func controlStateEnvelopePreservesFramePublicationSequence() throws {
+        let frame = SpiceFrame(
+            surfaceID: 0,
+            width: 4,
+            height: 4,
+            bytesPerRow: 16,
+            pixels: Data(repeating: 12, count: 64)
+        )
+        let surface = SpiceSurfaceIdentity(
+            displayChannelID: 0,
+            surfaceID: 0,
+            generation: 1
+        )
+        let publishedUpdate = SpiceFrameUpdate(
+            frame: frame,
+            revision: SpiceFrameRevision(surface: surface, value: 7),
+            damage: .full,
+            deliverySequence: 40
+        )
+        let published = SpiceDesktopSnapshot(
+            generation: 3,
+            frame: publishedUpdate,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 40
+        )
+        let controlOnly = SpiceDesktopSnapshot(
+            generation: 3,
+            frame: SpiceFrameUpdate(
+                frame: frame,
+                revision: publishedUpdate.revision,
+                damage: .rectangles([]),
+                deliverySequence: 40
+            ),
+            cursor: SpiceCursorState(x: 9, y: 8, isVisible: true, image: nil),
+            pointerMode: .relative,
+            deliverySequence: 41
+        )
+
+        let selected = SpiceDesktopSource.merging(published, controlOnly)
+
+        #expect(selected.deliverySequence == 41)
+        #expect(selected.frameDeliverySequence == 40)
+        #expect(selected.frame?.revision.value == 7)
+        #expect(selected.cursor?.x == 9)
+        #expect(selected.pointerMode == .relative)
+    }
+
     private static func frame(
         lifecycle: UInt64 = 1,
         revision: UInt64
