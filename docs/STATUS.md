@@ -144,6 +144,28 @@ Agent behavior, including system-trusted TLS.
   remain open, with no Rocky, external-SPICE, latency, CPU/RSS, or release
   improvement claimed.
 
+- AIP-00h2b1 is now merged on PRs #68-#69 as main commit `1d3674f`. The local
+  stage protocol admits only canonical single-line v1 frames of at most 4 KiB
+  and binds the full campaign/run/evidence/action/stage/sequence/manifest-
+  generation identity. The durable gate enforces the exact nine child stages,
+  creates a pending ACK only after synchronous manifest persistence, and
+  advances only after exact ACK delivery. Invalid identity or order, replay,
+  stale generation, persistence uncertainty, ACK failure, EOF, and cancellation
+  are terminal with zero retry and at most one durable terminal successor. The
+  10-test suite includes 79 malformed event/ACK frames. Four review findings
+  strengthened all 15 ACK fields, meaningful oversized JSON, repeated no-retry
+  persistence proof, and EOF/cancel without a pending ACK; each was fixed
+  test-first, replied to, and resolved. Local Debug, Release, and focused ASan
+  passed 10/10, with h1/h2a regression for an independently verified 47/47.
+  Combined Apple Silicon CI run `33326178174` passed build, public API, full
+  tests, AddressSanitizer, and coverage in 17m49s; exact combined-head review
+  found no issue and unresolved threads are zero. This is local codec/gate
+  closure only. AIP-00h2b2 must next add a Sendable transport abstraction and
+  single-reader driver; actual duplex FDs/processes, fixture teardown, `wait4`,
+  artifacts, SSH/RemoteRocky, baseline overlay, and paired execution remain
+  h2c/h2d. No live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
+  claimed.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
