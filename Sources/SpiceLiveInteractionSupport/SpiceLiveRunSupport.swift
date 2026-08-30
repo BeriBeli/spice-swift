@@ -60,7 +60,11 @@ package struct SpiceLiveInputDispatchMetadata: Sendable, Equatable {
 package struct SpiceLiveSingleRunExecution: Sendable {
     private enum Phase: Sendable {
         case ready(index: Int)
-        case active(index: Int, exactPresented: Bool, localAppended: Bool)
+        case active(
+            index: Int,
+            exactPresented: Bool,
+            localRecord: SpiceInteractionTraceRecord?
+        )
         case completed
         case failed
     }
@@ -95,31 +99,38 @@ package struct SpiceLiveSingleRunExecution: Sendable {
             phase = .failed
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
-        phase = .active(index: index, exactPresented: false, localAppended: false)
+        phase = .active(index: index, exactPresented: false, localRecord: nil)
         return steps[index]
     }
 
     package mutating func recordExactPresentation(order: UInt64) throws {
-        guard case let .active(index, false, false) = phase,
+        guard case let .active(index, false, nil) = phase,
               steps[index].order == order else {
             phase = .failed
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
-        phase = .active(index: index, exactPresented: true, localAppended: false)
+        phase = .active(index: index, exactPresented: true, localRecord: nil)
     }
 
-    package mutating func recordLocalAppend(order: UInt64) throws {
-        guard case let .active(index, true, false) = phase,
-              steps[index].order == order else {
+    package mutating func recordLocalAppend(
+        _ record: SpiceInteractionTraceRecord
+    ) throws {
+        guard case let .active(index, true, nil) = phase,
+              recordMatchesStep(record, step: steps[index]),
+              record.valid else {
             phase = .failed
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
-        phase = .active(index: index, exactPresented: true, localAppended: true)
+        phase = .active(index: index, exactPresented: true, localRecord: record)
     }
 
-    package mutating func recordRemoteAppend(order: UInt64) throws {
-        guard case let .active(index, true, true) = phase,
-              steps[index].order == order else {
+    package mutating func recordRemoteAppend(
+        _ record: SpiceInteractionTraceRecord
+    ) throws {
+        guard case let .active(index, true, localRecord?) = phase,
+              localRecord == record,
+              recordMatchesStep(record, step: steps[index]),
+              record.valid else {
             phase = .failed
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
@@ -129,6 +140,17 @@ package struct SpiceLiveSingleRunExecution: Sendable {
 
     package mutating func fail() {
         phase = .failed
+    }
+
+    private func recordMatchesStep(
+        _ record: SpiceInteractionTraceRecord,
+        step: SpiceLiveInteractionClusterPlan.Step
+    ) -> Bool {
+        record.pairId == step.pairID
+            && record.order == step.order
+            && record.actionClass == step.actionClass
+            && record.token == step.token
+            && record.markerChecksum == String(format: "%08x", step.checksum)
     }
 }
 

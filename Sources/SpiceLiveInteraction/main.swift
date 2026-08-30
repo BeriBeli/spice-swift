@@ -222,7 +222,7 @@ private final class SpiceLiveInteractionHarness {
                 guard var localExecution = runExecution else {
                     throw SpiceLiveInteractionSupportError.invalidTraceProtocol
                 }
-                try localExecution.recordLocalAppend(order: step.order)
+                try localExecution.recordLocalAppend(record)
                 runExecution = localExecution
 
                 stage = .remoteCollector
@@ -237,7 +237,7 @@ private final class SpiceLiveInteractionHarness {
                 guard var remoteExecution = runExecution else {
                     throw SpiceLiveInteractionSupportError.invalidTraceProtocol
                 }
-                try remoteExecution.recordRemoteAppend(order: step.order)
+                try remoteExecution.recordRemoteAppend(record)
                 runExecution = remoteExecution
                 _ = await trace.terminateAndWait()
                 traceProcess = nil
