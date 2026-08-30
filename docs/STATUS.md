@@ -42,9 +42,19 @@ Agent behavior, including system-trusted TLS.
   dropped drawable; one bounded authoritative latest-only retry is allowed
   without idle commits or exceeding two GPU commands in flight. Eight further
   cold starts still reached two commits with no presented callback and failed
-  before arm. AIP-00 is therefore in progress, not complete: direct session
-  clicks bypass AppKit input receipt, and paired click/key/motion run clusters
-  for `v0.2.7` and current `v0.3.x` remain required.
+  before arm. AIP-00d now serializes a fixed click/key/motion cluster in one
+  visible Session and admits the next action only after exact presentation and
+  remote append. Rocky run
+  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260830T021418Z.037hAL`
+  retained successful cluster `0000000000000008`: all three schema-2 records
+  are valid, with directional input-to-presented times 197.254/107.894/216.268
+  ms and ready-to-selection times 0.010/8.195/0.012 ms for click/key/motion.
+  Markerless drawable retries no longer contaminate a later exact marker;
+  relative motion alone requires the SPICE motion ACK, while absolute tablet
+  motion is closed by guest marker and exact-presented evidence. AIP-00 is
+  still in progress: direct Session inputs bypass AppKit receipt, and ten
+  paired click/key/motion clusters for `v0.2.7` and current `v0.3.x` remain
+  required.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
