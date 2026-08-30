@@ -515,6 +515,103 @@ struct SpiceDesktopPresentationPolicyTests {
         #expect(cpuFallbacks == 1)
     }
 
+    @Test func droppedDrawableRequestsOneVisibleCurrentRevisionRecovery() {
+        let current = Self.revision(43)
+        let stale = Self.revision(42)
+        var recovery = SpiceDrawablePresentationDropRecoveryPolicy()
+
+        // A callback cannot implicitly create tracked presentation state. The
+        // view must first select the exact revision through its normal apply
+        // path, even if an external selected-revision value happens to match.
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .none)
+        // An empty view, a hidden view, and a stale callback cannot create work
+        // or consume the one recovery opportunity for the selected frame.
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: nil,
+            isVisibleDemand: true
+        ) == .none)
+        recovery.revisionSelected(current)
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: false
+        ) == .none)
+        #expect(recovery.presentationDropped(
+            revision: stale,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .none)
+
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .requestAuthoritativeRedraw)
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .none)
+
+        // A stale success cannot reset the current revision's budget. A real
+        // presentation of that revision does, so a later independent drop is
+        // eligible for one new bounded recovery.
+        recovery.presentationSucceeded(revision: stale)
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .none)
+        recovery.presentationSucceeded(revision: current)
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .requestAuthoritativeRedraw)
+        #expect(recovery.presentationDropped(
+            revision: current,
+            selectedRevision: current,
+            isVisibleDemand: true
+        ) == .none)
+    }
+
+    @Test func newerRevisionStartsAnIndependentDropRecoveryBudget() {
+        let original = Self.revision(43)
+        let newer = Self.revision(44)
+        var recovery = SpiceDrawablePresentationDropRecoveryPolicy()
+
+        recovery.revisionSelected(original)
+        #expect(recovery.presentationDropped(
+            revision: original,
+            selectedRevision: original,
+            isVisibleDemand: true
+        ) == .requestAuthoritativeRedraw)
+
+        recovery.revisionSelected(newer)
+        #expect(recovery.presentationDropped(
+            revision: original,
+            selectedRevision: newer,
+            isVisibleDemand: true
+        ) == .none)
+        #expect(recovery.presentationDropped(
+            revision: newer,
+            selectedRevision: newer,
+            isVisibleDemand: true
+        ) == .requestAuthoritativeRedraw)
+
+        recovery.reset()
+        #expect(recovery.presentationDropped(
+            revision: newer,
+            selectedRevision: newer,
+            isVisibleDemand: true
+        ) == .none)
+    }
+
     @Test func absolutePointerUsesOnlyTheNativeCursor() {
         #expect(SpiceDesktopPresentationPolicy.cursorLayer(for: .absolute) == .native)
     }
@@ -632,6 +729,17 @@ struct SpiceDesktopPresentationPolicyTests {
         )
 
         #expect(first != replaced)
+    }
+
+    private static func revision(_ value: UInt64) -> SpiceFrameRevision {
+        SpiceFrameRevision(
+            surface: SpiceSurfaceIdentity(
+                displayChannelID: 0,
+                surfaceID: 0,
+                generation: 1
+            ),
+            value: value
+        )
     }
 }
 

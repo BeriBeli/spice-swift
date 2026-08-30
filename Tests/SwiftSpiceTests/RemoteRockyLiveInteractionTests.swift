@@ -24,6 +24,31 @@ struct RemoteRockyLiveInteractionTests {
         #expect(configuration.controlPort == 6_136)
         #expect(configuration.endpointHost == "127.0.0.1")
         #expect(configuration.endpointPort == 6_235)
+        #expect(configuration.version == "v0.3.3")
+    }
+
+    @Test func configurationRequiresACanonicalExplicitLiveVersion() throws {
+        let canonical = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        #expect(canonical.version == "v0.3.3")
+
+        for invalidVersion in [
+            "0.3.3",
+            "v00.3.3",
+            "v0.03.3",
+            "v0.3.03",
+            "v0.3",
+            "v0.3.3-beta",
+            "v0.3.3\n",
+            "v0.3.3\r",
+            "v0.3.3\r\n",
+            "v0.3.3 ",
+            "v0.3.3\t",
+            "v0.3.3x",
+        ] {
+            var environment = validEnvironment
+            environment["SWIFTSPICE_LIVE_VERSION"] = invalidVersion
+            expectConfigurationError(environment, .invalidLiveVersion)
+        }
     }
 
     @Test func configurationRejectsHistoricalDefaultsAndSSHOptionInjection() {
@@ -521,6 +546,7 @@ struct RemoteRockyLiveInteractionTests {
             "SWIFTSPICE_PERF_CONTROL_PORT": "6136",
             "SWIFTSPICE_LIVE_ENDPOINT_HOST": "127.0.0.1",
             "SWIFTSPICE_LIVE_ENDPOINT_PORT": "6235",
+            "SWIFTSPICE_LIVE_VERSION": "v0.3.3",
         ]
     }
 

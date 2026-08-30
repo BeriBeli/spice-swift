@@ -425,6 +425,11 @@ package enum SpiceMetalCommandCompletion: Sendable, Equatable {
     case failed
 }
 
+package enum SpiceMetalDrawablePresentationOutcome: Sendable, Equatable {
+    case presented
+    case dropped
+}
+
 @MainActor
 package final class SpiceMetalFrameView: MTKView {
     private struct PendingPresentation {
@@ -434,6 +439,9 @@ package final class SpiceMetalFrameView: MTKView {
         let interactionContext: SpiceInteractionPresentationContext?
         let onCompletion: @MainActor @Sendable (
             SpiceMetalCommandCompletion
+        ) -> Void
+        let onDrawablePresentation: @MainActor @Sendable (
+            SpiceMetalDrawablePresentationOutcome
         ) -> Void
     }
 
@@ -485,6 +493,9 @@ package final class SpiceMetalFrameView: MTKView {
         interactionContext: SpiceInteractionPresentationContext? = nil,
         onCompletion: @escaping @MainActor @Sendable (
             SpiceMetalCommandCompletion
+        ) -> Void = { _ in },
+        onDrawablePresentation: @escaping @MainActor @Sendable (
+            SpiceMetalDrawablePresentationOutcome
         ) -> Void = { _ in }
     ) -> SpiceMetalFramePresentationResult {
         let sourceTexture: any MTLTexture
@@ -518,7 +529,8 @@ package final class SpiceMetalFrameView: MTKView {
             frame: frame,
             requestedAt: requestedAt,
             interactionContext: interactionContext,
-            onCompletion: onCompletion
+            onCompletion: onCompletion,
+            onDrawablePresentation: onDrawablePresentation
         )
         pendingDrawResult = nil
         draw()
@@ -571,9 +583,18 @@ package final class SpiceMetalFrameView: MTKView {
         let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
         let requestToPresentedStartedAt = pending.requestedAt
         let interactionIdentity = pending.interactionContext?.identity
+        let onDrawablePresentation = pending.onDrawablePresentation
         drawable.addPresentedHandler { [presentationDiagnostics] presentedDrawable in
+            let drawableWasDropped = presentedDrawable.presentedTime == 0
+            // Calibrate in this callback instead of retaining a process-lifetime
+            // Core Animation offset, which can drift from ContinuousClock when
+            // the machine sleeps between trace events.
+            let mediaTimeNow = CACurrentMediaTime()
+            let continuousNanosecondsNow = SpiceInteractionHostClock.nowNanoseconds()
             let presentedNanoseconds = SpiceInteractionHostClock.nanoseconds(
-                forCoreAnimationTime: presentedDrawable.presentedTime
+                forCoreAnimationTime: presentedDrawable.presentedTime,
+                mediaTimeNow: mediaTimeNow,
+                continuousNanosecondsNow: continuousNanosecondsNow
             )
             if let presentedNanoseconds,
                let requestedNanoseconds = SpiceInteractionHostClock.nanoseconds(
@@ -590,19 +611,36 @@ package final class SpiceMetalFrameView: MTKView {
                     epoch: presentationEpoch
                 )
             }
-            presentationDiagnostics?.recordMetalPresentedFrame(
-                isAdvancedVideo: isAdvancedVideoFrame,
-                epoch: presentationEpoch
-            )
-            if let interactionIdentity, let presentedNanoseconds {
+            if !drawableWasDropped {
+                presentationDiagnostics?.recordMetalPresentedFrame(
+                    isAdvancedVideo: isAdvancedVideoFrame,
+                    epoch: presentationEpoch
+                )
                 // The callback may arrive on a Metal-owned thread. Queue trace
-                // mutation on this view's MainActor so the actual commit call
-                // and its immediately following evidence always linearize first.
+                // mutation and drop recovery on this view's MainActor so the
+                // actual commit call and its immediately following evidence
+                // always linearize first.
                 Task { @MainActor in
-                    presentationDiagnostics?.recordInteractionPresented(
-                        identity: interactionIdentity,
-                        at: presentedNanoseconds
-                    )
+                    if let interactionIdentity, let presentedNanoseconds {
+                        presentationDiagnostics?.recordInteractionPresented(
+                            identity: interactionIdentity,
+                            at: presentedNanoseconds
+                        )
+                    }
+                    onDrawablePresentation(.presented)
+                }
+            } else {
+                // CAMetalDrawable reports zero when the drawable was not
+                // presented. Keep that outcome distinct from a real timestamp;
+                // the MainActor owner may request one bounded authoritative
+                // redraw without fabricating presentation evidence.
+                Task { @MainActor in
+                    if let interactionIdentity {
+                        presentationDiagnostics?.recordInteractionPresentationDropped(
+                            identity: interactionIdentity
+                        )
+                    }
+                    onDrawablePresentation(.dropped)
                 }
             }
         }

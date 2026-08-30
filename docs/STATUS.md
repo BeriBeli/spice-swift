@@ -24,22 +24,27 @@ Agent behavior, including system-trusted TLS.
 
 ## Algorithm plan execution
 
-- AIP-00c now has a dedicated `spice-live-interaction` foreground AppKit
-  executable without changing the Viewer or display pacing. It replaces the
-  unsuitable SwiftPM test-host window, requires real visible demand and an
-  initial Metal commit/present before arming, streams one strictly correlated
-  guest arm/received/drawn transaction, and waits only for the selected and
-  committed identity accepted by AppKit presented. Its support target exposes
-  the non-UI timeout, parser, process, and derived-invalid finalization logic
-  for local tests. The isolated `5945`/`5946` run at
-  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T061937Z.9FuYes`
-  remains guest-causal smoke evidence. Release foreground attempts reached a
-  real window but the current Mac WindowServer session kept it occluded, so
-  visible demand remained zero and the harness failed before arm with no guest
-  input or collector bytes. The live gate is therefore environment-blocked
-  until it can run in an interactive, unlocked Mac session. Its direct session
-  click will not measure the AppKit input queue. No input-to-visible or
-  scheduling conclusion is claimed.
+- AIP-00c resumed after the Mac session was unlocked. The dedicated
+  `spice-live-interaction` AppKit executable now has live schema-2 evidence that
+  binds one direct-session click and unique guest marker through the exact
+  SwiftSpice frame identity, selected-ready, selection, Metal commit, and
+  actual AppKit presented callback. The pre-atomic Rocky run at
+  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T141056Z.dWq0dC`
+  produced ten valid records; its ready-to-selection p50/p95 was
+  0.039/8.044 ms. The guest marker now builds its complete binary grid in one
+  native `XImage` and publishes one `XPutImage`, removing the per-cell
+  foreground/fill request pairs. The adjacent atomic-marker run at
+  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260830T011820Z.L5b0o6`
+  produced seven valid records with ready-to-selection p50/p95/max
+  0.041/0.043/0.043 ms, while input-to-presented p50/p95 remained
+  125.466/213.059 ms. This means the older one-tick tail is not sufficient
+  evidence for an AIP-44 pacing change. `presentedTime == 0` is rejected as a
+  dropped drawable; one bounded authoritative latest-only retry is allowed
+  without idle commits or exceeding two GPU commands in flight. Eight further
+  cold starts still reached two commits with no presented callback and failed
+  before arm. AIP-00 is therefore in progress, not complete: direct session
+  clicks bypass AppKit input receipt, and paired click/key/motion run clusters
+  for `v0.2.7` and current `v0.3.x` remain required.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under

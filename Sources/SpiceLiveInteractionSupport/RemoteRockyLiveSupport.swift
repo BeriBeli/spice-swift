@@ -7,6 +7,7 @@ package enum SpiceLiveInteractionSupportError: Error, Sendable, Equatable {
     case notExplicitlyEnabled
     case incompleteIsolatedConfiguration
     case invalidIsolatedConfiguration
+    case invalidLiveVersion
     case invalidRunDirectory
     case invalidTicket
     case invalidTraceProtocol
@@ -686,6 +687,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
     package let controlPort: UInt16
     package let endpointHost: String
     package let endpointPort: UInt16
+    package let version: String
 
     package init(environment: [String: String]) throws {
         guard environment["SWIFTSPICE_LIVE_INTERACTION"] == "1" else {
@@ -700,6 +702,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
             "SWIFTSPICE_PERF_CONTROL_PORT",
             "SWIFTSPICE_LIVE_ENDPOINT_HOST",
             "SWIFTSPICE_LIVE_ENDPOINT_PORT",
+            "SWIFTSPICE_LIVE_VERSION",
         ]
         guard required.allSatisfy({ !(environment[$0] ?? "").isEmpty }) else {
             throw SpiceLiveInteractionSupportError.incompleteIsolatedConfiguration
@@ -710,6 +713,10 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         let container = environment["SWIFTSPICE_PERF_CONTAINER"]!
         let image = environment["SWIFTSPICE_PERF_IMAGE"]!
         let endpointHost = environment["SWIFTSPICE_LIVE_ENDPOINT_HOST"]!
+        let version = environment["SWIFTSPICE_LIVE_VERSION"]!
+        guard Self.isCanonicalLiveVersion(version) else {
+            throw SpiceLiveInteractionSupportError.invalidLiveVersion
+        }
         guard !sshHost.hasPrefix("-"),
               Self.matches(sshHost, "^[A-Za-z0-9_.@:-]+$"),
               Self.validAbsolutePath(base),
@@ -743,6 +750,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         self.controlPort = controlPort
         self.endpointHost = endpointHost
         self.endpointPort = endpointPort
+        self.version = version
     }
 
     package func runRemoteScript(
@@ -839,6 +847,22 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
 
     private static func matches(_ value: String, _ pattern: String) -> Bool {
         value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func isCanonicalLiveVersion(_ value: String) -> Bool {
+        let pattern = #"\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return false
+        }
+        let fullRange = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = expression.firstMatch(
+            in: value,
+            options: [],
+            range: fullRange
+        ) else {
+            return false
+        }
+        return match.range == fullRange
     }
 }
 

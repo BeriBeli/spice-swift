@@ -1796,6 +1796,13 @@ struct RemoteRockyFixtureTests {
         #expect(markerSource.contains("--encode-bgra"))
         #expect(markerSource.contains("getenv(\"WINDOWID\")"))
         #expect(!markerSource.contains("XGetInputFocus"))
+        #expect(markerSource.contains("XQueryTree"))
+        #expect(markerSource.contains("attributes.map_state != IsViewable"))
+        #expect(markerSource.contains("attributes.class != InputOutput"))
+        #expect(markerSource.contains("select_visible_marker_window"))
+        #expect(markerSource.contains("XPutImage("))
+        #expect(!markerSource.contains("XFillRectangle"))
+        #expect(!markerSource.contains("XSetForeground"))
         #expect(renderer.contains("/usr/local/bin/binary-grid-marker"))
         #expect(renderer.contains("--draw"))
         #expect(buildScript.contains("binary-grid-marker.c"))
@@ -1803,6 +1810,123 @@ struct RemoteRockyFixtureTests {
         #expect(startScript.contains("guest_marker_roi"))
         #expect(startScript.contains("guest_marker_roi=binary-grid-v1"))
         #expect(startScript.contains("interaction_trace_schema=2"))
+    }
+
+    @Test func guestMarkerPublishesOneFullyPopulatedAtomicXImage() throws {
+        let markerSource = try script(
+            "Integration/RemoteRocky/guest/binary-grid-marker.c"
+        )
+        let renderer = try script(
+            "Integration/RemoteRocky/guest/input-marker-renderer.sh"
+        )
+
+        let createImage = try #require(markerSource.range(
+            of: "static XImage *create_marker_image("
+        ))
+        let drawMarker = try #require(markerSource.range(
+            of: "static int draw_marker(",
+            range: createImage.upperBound..<markerSource.endIndex
+        ))
+        let createBody = createImage.lowerBound..<drawMarker.lowerBound
+        let createXImage = try #require(markerSource.range(
+            of: "XCreateImage(",
+            range: createBody
+        ))
+        let nativeStride = try #require(markerSource.range(
+            of: "image->bytes_per_line",
+            range: createXImage.upperBound..<createBody.upperBound
+        ))
+        let allocatePixels = try #require(markerSource.range(
+            of: "calloc(",
+            range: nativeStride.upperBound..<createBody.upperBound
+        ))
+        let populatePixel = try #require(markerSource.range(
+            of: "XPutPixel(",
+            range: allocatePixels.upperBound..<createBody.upperBound
+        ))
+        #expect(createXImage.lowerBound < nativeStride.lowerBound)
+        #expect(nativeStride.lowerBound < allocatePixels.lowerBound)
+        #expect(allocatePixels.lowerBound < populatePixel.lowerBound)
+        #expect(markerSource[createBody].contains("SIZE_MAX"))
+        #expect(
+            markerSource[createBody]
+                .components(separatedBy: "XDestroyImage(image)").count >= 5
+        )
+        #expect(!markerSource[createBody].contains("free(image->data)"))
+
+        let drawEnd = try #require(markerSource.range(
+            of: "\n}\n#endif",
+            range: drawMarker.upperBound..<markerSource.endIndex
+        ))
+        let drawBody = drawMarker.lowerBound..<drawEnd.lowerBound
+        let selectDescendant = try #require(markerSource.range(
+            of: "select_visible_marker_window(",
+            range: drawBody
+        ))
+        let selectedAttributes = try #require(markerSource.range(
+            of: "XGetWindowAttributes(",
+            range: selectDescendant.upperBound..<drawBody.upperBound
+        ))
+        let fullyPopulatedImage = try #require(markerSource.range(
+            of: "create_marker_image(",
+            range: selectedAttributes.upperBound..<drawBody.upperBound
+        ))
+        let publish = try #require(markerSource.range(
+            of: "XPutImage(",
+            range: fullyPopulatedImage.upperBound..<drawBody.upperBound
+        ))
+        let synchronize = try #require(markerSource.range(
+            of: "XSync(",
+            range: publish.upperBound..<drawBody.upperBound
+        ))
+        let publishLineStart = markerSource[..<publish.lowerBound]
+            .lastIndex(of: "\n")
+            .map { markerSource.index(after: $0) }
+            ?? markerSource.startIndex
+        let publishLineEnd = markerSource[publish.lowerBound...]
+            .firstIndex(of: "\n")
+            ?? markerSource.endIndex
+        let publishLine = markerSource[publishLineStart..<publishLineEnd]
+            .trimmingCharacters(in: .whitespaces)
+        let publishStatement = markerSource[publish.lowerBound..<synchronize.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(selectDescendant.lowerBound < selectedAttributes.lowerBound)
+        #expect(selectedAttributes.lowerBound < fullyPopulatedImage.lowerBound)
+        #expect(fullyPopulatedImage.lowerBound < publish.lowerBound)
+        #expect(publish.lowerBound < synchronize.lowerBound)
+        #expect(markerSource[drawBody].components(separatedBy: "XPutImage(").count == 2)
+        // XPutImage returns zero even when it successfully queues the request.
+        // It must be an unconditional statement, never a boolean branch or a
+        // comparison that suppresses the subsequent XSync/barrier/ACK chain.
+        #expect(publishLine == "XPutImage(")
+        #expect(publishStatement.hasSuffix(");"))
+        #expect(!publishStatement.contains("=="))
+        #expect(!publishStatement.contains("!="))
+        #expect(
+            markerSource[drawBody]
+                .components(separatedBy: "XDestroyImage(image)").count == 3
+        )
+        #expect(markerSource[drawBody].contains("XFreeGC(display, graphics)"))
+        #expect(!markerSource[drawBody].contains("XFillRectangle"))
+        #expect(!markerSource[drawBody].contains("XSetForeground"))
+
+        let processMarker = try #require(renderer.range(of: "process_marker() {"))
+        let processMarkerEnd = try #require(renderer.range(
+            of: "\n}\n\ncase ",
+            range: processMarker.upperBound..<renderer.endIndex
+        ))
+        let processBody = processMarker.upperBound..<processMarkerEnd.lowerBound
+        let draw = try #require(renderer.range(of: "draw_marker", range: processBody))
+        let barrier = try #require(renderer.range(
+            of: "terminal_visibility_barrier",
+            range: draw.upperBound..<processBody.upperBound
+        ))
+        let acknowledgment = try #require(renderer.range(
+            of: "acknowledge_marker",
+            range: barrier.upperBound..<processBody.upperBound
+        ))
+        #expect(draw.lowerBound < barrier.lowerBound)
+        #expect(barrier.lowerBound < acknowledgment.lowerBound)
     }
 
     @Test func guestMarkerConsumesOnlyTheNextMatchingInputAndRendersItsToken() throws {

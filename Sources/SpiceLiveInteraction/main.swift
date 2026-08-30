@@ -57,21 +57,32 @@ private final class SpiceLiveInteractionHarness {
             let ticketResult = try await parsed.runRemoteScript("ticket.sh", runner: runner)
             let ticket = try parsed.ticket(from: ticketResult)
 
+            stage = .foregroundWindow
+            installWindow(desktop: session.desktop)
+            try await waitForVisibleSubscription(
+                desktop: session.desktop,
+                timeout: .seconds(20)
+            )
+
+            // Establish both baselines while the real view is already visible,
+            // but before connect can deliver its first desktop publication.
+            // This avoids relying on a synthetic requestLatest redraw after an
+            // initial hidden-demand publication has been discarded.
+            let initialMetrics = session.presentationDiagnostics.snapshot()
+            let initialSourceMetrics = session.desktop.metrics()
+
             stage = .connection
             _ = try await session.connect(
                 endpoint: SpiceEndpoint(host: parsed.endpointHost, port: parsed.endpointPort),
                 credentials: SpiceCredentials(password: ticket)
             )
 
-            stage = .foregroundWindow
-            let initialMetrics = session.presentationDiagnostics.snapshot()
-            installWindow(desktop: session.desktop)
-
             stage = .initialPresentation
             try await waitForInitialPresentation(
                 desktop: session.desktop,
                 diagnostics: session.presentationDiagnostics,
                 baseline: initialMetrics,
+                sourceBaseline: initialSourceMetrics,
                 timeout: .seconds(20)
             )
 
@@ -82,7 +93,7 @@ private final class SpiceLiveInteractionHarness {
                 session: session,
                 writer: writer,
                 pairId: "live-\(token)",
-                version: "v0.3.1",
+                version: parsed.version,
                 runId: URL(fileURLWithPath: evidenceDirectory).lastPathComponent,
                 order: 1,
                 actionClass: .click,
@@ -216,6 +227,7 @@ private final class SpiceLiveInteractionHarness {
         desktop: SpiceDesktopSource,
         diagnostics: SpicePresentationDiagnostics,
         baseline: SpicePresentationMetrics,
+        sourceBaseline: SpiceDesktopSourceMetrics,
         timeout: Duration
     ) async throws {
         let deadline = ContinuousClock().now.advanced(by: timeout)
@@ -248,10 +260,65 @@ private final class SpiceLiveInteractionHarness {
             "visible_rect=\(Int(hostingView?.visibleRect.width ?? 0))x\(Int(hostingView?.visibleRect.height ?? 0))",
             "subscriptions=\(sourceMetrics.subscriptions)",
             "visible_subscriptions=\(sourceMetrics.visibleSubscriptions)",
-            "commit_delta=\(metrics.metalCommandBuffersCommitted - baseline.metalCommandBuffersCommitted)",
-            "presented_delta=\(metrics.metalPresentedFrames - baseline.metalPresentedFrames)",
+            "delivered_snapshots_delta=\(delta(sourceMetrics.deliveredSnapshots, from: sourceBaseline.deliveredSnapshots))",
+            "handler_deliveries_delta=\(delta(sourceMetrics.handlerDeliveries, from: sourceBaseline.handlerDeliveries))",
+            "stream_coalesces_delta=\(delta(sourceMetrics.streamCoalesces, from: sourceBaseline.streamCoalesces))",
+            "display_link_wake_delta=\(delta(metrics.desktopDisplayLinkWakeups, from: baseline.desktopDisplayLinkWakeups))",
+            "display_link_tick_delta=\(delta(metrics.desktopDisplayLinkTicks, from: baseline.desktopDisplayLinkTicks))",
+            "immediate_selection_delta=\(delta(metrics.desktopImmediateSelections, from: baseline.desktopImmediateSelections))",
+            "commit_delta=\(delta(metrics.metalCommandBuffersCommitted, from: baseline.metalCommandBuffersCommitted))",
+            "presented_delta=\(delta(metrics.metalPresentedFrames, from: baseline.metalPresentedFrames))",
+            "cpu_fallback_delta=\(delta(metrics.cpuFallbackFrames, from: baseline.cpuFallbackFrames))",
+            "metal_unavailable_fallback_delta=\(delta(metrics.metalUnavailableFallbackFrames, from: baseline.metalUnavailableFallbackFrames))",
+            "missing_iosurface_fallback_delta=\(delta(metrics.missingIOSurfaceFallbackFrames, from: baseline.missingIOSurfaceFallbackFrames))",
+            "iosurface_dimension_mismatch_fallback_delta=\(delta(metrics.ioSurfaceDimensionMismatchFallbackFrames, from: baseline.ioSurfaceDimensionMismatchFallbackFrames))",
+            "pixel_format_mismatch_fallback_delta=\(delta(metrics.pixelFormatMismatchFallbackFrames, from: baseline.pixelFormatMismatchFallbackFrames))",
+            "texture_creation_failed_fallback_delta=\(delta(metrics.textureCreationFailedFallbackFrames, from: baseline.textureCreationFailedFallbackFrames))",
+            "metal_command_failure_fallback_delta=\(delta(metrics.metalCommandFailureFallbackFrames, from: baseline.metalCommandFailureFallbackFrames))",
+            "last_cpu_fallback_reason=\(metrics.lastCPUFallbackReason?.rawValue ?? "none")",
+            "drawable_miss_delta=\(delta(metrics.metalDrawableMisses, from: baseline.metalDrawableMisses))",
+            "gpu_busy_delta=\(delta(metrics.metalGPUBusySkips, from: baseline.metalGPUBusySkips))",
+            "metal_error_delta=\(delta(metrics.metalPresentationErrors, from: baseline.metalPresentationErrors))",
         ].joined(separator: ",")
         throw SpiceLiveInteractionSupportError.operationTimedOut
+    }
+
+    private func waitForVisibleSubscription(
+        desktop: SpiceDesktopSource,
+        timeout: Duration
+    ) async throws {
+        let deadline = ContinuousClock().now.advanced(by: timeout)
+        while ContinuousClock().now < deadline {
+            hostingView?.layoutSubtreeIfNeeded()
+            window?.displayIfNeeded()
+            if let window,
+               let hostingView,
+               window.isVisible,
+               window.occlusionState.contains(.visible),
+               hostingView.bounds.width > 0,
+               hostingView.bounds.height > 0,
+               hostingView.visibleRect.width > 0,
+               hostingView.visibleRect.height > 0,
+               desktop.metrics().visibleSubscriptions == 1 {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let sourceMetrics = desktop.metrics()
+        readinessDiagnostics = [
+            "window_visible=\(window?.isVisible == true)",
+            "window_occluded=\(window?.occlusionState.contains(.visible) != true)",
+            "hosting_hidden=\(hostingView?.isHiddenOrHasHiddenAncestor != false)",
+            "bounds=\(Int(hostingView?.bounds.width ?? 0))x\(Int(hostingView?.bounds.height ?? 0))",
+            "visible_rect=\(Int(hostingView?.visibleRect.width ?? 0))x\(Int(hostingView?.visibleRect.height ?? 0))",
+            "subscriptions=\(sourceMetrics.subscriptions)",
+            "visible_subscriptions=\(sourceMetrics.visibleSubscriptions)",
+        ].joined(separator: ",")
+        throw SpiceLiveInteractionSupportError.operationTimedOut
+    }
+
+    private func delta(_ current: UInt64, from baseline: UInt64) -> UInt64 {
+        current >= baseline ? current - baseline : current
     }
 
     private func tearDownWindow(

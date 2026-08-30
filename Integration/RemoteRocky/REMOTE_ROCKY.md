@@ -319,6 +319,7 @@ SWIFTSPICE_PERF_SPICE_PORT=5945 \
 SWIFTSPICE_PERF_CONTROL_PORT=5946 \
 SWIFTSPICE_LIVE_ENDPOINT_HOST=127.0.0.1 \
 SWIFTSPICE_LIVE_ENDPOINT_PORT=15945 \
+SWIFTSPICE_LIVE_VERSION=v0.3.3 \
 swift run -c release spice-live-interaction
 ```
 
@@ -328,10 +329,11 @@ subscription and a Metal commit plus actual presented callback before arming.
 It then streams the isolated `control.sh trace` transaction, records host input
 before sending a direct session click, waits for the matching guest pair and
 the exact presented delivery, and sends the resulting schema-2 line to the
-isolated run collector. The five `SWIFTSPICE_PERF_*` identity values and both
-live endpoint values are mandatory; the historical default container, base,
-and `5935`/`5936` endpoint (including its prior `15935` local forward) are
-rejected. SSH stdout and stderr stay separate,
+isolated run collector. The five `SWIFTSPICE_PERF_*` identity values, both live
+endpoint values, and a canonical
+`SWIFTSPICE_LIVE_VERSION=vMAJOR.MINOR.PATCH` are mandatory; the historical
+default container, base, and `5935`/`5936` endpoint (including its prior
+`15935` local forward) are rejected. SSH stdout and stderr stay separate,
 and the ticket is used only as in-process credentials and is never printed.
 
 On failure, the harness finishes the capture without substituting a coarse
@@ -342,6 +344,24 @@ non-secret framebuffer-readiness counters, and local record path are reported.
 The direct session click intentionally bypasses the AppKit input queue, so a
 successful run closes marker-to-exact-presented correlation but does not
 measure input-event queue latency.
+
+The drawable callback treats `CAMetalDrawable.presentedTime == 0` as dropped,
+not as a host timestamp. When the dropped identity is still the latest selected
+revision and visible demand remains, the desktop may request one authoritative
+latest-only redraw for that revision. A second consecutive drop for the same
+revision does not retry again; success or a newer revision resets the budget.
+The recovery never fabricates presentation evidence, commits without an update,
+or relaxes the two-command GPU in-flight limit. A run that cannot obtain an
+initial actual-presented callback still fails before arm.
+
+The guest marker is assembled completely in client memory as a native-depth
+`XImage`, then published to the selected topmost viewable descendant with one
+standalone `XPutImage` followed by `XSync`. Do not branch on the `XPutImage`
+return value: Xlib does not define it as the request's success result, and
+protocol errors are dispatched by the synchronization round trip. This keeps
+the binary-grid layout and terminal barrier/ACK ordering while preventing the
+old per-cell `XSetForeground`/`XFillRectangle` requests from creating visible
+intermediate marker frames that perturb latency measurement.
 
 The host records `scheduledNs`, `hostInputNs`, and `sendStartedNs` before the
 wire send, then records `sendCompletedNs` after its continuation resumes. This
