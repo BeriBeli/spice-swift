@@ -6,18 +6,16 @@ import Testing
 @Suite("Live paired campaign driver")
 struct SpiceLiveCampaignDriverTests {
     private static let campaignID = "a10000000000000f"
-    private static let baselineVersion = "v0.2.7"
-    private static let candidateVersion = "v0.3.4"
-    private static let clusterIDs = (0..<10).map { String(format: "%016x", $0) }
 
     @Test func planIsExactCounterbalancedFreshBootAndZeroRetry() throws {
         let plan = try Self.plan()
+        let specification = try Self.pairedSpecification()
         #expect(plan.runs.count == 20)
         #expect(plan.runs.flatMap(\.steps).count == 60)
         #expect(plan.runs.map(\.sequence) == Array(1...20).map(UInt64.init))
         #expect(Set(plan.runs.map(\.runID)).count == 20)
 
-        for (clusterIndex, clusterID) in Self.clusterIDs.enumerated() {
+        for (clusterIndex, clusterID) in specification.clusterIDs.enumerated() {
             let offset = clusterIndex * 2
             let pair = Array(plan.runs[offset...(offset + 1)])
             #expect(pair.map(\.clusterID) == [clusterID, clusterID])
@@ -27,8 +25,8 @@ struct SpiceLiveCampaignDriverTests {
             #expect(pair[0].steps.map(\.order) == [1, 2, 3])
             #expect(pair[0].steps.map(\.actionClass) == [.click, .key, .motion])
             #expect(pair.map(\.version) == (clusterIndex < 5
-                ? [Self.baselineVersion, Self.candidateVersion]
-                : [Self.candidateVersion, Self.baselineVersion]))
+                ? [specification.baselineVersion, specification.candidateVersion]
+                : [specification.candidateVersion, specification.baselineVersion]))
         }
     }
 
@@ -132,9 +130,9 @@ struct SpiceLiveCampaignDriverTests {
 
         let differentPlan = try SpiceLiveCampaignPlan(
             campaignID: "b10000000000000f",
-            baselineVersion: Self.baselineVersion,
-            candidateVersion: Self.candidateVersion,
-            clusterIDs: Self.clusterIDs
+            baselineVersion: fixture.specification.baselineVersion,
+            candidateVersion: fixture.specification.candidateVersion,
+            clusterIDs: fixture.specification.clusterIDs
         )
         let wrongExecution = try Self.completedExecution(for: differentPlan)
         #expect(throws: (any Error).self) {
@@ -183,12 +181,19 @@ private extension SpiceLiveCampaignDriverTests {
     ]
 
     static func plan() throws -> SpiceLiveCampaignPlan {
+        let specification = try pairedSpecification()
         try SpiceLiveCampaignPlan(
             campaignID: campaignID,
-            baselineVersion: baselineVersion,
-            candidateVersion: candidateVersion,
-            clusterIDs: clusterIDs
+            baselineVersion: specification.baselineVersion,
+            candidateVersion: specification.candidateVersion,
+            clusterIDs: specification.clusterIDs
         )
+    }
+
+    static func pairedSpecification() throws -> SpicePairedInteractionArtifactSpecification {
+        try SpicePairedInteractionArtifactTests.makeFixture(
+            pointerMode: .absolute
+        ).specification
     }
 
     static func fill(
