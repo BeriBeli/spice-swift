@@ -255,6 +255,22 @@ package struct DisplayFrameSourceTiming: Sendable, Equatable {
     }
 }
 
+/// One immutable publication and the receive/ready timing belonging to that
+/// exact Surface revision. Timing stays beside the renderer snapshot so a
+/// coalesced replacement cannot inherit a neighboring request's evidence.
+package struct PublishedDisplayFrame: Sendable, Equatable {
+    package let snapshot: FrameSnapshot
+    package let sourceTiming: DisplayFrameSourceTiming?
+
+    package init(
+        snapshot: FrameSnapshot,
+        sourceTiming: DisplayFrameSourceTiming?
+    ) {
+        self.snapshot = snapshot
+        self.sourceTiming = sourceTiming
+    }
+}
+
 package struct DisplayFramePublisherMetrics: Sendable, Equatable {
     package var submissions: UInt64
     package var snapshotAttempts: UInt64
@@ -359,11 +375,12 @@ package struct DisplayFramePublisherMetrics: Sendable, Equatable {
 
 package actor DisplayFramePublisher {
     package typealias Snapshot = @Sendable (SurfaceRevision) async -> FrameSnapshot?
-    package typealias Emit = @Sendable (FrameSnapshot) async -> Void
+    package typealias Emit = @Sendable (PublishedDisplayFrame) async -> Void
 
     private struct Request: Sendable, Equatable {
         let surfaceRevision: SurfaceRevision
         let invalidationGeneration: UInt64
+        let sourceTiming: DisplayFrameSourceTiming?
     }
 
     private let interval: Duration
@@ -496,7 +513,8 @@ package actor DisplayFramePublisher {
         }
         pending[surfaceID] = Request(
             surfaceRevision: surfaceRevision,
-            invalidationGeneration: invalidationGeneration
+            invalidationGeneration: invalidationGeneration,
+            sourceTiming: sourceTiming
         )
 
         scheduleFlushIfNeeded()
@@ -559,7 +577,8 @@ package actor DisplayFramePublisher {
             if let latest = latestSubmittedRevisions[surfaceID] {
                 let request = Request(
                     surfaceRevision: latest,
-                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0
+                    invalidationGeneration: invalidationGenerations[surfaceID] ?? 0,
+                    sourceTiming: nil
                 )
                 if pending[surfaceID] == nil {
                     if pending.count >= maximumPendingSurfaces, let oldest = order.first {
@@ -725,7 +744,19 @@ package actor DisplayFramePublisher {
                 preparedRevisions[frame.surfaceID] = frame.surfaceRevision
             }
             let emitStartedAt = clock.now
-            await emit(publishedFrame)
+            let emittedSourceTiming: DisplayFrameSourceTiming?
+            if frame.surfaceRevision == request.surfaceRevision {
+                emittedSourceTiming = request.sourceTiming
+            } else if let replacement,
+                      frame.surfaceRevision == replacement.surfaceRevision {
+                emittedSourceTiming = replacement.sourceTiming
+            } else {
+                emittedSourceTiming = nil
+            }
+            await emit(PublishedDisplayFrame(
+                snapshot: publishedFrame,
+                sourceTiming: emittedSourceTiming
+            ))
             emitDuration.record(emitStartedAt.duration(to: clock.now))
             guard generation == flushGeneration else { return }
             if isCurrent(request) {

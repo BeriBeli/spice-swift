@@ -316,6 +316,151 @@ struct SpiceDesktopSourceTests {
         ]))
     }
 
+    @Test func controlStateEnvelopePreservesFramePublicationSequence() throws {
+        let frame = SpiceFrame(
+            surfaceID: 0,
+            width: 4,
+            height: 4,
+            bytesPerRow: 16,
+            pixels: Data(repeating: 12, count: 64)
+        )
+        let surface = SpiceSurfaceIdentity(
+            displayChannelID: 0,
+            surfaceID: 0,
+            generation: 1
+        )
+        let publishedUpdate = SpiceFrameUpdate(
+            frame: frame,
+            revision: SpiceFrameRevision(surface: surface, value: 7),
+            damage: .full,
+            deliverySequence: 40
+        )
+        let published = SpiceDesktopSnapshot(
+            generation: 3,
+            frame: publishedUpdate,
+            cursor: nil,
+            pointerMode: .absolute,
+            deliverySequence: 40
+        )
+        let controlOnly = SpiceDesktopSnapshot(
+            generation: 3,
+            frame: SpiceFrameUpdate(
+                frame: frame,
+                revision: publishedUpdate.revision,
+                damage: .rectangles([]),
+                deliverySequence: 40
+            ),
+            cursor: SpiceCursorState(x: 9, y: 8, isVisible: true, image: nil),
+            pointerMode: .relative,
+            deliverySequence: 41
+        )
+
+        let selected = SpiceDesktopSource.merging(published, controlOnly)
+
+        #expect(selected.deliverySequence == 41)
+        #expect(selected.frameDeliverySequence == 40)
+        #expect(selected.interactionFrameIdentity == published.interactionFrameIdentity)
+        #expect(selected.frame?.revision.value == 7)
+        #expect(selected.cursor?.x == 9)
+        #expect(selected.pointerMode == .relative)
+    }
+
+    @Test func interactionFrameIsObservedBeforeSynchronousDelivery() throws {
+        let diagnostics = SpicePresentationDiagnostics()
+        let capture = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: capture)
+        let source = SpiceDesktopSource(presentationDiagnostics: diagnostics)
+        source.beginSession(pointerMode: .absolute)
+        let subscription = source.subscribe(surface: .surface(displayChannelID: 2, surfaceID: 7))
+        subscription.setUpdateHandler { snapshot in
+            guard let identity = snapshot.interactionFrameIdentity else { return }
+            Stage3InteractionFixture.present(identity, using: diagnostics)
+        }
+        subscription.setDemand(.visible)
+
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 4, revision: 9),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+            ),
+            displayChannelID: 2
+        )
+
+        let record = try capture.finish()
+        #expect(record.valid)
+        #expect(record.displayChannelID == 2)
+        #expect(record.surfaceID == 7)
+        #expect(record.surfaceGeneration == 4)
+        #expect(record.frameRevision == 9)
+        subscription.cancel()
+    }
+
+    @Test func sourceReplacementRetiresOnlyTheOldSurfaceLifecycle() throws {
+        let diagnostics = SpicePresentationDiagnostics()
+        let source = SpiceDesktopSource(presentationDiagnostics: diagnostics)
+        source.beginSession(pointerMode: .absolute)
+        let subscription = source.subscribe(surface: .surface(displayChannelID: 2, surfaceID: 7))
+        subscription.setDemand(.visible)
+
+        let retired = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: retired)
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 4, revision: 9),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 30, ready: 40)
+            ),
+            displayChannelID: 2
+        )
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 5, revision: 1, marker: false),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 31, ready: 41)
+            ),
+            displayChannelID: 2
+        )
+        #expect(try retired.finish().invalidReason == "surface_lifecycle_retired")
+
+        let sameLifecycle = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: sameLifecycle)
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 5, revision: 2),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 32, ready: 42)
+            ),
+            displayChannelID: 2
+        )
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 5, revision: 3),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 33, ready: 43)
+            ),
+            displayChannelID: 2
+        )
+        let identity = SpiceInteractionFrameIdentity(
+            desktopGeneration: 1,
+            displayChannelID: 2,
+            surfaceID: 7,
+            surfaceGeneration: 5,
+            frameRevision: 3,
+            deliverySequence: 5
+        )
+        Stage3InteractionFixture.present(identity, using: diagnostics)
+        #expect(try sameLifecycle.finish().valid)
+
+        let destroyed = try Stage3InteractionFixture.capture(diagnostics: diagnostics)
+        try Stage3InteractionFixture.recordPrelude(on: destroyed)
+        source.receiveFrame(
+            PublishedDisplayFrame(
+                snapshot: Stage3InteractionFixture.rendererFrame(lifecycle: 6, revision: 1),
+                sourceTiming: Stage3InteractionFixture.timing(receive: 34, ready: 44)
+            ),
+            displayChannelID: 2
+        )
+        source.surfaceDestroyed(displayChannelID: 2, surfaceID: 7)
+        #expect(try destroyed.finish().invalidReason == "surface_lifecycle_retired")
+        subscription.cancel()
+    }
+
     private static func frame(
         lifecycle: UInt64 = 1,
         revision: UInt64

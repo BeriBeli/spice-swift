@@ -128,6 +128,33 @@ package final class IOSurfaceFrame: @unchecked Sendable {
         return pixels
     }
 
+    /// Borrows the immutable committed bytes while the IOSurface is read-locked.
+    /// The pointer is valid only for the synchronous duration of `body`.
+    package func withLockedBytes<Result>(
+        _ body: (UnsafeRawPointer, Int, Int) -> Result
+    ) -> Result? {
+        let (requiredBytes, overflow) = frameBytesPerRow.multipliedReportingOverflow(
+            by: frameHeight
+        )
+        guard frameBytesPerRow >= 0,
+              frameHeight >= 0,
+              !overflow,
+              requiredBytes <= IOSurfaceGetAllocSize(surface)
+        else {
+            return nil
+        }
+        var seed: UInt32 = 0
+        guard IOSurfaceLock(surface, .readOnly, &seed) == 0 else {
+            return nil
+        }
+        defer { IOSurfaceUnlock(surface, .readOnly, &seed) }
+        return body(
+            IOSurfaceGetBaseAddress(surface),
+            frameBytesPerRow,
+            requiredBytes
+        )
+    }
+
     package func withIOSurface<Result, Failure: Error>(
         _ body: (IOSurfaceRef) throws(Failure) -> Result
     ) throws(Failure) -> Result {

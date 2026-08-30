@@ -76,7 +76,18 @@ public final class SpicePresentationDiagnostics: Sendable {
         var epoch: UInt64 = 0
     }
 
+    private enum InteractionSink: Sendable {
+        case observer(any SpiceInteractionPresentationObserver)
+        case assembler(SpiceInteractionTraceAssembler)
+    }
+
+    private struct InstalledInteractionSink: Sendable {
+        let sink: InteractionSink
+        var presenterID: SpiceInteractionPresenterID? = nil
+    }
+
     private let state = Mutex(State())
+    private let interactionSink = Mutex<InstalledInteractionSink?>(nil)
 
     public init() {}
 
@@ -86,6 +97,172 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func currentEpoch() -> UInt64 {
         state.withLock { $0.epoch }
+    }
+
+    package func installInteractionPresentationObserver(
+        _ observer: any SpiceInteractionPresentationObserver
+    ) -> Bool {
+        interactionSink.withLock { current in
+            guard current == nil else { return false }
+            current = InstalledInteractionSink(sink: .observer(observer))
+            return true
+        }
+    }
+
+    package func removeInteractionPresentationObserver(
+        _ observer: any SpiceInteractionPresentationObserver
+    ) {
+        interactionSink.withLock { installed in
+            guard case let .observer(current) = installed?.sink,
+                  ObjectIdentifier(current) == ObjectIdentifier(observer) else { return }
+            installed = nil
+        }
+    }
+
+    package func installInteractionTraceAssembler(
+        _ assembler: SpiceInteractionTraceAssembler
+    ) -> Bool {
+        interactionSink.withLock { current in
+            guard current == nil else { return false }
+            current = InstalledInteractionSink(sink: .assembler(assembler))
+            return true
+        }
+    }
+
+    package func removeInteractionTraceAssembler(
+        _ assembler: SpiceInteractionTraceAssembler
+    ) {
+        interactionSink.withLock { installed in
+            guard case let .assembler(current) = installed?.sink,
+                  current === assembler else { return }
+            installed = nil
+        }
+    }
+
+    package func recordInteractionFrameReceived(
+        _ snapshot: SpiceDesktopSnapshot,
+        sourceTiming: DisplayFrameSourceTiming?
+    ) {
+        interactionSink.withLock { sink in
+            guard case let .assembler(assembler) = sink?.sink else { return }
+            assembler.observeFrame(snapshot: snapshot, sourceTiming: sourceTiming)
+        }
+    }
+
+    package func recordInteractionSelected(
+        _ context: SpiceInteractionPresentationContext
+    ) {
+        let observer = interactionSink.withLock { installedState -> (
+            any SpiceInteractionPresentationObserver
+        )? in
+            guard var installed = installedState else { return nil }
+            switch installed.sink {
+            case let .assembler(assembler):
+                if let owner = installed.presenterID {
+                    guard owner == context.presenterID else { return nil }
+                } else {
+                    guard assembler.canBindPresentationOwner(
+                        identity: context.identity
+                    ) else { return nil }
+                    installed.presenterID = context.presenterID
+                    installedState = installed
+                }
+                assembler.observeSelected(
+                    identity: context.identity,
+                    readyNs: context.readyNanoseconds,
+                    selectionNs: context.selectionNanoseconds
+                )
+                return nil
+            case let .observer(observer):
+                return observer
+            }
+        }
+        observer?.observeSelected(context)
+    }
+
+    package func recordInteractionCommitted(
+        identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified,
+        at nanoseconds: UInt64
+    ) {
+        let observer = interactionSink.withLock { installed -> (
+            any SpiceInteractionPresentationObserver
+        )? in
+            guard let installed else { return nil }
+            switch installed.sink {
+            case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return nil }
+                assembler.observeCommitted(identity: identity, at: nanoseconds)
+                return nil
+            case let .observer(observer):
+                return observer
+            }
+        }
+        observer?.observeCommitted(identity: identity, at: nanoseconds)
+    }
+
+    package func recordInteractionPresented(
+        identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified,
+        at nanoseconds: UInt64
+    ) {
+        let result = interactionSink.withLock { installed -> (
+            observer: (any SpiceInteractionPresentationObserver)?,
+            resumption: SpiceInteractionPresentationWaiter.Resumption?
+        ) in
+            guard let installed else { return (nil, nil) }
+            switch installed.sink {
+            case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return (nil, nil) }
+                return (nil, assembler.observePresented(identity: identity, at: nanoseconds))
+            case let .observer(observer):
+                return (observer, nil)
+            }
+        }
+        result.observer?.observePresented(identity: identity, at: nanoseconds)
+        result.resumption?.resume()
+    }
+
+    package func recordInteractionPresentationDropped(
+        identity: SpiceInteractionFrameIdentity,
+        presenterID: SpiceInteractionPresenterID = .unspecified
+    ) {
+        let observer = interactionSink.withLock { installed -> (
+            any SpiceInteractionPresentationObserver
+        )? in
+            guard let installed else { return nil }
+            switch installed.sink {
+            case let .assembler(assembler):
+                guard installed.presenterID == presenterID else { return nil }
+                assembler.observePresentationDropped(identity: identity)
+                return nil
+            case let .observer(observer):
+                return observer
+            }
+        }
+        observer?.observePresentationDropped(identity: identity)
+    }
+
+    package func retireInteractionDesktopGeneration(_ generation: UInt64) {
+        interactionSink.withLock { sink in
+            guard case let .assembler(assembler) = sink?.sink else { return }
+            assembler.retireDesktopGeneration(generation)
+        }
+    }
+
+    package func retireInteractionSurfaceLifecycle(
+        displayChannelID: UInt8,
+        surfaceID: UInt32,
+        generation: UInt64
+    ) {
+        interactionSink.withLock { sink in
+            guard case let .assembler(assembler) = sink?.sink else { return }
+            assembler.retireSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID,
+                generation: generation
+            )
+        }
     }
 
     package func recordMetalPresentedFrame(
@@ -216,4 +393,5 @@ public final class SpicePresentationDiagnostics: Sendable {
     private func update(_ body: (inout SpicePresentationMetrics) -> Void) {
         state.withLock { body(&$0.metrics) }
     }
+
 }

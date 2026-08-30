@@ -274,6 +274,86 @@ struct DisplayFramePublisherTests {
         #expect(metrics.pendingSurfaces == 0)
     }
 
+    @Test func coveredReplacementUsesOnlyItsOwnExactSourceTiming() async {
+        let first = surfaceRevision(surfaceID: 1, revision: 1)
+        let replacement = surfaceRevision(surfaceID: 1, revision: 2)
+        let clock = ContinuousClock()
+        let firstTiming = DisplayFrameSourceTiming(
+            messageReceivedAt: clock.now.advanced(by: .milliseconds(-20)),
+            surfaceReadyAt: clock.now.advanced(by: .milliseconds(-15))
+        )
+        let replacementTiming = DisplayFrameSourceTiming(
+            messageReceivedAt: clock.now.advanced(by: .milliseconds(-10)),
+            surfaceReadyAt: clock.now.advanced(by: .milliseconds(-5))
+        )
+        let observations = FramePublisherObservations(
+            blockNextSnapshot: true,
+            nextSnapshotRevision: replacement
+        )
+        let publisher = makePublisher(observations: observations)
+        await publisher.submit(first, sourceTiming: firstTiming)
+
+        let flush = Task { await publisher.flushNow() }
+        await waitForSnapshotStart(observations)
+        await publisher.submit(replacement, sourceTiming: replacementTiming)
+        await observations.resumeSnapshot()
+        await flush.value
+
+        #expect(await observations.emittedRevisions == [replacement])
+        #expect(await observations.emittedSourceTimings == [replacementTiming])
+    }
+
+    @Test func originalSnapshotPreservesItsOwnExactSourceTiming() async {
+        let original = surfaceRevision(surfaceID: 1, revision: 1)
+        let clock = ContinuousClock()
+        let timing = DisplayFrameSourceTiming(
+            messageReceivedAt: clock.now.advanced(by: .milliseconds(-10)),
+            surfaceReadyAt: clock.now.advanced(by: .milliseconds(-5))
+        )
+        let observations = FramePublisherObservations()
+        let publisher = makePublisher(observations: observations)
+
+        await publisher.submit(original, sourceTiming: timing)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [original])
+        #expect(await observations.emittedSourceTimings == [timing])
+    }
+
+    @Test func authoritativeRedrawDoesNotReuseOldSourceTiming() async {
+        let revision = surfaceRevision(surfaceID: 1, revision: 1)
+        let clock = ContinuousClock()
+        let timing = DisplayFrameSourceTiming(
+            messageReceivedAt: clock.now.advanced(by: .milliseconds(-10)),
+            surfaceReadyAt: clock.now.advanced(by: .milliseconds(-5))
+        )
+        let observations = FramePublisherObservations()
+        let publisher = DisplayFramePublisher(
+            interval: .seconds(10),
+            requiresExplicitDemand: true,
+            waitsForConsumption: true,
+            snapshot: { requested in
+                await observations.snapshot(revision: requested)
+            },
+            emit: { published in
+                await observations.emit(published)
+            }
+        )
+
+        await publisher.setDemand(surfaceID: 1, isDemanded: true)
+        await publisher.submit(revision, sourceTiming: timing)
+        await publisher.flushNow()
+        await publisher.acknowledge(revision)
+
+        await publisher.setDemand(surfaceID: 1, isDemanded: false)
+        await publisher.setDemand(surfaceID: 1, isDemanded: true)
+        await publisher.flushNow()
+
+        #expect(await observations.emittedRevisions == [revision, revision])
+        #expect(await observations.emittedSourceTimings == [timing, nil])
+        #expect(await observations.emittedFullDamage == [true, true])
+    }
+
     @Test func surfaceStorePublicationWaitsUntilNewerRevisionIsSubmitted() async throws {
         let store = SurfaceStore(backingPolicy: .dataOnly)
         try await store.create(id: 7, width: 1, height: 1, format: 32)
@@ -530,6 +610,7 @@ private actor FramePublisherObservations {
     private(set) var emitCount = 0
     private(set) var emittedRevisions: [SurfaceRevision] = []
     private(set) var emittedFullDamage: [Bool] = []
+    private(set) var emittedSourceTimings: [DisplayFrameSourceTiming?] = []
 
     init(
         blockNextSnapshot: Bool = false,
@@ -569,7 +650,8 @@ private actor FramePublisherObservations {
         snapshotContinuation = nil
     }
 
-    func emit(_ frame: FrameSnapshot) async {
+    func emit(_ published: PublishedDisplayFrame) async {
+        let frame = published.snapshot
         emitCount += 1
         if shouldBlockNextEmit {
             shouldBlockNextEmit = false
@@ -579,6 +661,7 @@ private actor FramePublisherObservations {
         }
         emittedRevisions.append(frame.surfaceRevision)
         emittedFullDamage.append(frame.publicationDamage.isFullFrame)
+        emittedSourceTimings.append(published.sourceTiming)
     }
 
     func resumeEmit() {

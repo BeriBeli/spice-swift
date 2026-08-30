@@ -143,6 +143,7 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
 package final class FramePixelStorage: @unchecked Sendable {
     private struct State {
         var pixels: Data?
+        var failNextReadForTesting = false
     }
 
     private let state: Mutex<State>
@@ -176,6 +177,32 @@ package final class FramePixelStorage: @unchecked Sendable {
             materializationMetrics?.record(bytes: pixels.count)
             return pixels
         }
+    }
+
+    /// Borrows immutable published bytes without populating the full-frame
+    /// IOSurface materialization cache. The pointer cannot escape `body`.
+    package func withReadOnlyBytes<Result>(
+        dataBytesPerRow: Int,
+        _ body: (UnsafeRawPointer, Int, Int) -> Result
+    ) -> Result? {
+        let (pixels, shouldFail) = state.withLock { state in
+            let shouldFail = state.failNextReadForTesting
+            state.failNextReadForTesting = false
+            return (state.pixels, shouldFail)
+        }
+        guard !shouldFail else { return nil }
+        if let pixels {
+            return pixels.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else { return nil }
+                return body(baseAddress, dataBytesPerRow, bytes.count)
+            }
+        }
+        return ioSurfaceFrame?.withLockedBytes(body)
+    }
+
+    /// Deterministic package seam for the fail-closed borrow path.
+    package func failNextReadForTesting() {
+        state.withLock { $0.failNextReadForTesting = true }
     }
 
     package var backingIOSurfaceFrame: IOSurfaceFrame? {
