@@ -714,10 +714,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         let image = environment["SWIFTSPICE_PERF_IMAGE"]!
         let endpointHost = environment["SWIFTSPICE_LIVE_ENDPOINT_HOST"]!
         let version = environment["SWIFTSPICE_LIVE_VERSION"]!
-        guard Self.matches(
-            version,
-            "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
-        ) else {
+        guard Self.isCanonicalLiveVersion(version) else {
             throw SpiceLiveInteractionSupportError.invalidLiveVersion
         }
         guard !sshHost.hasPrefix("-"),
@@ -850,6 +847,22 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
 
     private static func matches(_ value: String, _ pattern: String) -> Bool {
         value.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func isCanonicalLiveVersion(_ value: String) -> Bool {
+        let pattern = #"\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return false
+        }
+        let fullRange = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = expression.firstMatch(
+            in: value,
+            options: [],
+            range: fullRange
+        ) else {
+            return false
+        }
+        return match.range == fullRange
     }
 }
 

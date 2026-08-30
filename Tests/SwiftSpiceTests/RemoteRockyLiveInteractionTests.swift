@@ -27,7 +27,10 @@ struct RemoteRockyLiveInteractionTests {
         #expect(configuration.version == "v0.3.3")
     }
 
-    @Test func configurationRequiresACanonicalExplicitLiveVersion() {
+    @Test func configurationRequiresACanonicalExplicitLiveVersion() throws {
+        let canonical = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        #expect(canonical.version == "v0.3.3")
+
         for invalidVersion in [
             "0.3.3",
             "v00.3.3",
@@ -36,6 +39,11 @@ struct RemoteRockyLiveInteractionTests {
             "v0.3",
             "v0.3.3-beta",
             "v0.3.3\n",
+            "v0.3.3\r",
+            "v0.3.3\r\n",
+            "v0.3.3 ",
+            "v0.3.3\t",
+            "v0.3.3x",
         ] {
             var environment = validEnvironment
             environment["SWIFTSPICE_LIVE_VERSION"] = invalidVersion
