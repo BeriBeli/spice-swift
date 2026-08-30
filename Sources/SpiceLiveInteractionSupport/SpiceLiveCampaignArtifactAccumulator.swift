@@ -2,7 +2,7 @@ import Foundation
 import SwiftSpice
 
 /// The canonical basename assigned by the RemoteRocky fixture to one evidence run.
-package struct SpiceLiveEvidenceRunID: Sendable, Hashable {
+package struct SpiceLiveEvidenceRunID: Codable, Sendable, Hashable {
     package let rawValue: String
 
     package init(_ rawValue: String) throws {
@@ -17,6 +17,16 @@ package struct SpiceLiveEvidenceRunID: Sendable, Hashable {
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
         self.rawValue = rawValue
+    }
+
+    package init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        try self.init(container.decode(String.self))
+    }
+
+    package func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 
     private static func isASCIIDigit(_ byte: UInt8) -> Bool {
