@@ -3,9 +3,10 @@ import Foundation
 import Synchronization
 
 /// A bounded, cross-process serialized writer for canonical schema-2 records.
-/// The parent directory and published inode are private, and publication uses
-/// a fully-synced same-directory replacement so no partial JSON line is ever
-/// visible at the output path.
+/// The caller owns the existing parent directory and its permissions. The
+/// published inode, temporary inode, and sidecar lock are private, and
+/// publication uses a fully-synced same-directory replacement so no partial
+/// JSON line is ever visible at the output path.
 package final class SpiceInteractionTraceJSONLWriter: Sendable {
     package static let maximumRecordBytes = 64 * 1_024
     package static let maximumFileBytes = 16 * 1_024 * 1_024
@@ -55,10 +56,6 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
               directoryStatus.st_mode & S_IFMT == S_IFDIR else {
             throw SpiceInteractionTraceCollectionError.outputDirectoryUnavailable
         }
-        guard fchmod(directoryDescriptor, S_IRWXU) == 0 else {
-            throw operationError("chmod_directory")
-        }
-
         let lockName = ".\(outputURL.lastPathComponent).lock"
         let lockDescriptor = Darwin.openat(
             directoryDescriptor,
