@@ -288,7 +288,11 @@ public final class SpiceDesktopSource: Sendable {
     }
 
     package func beginSession(pointerMode: SpicePointerMode) {
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            retiredGeneration: UInt64,
+            deliveries: [SpiceDesktopDelivery]
+        ) in
+            let retiredGeneration = state.generation
             state.generation &+= 1
             state.deliverySequence &+= 1
             state.isSynthetic = false
@@ -296,22 +300,38 @@ public final class SpiceDesktopSource: Sendable {
             state.cursor = nil
             state.frames.removeAll(keepingCapacity: true)
             state.surfacesAwaitingFreshPublication.removeAll(keepingCapacity: true)
-            return deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            return (
+                retiredGeneration,
+                deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            )
         }
-        deliver(deliveries)
+        presentationDiagnostics.retireInteractionDesktopGeneration(
+            result.retiredGeneration
+        )
+        deliver(result.deliveries)
     }
 
     package func endSession() {
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            retiredGeneration: UInt64,
+            deliveries: [SpiceDesktopDelivery]
+        ) in
+            let retiredGeneration = state.generation
             state.generation &+= 1
             state.deliverySequence &+= 1
             state.isSynthetic = false
             state.cursor = nil
             state.frames.removeAll(keepingCapacity: true)
             state.surfacesAwaitingFreshPublication.removeAll(keepingCapacity: true)
-            return deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            return (
+                retiredGeneration,
+                deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            )
         }
-        deliver(deliveries)
+        presentationDiagnostics.retireInteractionDesktopGeneration(
+            result.retiredGeneration
+        )
+        deliver(result.deliveries)
     }
 
     /// Advances the public desktop generation at a seamless migration
@@ -321,15 +341,25 @@ public final class SpiceDesktopSource: Sendable {
     /// update keeps a static guest desktop visible when the target sends no new
     /// display damage after handoff.
     package func beginSeamlessMigration(pointerMode: SpicePointerMode) {
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            retiredGeneration: UInt64,
+            deliveries: [SpiceDesktopDelivery]
+        ) in
+            let retiredGeneration = state.generation
             state.generation &+= 1
             state.deliverySequence &+= 1
             state.isSynthetic = false
             state.pointerMode = pointerMode
             state.cursor = nil
-            return deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            return (
+                retiredGeneration,
+                deliveriesForAllVisibleSubscribers(state: state, forceFull: true)
+            )
         }
-        deliver(deliveries)
+        presentationDiagnostics.retireInteractionDesktopGeneration(
+            result.retiredGeneration
+        )
+        deliver(result.deliveries)
     }
 
     package func receiveFrame(
@@ -354,8 +384,15 @@ public final class SpiceDesktopSource: Sendable {
         )
         let result = state.withLock { state -> (
             deliveries: [SpiceDesktopDelivery],
-            autoAcknowledge: Bool
+            autoAcknowledge: Bool,
+            traceSnapshot: SpiceDesktopSnapshot?,
+            retiredSurfaceGeneration: UInt64?
         ) in
+            let retiredSurfaceGeneration = state.frames[key].flatMap { previous in
+                previous.revision.surface.generation == identity.generation
+                    ? nil
+                    : previous.revision.surface.generation
+            }
             state.deliverySequence &+= 1
             let sequencedUpdate = SpiceFrameUpdate(
                 frame: deliveredUpdate.frame,
@@ -370,6 +407,13 @@ public final class SpiceDesktopSource: Sendable {
                 deliverySequence: sequencedUpdate.deliverySequence
             )
             state.surfacesAwaitingFreshPublication.remove(key)
+            let traceSnapshot = SpiceDesktopSnapshot(
+                generation: state.generation,
+                frame: sequencedUpdate,
+                cursor: state.cursor,
+                pointerMode: state.pointerMode,
+                deliverySequence: state.deliverySequence
+            )
             let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
@@ -377,18 +421,27 @@ public final class SpiceDesktopSource: Sendable {
                 }
                 return delivery(
                     for: subscriber,
-                    snapshot: SpiceDesktopSnapshot(
-                        generation: state.generation,
-                        frame: sequencedUpdate,
-                        cursor: state.cursor,
-                        pointerMode: state.pointerMode,
-                        deliverySequence: state.deliverySequence
-                    )
+                    snapshot: traceSnapshot
                 )
             }
             return (
                 deliveries,
-                shouldAutoAcknowledge(key: key, state: state)
+                shouldAutoAcknowledge(key: key, state: state),
+                deliveries.isEmpty ? nil : traceSnapshot,
+                retiredSurfaceGeneration
+            )
+        }
+        if let retiredGeneration = result.retiredSurfaceGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: snapshot.surfaceID,
+                generation: retiredGeneration
+            )
+        }
+        if let traceSnapshot = result.traceSnapshot {
+            presentationDiagnostics.recordInteractionFrameReceived(
+                traceSnapshot,
+                sourceTiming: published.sourceTiming
             )
         }
         deliver(result.deliveries)
@@ -409,11 +462,15 @@ public final class SpiceDesktopSource: Sendable {
 
     package func surfaceDestroyed(displayChannelID: UInt8, surfaceID: UInt32) {
         let key = DisplaySurfaceKey(channelID: displayChannelID, surfaceID: surfaceID)
-        let deliveries = state.withLock { state -> [SpiceDesktopDelivery] in
+        let result = state.withLock { state -> (
+            retiredGeneration: UInt64?,
+            deliveries: [SpiceDesktopDelivery]
+        ) in
             state.deliverySequence &+= 1
-            state.frames.removeValue(forKey: key)
+            let retiredGeneration = state.frames.removeValue(forKey: key)?
+                .revision.surface.generation
             state.surfacesAwaitingFreshPublication.remove(key)
-            return state.subscribers.values.compactMap {
+            let deliveries = state.subscribers.values.compactMap {
                 subscriber -> SpiceDesktopDelivery? in
                 guard subscriber.demand == .visible, subscriber.selection.key == key else {
                     return nil
@@ -427,8 +484,16 @@ public final class SpiceDesktopSource: Sendable {
                     )
                 )
             }
+            return (retiredGeneration, deliveries)
         }
-        deliver(deliveries)
+        if let retiredGeneration = result.retiredGeneration {
+            presentationDiagnostics.retireInteractionSurfaceLifecycle(
+                displayChannelID: displayChannelID,
+                surfaceID: surfaceID,
+                generation: retiredGeneration
+            )
+        }
+        deliver(result.deliveries)
     }
 
     package func updateCursor(_ cursor: SpiceCursorState?) {
