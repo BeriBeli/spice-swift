@@ -159,7 +159,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         ]
     }
 
-    fileprivate var sshArguments: [String] {
+    package var sshArguments: [String] {
         [
             "-o",
             "BatchMode=yes",
@@ -177,7 +177,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         ]
     }
 
-    fileprivate static func isCanonicalAbsolutePath(_ value: String) -> Bool {
+    package static func isCanonicalAbsolutePath(_ value: String) -> Bool {
         value.hasPrefix("/")
             && value != "/"
             && !value.hasSuffix("/")

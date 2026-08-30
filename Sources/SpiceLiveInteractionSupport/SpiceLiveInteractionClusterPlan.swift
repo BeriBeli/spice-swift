@@ -8,6 +8,13 @@ package enum SpiceLiveInteractionSupportError: Error, Sendable, Equatable {
     case invalidConfiguration
     case invalidCampaignPlan
     case invalidExecutionTransition
+    case invalidRunDirectory
+    case invalidTicket
+    case invalidTraceProtocol
+    case childFailed
+    case childTimedOut
+    case outputLimitExceeded
+    case operationTimedOut
 }
 
 package struct SpiceLiveInteractionClusterPlan: Sendable, Equatable {
@@ -107,6 +114,91 @@ package struct SpiceLiveInteractionClusterPlan: Sendable, Equatable {
         SHA256.hash(data: Data(token.utf8)).prefix(4).reduce(UInt32(0)) {
             ($0 << 8) | UInt32($1)
         }
+    }
+}
+
+package actor SpiceLiveMotionAcknowledgementMonitor {
+    package struct Epoch: Sendable, Equatable {
+        fileprivate let sequence: UInt64
+    }
+
+    private struct Acknowledgement: Sendable {
+        let sequence: UInt64
+        let nanoseconds: UInt64
+    }
+
+    private struct Waiter: @unchecked Sendable {
+        let identifier: UUID
+        let epoch: Epoch
+        let notBefore: UInt64
+        let continuation: CheckedContinuation<UInt64, any Error>
+    }
+
+    private var sequence: UInt64 = 0
+    private var latest: Acknowledgement?
+    private var waiter: Waiter?
+
+    package init() {}
+
+    package func beginCleanEpoch() throws -> Epoch {
+        guard waiter == nil else {
+            throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+        }
+        return Epoch(sequence: sequence)
+    }
+
+    package func recordAcknowledgement(at nanoseconds: UInt64) {
+        guard sequence < UInt64.max else { return }
+        sequence += 1
+        let acknowledgement = Acknowledgement(
+            sequence: sequence,
+            nanoseconds: nanoseconds
+        )
+        latest = acknowledgement
+        guard let waiter,
+              acknowledgement.sequence > waiter.epoch.sequence,
+              acknowledgement.nanoseconds >= waiter.notBefore else { return }
+        self.waiter = nil
+        waiter.continuation.resume(returning: acknowledgement.nanoseconds)
+    }
+
+    package func waitForAcknowledgement(
+        after epoch: Epoch,
+        notBefore nanoseconds: UInt64
+    ) async throws -> UInt64 {
+        try Task.checkCancellation()
+        if let latest,
+           latest.sequence > epoch.sequence,
+           latest.nanoseconds >= nanoseconds {
+            return latest.nanoseconds
+        }
+        let identifier = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if waiter != nil {
+                    continuation.resume(
+                        throwing: SpiceLiveInteractionSupportError.invalidTraceProtocol
+                    )
+                } else {
+                    waiter = Waiter(
+                        identifier: identifier,
+                        epoch: epoch,
+                        notBefore: nanoseconds,
+                        continuation: continuation
+                    )
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(identifier) }
+        }
+    }
+
+    private func cancelWaiter(_ identifier: UUID) {
+        guard let waiter, waiter.identifier == identifier else { return }
+        self.waiter = nil
+        waiter.continuation.resume(throwing: CancellationError())
     }
 }
 
