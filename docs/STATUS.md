@@ -166,6 +166,26 @@ Agent behavior, including system-trusted TLS.
   h2c/h2d. No live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
   claimed.
 
+- AIP-00h2b2 is now merged on PRs #71-#72 as main commit `3e69c03`. A
+  Sendable closure-backed transport and single-reader actor driver now carry
+  each canonical event through synchronous durable gate acceptance, exact ACK
+  transmission, and delivery confirmation. Run-task cancellation terminates
+  receive or send operations that only unblock on close; cancellation wins
+  over a simultaneous nil receive, and transport errors cannot impersonate the
+  driver's internal control-flow errors. The focused gate passed 16 tests / 28
+  executions in strict Debug, strict Release, and AddressSanitizer.
+  Cancellation-to-nil passed 20/20 repetitions and all nine driver-error
+  impersonation cases failed closed. Three Sources review findings were fixed
+  test-first, replied to, and resolved. Combined Apple Silicon CI run
+  `33337686652`, job `99327451720`, passed build, public API, full tests,
+  AddressSanitizer, and coverage in 17m9s; exact combined-head review of
+  `3ab4a2e` found no issue and unresolved threads are zero. This is local
+  transport/driver closure only. AIP-00h2c must next proceed as h2c-1 Darwin
+  socket/FD framing, h2c-2 local process-group ownership plus unique `wait4`,
+  and h2c-3 atomic artifact ownership/index. Baseline-overlay and real paired
+  Rocky execution remain h2d. No actual FD/process/SSH/RemoteRocky, artifact,
+  live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is claimed.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
