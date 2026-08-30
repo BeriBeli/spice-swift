@@ -69,6 +69,12 @@ package struct SpicePairedInteractionArtifactSpecification: Sendable, Equatable 
         })
         guard Set(runSequence) == expectedRunKeys,
               Set(runSequence).count == runSequence.count,
+              Self.isCounterbalanced(
+                  runSequence,
+                  clusterIDs: clusterIDs,
+                  baselineVersion: baselineVersion,
+                  candidateVersion: candidateVersion
+              ),
               try Self.hasThirtyDistinctPlanIdentities(clusterIDs: clusterIDs)
         else {
             throw SpicePairedInteractionArtifactError.invalidSpecification
@@ -79,6 +85,32 @@ package struct SpicePairedInteractionArtifactSpecification: Sendable, Equatable 
         self.clusterIDs = clusterIDs
         self.pointerMode = pointerMode
         self.runSequence = runSequence
+    }
+
+    private static func isCounterbalanced(
+        _ runSequence: [SpicePairedInteractionRunKey],
+        clusterIDs: [String],
+        baselineVersion: String,
+        candidateVersion: String
+    ) -> Bool {
+        var baselineFirstCount = 0
+        for (index, clusterID) in clusterIDs.enumerated() {
+            let pairOffset = index * 2
+            let first = runSequence[pairOffset]
+            let second = runSequence[pairOffset + 1]
+            guard first.clusterID == clusterID,
+                  second.clusterID == clusterID,
+                  first.version != second.version,
+                  (first.version == baselineVersion || first.version == candidateVersion),
+                  (second.version == baselineVersion || second.version == candidateVersion)
+            else {
+                return false
+            }
+            if first.version == baselineVersion {
+                baselineFirstCount += 1
+            }
+        }
+        return baselineFirstCount == clusterIDs.count / 2
     }
 
     private static func isCanonicalClusterID(_ value: String) -> Bool {
