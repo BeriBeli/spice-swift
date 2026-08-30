@@ -77,6 +77,9 @@ public final class SpicePresentationDiagnostics: Sendable {
     }
 
     private let state = Mutex(State())
+    private let interactionObserver = Mutex<(
+        any SpiceInteractionPresentationObserver
+    )?>(nil)
 
     public init() {}
 
@@ -86,6 +89,59 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func currentEpoch() -> UInt64 {
         state.withLock { $0.epoch }
+    }
+
+    package func installInteractionPresentationObserver(
+        _ observer: any SpiceInteractionPresentationObserver
+    ) -> Bool {
+        interactionObserver.withLock { current in
+            guard current == nil else { return false }
+            current = observer
+            return true
+        }
+    }
+
+    package func removeInteractionPresentationObserver(
+        _ observer: any SpiceInteractionPresentationObserver
+    ) {
+        interactionObserver.withLock { installed in
+            guard let current = installed,
+                  ObjectIdentifier(current) == ObjectIdentifier(observer)
+            else { return }
+            installed = nil
+        }
+    }
+
+    package func recordInteractionSelected(
+        _ context: SpiceInteractionPresentationContext
+    ) {
+        currentInteractionObserver()?.observeSelected(context)
+    }
+
+    package func recordInteractionCommitted(
+        identity: SpiceInteractionFrameIdentity,
+        at nanoseconds: UInt64
+    ) {
+        currentInteractionObserver()?.observeCommitted(
+            identity: identity,
+            at: nanoseconds
+        )
+    }
+
+    package func recordInteractionPresented(
+        identity: SpiceInteractionFrameIdentity,
+        at nanoseconds: UInt64
+    ) {
+        currentInteractionObserver()?.observePresented(
+            identity: identity,
+            at: nanoseconds
+        )
+    }
+
+    package func recordInteractionPresentationDropped(
+        identity: SpiceInteractionFrameIdentity
+    ) {
+        currentInteractionObserver()?.observePresentationDropped(identity: identity)
     }
 
     package func recordMetalPresentedFrame(
@@ -215,5 +271,11 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     private func update(_ body: (inout SpicePresentationMetrics) -> Void) {
         state.withLock { body(&$0.metrics) }
+    }
+
+    private func currentInteractionObserver() -> (
+        any SpiceInteractionPresentationObserver
+    )? {
+        interactionObserver.withLock { $0 }
     }
 }

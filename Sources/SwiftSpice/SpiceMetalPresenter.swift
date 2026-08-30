@@ -4,6 +4,7 @@ import Metal
 import MetalKit
 import MetalPerformanceShaders
 import OSLog
+import QuartzCore
 import SpiceIOSurface
 import SpiceMetalCompositor
 import Synchronization
@@ -431,6 +432,7 @@ package final class SpiceMetalFrameView: MTKView {
         let sourceTexture: any MTLTexture
         let frame: SpiceFrame
         let requestedAt: ContinuousClock.Instant
+        let interactionContext: SpiceInteractionPresentationContext?
         let onCompletion: @MainActor @Sendable (
             SpiceMetalCommandCompletion
         ) -> Void
@@ -481,6 +483,7 @@ package final class SpiceMetalFrameView: MTKView {
     package func present(
         _ frame: SpiceFrame,
         requestedAt: ContinuousClock.Instant,
+        interactionContext: SpiceInteractionPresentationContext? = nil,
         onCompletion: @escaping @MainActor @Sendable (
             SpiceMetalCommandCompletion
         ) -> Void = { _ in }
@@ -515,6 +518,7 @@ package final class SpiceMetalFrameView: MTKView {
             sourceTexture: sourceTexture,
             frame: frame,
             requestedAt: requestedAt,
+            interactionContext: interactionContext,
             onCompletion: onCompletion
         )
         pendingDrawResult = nil
@@ -563,17 +567,16 @@ package final class SpiceMetalFrameView: MTKView {
             return .cpuFallback(.metalCommandFailure)
         }
 
-        let committedAt = clock.now
-        presentationDiagnostics?.recordViewUpdateToMetalCommit(
-            pending.requestedAt.duration(to: committedAt)
-        )
-        let completionStartedAt = committedAt
         let onCompletion = pending.onCompletion
+        let committedAt = Mutex<ContinuousClock.Instant?>(nil)
         commandBuffer.addCompletedHandler { [presentationDiagnostics] commandBuffer in
-            presentationDiagnostics?.recordMetalCommitToCompletion(
-                completionStartedAt.duration(to: ContinuousClock().now),
-                epoch: presentationEpoch
-            )
+            let completedAt = ContinuousClock().now
+            if let committed = committedAt.withLock({ $0 }) {
+                presentationDiagnostics?.recordMetalCommitToCompletion(
+                    committed.duration(to: completedAt),
+                    epoch: presentationEpoch
+                )
+            }
             let completion: SpiceMetalCommandCompletion =
                 commandBuffer.status == .completed ? .succeeded : .failed
             Task { @MainActor in
@@ -583,23 +586,73 @@ package final class SpiceMetalFrameView: MTKView {
         let completionMetrics = presenter.completionMetrics
         let isAdvancedVideoFrame = pending.frame.isAdvancedVideoFrame
         let requestToPresentedStartedAt = pending.requestedAt
-        drawable.addPresentedHandler { [presentationDiagnostics] _ in
-            let duration = requestToPresentedStartedAt.duration(
-                to: ContinuousClock().now
+        let interactionIdentity = pending.interactionContext?.identity
+        drawable.addPresentedHandler { [presentationDiagnostics] presentedDrawable in
+            let mediaTimeNow = CACurrentMediaTime()
+            let continuousNanosecondsNow = SpiceInteractionHostClock.nowNanoseconds()
+            let presentedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+                forCoreAnimationTime: presentedDrawable.presentedTime,
+                mediaTimeNow: mediaTimeNow,
+                continuousNanosecondsNow: continuousNanosecondsNow
             )
-            completionMetrics.recordDrawablePresented(duration)
-            presentationDiagnostics?.recordMetalPresentedFrame(
-                isAdvancedVideo: isAdvancedVideoFrame,
-                epoch: presentationEpoch
-            )
-            presentationDiagnostics?.recordMetalRequestToPresented(
-                duration,
-                epoch: presentationEpoch
-            )
+            if let presentedNanoseconds,
+               let requestedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+                   for: requestToPresentedStartedAt
+               ),
+               presentedNanoseconds >= requestedNanoseconds,
+               let elapsed = Int64(
+                   exactly: presentedNanoseconds - requestedNanoseconds
+               ) {
+                let duration = Duration.nanoseconds(elapsed)
+                completionMetrics.recordDrawablePresented(duration)
+                presentationDiagnostics?.recordMetalRequestToPresented(
+                    duration,
+                    epoch: presentationEpoch
+                )
+            }
+            if let presentedNanoseconds {
+                presentationDiagnostics?.recordMetalPresentedFrame(
+                    isAdvancedVideo: isAdvancedVideoFrame,
+                    epoch: presentationEpoch
+                )
+                Task { @MainActor in
+                    if let interactionIdentity {
+                        presentationDiagnostics?.recordInteractionPresented(
+                            identity: interactionIdentity,
+                            at: presentedNanoseconds
+                        )
+                    }
+                }
+            } else {
+                Task { @MainActor in
+                    if let interactionIdentity {
+                        presentationDiagnostics?.recordInteractionPresentationDropped(
+                            identity: interactionIdentity
+                        )
+                    }
+                }
+            }
         }
         commandBuffer.present(drawable)
-        presentationDiagnostics?.recordMetalCommandBufferCommitted()
+        // Publish the call-boundary timestamp before commit so a completion on
+        // another thread can never observe an empty timestamp. No diagnostics
+        // or external work may be inserted between this store and `commit()`.
+        let commitCallBoundary = clock.now
+        committedAt.withLock { $0 = commitCallBoundary }
         commandBuffer.commit()
+        presentationDiagnostics?.recordViewUpdateToMetalCommit(
+            pending.requestedAt.duration(to: commitCallBoundary)
+        )
+        if let interactionIdentity,
+           let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(
+               for: commitCallBoundary
+           ) {
+            presentationDiagnostics?.recordInteractionCommitted(
+                identity: interactionIdentity,
+                at: committedNanoseconds
+            )
+        }
+        presentationDiagnostics?.recordMetalCommandBufferCommitted()
 
         if !wasUsingMetal {
             spiceRenderingLogger.info("Presentation path changed to Metal IOSurface")
