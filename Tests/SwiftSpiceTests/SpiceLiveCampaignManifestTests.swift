@@ -13,8 +13,14 @@ struct SpiceLiveCampaignManifestTests {
         let result = try Self.recorder(plan: plan)
         defer { Self.removeOutput(result.output) }
         let manifest = result.recorder.snapshot
+        let metadata = try Self.metadata()
+        let executionContract = try Self.executionContract(
+            plan: plan,
+            metadata: metadata
+        )
 
         #expect(manifest.schemaVersion == SpiceLiveCampaignManifest.currentSchemaVersion)
+        #expect(manifest.schemaVersion == 2)
         #expect(manifest.generation == 0)
         #expect(manifest.state == .recording)
         #expect(manifest.campaignID == plan.campaignID)
@@ -31,6 +37,8 @@ struct SpiceLiveCampaignManifestTests {
         #expect(manifest.metadata.thermalState == .nominal)
         #expect(manifest.metadata.workload == "aip-00-paired-click-key-motion-v1")
         #expect(manifest.metadata.startedAtUTC == "2026-08-30T10:00:00Z")
+        #expect(manifest.executionContract == executionContract)
+        #expect(manifest.executionContractDigest == executionContract.digest)
         #expect(manifest.planDigest.utf8.count == 64)
         #expect(manifest.planDigest.utf8.allSatisfy(Self.isLowerHex))
         let persistedBytes = try Data(contentsOf: result.output)
@@ -82,9 +90,14 @@ struct SpiceLiveCampaignManifestTests {
         let output = try Self.outputURL()
         defer { Self.removeOutput(output) }
         let writer = try SpiceLiveCampaignManifestWriter(outputURL: output)
+        let executionContract = try Self.executionContract(
+            plan: plan,
+            metadata: metadata
+        )
         let firstRecorder = try SpiceLiveRealtimeStageRecorder(
             plan: plan,
             metadata: metadata,
+            executionContract: executionContract,
             manifestWriter: writer
         )
 
@@ -92,6 +105,7 @@ struct SpiceLiveCampaignManifestTests {
             _ = try SpiceLiveRealtimeStageRecorder(
                 plan: plan,
                 metadata: metadata,
+                executionContract: executionContract,
                 manifestWriter: writer
             )
         }
@@ -135,6 +149,10 @@ struct SpiceLiveCampaignManifestTests {
         let recorder = try SpiceLiveRealtimeStageRecorder(
             plan: plan,
             metadata: metadata,
+            executionContract: Self.executionContract(
+                plan: plan,
+                metadata: metadata
+            ),
             manifestWriter: writer
         )
         let callsAfterCreate = syncCalls.withLock { $0 }
@@ -159,6 +177,10 @@ struct SpiceLiveCampaignManifestTests {
         let recovered = try SpiceLiveRealtimeStageRecorder.resume(
             plan: plan,
             metadata: metadata,
+            expectedExecutionContract: Self.executionContract(
+                plan: plan,
+                metadata: metadata
+            ),
             manifestWriter: writer
         )
         let callsAfterResume = syncCalls.withLock { $0 }
@@ -263,6 +285,10 @@ struct SpiceLiveCampaignManifestTests {
         let recovered = try SpiceLiveRealtimeStageRecorder.resume(
             plan: plan,
             metadata: Self.metadata(),
+            expectedExecutionContract: Self.executionContract(
+                plan: plan,
+                metadata: Self.metadata()
+            ),
             manifestWriter: seed.writer
         )
         let loadedInterrupted = try seed.writer.load()
@@ -369,6 +395,10 @@ struct SpiceLiveCampaignManifestTests {
             _ = try SpiceLiveRealtimeStageRecorder.resume(
                 plan: otherPlan,
                 metadata: Self.metadata(),
+                expectedExecutionContract: Self.executionContract(
+                    plan: otherPlan,
+                    metadata: Self.metadata()
+                ),
                 manifestWriter: mismatch.writer
             )
         }
@@ -412,6 +442,10 @@ struct SpiceLiveCampaignManifestTests {
         let boundedRecorder = try SpiceLiveRealtimeStageRecorder(
             plan: plan,
             metadata: Self.metadata(),
+            executionContract: Self.executionContract(
+                plan: plan,
+                metadata: Self.metadata()
+            ),
             manifestWriter: boundedWriter
         )
         let beforeFailedReplacement = try Data(contentsOf: boundedOutput)
@@ -516,6 +550,31 @@ private extension SpiceLiveCampaignManifestTests {
         )
     }
 
+    static func executionContract(
+        plan: SpiceLiveCampaignPlan,
+        metadata: SpiceLiveCampaignManifestMetadata
+    ) throws -> SpiceLiveCampaignExecutionContract {
+        try SpiceLiveCampaignExecutionContract(
+            plan: plan,
+            metadata: metadata,
+            baselineVersion: plan.baselineVersion,
+            candidateVersion: plan.candidateVersion,
+            baselineSourceCommit: metadata.baselineSourceCommit,
+            candidateSourceCommit: metadata.candidateSourceCommit,
+            baselineReleaseBinarySHA256: String(repeating: "1", count: 64),
+            candidateReleaseBinarySHA256: String(repeating: "2", count: 64),
+            runnerSourceCommit: String(repeating: "c", count: 40),
+            runnerReleaseBinarySHA256: String(repeating: "3", count: 64),
+            remoteImageReference: "registry.example/swiftspice/perf:v0.3.4",
+            remoteImageDigest: String(repeating: "4", count: 64),
+            guestBuildManifestSHA256: String(repeating: "5", count: 64),
+            fixtureSourcesSHA256: String(repeating: "6", count: 64),
+            controlSourceSHA256: String(repeating: "7", count: 64),
+            pointerMode: .absolute,
+            stageProtocolVersion: .v1
+        )
+    }
+
     static func invalidMetadata() -> [() throws -> SpiceLiveCampaignManifestMetadata] {
         [
             { try metadata(baselineSourceCommit: "") },
@@ -563,6 +622,10 @@ private extension SpiceLiveCampaignManifestTests {
             try SpiceLiveRealtimeStageRecorder(
                 plan: plan,
                 metadata: metadata(),
+                executionContract: executionContract(
+                    plan: plan,
+                    metadata: metadata()
+                ),
                 manifestWriter: writer
             ),
             writer,
