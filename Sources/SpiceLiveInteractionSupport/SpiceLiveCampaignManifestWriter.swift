@@ -16,6 +16,11 @@ package enum SpiceLiveCampaignManifestError: Error, Sendable, Equatable {
 
 private let campaignManifestProcessLock = Mutex<Void>(())
 
+package enum SpiceLiveCampaignManifestClassification: Sendable, Equatable {
+    case current(SpiceLiveCampaignManifest)
+    case legacySchema1
+}
+
 package final class SpiceLiveCampaignManifestWriter: Sendable {
     package static let defaultMaximumBytes = 1024 * 1024
     private static let absoluteMaximumBytes = 16 * 1024 * 1024
@@ -87,9 +92,20 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
     }
 
     package func load() throws -> SpiceLiveCampaignManifest? {
-        try withTransaction { directoryDescriptor in
+        try withReadOnlyDirectory { directoryDescriptor in
             try readManifest(directoryDescriptor: directoryDescriptor)?.manifest
         }
+    }
+
+    package func classification() throws -> SpiceLiveCampaignManifestClassification {
+        guard let manifest = try load() else {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        if manifest.isLegacySchemaOne { return .legacySchema1 }
+        guard manifest.schemaVersion == SpiceLiveCampaignManifest.currentSchemaVersion else {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        return .current(manifest)
     }
 
     func create(
@@ -104,6 +120,9 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         guard manifest.generation == 0,
               manifest.state == .recording,
               manifest.stages.isEmpty else {
+            throw SpiceLiveCampaignManifestError.invalidTransition
+        }
+        if try load() != nil {
             throw SpiceLiveCampaignManifestError.invalidTransition
         }
         try withTransaction { directoryDescriptor in
@@ -127,6 +146,15 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
             plan: plan
         )
         let encoded = try Self.encodedAndValidated(manifest, maximumBytes: maximumBytes)
+
+        guard let preflight = try load(),
+              preflight.schemaVersion == SpiceLiveCampaignManifest.currentSchemaVersion else {
+            throw SpiceLiveCampaignManifestError.invalidTransition
+        }
+        _ = try SpiceLiveCampaignManifestValidator.validateAndReplay(
+            manifest: preflight,
+            plan: plan
+        )
 
         try withTransaction { directoryDescriptor in
             let existing = try readManifest(directoryDescriptor: directoryDescriptor)
@@ -188,6 +216,17 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
             }
             try lock(lockDescriptor)
             defer { unlock(lockDescriptor) }
+            return try body(directoryDescriptor)
+        }
+    }
+
+    private func withReadOnlyDirectory<Result>(
+        _ body: (Int32) throws -> Result
+    ) throws -> Result {
+        try campaignManifestProcessLock.withLock { _ in
+            let directoryDescriptor = try Self.openDirectory(path: directoryPath)
+            defer { Darwin.close(directoryDescriptor) }
+            try Self.validatePrivateDirectory(directoryDescriptor)
             return try body(directoryDescriptor)
         }
     }
@@ -370,8 +409,7 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
     }
 
     private static func validateShape(_ manifest: SpiceLiveCampaignManifest) throws {
-        guard manifest.schemaVersion == SpiceLiveCampaignManifest.currentSchemaVersion,
-              manifest.planDigest.utf8.count == 64,
+        guard manifest.planDigest.utf8.count == 64,
               manifest.planDigest.utf8.allSatisfy({
                   ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66)
               }),
@@ -380,6 +418,28 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
               Set(manifest.runs.map(\.logicalRunID)).count == manifest.runs.count,
               Set(manifest.runs.compactMap(\.evidenceRunID)).count
                   == manifest.runs.compactMap(\.evidenceRunID).count else {
+            throw SpiceLiveCampaignManifestError.invalidManifest
+        }
+        switch manifest.schemaVersion {
+        case SpiceLiveCampaignManifest.legacySchemaVersion:
+            guard manifest.isLegacySchemaOne else {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+        case SpiceLiveCampaignManifest.currentSchemaVersion:
+            guard let executionContract = manifest.executionContract,
+                  manifest.executionContractDigest == executionContract.digest else {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+            do {
+                try executionContract.validate(
+                    baselineVersion: manifest.baselineVersion,
+                    candidateVersion: manifest.candidateVersion,
+                    metadata: manifest.metadata
+                )
+            } catch {
+                throw SpiceLiveCampaignManifestError.invalidManifest
+            }
+        default:
             throw SpiceLiveCampaignManifestError.invalidManifest
         }
     }
