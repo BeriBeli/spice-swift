@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Synchronization
 
 /// A bounded, cross-process serialized writer for canonical schema-2 records.
 /// The parent directory and published inode are private, and publication uses
@@ -19,6 +20,14 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
         guard Self.isCanonicalAbsoluteFileURL(outputURL) else {
             throw SpiceInteractionTraceCollectionError.invalidOutputPath
         }
+        try SpiceInteractionTraceProcessLock.lock.withLock { _ in
+            try appendWhileProcessLocked(record)
+        }
+    }
+
+    private func appendWhileProcessLocked(
+        _ record: SpiceInteractionTraceRecord
+    ) throws {
         var encoded = try JSONEncoder.interactionTrace.encode(record)
         encoded.append(0x0A)
         guard encoded.count <= Self.maximumRecordBytes else {
@@ -28,17 +37,7 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
             )
         }
 
-        let directoryURL = outputURL.deletingLastPathComponent()
-        let directoryDescriptor = Darwin.open(
-            directoryURL.path,
-            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY
-        )
-        guard directoryDescriptor >= 0 else {
-            if errno == ELOOP {
-                throw SpiceInteractionTraceCollectionError.outputIsSymbolicLink
-            }
-            throw operationError("open_directory")
-        }
+        let directoryDescriptor = try openOutputDirectory()
         defer { Darwin.close(directoryDescriptor) }
         var directoryStatus = stat()
         guard fstat(directoryDescriptor, &directoryStatus) == 0,
@@ -131,6 +130,49 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
             // therefore intentionally idempotent rather than duplicating it.
             throw operationError("fsync_directory")
         }
+    }
+
+    /// Walks from a trusted root descriptor so `O_NOFOLLOW` applies to every
+    /// directory component rather than only the final parent spelling.
+    private func openOutputDirectory() throws -> Int32 {
+        var descriptor = Darwin.open(
+            "/",
+            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NONBLOCK
+        )
+        guard descriptor >= 0 else { throw operationError("open_root") }
+
+        let components = outputURL.deletingLastPathComponent().path
+            .split(separator: "/")
+        for component in components {
+            let nextDescriptor = Darwin.openat(
+                descriptor,
+                String(component),
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY | O_NONBLOCK
+            )
+            guard nextDescriptor >= 0 else {
+                let failure = errno
+                var componentStatus = stat()
+                let isSymbolicLink = fstatat(
+                    descriptor,
+                    String(component),
+                    &componentStatus,
+                    AT_SYMLINK_NOFOLLOW
+                ) == 0 && componentStatus.st_mode & S_IFMT == S_IFLNK
+                Darwin.close(descriptor)
+                if failure == ELOOP || isSymbolicLink {
+                    throw SpiceInteractionTraceCollectionError.outputIsSymbolicLink
+                }
+                if componentStatus.st_mode & S_IFMT != S_IFDIR,
+                   componentStatus.st_mode != 0 {
+                    throw SpiceInteractionTraceCollectionError.outputDirectoryUnavailable
+                }
+                errno = failure
+                throw operationError("open_directory")
+            }
+            Darwin.close(descriptor)
+            descriptor = nextDescriptor
+        }
+        return descriptor
     }
 
     private func readExistingOutput(
@@ -273,6 +315,7 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
         return path.hasPrefix("/")
             && url.relativePath == path
             && path != "/"
+            && url.deletingLastPathComponent().path != "/"
             && !path.hasSuffix("/")
             && !path.contains("//")
             && !path.split(separator: "/").contains(".")
@@ -285,6 +328,14 @@ package final class SpiceInteractionTraceJSONLWriter: Sendable {
     ) -> SpiceInteractionTraceCollectionError {
         .fileOperationFailed(operation: operation, code: errno)
     }
+}
+
+/// POSIX record locks are process-associated and therefore do not serialize
+/// independent descriptors opened by two writers in this process. This one
+/// bounded lock covers the complete sidecar-lock/read/replace/fsync transaction;
+/// the existing record lock continues to serialize other processes.
+private enum SpiceInteractionTraceProcessLock {
+    static let lock = Mutex<Void>(())
 }
 
 private extension JSONEncoder {
