@@ -554,6 +554,10 @@ public final class SpiceDesktopSource: Sendable {
         }
     }
 
+    package func currentPointerMode() -> SpicePointerMode {
+        state.withLock { $0.pointerMode }
+    }
+
     fileprivate func setDemand(_ demand: SpiceDesktopDemand, subscriberID: UInt64) {
         let result = state.withLock { state -> (
             key: DisplaySurfaceKey,

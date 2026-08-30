@@ -81,11 +81,16 @@ package struct SpiceLiveTraceOrchestrator: Sendable {
     private func finalized(
         _ record: SpiceInteractionTraceRecord
     ) throws -> SpiceLiveFinalizedTrace {
-        let encoded = try Data(contentsOf: outputURL)
-        guard encoded.split(separator: 0x0A).count == 1 else {
+        let output = try Data(contentsOf: outputURL)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let recordBytes = try encoder.encode(record)
+        guard output.split(separator: 0x0A).last == recordBytes else {
             throw SpiceLiveInteractionSupportError.invalidTraceProtocol
         }
-        return SpiceLiveFinalizedTrace(record: record, encodedJSONL: encoded)
+        var encodedJSONL = recordBytes
+        encodedJSONL.append(0x0A)
+        return SpiceLiveFinalizedTrace(record: record, encodedJSONL: encodedJSONL)
     }
 }
 
@@ -688,6 +693,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
     package let endpointHost: String
     package let endpointPort: UInt16
     package let version: String
+    package let clusterID: String
 
     package init(environment: [String: String]) throws {
         guard environment["SWIFTSPICE_LIVE_INTERACTION"] == "1" else {
@@ -703,6 +709,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
             "SWIFTSPICE_LIVE_ENDPOINT_HOST",
             "SWIFTSPICE_LIVE_ENDPOINT_PORT",
             "SWIFTSPICE_LIVE_VERSION",
+            "SWIFTSPICE_LIVE_CLUSTER_ID",
         ]
         guard required.allSatisfy({ !(environment[$0] ?? "").isEmpty }) else {
             throw SpiceLiveInteractionSupportError.incompleteIsolatedConfiguration
@@ -714,6 +721,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         let image = environment["SWIFTSPICE_PERF_IMAGE"]!
         let endpointHost = environment["SWIFTSPICE_LIVE_ENDPOINT_HOST"]!
         let version = environment["SWIFTSPICE_LIVE_VERSION"]!
+        let clusterID = environment["SWIFTSPICE_LIVE_CLUSTER_ID"]!
         guard Self.isCanonicalLiveVersion(version) else {
             throw SpiceLiveInteractionSupportError.invalidLiveVersion
         }
@@ -726,6 +734,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
                   "^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
               ),
               Self.matches(endpointHost, "^[A-Za-z0-9_.:-]+$"),
+              Self.isCanonicalLowerHex(clusterID, count: 16),
               let spicePort = UInt16(environment["SWIFTSPICE_PERF_SPICE_PORT"]!),
               let controlPort = UInt16(environment["SWIFTSPICE_PERF_CONTROL_PORT"]!),
               let endpointPort = UInt16(environment["SWIFTSPICE_LIVE_ENDPOINT_PORT"]!),
@@ -751,6 +760,7 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
         self.endpointHost = endpointHost
         self.endpointPort = endpointPort
         self.version = version
+        self.clusterID = clusterID
     }
 
     package func runRemoteScript(
@@ -863,6 +873,12 @@ package struct SpiceRemoteLiveConfiguration: Sendable, Equatable {
             return false
         }
         return match.range == fullRange
+    }
+
+    private static func isCanonicalLowerHex(_ value: String, count: Int) -> Bool {
+        value.utf8.count == count && value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
     }
 }
 
