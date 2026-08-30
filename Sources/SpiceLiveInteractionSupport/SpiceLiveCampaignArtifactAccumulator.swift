@@ -1,6 +1,35 @@
 import Foundation
 import SwiftSpice
 
+/// The canonical basename assigned by the RemoteRocky fixture to one evidence run.
+package struct SpiceLiveEvidenceRunID: Sendable, Hashable {
+    package let rawValue: String
+
+    package init(_ rawValue: String) throws {
+        let bytes = Array(rawValue.utf8)
+        guard bytes.count == 23,
+              bytes[0..<8].allSatisfy(Self.isASCIIDigit),
+              bytes[8] == 0x54,
+              bytes[9..<15].allSatisfy(Self.isASCIIDigit),
+              bytes[15] == 0x5a,
+              bytes[16] == 0x2e,
+              bytes[17..<23].allSatisfy(Self.isASCIIAlphaNumeric) else {
+            throw SpiceLiveInteractionSupportError.invalidTraceProtocol
+        }
+        self.rawValue = rawValue
+    }
+
+    private static func isASCIIDigit(_ byte: UInt8) -> Bool {
+        byte >= 0x30 && byte <= 0x39
+    }
+
+    private static func isASCIIAlphaNumeric(_ byte: UInt8) -> Bool {
+        isASCIIDigit(byte)
+            || (byte >= 0x41 && byte <= 0x5a)
+            || (byte >= 0x61 && byte <= 0x7a)
+    }
+}
+
 /// A bounded, fail-closed admission gate for one predeclared paired campaign.
 /// It performs no I/O and does not retry or replace any run evidence.
 package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
@@ -14,8 +43,8 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
     private let pointerMode: SpicePointerMode
     private var phase: Phase = .collecting
     private var nextRunIndex = 0
-    private var evidenceRunIDsByLogicalRunID: [String: String] = [:]
-    private var usedEvidenceRunIDs = Set<String>()
+    private var evidenceRunIDsByLogicalRunID: [String: SpiceLiveEvidenceRunID] = [:]
+    private var usedEvidenceRunIDs = Set<SpiceLiveEvidenceRunID>()
     private var records: [SpiceInteractionTraceRecord] = []
     private var resourceSamplesByLogicalRunID:
         [String: SpicePairedInteractionResourceSample] = [:]
@@ -31,14 +60,13 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
 
     package mutating func recordRun(
         logicalRunID: String,
-        evidenceRunID: String,
+        evidenceRunID: SpiceLiveEvidenceRunID,
         canonicalRecords: [Data]
     ) throws {
         do {
             guard case .collecting = phase,
                   plan.runs.indices.contains(nextRunIndex),
                   plan.runs[nextRunIndex].runID == logicalRunID,
-                  !evidenceRunID.isEmpty,
                   canonicalRecords.count == 3,
                   records.count <= 60 - canonicalRecords.count,
                   evidenceRunIDsByLogicalRunID[logicalRunID] == nil,
@@ -55,7 +83,7 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
                 guard record.schemaVersion == SpiceInteractionTraceRecord.currentSchemaVersion,
                       record.valid,
                       record.invalidReason == nil,
-                      record.runId == evidenceRunID,
+                      record.runId == evidenceRunID.rawValue,
                       record.version == run.version,
                       record.order == step.order,
                       record.actionClass == step.actionClass,
@@ -67,7 +95,7 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
                 }
             }
             if let sample = resourceSamplesByLogicalRunID[logicalRunID] {
-                guard sample.runId == evidenceRunID else {
+                guard sample.runId == evidenceRunID.rawValue else {
                     throw SpiceLiveInteractionSupportError.invalidTraceProtocol
                 }
             }
@@ -97,7 +125,7 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
                 throw SpiceLiveInteractionSupportError.invalidTraceProtocol
             }
             if let evidenceRunID = evidenceRunIDsByLogicalRunID[logicalRunID] {
-                guard sample.runId == evidenceRunID else {
+                guard sample.runId == evidenceRunID.rawValue else {
                     throw SpiceLiveInteractionSupportError.invalidTraceProtocol
                 }
             }
@@ -108,7 +136,9 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
         }
     }
 
-    package func evidenceRunID(forLogicalRunID logicalRunID: String) -> String? {
+    package func evidenceRunID(
+        forLogicalRunID logicalRunID: String
+    ) -> SpiceLiveEvidenceRunID? {
         evidenceRunIDsByLogicalRunID[logicalRunID]
     }
 
@@ -134,7 +164,7 @@ package struct SpiceLiveCampaignArtifactAccumulator: Sendable {
             for run in plan.runs {
                 guard let evidenceRunID = evidenceRunIDsByLogicalRunID[run.runID],
                       let sample = resourceSamplesByLogicalRunID[run.runID],
-                      sample.runId == evidenceRunID else {
+                      sample.runId == evidenceRunID.rawValue else {
                     throw SpiceLiveInteractionSupportError.invalidTraceProtocol
                 }
                 resources.append(sample)
