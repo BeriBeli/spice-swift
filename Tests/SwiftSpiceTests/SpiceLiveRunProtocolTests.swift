@@ -316,6 +316,137 @@ struct SpiceLiveRunProtocolTests {
         }
     }
 
+    @Test func collectorValidityMismatchCannotCompleteTheRun() async throws {
+        try await Stage3LiveRunFixture.withTemporaryDirectory { directory in
+            let plan = try SpiceLiveInteractionClusterPlan(
+                clusterID: Stage3LiveRunFixture.clusterIDs[0]
+            )
+            let campaign = try Stage3LiveRunFixture.plan()
+            let configuration = try Stage3LiveRunFixture.configuration(
+                run: campaign.runs[0]
+            )
+            let runDirectory = Stage3LiveRunFixture.remoteRunDirectory
+            let status = try SpiceRemoteRunStatus(
+                result: SpiceLiveProcessResult(
+                    status: 0,
+                    standardOutput: Stage3LiveRunFixture.statusOutput(
+                        runDirectory: runDirectory
+                    ),
+                    standardError: ""
+                ),
+                configuration: configuration
+            )
+            let readiness = try #require(SpiceLiveReadinessState(
+                windowVisible: true,
+                windowOccluded: false,
+                hostingVisible: true,
+                visibleSubscriptions: 1,
+                metalPresentedFrames: 2
+            ).permit(since: 1))
+            var execution = try SpiceLiveSingleRunExecution(steps: plan.steps)
+
+            for step in plan.steps.dropLast() {
+                #expect(try execution.beginNextStep(
+                    readiness: step.order == 1 ? readiness : nil
+                ) == step)
+                try execution.recordExactPresentation(order: step.order)
+                let record = Stage3LiveRunFixture.validRecord(for: step)
+                try execution.recordLocalAppend(record)
+                try execution.recordRemoteAppend(record)
+            }
+
+            let final = try #require(plan.steps.last)
+            #expect(try execution.beginNextStep(readiness: nil) == final)
+            try execution.recordExactPresentation(order: final.order)
+            let frozen = Stage3LiveRunFixture.validRecord(
+                for: final,
+                runID: status.evidenceRunID
+            )
+            #expect(frozen.valid)
+            try execution.recordLocalAppend(frozen)
+
+            var collectorRejected = false
+            do {
+                try await appendToCollectorFixture(
+                    configuration: configuration,
+                    record: frozen,
+                    runDirectory: runDirectory,
+                    acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=false reason=missing_presented",
+                    capturedAt: directory.appending(path: "valid-mismatch.jsonl")
+                )
+                try execution.recordRemoteAppend(frozen)
+            } catch SpiceLiveInteractionSupportError.invalidTraceProtocol {
+                collectorRejected = true
+                execution.fail()
+            }
+
+            #expect(collectorRejected)
+            #expect(execution.failed)
+            #expect(!execution.completed)
+        }
+    }
+
+    @Test func collectorRequiresExactFrozenInvalidReason() async throws {
+        try await Stage3LiveRunFixture.withTemporaryDirectory { directory in
+            let campaign = try Stage3LiveRunFixture.plan()
+            let run = campaign.runs[0]
+            let configuration = try Stage3LiveRunFixture.configuration(run: run)
+            let runDirectory = Stage3LiveRunFixture.remoteRunDirectory
+            let status = try SpiceRemoteRunStatus(
+                result: SpiceLiveProcessResult(
+                    status: 0,
+                    standardOutput: Stage3LiveRunFixture.statusOutput(
+                        runDirectory: runDirectory
+                    ),
+                    standardError: ""
+                ),
+                configuration: configuration
+            )
+            let step = try #require(try SpiceLiveInteractionClusterPlan(
+                clusterID: run.clusterID
+            ).steps.first)
+            let capture = try SpiceInteractionTraceCapture(
+                presentationDiagnostics: SpicePresentationDiagnostics(),
+                pairId: step.pairID,
+                version: run.version,
+                runId: status.evidenceRunID,
+                order: step.order,
+                actionClass: step.actionClass,
+                token: step.token,
+                checksum: step.checksum
+            )
+            let frozen = try capture.finish()
+            let reason = try #require(frozen.invalidReason)
+            #expect(!frozen.valid)
+
+            try await appendToCollectorFixture(
+                configuration: configuration,
+                record: frozen,
+                runDirectory: runDirectory,
+                acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=false reason=\(reason)",
+                capturedAt: directory.appending(path: "invalid-exact.jsonl")
+            )
+            await #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+                try await appendToCollectorFixture(
+                    configuration: configuration,
+                    record: frozen,
+                    runDirectory: runDirectory,
+                    acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=false reason=missing_presented",
+                    capturedAt: directory.appending(path: "invalid-reason-mismatch.jsonl")
+                )
+            }
+            await #expect(throws: SpiceLiveInteractionSupportError.invalidTraceProtocol) {
+                try await appendToCollectorFixture(
+                    configuration: configuration,
+                    record: frozen,
+                    runDirectory: runDirectory,
+                    acknowledgement: "PERF_INPUT_EVENT_COLLECTED valid=true reason=none",
+                    capturedAt: directory.appending(path: "invalid-validity-mismatch.jsonl")
+                )
+            }
+        }
+    }
+
     @Test func readinessPermitIsRequiredBeforeTheFirstActionOnly() throws {
         let baseline: UInt64 = 11
         let blockedStates = [
@@ -606,6 +737,34 @@ struct SpiceLiveRunProtocolTests {
         #expect(metadata.kind == .directSessionAPI)
         #expect(!metadata.reportsAppKitReceipt)
     }
+}
+
+private func appendToCollectorFixture(
+    configuration: SpiceRemoteLiveConfiguration,
+    record: SpiceInteractionTraceRecord,
+    runDirectory: String,
+    acknowledgement: String,
+    capturedAt output: URL
+) async throws {
+    let fixture = try Stage3RunScriptFixture(
+        """
+        output="$1"
+        acknowledgement="$2"
+        shift 2
+        /bin/cat > "$output"
+        printf '%s\n' "$acknowledgement"
+        """
+    )
+    defer { fixture.remove() }
+    let runner = SpiceLiveProcessRunner(
+        executableURL: fixture.executableURL,
+        argumentPrefix: [output.path, acknowledgement]
+    )
+    try await configuration.appendRecord(
+        Stage3LiveRunFixture.canonicalRecordLine(record),
+        runDirectory: runDirectory,
+        runner: runner
+    )
 }
 
 private enum Stage3LiveRunFixture {
