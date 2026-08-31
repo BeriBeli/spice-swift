@@ -750,11 +750,93 @@ struct SpiceLiveStageSocketTransportTests {
         )
         let reusedTransport = reused.stageTransport
         try await reusedTransport.sendFrame(Data("new-owner\n".utf8))
+
+        let firstBeforeClosedIO = firstCalls.snapshot
+        let reusedBeforeClosedIO = reusedCalls.snapshot
+        let closedReceiveError = SocketErrorCapture()
+        let closedSendError = SocketErrorCapture()
+        let closedReceiveCompletion = ObservationLatch()
+        let closedSendCompletion = ObservationLatch()
+        let closedReceive = Task {
+            defer { closedReceiveCompletion.signal() }
+            do {
+                _ = try await firstTransport.receiveFrame(
+                    maximumBytes:
+                        SpiceLiveStageProtocolCodec.maximumFrameBytes
+                )
+                Issue.record("post-close receive unexpectedly succeeded")
+            } catch let error as SpiceLiveStageSocketTransport.SocketError {
+                closedReceiveError.record(error)
+            } catch {
+                Issue.record("unexpected post-close receive error: \(error)")
+            }
+        }
+        let closedSend = Task {
+            defer { closedSendCompletion.signal() }
+            do {
+                try await firstTransport.sendFrame(Data("old-owner\n".utf8))
+                Issue.record("post-close send unexpectedly succeeded")
+            } catch let error as SpiceLiveStageSocketTransport.SocketError {
+                closedSendError.record(error)
+            } catch {
+                Issue.record("unexpected post-close send error: \(error)")
+            }
+        }
+        do {
+            try await Self.awaitCompletedVoidTasks(
+                [closedReceive, closedSend],
+                completions: [closedReceiveCompletion, closedSendCompletion]
+            )
+        } catch {
+            firstCalls.emergencyReleaseForTestCleanup()
+            closedReceive.cancel()
+            closedSend.cancel()
+            _ = try? await Self.awaitCompletedVoidTasks(
+                [closedReceive, closedSend],
+                completions: [closedReceiveCompletion, closedSendCompletion]
+            )
+            _ = try? await Self.closeWithinDeadline(reusedTransport)
+            throw error
+        }
+        #expect(closedReceiveError.error == .closed)
+        #expect(closedSendError.error == .closed)
+
+        let firstAfterClosedIO = firstCalls.snapshot
+        #expect(firstAfterClosedIO.readCalls == firstBeforeClosedIO.readCalls)
+        #expect(firstAfterClosedIO.writeCalls == firstBeforeClosedIO.writeCalls)
+        #expect(
+            firstAfterClosedIO.shutdownCalls
+                == firstBeforeClosedIO.shutdownCalls
+        )
+        #expect(
+            firstAfterClosedIO.rawCloseCalls
+                == firstBeforeClosedIO.rawCloseCalls
+        )
+        let reusedAfterClosedIO = reusedCalls.snapshot
+        #expect(
+            reusedAfterClosedIO.readRequests
+                == reusedBeforeClosedIO.readRequests
+        )
+        #expect(
+            reusedAfterClosedIO.writeOffsets
+                == reusedBeforeClosedIO.writeOffsets
+        )
+        #expect(
+            reusedAfterClosedIO.shutdownCalls
+                == reusedBeforeClosedIO.shutdownCalls
+        )
+        #expect(
+            reusedAfterClosedIO.rawCloseCalls
+                == reusedBeforeClosedIO.rawCloseCalls
+        )
+
         try await Self.closeWithinDeadline(firstTransport)
         #expect(firstCalls.snapshot.closeCallEntries == 4)
         #expect(firstCalls.snapshot.rawCloseCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 0)
         #expect(reusedCalls.snapshot.writeOffsets == [0])
+        try await reusedTransport.sendFrame(Data("new-owner-again\n".utf8))
+        #expect(reusedCalls.snapshot.writeOffsets == [0, 0])
         try await Self.closeWithinDeadline(reusedTransport)
         #expect(reusedCalls.snapshot.shutdownCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 1)
@@ -830,6 +912,24 @@ private extension SpiceLiveStageSocketTransportTests {
             guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
                 throw FixtureError.systemCall(errno)
             }
+
+            var noSigPipe: Int32 = 1
+            let configurationResult = withUnsafePointer(to: &noSigPipe) {
+                setsockopt(
+                    descriptors[1],
+                    SOL_SOCKET,
+                    SO_NOSIGPIPE,
+                    $0,
+                    socklen_t(MemoryLayout<Int32>.size)
+                )
+            }
+            guard configurationResult == 0 else {
+                let configurationErrno = errno
+                _ = Darwin.close(descriptors[0])
+                _ = Darwin.close(descriptors[1])
+                throw FixtureError.systemCall(configurationErrno)
+            }
+
             state = Mutex(
                 State(
                     transportDescriptor: descriptors[0],
