@@ -25,7 +25,7 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
     package static let defaultMaximumBytes = 1024 * 1024
     private static let absoluteMaximumBytes = 16 * 1024 * 1024
 
-    private let directoryPath: String
+    private let directoryDescriptor: Int32
     private let outputName: String
     private let maximumBytes: Int
     private let directorySync: @Sendable (Int32) throws -> Void
@@ -76,19 +76,66 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         }
 
         let canonicalParent = Self.canonicalDirectoryPath(parent.path)
-        directoryPath = canonicalParent
+        let descriptor = try Self.openDirectory(path: canonicalParent)
+        do {
+            try Self.validatePrivateDirectory(descriptor)
+            try Self.validateExistingOutput(
+                directoryDescriptor: descriptor,
+                outputName: outputURL.lastPathComponent,
+                maximumBytes: maximumBytes
+            )
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+        directoryDescriptor = descriptor
         outputName = outputURL.lastPathComponent
         self.maximumBytes = maximumBytes
         self.directorySync = directorySync
+    }
 
-        let descriptor = try Self.openDirectory(path: canonicalParent)
-        defer { Darwin.close(descriptor) }
-        try Self.validatePrivateDirectory(descriptor)
-        try Self.validateExistingOutput(
-            directoryDescriptor: descriptor,
-            outputName: outputName,
-            maximumBytes: maximumBytes
-        )
+    init(
+        duplicatingDirectoryDescriptor descriptor: Int32,
+        outputName: String,
+        maximumBytes: Int = SpiceLiveCampaignManifestWriter.defaultMaximumBytes,
+        directorySync: @escaping @Sendable (Int32) throws -> Void = { descriptor in
+            guard Darwin.fsync(descriptor) == 0 else {
+                throw SpiceLiveCampaignManifestError.fileOperationFailed(
+                    operation: "fsync_directory",
+                    code: errno
+                )
+            }
+        }
+    ) throws {
+        guard !outputName.isEmpty,
+              outputName != ".",
+              outputName != "..",
+              !outputName.contains("/"),
+              maximumBytes > 0,
+              maximumBytes <= Self.absoluteMaximumBytes else {
+            throw SpiceLiveCampaignManifestError.outputDirectoryUnavailable
+        }
+        let duplicate = Darwin.fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0 else { throw Self.operationError("duplicate_directory") }
+        do {
+            try Self.validatePrivateDirectory(duplicate)
+            try Self.validateExistingOutput(
+                directoryDescriptor: duplicate,
+                outputName: outputName,
+                maximumBytes: maximumBytes
+            )
+        } catch {
+            Darwin.close(duplicate)
+            throw error
+        }
+        directoryDescriptor = duplicate
+        self.outputName = outputName
+        self.maximumBytes = maximumBytes
+        self.directorySync = directorySync
+    }
+
+    deinit {
+        Darwin.close(directoryDescriptor)
     }
 
     package func load() throws -> SpiceLiveCampaignManifest? {
@@ -184,8 +231,6 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         _ body: (Int32) throws -> Result
     ) throws -> Result {
         try campaignManifestProcessLock.withLock { _ in
-            let directoryDescriptor = try Self.openDirectory(path: directoryPath)
-            defer { Darwin.close(directoryDescriptor) }
             try Self.validatePrivateDirectory(directoryDescriptor)
 
             let lockName = ".\(outputName).lock"
@@ -224,8 +269,6 @@ package final class SpiceLiveCampaignManifestWriter: Sendable {
         _ body: (Int32) throws -> Result
     ) throws -> Result {
         try campaignManifestProcessLock.withLock { _ in
-            let directoryDescriptor = try Self.openDirectory(path: directoryPath)
-            defer { Darwin.close(directoryDescriptor) }
             try Self.validatePrivateDirectory(directoryDescriptor)
             return try body(directoryDescriptor)
         }
