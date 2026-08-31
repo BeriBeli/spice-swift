@@ -206,6 +206,24 @@ Agent behavior, including system-trusted TLS.
   starts no child process and provides no `wait4`, artifact, SSH/RemoteRocky,
   live SPICE, latency, CPU/RSS, release, or AIP-44 improvement evidence.
 
+- AIP-00h2c-2 is now merged on PRs #79 and #80 as main commit `f6dedd2`.
+  `SpiceLiveProcessGroup` atomically creates an independent child process
+  group with an empty signal mask, converges concurrent `finish()` and
+  `cancel()` calls on one lifecycle, validates ownership before group signals,
+  performs bounded TERM-to-KILL cleanup including leader-first exit, and
+  publishes one cached terminal result from one EINTR-safe `wait4` plus copied
+  Sendable resource scalars. Six real-process tests preserve bounded cleanup
+  through assertion and external-reap failure paths. Exact combined-head CI
+  run `33367824639`, job `99412152419`, passed every gate in 14m00s; exact
+  review of `a588b85` was clean. Three C findings removed ten net lines of
+  duplicate state. An unbounded post-reap cleanup owner remained D because no
+  reproducible signalable leak was provided and repeated group signaling after
+  leader reap creates PGID-reuse risk. AIP-00h2c-3 must next atomically bind
+  the existing canonical records, resource sample, terminal manifest,
+  teardown result, reports, and success index without scan-based recovery or
+  synthesized success. This slice contains no artifact, SSH/RemoteRocky, live
+  SPICE, latency, CPU/RSS acceptance, release, or AIP-44 improvement claim.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
