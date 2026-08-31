@@ -13,56 +13,97 @@ struct SpiceLiveStageSocketTransportTests {
             takingDescriptor: pair.takeTransportDescriptor()
         )
         let transport = socket.stageTransport
-        let watchdog = Self.socketPairWatchdog(
-            pair: pair,
-            transport: transport,
-            after: .seconds(2)
-        )
 
         let first = Data("first-inbound\n".utf8)
         let second = Data("second-inbound\n".utf8)
         let outbound = Data("outbound-ack\n".utf8)
         let inboundWire = first + second
-
-        do {
-            async let peerWrite: Void = Self.onIOQueue {
+        let peerWriteCompletion = ObservationLatch()
+        let peerReadCompletion = ObservationLatch()
+        let sendCompletion = ObservationLatch()
+        let firstReceiveCompletion = ObservationLatch()
+        let peerWrite = Task {
+            defer { peerWriteCompletion.signal() }
+            try await Self.onIOQueue {
                 try Self.writeAll(inboundWire, to: pair.peerDescriptor)
             }
-            async let peerRead: Data = Self.onIOQueue {
+        }
+        let peerRead = Task {
+            defer { peerReadCompletion.signal() }
+            return try await Self.onIOQueue {
                 try Self.readExactly(outbound.count, from: pair.peerDescriptor)
             }
-            async let send: Void = transport.sendFrame(outbound)
-            async let receivedFirst: Data? = transport.receiveFrame(
-                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
-            )
-
-            try await peerWrite
-            #expect(try await receivedFirst == first)
-            try await send
-            #expect(try await peerRead == outbound)
-            let receivedSecond = try await transport.receiveFrame(
-                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
-            )
-            #expect(receivedSecond == second)
-        } catch {
-            let timedOut = await Self.finishSocketPairWatchdog(
-                watchdog,
-                pair: pair,
-                transport: transport
-            )
-            if timedOut {
-                throw SpiceLiveInteractionSupportError.operationTimedOut
-            }
-            throw error
         }
-        let timedOut = await Self.finishSocketPairWatchdog(
-            watchdog,
-            pair: pair,
-            transport: transport
-        )
-        if timedOut {
+        let send = Task {
+            defer { sendCompletion.signal() }
+            try await transport.sendFrame(outbound)
+        }
+        let receivedFirst = Task {
+            defer { firstReceiveCompletion.signal() }
+            return try await transport.receiveFrame(
+                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
+            )
+        }
+
+        do {
+            try await Self.waitForCompletions([
+                peerWriteCompletion,
+                peerReadCompletion,
+                sendCompletion,
+                firstReceiveCompletion,
+            ])
+        } catch {
+            pair.closePeer()
+            peerWrite.cancel()
+            peerRead.cancel()
+            send.cancel()
+            receivedFirst.cancel()
+            _ = try? await Self.waitForCompletions([
+                peerWriteCompletion,
+                peerReadCompletion,
+                sendCompletion,
+                firstReceiveCompletion,
+            ])
+            _ = try? await Self.closeWithinDeadline(transport)
             throw SpiceLiveInteractionSupportError.operationTimedOut
         }
+
+        do {
+            try await peerWrite.value
+            #expect(try await receivedFirst.value == first)
+            try await send.value
+            #expect(try await peerRead.value == outbound)
+        } catch {
+            pair.closePeer()
+            _ = try? await Self.closeWithinDeadline(transport)
+            throw error
+        }
+
+        let secondReceiveCompletion = ObservationLatch()
+        let receivedSecond = Task {
+            defer { secondReceiveCompletion.signal() }
+            return try await transport.receiveFrame(
+                maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
+            )
+        }
+        do {
+            try await Self.waitForCompletions([secondReceiveCompletion])
+        } catch {
+            pair.closePeer()
+            receivedSecond.cancel()
+            _ = try? await Self.waitForCompletions([secondReceiveCompletion])
+            _ = try? await Self.closeWithinDeadline(transport)
+            throw SpiceLiveInteractionSupportError.operationTimedOut
+        }
+        do {
+            #expect(try await receivedSecond.value == second)
+        } catch {
+            pair.closePeer()
+            _ = try? await Self.closeWithinDeadline(transport)
+            throw error
+        }
+        pair.closePeer()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -90,6 +131,12 @@ struct SpiceLiveStageSocketTransportTests {
                 .result(.interrupted),
                 .result(.bytes(wire)),
             ]
+        case .partialReadAheadAcrossInterruption:
+            directives = [
+                .result(.bytes(first + second.prefix(2))),
+                .result(.interrupted),
+                .result(.bytes(Data(second.dropFirst(2)))),
+            ]
         }
         let calls = ScriptedSocketCalls(reads: directives)
         let socket = try SpiceLiveStageSocketTransport(
@@ -109,8 +156,10 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(snapshot.readRequests.count == 5)
         case .readAhead:
             #expect(snapshot.readRequests.count == 2)
+        case .partialReadAheadAcrossInterruption:
+            #expect(snapshot.readRequests.count == 3)
         }
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -155,7 +204,7 @@ struct SpiceLiveStageSocketTransportTests {
             }
             #expect(error == .receiveFailed(ECONNRESET))
         }
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -184,6 +233,13 @@ struct SpiceLiveStageSocketTransportTests {
                 .written(frame.count - 4),
             ]
             expectedOffsets = [0, 3, 4]
+        case .interruptedAfterPartialProgress:
+            writes = [
+                .written(2),
+                .interrupted,
+                .written(frame.count - 2),
+            ]
+            expectedOffsets = [0, 2, 2]
         }
         let calls = ScriptedSocketCalls(writes: writes)
         let socket = try SpiceLiveStageSocketTransport(
@@ -196,7 +252,7 @@ struct SpiceLiveStageSocketTransportTests {
         let snapshot = calls.snapshot
         #expect(snapshot.writeOffsets == expectedOffsets)
         #expect(snapshot.writeBuffers.allSatisfy { $0 == frame })
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -240,7 +296,7 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(error == .invalidSystemCallResult)
         }
         #expect(calls.snapshot.writeOffsets == expectedOffsets)
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -293,7 +349,7 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(error == .frameTooLarge)
             #expect(calls.snapshot.writeOffsets.isEmpty)
         }
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -356,7 +412,7 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(error == .invalidSystemCallResult)
         }
         #expect(calls.snapshot.readRequests.allSatisfy { $0 <= maximum })
-        await transport.close()
+        try await Self.closeWithinDeadline(transport)
     }
 
     @Test(
@@ -372,16 +428,19 @@ struct SpiceLiveStageSocketTransportTests {
             systemCalls: calls.systemCalls
         )
         let transport = socket.stageTransport
+        let firstCompletion = ObservationLatch()
         let first: Task<Void, Never>
         switch scenario {
         case .receive:
             first = Task {
+                defer { firstCompletion.signal() }
                 _ = try? await transport.receiveFrame(
                     maximumBytes: SpiceLiveStageProtocolCodec.maximumFrameBytes
                 )
             }
         case .send:
             first = Task {
+                defer { firstCompletion.signal() }
                 try? await transport.sendFrame(Data("first\n".utf8))
             }
         }
@@ -395,13 +454,19 @@ struct SpiceLiveStageSocketTransportTests {
             }
         } catch {
             calls.emergencyReleaseForTestCleanup()
-            await first.value
-            await transport.close()
+            first.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [first],
+                completions: [firstCompletion]
+            )
+            try await Self.closeWithinDeadline(transport)
             throw error
         }
 
         let completion = OperationCompletion()
+        let secondCompletion = ObservationLatch()
         let second = Task {
+            defer { secondCompletion.signal() }
             do {
                 switch scenario {
                 case .receive:
@@ -442,9 +507,11 @@ struct SpiceLiveStageSocketTransportTests {
         }
 
         calls.emergencyReleaseForTestCleanup()
-        await first.value
-        await second.value
-        await transport.close()
+        try await Self.awaitCompletedVoidTasks(
+            [first, second],
+            completions: [firstCompletion, secondCompletion]
+        )
+        try await Self.closeWithinDeadline(transport)
         #expect(calls.snapshot.rawCloseCalls == 1)
     }
 
@@ -463,7 +530,10 @@ struct SpiceLiveStageSocketTransportTests {
         let transport = socket.stageTransport
         let receiveError = SocketErrorCapture()
         let sendError = SocketErrorCapture()
+        let receiveCompletion = ObservationLatch()
+        let sendCompletion = ObservationLatch()
         let receive = Task {
+            defer { receiveCompletion.signal() }
             do {
                 _ = try await transport.receiveFrame(
                     maximumBytes:
@@ -477,6 +547,7 @@ struct SpiceLiveStageSocketTransportTests {
             }
         }
         let send = Task {
+            defer { sendCompletion.signal() }
             do {
                 try await transport.sendFrame(Data("blocked\n".utf8))
                 Issue.record("closed send unexpectedly succeeded")
@@ -494,23 +565,38 @@ struct SpiceLiveStageSocketTransportTests {
             }
         } catch {
             calls.emergencyReleaseForTestCleanup()
-            await receive.value
-            await send.value
-            await transport.close()
+            receive.cancel()
+            send.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [receive, send],
+                completions: [receiveCompletion, sendCompletion]
+            )
+            try await Self.closeWithinDeadline(transport)
             throw error
         }
 
-        let close = Task { await transport.close() }
+        let closeCompletion = ObservationLatch()
+        let close = Task {
+            defer { closeCompletion.signal() }
+            await transport.close()
+        }
         do {
             try await Self.waitUntil {
                 calls.shutdownWasObserved
             }
         } catch {
             calls.emergencyReleaseForTestCleanup()
-            await receive.value
-            await send.value
-            await close.value
-            await transport.close()
+            receive.cancel()
+            send.cancel()
+            close.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [receive, send, close],
+                completions: [
+                    receiveCompletion,
+                    sendCompletion,
+                    closeCompletion,
+                ]
+            )
             throw error
         }
         let beforeWorkerRelease = calls.snapshot
@@ -520,9 +606,14 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(beforeWorkerRelease.rawCloseCalls == 0)
 
         calls.releaseWorkersForTest()
-        await receive.value
-        await send.value
-        await close.value
+        try await Self.awaitCompletedVoidTasks(
+            [receive, send, close],
+            completions: [
+                receiveCompletion,
+                sendCompletion,
+                closeCompletion,
+            ]
+        )
         let terminal = calls.snapshot
         #expect(receiveError.error == .closed)
         #expect(sendError.error == .closed)
@@ -546,7 +637,9 @@ struct SpiceLiveStageSocketTransportTests {
         )
         let firstTransport = first.stageTransport
         let receiveError = SocketErrorCapture()
+        let receiveCompletion = ObservationLatch()
         let receive = Task {
+            defer { receiveCompletion.signal() }
             do {
                 _ = try await firstTransport.receiveFrame(
                     maximumBytes:
@@ -565,28 +658,43 @@ struct SpiceLiveStageSocketTransportTests {
             }
         } catch {
             firstCalls.emergencyReleaseForTestCleanup()
-            await receive.value
-            await firstTransport.close()
+            receive.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [receive],
+                completions: [receiveCompletion]
+            )
+            try await Self.closeWithinDeadline(firstTransport)
             throw error
         }
 
-        let firstClose = Task { await firstTransport.close() }
+        let firstCloseCompletion = ObservationLatch()
+        let firstClose = Task {
+            defer { firstCloseCompletion.signal() }
+            await firstTransport.close()
+        }
         do {
             try await Self.waitUntil {
                 firstCalls.shutdownWasObserved
             }
         } catch {
             firstCalls.emergencyReleaseForTestCleanup()
-            await receive.value
-            await firstClose.value
-            await firstTransport.close()
+            receive.cancel()
+            firstClose.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [receive, firstClose],
+                completions: [receiveCompletion, firstCloseCompletion]
+            )
             throw error
         }
 
+        let secondCloseCompletion = ObservationLatch()
+        let thirdCloseCompletion = ObservationLatch()
         let secondClose = Task {
+            defer { secondCloseCompletion.signal() }
             await firstTransport.close()
         }
         let thirdClose = Task {
+            defer { thirdCloseCompletion.signal() }
             await firstTransport.close()
         }
         do {
@@ -595,11 +703,19 @@ struct SpiceLiveStageSocketTransportTests {
             }
         } catch {
             firstCalls.emergencyReleaseForTestCleanup()
-            await receive.value
-            await firstClose.value
-            await secondClose.value
-            await thirdClose.value
-            await firstTransport.close()
+            receive.cancel()
+            firstClose.cancel()
+            secondClose.cancel()
+            thirdClose.cancel()
+            try await Self.awaitCompletedVoidTasks(
+                [receive, firstClose, secondClose, thirdClose],
+                completions: [
+                    receiveCompletion,
+                    firstCloseCompletion,
+                    secondCloseCompletion,
+                    thirdCloseCompletion,
+                ]
+            )
             throw error
         }
 
@@ -610,10 +726,15 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(overlapping.rawCloseCalls == 0)
 
         firstCalls.releaseWorkersForTest()
-        await receive.value
-        await firstClose.value
-        await secondClose.value
-        await thirdClose.value
+        try await Self.awaitCompletedVoidTasks(
+            [receive, firstClose, secondClose, thirdClose],
+            completions: [
+                receiveCompletion,
+                firstCloseCompletion,
+                secondCloseCompletion,
+                thirdCloseCompletion,
+            ]
+        )
         let firstTerminal = firstCalls.snapshot
         #expect(receiveError.error == .closed)
         #expect(firstTerminal.activeReads == 0)
@@ -629,12 +750,12 @@ struct SpiceLiveStageSocketTransportTests {
         )
         let reusedTransport = reused.stageTransport
         try await reusedTransport.sendFrame(Data("new-owner\n".utf8))
-        await firstTransport.close()
+        try await Self.closeWithinDeadline(firstTransport)
         #expect(firstCalls.snapshot.closeCallEntries == 4)
         #expect(firstCalls.snapshot.rawCloseCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 0)
         #expect(reusedCalls.snapshot.writeOffsets == [0])
-        await reusedTransport.close()
+        try await Self.closeWithinDeadline(reusedTransport)
         #expect(reusedCalls.snapshot.shutdownCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 1)
     }
@@ -663,7 +784,7 @@ struct SpiceLiveStageSocketTransportTests {
             )
             let beforeClose = calls.snapshot
             #expect(beforeClose.events == ["configure_no_sigpipe"])
-            await socket.stageTransport.close()
+            try await Self.closeWithinDeadline(socket.stageTransport)
             let closed = calls.snapshot
             #expect(closed.events == [
                 "configure_no_sigpipe",
@@ -809,35 +930,6 @@ private extension SpiceLiveStageSocketTransportTests {
         }
     }
 
-    static func socketPairWatchdog(
-        pair: SocketPair,
-        transport: SpiceLiveStageTransport,
-        after timeout: Duration
-    ) -> Task<Bool, Never> {
-        Task {
-            do {
-                try await Task.sleep(for: timeout)
-            } catch {
-                return false
-            }
-            pair.closePeer()
-            await transport.close()
-            return true
-        }
-    }
-
-    static func finishSocketPairWatchdog(
-        _ watchdog: Task<Bool, Never>,
-        pair: SocketPair,
-        transport: SpiceLiveStageTransport
-    ) async -> Bool {
-        watchdog.cancel()
-        let timedOut = await watchdog.value
-        pair.closePeer()
-        await transport.close()
-        return timedOut
-    }
-
     static func waitUntil(
         _ condition: @escaping @Sendable () async -> Bool
     ) async throws {
@@ -850,6 +942,43 @@ private extension SpiceLiveStageSocketTransportTests {
                 await Task.yield()
             }
         }
+    }
+
+    static func waitForCompletions(
+        _ completions: [ObservationLatch]
+    ) async throws {
+        try await waitUntil {
+            completions.allSatisfy(\.isSignaled)
+        }
+    }
+
+    static func awaitCompletedVoidTasks(
+        _ tasks: [Task<Void, Never>],
+        completions: [ObservationLatch]
+    ) async throws {
+        do {
+            try await waitForCompletions(completions)
+        } catch {
+            tasks.forEach { $0.cancel() }
+            throw error
+        }
+        for task in tasks {
+            await task.value
+        }
+    }
+
+    static func closeWithinDeadline(
+        _ transport: SpiceLiveStageTransport
+    ) async throws {
+        let completion = ObservationLatch()
+        let close = Task {
+            defer { completion.signal() }
+            await transport.close()
+        }
+        try await awaitCompletedVoidTasks(
+            [close],
+            completions: [completion]
+        )
     }
 
     static func socketError(
@@ -1166,11 +1295,14 @@ private final class SocketErrorCapture: Sendable {
 private enum ReceiveAssemblyScenario: CaseIterable, CustomTestStringConvertible {
     case fragmented
     case readAhead
+    case partialReadAheadAcrossInterruption
 
     var testDescription: String {
         switch self {
         case .fragmented: "EINTR plus fragmented prefix and payload"
         case .readAhead: "two frames from one read"
+        case .partialReadAheadAcrossInterruption:
+            "partial read-ahead survives EINTR in the next receive"
         }
     }
 }
@@ -1192,11 +1324,14 @@ private enum ReceiveTerminationScenario: CaseIterable, CustomTestStringConvertib
 private enum WriteProgressScenario: CaseIterable, CustomTestStringConvertible {
     case interruptedAndFragmented
     case fragmented
+    case interruptedAfterPartialProgress
 
     var testDescription: String {
         switch self {
         case .interruptedAndFragmented: "EINTR then partial writes"
         case .fragmented: "partial writes"
+        case .interruptedAfterPartialProgress:
+            "EINTR preserves offset after partial progress"
         }
     }
 }
