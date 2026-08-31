@@ -187,10 +187,12 @@ Agent behavior, including system-trusted TLS.
 - AIP-00h2c-1 is now merged on PRs #74 and #77 as main commit `5a91fac`.
   The Darwin socket transport owns one descriptor, configures
   `SO_NOSIGPIPE`, preserves bounded canonical LF framing with EINTR retry and
-  write-all offsets, admits one receive plus one send, and performs raw close
-  exactly once only after shutdown has unblocked and drained every admitted
-  worker. Repeated close and later reuse of the same descriptor number cannot
-  affect a new owner. The final AGENTS.md simplification removed speculative
+  write-all offsets, and admits one receive plus one send. Explicit async close
+  uses shutdown to unblock admitted workers and defers raw close until they
+  drain; deinitialization may directly raw-close only when no worker is active.
+  Both paths claim raw close exactly once. Repeated close and later reuse of
+  the same descriptor number cannot affect a new owner. The final AGENTS.md
+  simplification removed speculative
   scripted-operation watchdogs and a production test observer while retaining
   real FD and blocked-worker failure cleanup. Focused strict Debug, Release,
   AddressSanitizer, and ThreadSanitizer each passed 11 tests / 30 executions;
