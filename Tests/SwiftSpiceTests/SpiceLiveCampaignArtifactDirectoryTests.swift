@@ -313,6 +313,105 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
         #expect(reportAfterSecondFailure == plantedReport)
     }
 
+    @Test(arguments: PublishedRunMutation.allCases)
+    func mutatedRunEvidencePermanentlyRejectsSuccess(
+        _ mutation: PublishedRunMutation
+    ) throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let directory = Self.directoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try SpiceLiveCampaignArtifactDirectory(
+            directoryURL: directory,
+            plan: plan,
+            pointerMode: .absolute
+        )
+        let recorder = try Self.recorder(owner: owner, plan: plan)
+        for runIndex in plan.runs.indices {
+            try Self.completeRun(runIndex, recorder: recorder, plan: plan)
+            try Self.recordRun(
+                runIndex,
+                owner: owner,
+                plan: plan,
+                fixture: fixture
+            )
+        }
+        _ = try recorder.finalize()
+
+        switch mutation {
+        case .missingEnvelope:
+            try FileManager.default.removeItem(
+                at: directory.appending(path: "run-00.json")
+            )
+        case .privateNoncanonicalRecords:
+            let recordsURL = directory.appending(path: "run-00.records.jsonl")
+            try Data(" {}\n".utf8).write(to: recordsURL, options: [.atomic])
+            #expect(chmod(recordsURL.path, S_IRUSR | S_IWUSR) == 0)
+            try Self.expectPrivateRegularFile(recordsURL)
+        }
+
+        #expect(throws: (any Error).self) { _ = try owner.publishSuccess() }
+        #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
+        #expect(throws: (any Error).self) { _ = try owner.publishSuccess() }
+        #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
+    }
+
+    @Test func replacingOwnedDirectoryCannotSplitOrPublishArtifacts() throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let directory = Self.directoryURL()
+        let movedDirectory = directory.deletingLastPathComponent().appending(
+            path: "\(directory.lastPathComponent)-moved"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? FileManager.default.removeItem(at: movedDirectory)
+        }
+        let owner = try SpiceLiveCampaignArtifactDirectory(
+            directoryURL: directory,
+            plan: plan,
+            pointerMode: .absolute
+        )
+        try FileManager.default.moveItem(at: directory, to: movedDirectory)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        #expect(chmod(directory.path, S_IRWXU) == 0)
+
+        var rejected = false
+        do {
+            let recorder = try Self.recorder(owner: owner, plan: plan)
+            for runIndex in plan.runs.indices {
+                try Self.completeRun(runIndex, recorder: recorder, plan: plan)
+                try Self.recordRun(
+                    runIndex,
+                    owner: owner,
+                    plan: plan,
+                    fixture: fixture
+                )
+            }
+            _ = try recorder.finalize()
+            _ = try owner.publishSuccess()
+        } catch {
+            rejected = true
+        }
+        #expect(rejected)
+
+        let replacementManifestExists = FileManager.default.fileExists(
+            atPath: directory.appending(path: "campaign-manifest.json").path
+        )
+        let movedRunExists = FileManager.default.fileExists(
+            atPath: movedDirectory.appending(path: "run-00.json").path
+        )
+        #expect(!(replacementManifestExists && movedRunExists))
+        #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
+        #expect(!FileManager.default.fileExists(
+            atPath: movedDirectory.appending(path: "success-index.json").path
+        ))
+        #expect(throws: (any Error).self) { _ = try owner.publishSuccess() }
+    }
+
     @Test func interruptedOwnerCannotBeReopenedOrSynthesized() throws {
         let fixture = try Self.fixture()
         let plan = try Self.plan(fixture: fixture)
@@ -421,6 +520,13 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
         case recording
         case failed
         case interrupted
+
+        var testDescription: String { String(describing: self) }
+    }
+
+    enum PublishedRunMutation: CaseIterable, Sendable, CustomTestStringConvertible {
+        case missingEnvelope
+        case privateNoncanonicalRecords
 
         var testDescription: String { String(describing: self) }
     }
