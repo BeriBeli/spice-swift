@@ -53,18 +53,44 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
         for reference in references {
             try Self.expectReference(reference, in: directory)
         }
+        for runIndex in plan.runs.indices {
+            try Self.expectRunEnvelope(
+                index.runArtifacts[runIndex],
+                runIndex: runIndex,
+                directory: directory,
+                plan: plan,
+                fixture: fixture
+            )
+        }
         let reportURL = directory.appending(path: index.report.relativePath)
         let report = try JSONDecoder().decode(
             SpiceLiveCampaignArtifactReportSnapshot.self,
             from: Data(contentsOf: reportURL)
         )
+        let expectedReport = try SpicePairedInteractionArtifactEvaluator.evaluate(
+            records: fixture.records,
+            resourceSamples: fixture.resources,
+            specification: fixture.specification
+        )
         #expect(report.schemaVersion == 1)
         #expect(report.recordCount == 60)
         #expect(report.runCount == 20)
-        #expect(report.click.pairCount == 10)
-        #expect(report.key.pairCount == 10)
-        #expect(report.motion.pairCount == 10)
-        #expect(report.resources.pairCount == 10)
+        Self.expectActionReport(
+            report.click,
+            equals: expectedReport.summary(for: .click)
+        )
+        Self.expectActionReport(
+            report.key,
+            equals: expectedReport.summary(for: .key)
+        )
+        Self.expectActionReport(
+            report.motion,
+            equals: expectedReport.summary(for: .motion)
+        )
+        Self.expectResourceReport(
+            report.resources,
+            equals: expectedReport.resourceGuardrails
+        )
 
         let directoryAttributes = try FileManager.default.attributesOfItem(
             atPath: directory.path
@@ -260,6 +286,62 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
 }
 
 extension SpiceLiveCampaignArtifactDirectoryTests {
+    struct RunEnvelopeProbe: Decodable {
+        let schemaVersion: Int
+        let logicalRunID: String
+        let evidenceRunID: String
+        let resourceSample: ResourceSampleProbe
+        let teardownResult: TeardownResultProbe
+        let records: ReferenceProbe
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case logicalRunID = "logical_run_id"
+            case evidenceRunID = "evidence_run_id"
+            case resourceSample = "resource_sample"
+            case teardownResult = "teardown_result"
+            case records
+        }
+    }
+
+    struct ResourceSampleProbe: Decodable {
+        let runID: String
+        let cpuPercent: Double
+        let peakRSSBytes: UInt64
+
+        enum CodingKeys: String, CodingKey {
+            case runID = "run_id"
+            case cpuPercent = "cpu_percent"
+            case peakRSSBytes = "peak_rss_bytes"
+        }
+    }
+
+    struct TeardownResultProbe: Decodable {
+        let status: Int32
+        let userNanoseconds: UInt64
+        let systemNanoseconds: UInt64
+        let peakResidentBytes: UInt64
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case userNanoseconds = "user_nanoseconds"
+            case systemNanoseconds = "system_nanoseconds"
+            case peakResidentBytes = "peak_resident_bytes"
+        }
+    }
+
+    struct ReferenceProbe: Decodable {
+        let relativePath: String
+        let sha256: String
+        let byteCount: UInt64
+
+        enum CodingKeys: String, CodingKey {
+            case relativePath = "relative_path"
+            case sha256
+            case byteCount = "byte_count"
+        }
+    }
+
     enum ArtifactInputFailure: CaseIterable, Sendable, CustomTestStringConvertible {
         case missingRecord
         case noncanonicalRecord
@@ -464,6 +546,103 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
             String(format: "%02x", $0)
         }.joined())
         try expectPrivateRegularFile(url)
+    }
+
+    static func expectRunEnvelope(
+        _ reference: SpiceLiveCampaignArtifactReference,
+        runIndex: Int,
+        directory: URL,
+        plan: SpiceLiveCampaignPlan,
+        fixture: SpicePairedInteractionArtifactTests.Fixture
+    ) throws {
+        #expect(reference.relativePath == String(format: "run-%02d.json", runIndex))
+        let envelopeURL = directory.appending(path: reference.relativePath)
+        let envelope = try JSONDecoder().decode(
+            RunEnvelopeProbe.self,
+            from: Data(contentsOf: envelopeURL)
+        )
+        let expectedEvidenceID = try evidenceID(runIndex).rawValue
+        let sample = fixture.resources[runIndex]
+        #expect(envelope.schemaVersion == 1)
+        #expect(envelope.logicalRunID == plan.runs[runIndex].runID)
+        #expect(envelope.evidenceRunID == expectedEvidenceID)
+        #expect(envelope.resourceSample.runID == expectedEvidenceID)
+        #expect(envelope.resourceSample.cpuPercent == sample.cpuPercent)
+        #expect(envelope.resourceSample.peakRSSBytes == sample.peakRSSBytes)
+        #expect(envelope.teardownResult.status == 0)
+        #expect(envelope.teardownResult.userNanoseconds == 10_000)
+        #expect(envelope.teardownResult.systemNanoseconds == 5_000)
+        #expect(envelope.teardownResult.peakResidentBytes == sample.peakRSSBytes)
+
+        let expectedRecordsPath = String(
+            format: "run-%02d.records.jsonl",
+            runIndex
+        )
+        #expect(envelope.records.relativePath == expectedRecordsPath)
+        let recordsURL = directory.appending(path: envelope.records.relativePath)
+        let recordsBytes = try Data(contentsOf: recordsURL)
+        let expectedBytes = try lines(forRun: runIndex, fixture: fixture)
+            .reduce(into: Data(), { $0.append($1) })
+        #expect(recordsBytes == expectedBytes)
+        #expect(envelope.records.byteCount == UInt64(recordsBytes.count))
+        #expect(envelope.records.sha256 == digest(recordsBytes))
+        try expectPrivateRegularFile(recordsURL)
+    }
+
+    static func expectActionReport(
+        _ actual: SpiceLiveCampaignArtifactActionReport,
+        equals expected: SpicePairedInteractionActionSummary
+    ) {
+        #expect(actual.pairCount == expected.pairs.count)
+        expectQuantiles(
+            actual.baselineInputToPresented,
+            equals: expected.baselineInputToPresented
+        )
+        expectQuantiles(
+            actual.candidateInputToPresented,
+            equals: expected.candidateInputToPresented
+        )
+        expectQuantiles(
+            actual.pairedInputToPresentedDelta,
+            equals: expected.pairedInputToPresentedDelta
+        )
+    }
+
+    static func expectResourceReport(
+        _ actual: SpiceLiveCampaignArtifactResourceReport,
+        equals expected: SpicePairedInteractionResourceGuardrails
+    ) {
+        #expect(actual.pairCount == expected.pairs.count)
+        expectQuantiles(actual.baselineCPUPercent, equals: expected.baselineCPUPercent)
+        expectQuantiles(actual.candidateCPUPercent, equals: expected.candidateCPUPercent)
+        expectQuantiles(
+            actual.pairedCPUPercentDelta,
+            equals: expected.pairedCPUPercentDelta
+        )
+        expectQuantiles(
+            actual.baselinePeakRSSBytes,
+            equals: expected.baselinePeakRSSBytes
+        )
+        expectQuantiles(
+            actual.candidatePeakRSSBytes,
+            equals: expected.candidatePeakRSSBytes
+        )
+        expectQuantiles(
+            actual.pairedPeakRSSBytesDelta,
+            equals: expected.pairedPeakRSSBytesDelta
+        )
+    }
+
+    static func expectQuantiles(
+        _ actual: SpiceLiveCampaignArtifactQuantiles,
+        equals expected: SpiceLiveQuantiles
+    ) {
+        #expect(actual.p50 == expected.p50Nanoseconds)
+        #expect(actual.p95 == expected.p95Nanoseconds)
+    }
+
+    static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func expectPrivateRegularFile(_ url: URL) throws {
