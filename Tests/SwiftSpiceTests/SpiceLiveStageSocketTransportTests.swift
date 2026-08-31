@@ -145,8 +145,14 @@ struct SpiceLiveStageSocketTransportTests {
         )
         let transport = socket.stageTransport
 
-        let receivedFirst = try await transport.receiveFrame(maximumBytes: 64)
-        let receivedSecond = try await transport.receiveFrame(maximumBytes: 64)
+        let receivedFirst = try await Self.boundedReceiveFrame(
+            from: transport,
+            maximumBytes: 64
+        )
+        let receivedSecond = try await Self.boundedReceiveFrame(
+            from: transport,
+            maximumBytes: 64
+        )
         #expect(receivedFirst == first)
         #expect(receivedSecond == second)
         let snapshot = calls.snapshot
@@ -191,16 +197,25 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .cleanEOF:
-            let frame = try await transport.receiveFrame(maximumBytes: 64)
+            let frame = try await Self.boundedReceiveFrame(
+                from: transport,
+                maximumBytes: 64
+            )
             #expect(frame == nil)
         case .truncatedFrame:
             let error = await Self.socketError {
-                _ = try await transport.receiveFrame(maximumBytes: 64)
+                _ = try await Self.boundedReceiveFrame(
+                    from: transport,
+                    maximumBytes: 64
+                )
             }
             #expect(error == .truncatedFrame)
         case .readError:
             let error = await Self.socketError {
-                _ = try await transport.receiveFrame(maximumBytes: 64)
+                _ = try await Self.boundedReceiveFrame(
+                    from: transport,
+                    maximumBytes: 64
+                )
             }
             #expect(error == .receiveFailed(ECONNRESET))
         }
@@ -248,7 +263,7 @@ struct SpiceLiveStageSocketTransportTests {
         )
         let transport = socket.stageTransport
 
-        try await transport.sendFrame(frame)
+        try await Self.boundedSendFrame(frame, through: transport)
         let snapshot = calls.snapshot
         #expect(snapshot.writeOffsets == expectedOffsets)
         #expect(snapshot.writeBuffers.allSatisfy { $0 == frame })
@@ -287,7 +302,7 @@ struct SpiceLiveStageSocketTransportTests {
         let transport = socket.stageTransport
 
         let error = await Self.socketError {
-            try await transport.sendFrame(frame)
+            try await Self.boundedSendFrame(frame, through: transport)
         }
         switch scenario {
         case .brokenPipe:
@@ -332,19 +347,19 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .exactMaximum:
-            try await transport.sendFrame(frame)
+            try await Self.boundedSendFrame(frame, through: transport)
             #expect(calls.snapshot.writeOffsets == [0])
             #expect(calls.snapshot.writeBuffers == [frame])
         case .empty, .loneLineFeed, .maximumWithoutFinalLineFeed,
              .internalLineFeed:
             let error = await Self.socketError {
-                try await transport.sendFrame(frame)
+                try await Self.boundedSendFrame(frame, through: transport)
             }
             #expect(error == .invalidFrame)
             #expect(calls.snapshot.writeOffsets.isEmpty)
         case .oneByteTooLarge:
             let error = await Self.socketError {
-                try await transport.sendFrame(frame)
+                try await Self.boundedSendFrame(frame, through: transport)
             }
             #expect(error == .frameTooLarge)
             #expect(calls.snapshot.writeOffsets.isEmpty)
@@ -388,12 +403,16 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .exactMaximum:
-            let frame = try await transport.receiveFrame(maximumBytes: maximum)
+            let frame = try await Self.boundedReceiveFrame(
+                from: transport,
+                maximumBytes: maximum
+            )
             #expect(frame?.count == maximum)
             let successfulReadRequests = calls.snapshot.readRequests
             for invalidMaximum in [1, maximum + 1] {
                 let error = await Self.socketError {
-                    _ = try await transport.receiveFrame(
+                    _ = try await Self.boundedReceiveFrame(
+                        from: transport,
                         maximumBytes: invalidMaximum
                     )
                 }
@@ -402,12 +421,18 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(calls.snapshot.readRequests == successfulReadRequests)
         case .delimiterBeyondBound:
             let error = await Self.socketError {
-                _ = try await transport.receiveFrame(maximumBytes: maximum)
+                _ = try await Self.boundedReceiveFrame(
+                    from: transport,
+                    maximumBytes: maximum
+                )
             }
             #expect(error == .frameTooLarge)
         case .syscallOverReturn:
             let error = await Self.socketError {
-                _ = try await transport.receiveFrame(maximumBytes: maximum)
+                _ = try await Self.boundedReceiveFrame(
+                    from: transport,
+                    maximumBytes: maximum
+                )
             }
             #expect(error == .invalidSystemCallResult)
         }
@@ -507,10 +532,22 @@ struct SpiceLiveStageSocketTransportTests {
         }
 
         calls.emergencyReleaseForTestCleanup()
-        try await Self.awaitCompletedVoidTasks(
-            [first, second],
-            completions: [firstCompletion, secondCompletion]
-        )
+        do {
+            try await Self.awaitCompletedVoidTasks(
+                [first, second],
+                completions: [firstCompletion, secondCompletion]
+            )
+        } catch {
+            calls.emergencyReleaseForTestCleanup()
+            first.cancel()
+            second.cancel()
+            _ = try? await Self.awaitCompletedVoidTasks(
+                [first, second],
+                completions: [firstCompletion, secondCompletion]
+            )
+            _ = try? await Self.closeWithinDeadline(transport)
+            throw error
+        }
         try await Self.closeWithinDeadline(transport)
         #expect(calls.snapshot.rawCloseCalls == 1)
     }
@@ -749,7 +786,10 @@ struct SpiceLiveStageSocketTransportTests {
             systemCalls: reusedCalls.systemCalls
         )
         let reusedTransport = reused.stageTransport
-        try await reusedTransport.sendFrame(Data("new-owner\n".utf8))
+        try await Self.boundedSendFrame(
+            Data("new-owner\n".utf8),
+            through: reusedTransport
+        )
 
         let firstBeforeClosedIO = firstCalls.snapshot
         let reusedBeforeClosedIO = reusedCalls.snapshot
@@ -835,7 +875,10 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(firstCalls.snapshot.rawCloseCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 0)
         #expect(reusedCalls.snapshot.writeOffsets == [0])
-        try await reusedTransport.sendFrame(Data("new-owner-again\n".utf8))
+        try await Self.boundedSendFrame(
+            Data("new-owner-again\n".utf8),
+            through: reusedTransport
+        )
         #expect(reusedCalls.snapshot.writeOffsets == [0, 0])
         try await Self.closeWithinDeadline(reusedTransport)
         #expect(reusedCalls.snapshot.shutdownCalls == 1)
@@ -1064,6 +1107,53 @@ private extension SpiceLiveStageSocketTransportTests {
         }
         for task in tasks {
             await task.value
+        }
+    }
+
+    static func boundedTransportOperation<Value: Sendable>(
+        transport: SpiceLiveStageTransport,
+        emergencyRelease: @escaping @Sendable () -> Void = {},
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let completion = ObservationLatch()
+        let task = Task {
+            defer { completion.signal() }
+            return try await operation()
+        }
+        do {
+            try await waitForCompletions([completion])
+        } catch {
+            emergencyRelease()
+            task.cancel()
+            _ = try? await closeWithinDeadline(transport)
+            throw SpiceLiveInteractionSupportError.operationTimedOut
+        }
+        return try await task.value
+    }
+
+    static func boundedReceiveFrame(
+        from transport: SpiceLiveStageTransport,
+        maximumBytes: Int,
+        emergencyRelease: @escaping @Sendable () -> Void = {}
+    ) async throws -> Data? {
+        try await boundedTransportOperation(
+            transport: transport,
+            emergencyRelease: emergencyRelease
+        ) {
+            try await transport.receiveFrame(maximumBytes: maximumBytes)
+        }
+    }
+
+    static func boundedSendFrame(
+        _ frame: Data,
+        through transport: SpiceLiveStageTransport,
+        emergencyRelease: @escaping @Sendable () -> Void = {}
+    ) async throws {
+        try await boundedTransportOperation(
+            transport: transport,
+            emergencyRelease: emergencyRelease
+        ) {
+            try await transport.sendFrame(frame)
         }
     }
 
