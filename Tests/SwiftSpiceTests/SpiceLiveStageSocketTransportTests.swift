@@ -941,20 +941,22 @@ private extension SpiceLiveStageSocketTransportTests {
             }
 
             var noSigPipe: Int32 = 1
-            let configurationResult = withUnsafePointer(to: &noSigPipe) {
-                setsockopt(
-                    descriptors[1],
-                    SOL_SOCKET,
-                    SO_NOSIGPIPE,
-                    $0,
-                    socklen_t(MemoryLayout<Int32>.size)
-                )
-            }
-            guard configurationResult == 0 else {
-                let configurationErrno = errno
-                _ = Darwin.close(descriptors[0])
-                _ = Darwin.close(descriptors[1])
-                throw FixtureError.systemCall(configurationErrno)
+            for descriptor in descriptors {
+                let configurationResult = withUnsafePointer(to: &noSigPipe) {
+                    setsockopt(
+                        descriptor,
+                        SOL_SOCKET,
+                        SO_NOSIGPIPE,
+                        $0,
+                        socklen_t(MemoryLayout<Int32>.size)
+                    )
+                }
+                guard configurationResult == 0 else {
+                    let configurationErrno = errno
+                    _ = Darwin.close(descriptors[0])
+                    _ = Darwin.close(descriptors[1])
+                    throw FixtureError.systemCall(configurationErrno)
+                }
             }
 
             state = Mutex(
