@@ -200,11 +200,10 @@ Agent behavior, including system-trusted TLS.
   passed 43 tests in Debug and Release; and the Release interaction product
   built. Combined Apple Silicon CI run `33351342144`, job `99365206363`,
   passed every gate in 13m51s, and exact combined-head review found no issue.
-  AIP-00h2c-2 must next add local process-group ownership plus one unique
-  `wait4` resource sample; h2c-3 remains atomic artifact ownership/index, and
-  h2d remains baseline-overlay plus real paired Rocky execution. This slice
-  starts no child process and provides no `wait4`, artifact, SSH/RemoteRocky,
-  live SPICE, latency, CPU/RSS, release, or AIP-44 improvement evidence.
+  AIP-00h2c-2 and h2c-3 are now closed below; h2d is the next boundary for
+  baseline-overlay plus real paired Rocky execution. This slice starts no
+  child process and provides no `wait4`, artifact, SSH/RemoteRocky, live SPICE,
+  latency, CPU/RSS, release, or AIP-44 improvement evidence.
 
 - AIP-00h2c-2 is now merged on PRs #79 and #80 as main commit `f6dedd2`.
   `SpiceLiveProcessGroup` atomically creates an independent child process
@@ -218,11 +217,25 @@ Agent behavior, including system-trusted TLS.
   review of `a588b85` was clean. Three C findings removed ten net lines of
   duplicate state. An unbounded post-reap cleanup owner remained D because no
   reproducible signalable leak was provided and repeated group signaling after
-  leader reap creates PGID-reuse risk. AIP-00h2c-3 must next atomically bind
-  the existing canonical records, resource sample, terminal manifest,
-  teardown result, reports, and success index without scan-based recovery or
-  synthesized success. This slice contains no artifact, SSH/RemoteRocky, live
+  leader reap creates PGID-reuse risk. AIP-00h2c-3 is now closed below; h2d is
+  the next boundary. This slice contains no artifact, SSH/RemoteRocky, live
   SPICE, latency, CPU/RSS acceptance, release, or AIP-44 improvement claim.
+
+- AIP-00h2c-3 is now merged on PRs #82 and #83 as main commit `a56c890`.
+  One exclusive private directory owner binds the fixed canonical run records
+  and envelopes, resource samples, successful teardown results, finalized
+  manifest, aggregate report, and success index. Manifest and artifact I/O
+  retain the same directory inode; success revalidates every fixed run object
+  and publishes the index last. Post-record evidence mutation and original-path
+  replacement fail terminally without scanning, recovery, retry, or synthesized
+  success. Focused strict Debug, Release, and AddressSanitizer each passed 9
+  tests / 15 executions. Combined Apple Silicon CI run `33377358455`, job
+  `99441731841`, passed every gate in 18m54s; exact review of `ba854ca` was
+  clean, and both review-found Sources threads were resolved. The complete h2c
+  local execution boundary is closed. AIP-00h2d must next add structured SSH,
+  tunnel, fixture, baseline-overlay, and real paired Rocky execution. This
+  slice provides no live SPICE, latency, CPU/RSS acceptance, release, or
+  AIP-44 improvement claim.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
