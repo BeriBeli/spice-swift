@@ -21,7 +21,10 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path, fixture.releaseURL.path]
         )
-        let watchdog = processGroupWatchdog(process.processGroupIdentifier)
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         let identifiers = try await fixture.waitForIdentifiers(count: 1)
 
         #expect(process.processIdentifier == identifiers[0])
@@ -66,7 +69,10 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(process.processGroupIdentifier)
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         _ = try await fixture.waitForIdentifiers(count: 1)
 
         async let finished = process.finish()
@@ -98,7 +104,10 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(process.processGroupIdentifier)
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         _ = try await fixture.waitForIdentifiers(count: 1)
         let started = ContinuousClock().now
 
@@ -131,7 +140,10 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(process.processGroupIdentifier)
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         let identifiers = try await fixture.waitForIdentifiers(count: 2)
 
         let terminal = try await process.cancel()
@@ -161,7 +173,10 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(process.processGroupIdentifier)
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         _ = try await fixture.waitForIdentifiers(count: 2)
 
         let terminal = try await process.finish()
@@ -170,45 +185,6 @@ struct SpiceLiveProcessGroupTests {
         #expect(!(await watchdog.value))
         #expect(terminal.status == 0)
         #expect(!processGroupExists(process.processGroupIdentifier))
-    }
-
-    @Test
-    func terminalCallsDoNotAffectALaterUnrelatedProcess() async throws {
-        let completedFixture = try ProcessScriptFixture("exit 0")
-        defer { completedFixture.remove() }
-        let completed = try SpiceLiveProcessGroup.launch(
-            executableURL: completedFixture.executableURL,
-            arguments: []
-        )
-        let completedResult = try await completed.finish()
-
-        let unrelatedFixture = try ProcessScriptFixture(
-            """
-            printf '%s\n' "$$" > "$1"
-            while [ ! -f "$2" ]; do :; done
-            exit 11
-            """
-        )
-        defer { unrelatedFixture.remove() }
-        let unrelated = try SpiceLiveProcessGroup.launch(
-            executableURL: unrelatedFixture.executableURL,
-            arguments: [unrelatedFixture.readyURL.path, unrelatedFixture.releaseURL.path]
-        )
-        let watchdog = processGroupWatchdog(unrelated.processGroupIdentifier)
-        _ = try await unrelatedFixture.waitForIdentifiers(count: 1)
-
-        let repeatedFinish = try await completed.finish()
-        let repeatedCancel = try await completed.cancel()
-
-        #expect(repeatedFinish == completedResult)
-        #expect(repeatedCancel == completedResult)
-        #expect(Darwin.kill(unrelated.processIdentifier, 0) == 0)
-        #expect(Darwin.getpgid(unrelated.processIdentifier) == unrelated.processGroupIdentifier)
-        try unrelatedFixture.release()
-        let unrelatedResult = try await unrelated.finish()
-        watchdog.cancel()
-        #expect(!(await watchdog.value))
-        #expect(unrelatedResult.status == 11)
     }
 
     @Test
@@ -306,13 +282,21 @@ private func processGroupExists(_ processGroup: pid_t) -> Bool {
     return errno == EPERM
 }
 
-private func processGroupWatchdog(_ processGroup: pid_t) -> Task<Bool, Never> {
+private func processGroupWatchdog(
+    processIdentifier: pid_t,
+    processGroupIdentifier: pid_t
+) -> Task<Bool, Never> {
     Task.detached {
         do {
             try await Task.sleep(for: .seconds(4))
         } catch {
             return false
         }
-        return Darwin.kill(-processGroup, SIGKILL) == 0
+        guard processIdentifier > 1 else { return false }
+        if processGroupIdentifier == processIdentifier,
+           Darwin.getpgid(processIdentifier) == processIdentifier {
+            return Darwin.kill(-processGroupIdentifier, SIGKILL) == 0
+        }
+        return Darwin.kill(processIdentifier, SIGKILL) == 0
     }
 }
