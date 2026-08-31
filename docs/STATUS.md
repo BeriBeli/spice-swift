@@ -180,11 +180,29 @@ Agent behavior, including system-trusted TLS.
   `33337686652`, job `99327451720`, passed build, public API, full tests,
   AddressSanitizer, and coverage in 17m9s; exact combined-head review of
   `3ab4a2e` found no issue and unresolved threads are zero. This is local
-  transport/driver closure only. AIP-00h2c must next proceed as h2c-1 Darwin
-  socket/FD framing, h2c-2 local process-group ownership plus unique `wait4`,
-  and h2c-3 atomic artifact ownership/index. Baseline-overlay and real paired
-  Rocky execution remain h2d. No actual FD/process/SSH/RemoteRocky, artifact,
-  live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is claimed.
+  transport/driver closure only. No actual FD/process/SSH/RemoteRocky,
+  artifact, live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
+  claimed by this slice.
+
+- AIP-00h2c-1 is now merged on PRs #74 and #77 as main commit `5a91fac`.
+  The Darwin socket transport owns one descriptor, configures
+  `SO_NOSIGPIPE`, preserves bounded canonical LF framing with EINTR retry and
+  write-all offsets, admits one receive plus one send, and performs raw close
+  exactly once only after shutdown has unblocked and drained every admitted
+  worker. Repeated close and later reuse of the same descriptor number cannot
+  affect a new owner. The final AGENTS.md simplification removed speculative
+  scripted-operation watchdogs and a production test observer while retaining
+  real FD and blocked-worker failure cleanup. Focused strict Debug, Release,
+  AddressSanitizer, and ThreadSanitizer each passed 11 tests / 30 executions;
+  ThreadSanitizer passed 20 repetitions; related h1/h2a/h2b1/h2b2 regression
+  passed 43 tests in Debug and Release; and the Release interaction product
+  built. Combined Apple Silicon CI run `33351342144`, job `99365206363`,
+  passed every gate in 13m51s, and exact combined-head review found no issue.
+  AIP-00h2c-2 must next add local process-group ownership plus one unique
+  `wait4` resource sample; h2c-3 remains atomic artifact ownership/index, and
+  h2d remains baseline-overlay plus real paired Rocky execution. This slice
+  starts no child process and provides no `wait4`, artifact, SSH/RemoteRocky,
+  live SPICE, latency, CPU/RSS, release, or AIP-44 improvement evidence.
 
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
