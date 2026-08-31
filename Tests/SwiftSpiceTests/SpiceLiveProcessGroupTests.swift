@@ -140,19 +140,33 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(
+        let readinessWatchdog = processGroupWatchdog(
             processIdentifier: process.processIdentifier,
             processGroupIdentifier: process.processGroupIdentifier
         )
         let identifiers = try await fixture.waitForIdentifiers(count: 2)
+        readinessWatchdog.cancel()
+        #expect(!(await readinessWatchdog.value))
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier,
+            descendantProcessIdentifiers: [identifiers[1]]
+        )
 
-        let terminal = try await process.cancel()
+        let terminal: SpiceLiveProcessGroup.TerminalResult
+        do {
+            terminal = try await process.cancel()
+        } catch {
+            _ = await watchdog.value
+            throw error
+        }
 
-        watchdog.cancel()
-        #expect(!(await watchdog.value))
         #expect(terminal.status == 128 + SIGKILL)
         #expect(identifiers[0] == process.processIdentifier)
-        #expect(!processGroupExists(process.processGroupIdentifier))
+        let groupIsAbsent = !processGroupExists(process.processGroupIdentifier)
+        #expect(groupIsAbsent)
+        if groupIsAbsent { watchdog.cancel() }
+        _ = await watchdog.value
     }
 
     @Test
@@ -173,18 +187,32 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: [fixture.readyURL.path]
         )
-        let watchdog = processGroupWatchdog(
+        let readinessWatchdog = processGroupWatchdog(
             processIdentifier: process.processIdentifier,
             processGroupIdentifier: process.processGroupIdentifier
         )
-        _ = try await fixture.waitForIdentifiers(count: 2)
+        let identifiers = try await fixture.waitForIdentifiers(count: 2)
+        readinessWatchdog.cancel()
+        #expect(!(await readinessWatchdog.value))
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier,
+            descendantProcessIdentifiers: [identifiers[1]]
+        )
 
-        let terminal = try await process.finish()
+        let terminal: SpiceLiveProcessGroup.TerminalResult
+        do {
+            terminal = try await process.finish()
+        } catch {
+            _ = await watchdog.value
+            throw error
+        }
 
-        watchdog.cancel()
-        #expect(!(await watchdog.value))
         #expect(terminal.status == 0)
-        #expect(!processGroupExists(process.processGroupIdentifier))
+        let groupIsAbsent = !processGroupExists(process.processGroupIdentifier)
+        #expect(groupIsAbsent)
+        if groupIsAbsent { watchdog.cancel() }
+        _ = await watchdog.value
     }
 
     @Test
@@ -195,10 +223,16 @@ struct SpiceLiveProcessGroupTests {
             executableURL: fixture.executableURL,
             arguments: []
         )
+        let watchdog = processGroupWatchdog(
+            processIdentifier: process.processIdentifier,
+            processGroupIdentifier: process.processGroupIdentifier
+        )
         var rawStatus: Int32 = 0
 
         let reaped = Darwin.waitpid(process.processIdentifier, &rawStatus, 0)
 
+        watchdog.cancel()
+        #expect(!(await watchdog.value))
         #expect(reaped == process.processIdentifier)
         do {
             _ = try await process.finish()
@@ -284,7 +318,8 @@ private func processGroupExists(_ processGroup: pid_t) -> Bool {
 
 private func processGroupWatchdog(
     processIdentifier: pid_t,
-    processGroupIdentifier: pid_t
+    processGroupIdentifier: pid_t,
+    descendantProcessIdentifiers: [pid_t] = []
 ) -> Task<Bool, Never> {
     Task.detached {
         do {
@@ -297,6 +332,12 @@ private func processGroupWatchdog(
            Darwin.getpgid(processIdentifier) == processIdentifier {
             return Darwin.kill(-processGroupIdentifier, SIGKILL) == 0
         }
-        return Darwin.kill(processIdentifier, SIGKILL) == 0
+        var terminatedProcess = Darwin.kill(processIdentifier, SIGKILL) == 0
+        for descendant in descendantProcessIdentifiers where descendant > 1 {
+            if Darwin.kill(descendant, SIGKILL) == 0 {
+                terminatedProcess = true
+            }
+        }
+        return terminatedProcess
     }
 }
