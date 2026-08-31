@@ -563,6 +563,26 @@ flow. It adds no OS file descriptor, child process, process group, `wait4`,
 SSH/RemoteRocky effect, artifact ownership, live interaction, latency,
 CPU/RSS, release, or AIP-44 improvement evidence.
 
+AIP-00h2c-1 is merged on PRs #74 and #77 as main commit `5a91fac`. The new
+Darwin socket transport preserves canonical LF-terminated frames with bounded
+read-ahead, EINTR retry, and write-all offsets while admitting at most one
+receive plus one send. On explicit async close, one owner uses shutdown to
+unblock admitted workers and defers raw close until shutdown completes and
+every worker drains. Deinitialization may instead raw-close directly when no
+worker is active. Both paths claim raw close exactly once, so repeated close
+and later reuse of the same descriptor number cannot affect a new owner. The
+final AGENTS.md simplification removed a
+production test observer and speculative scripted-operation watchdogs while
+retaining real FD and blocked-worker failure bounds. Focused Debug, Release,
+AddressSanitizer, and ThreadSanitizer each passed 11 tests / 30 executions;
+ThreadSanitizer passed 20 repeated runs, the h1/h2a/h2b1/h2b2 regression passed
+43 tests in Debug and Release, and the Release interaction product built.
+Combined Apple Silicon CI run `33351342144`, job `99365206363`, passed build,
+public API, full tests, AddressSanitizer, and coverage in 13m51s; exact review
+of `47305c1` found no issue. This is local socket/FD ownership only: it starts
+no child process and produces no `wait4`, artifact, SSH/RemoteRocky, live
+SPICE, latency, CPU/RSS, release, or AIP-44 evidence.
+
 AIP-00h2 proceeds through the remaining reviewable local boundaries before any
 new real campaign:
 
@@ -577,9 +597,9 @@ new real campaign:
    child process is part of this layer.
 3. **h2c local execution boundary**, split into three independently reviewed
    slices:
-   - **h2c-1 Darwin socket/FD framing:** implement bounded duplex framing,
+   - **h2c-1 Darwin socket/FD framing — closed:** bounded duplex framing,
      write-all semantics, EOF/error classification, and close-unblocks-I/O
-     ownership without starting a child process.
+     ownership are merged without starting a child process.
    - **h2c-2 local process ownership:** add one child process group, bounded
      cancellation/teardown, one authoritative reap, and one unique `wait4`
      resource sample without SSH or Rocky.
@@ -922,6 +942,7 @@ behavior remain separate acceptance gates.
 | AIP-00 | 2026-08-30 | AIP-00g paired campaign structural gate / PRs #59-#60 / `21ed862` | Focused Debug, Release, and AddressSanitizer gates each passed 8/8. The matrix additionally covers all 13 stage-failure positions, nine artifact mutations, three execution-linkage rejection cases, and 11 malformed evidence-ID spellings. Apple Silicon CI run `33306335910`, job `99243450554`, passed build, public API, full tests, AddressSanitizer, and coverage; exact-head Codex review found no issues. | Pure package validation only. The gate fixes the 20-run counterbalance, 260-entry successful ledger, 60 canonical records, 20 resource samples, and typed actual-evidence mapping without executing Rocky or producing a paired live artifact. It contains no latency observation; AIP-00 and AIP-44 remain open. |
 | AIP-00 | 2026-08-30 | AIP-00h1 real-time manifest boundary / PRs #62-#63 / `c508718` | Focused strict Debug, Release, and AddressSanitizer gates each passed 10/10, plus a strict Release support build. Final Apple Silicon CI run `33314950299`, job `99266536122`, passed build, public API, full tests, AddressSanitizer, and coverage. Exact-head review of `4a1bb50` found no issues. Two earlier P2 findings were fixed test-first: terminal recovery re-syncs an uncertain directory entry, and full plan replay rejects a foreign but validly encoded ledger entry; both threads were replied to and resolved. | Persists one canonical generation per actual stage result, prevents a second active recorder, and makes failed/interrupted/finalized state terminal without replay. This is deterministic local persistence evidence only: no runner, RemoteRocky effect, live paired artifact, latency result, or AIP-44 scheduling change is included. |
 | AIP-00 | 2026-08-31 | AIP-00h2b2 local stage driver / PRs #71-#72 / `3e69c03` | The focused driver gate passed 16 tests / 28 executions in strict Debug, strict Release, and AddressSanitizer. Cancellation returning nil passed 20/20 repeated executions, and all nine transport attempts to throw the driver's own error cases were classified as external receive failures. Three Sources review findings were reproduced and fixed test-first. Combined Apple Silicon CI run `33337686652`, job `99327451720`, passed build, public API, full tests, AddressSanitizer, and coverage in 17m9s; exact combined-head review of `3ab4a2e` found no issue and unresolved threads are zero. | Deterministic local transport-abstraction and actor-state evidence only. No OS FD, process, process group, `wait4`, SSH/RemoteRocky, artifact, live SPICE, latency, CPU/RSS, release, or AIP-44 claim is included. |
+| AIP-00 | 2026-08-31 | AIP-00h2c-1 Darwin socket ownership / PRs #74, #77 / `5a91fac` | Focused strict Debug, Release, AddressSanitizer, and ThreadSanitizer gates each passed 11 tests / 30 executions; ThreadSanitizer passed 20 repeats; h1/h2a/h2b1/h2b2 regression passed 43 tests in Debug and Release; the Release interaction product built. Combined Apple Silicon CI run `33351342144`, job `99365206363`, passed build, public API, full tests, AddressSanitizer, and coverage in 13m51s. Exact combined-head review of `47305c1` found no issue; all 17 Tests review threads were resolved and the Sources PR had zero threads. | One owner now provides bounded LF framing, EINTR-safe read/write, one receive plus one send, `SO_NOSIGPIPE`, explicit-close shutdown-before-worker-drain, raw-close-once across explicit close and no-active-worker deinit, and FD-reuse safety. The AGENTS.md simplification removed speculative watchdogs and a production test observer. This is local FD evidence only: no child process, `wait4`, artifact, SSH/RemoteRocky, live SPICE, latency, CPU/RSS, release, or AIP-44 claim is included. |
 | AIP-10 | 2026-08-26 | PR #20 / `f68f6c6` | Apple Silicon SwiftPM CI; `swift build -Xswiftc -warnings-as-errors`; `InboundMessageBatchTests` 9/9 with 14 malformed-list arguments; `ChannelConnectionBatchTests` 3/3; `git diff --check` | Full-header batches share one owned body, dispatch submessages before the main prefix, and count ACK once per physical message. PR CI passed. Live-peer coverage remains for AIP-90. |
 | AIP-11 | 2026-08-26 | PR #21 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `ProcessedSerialBarrierTests` 16/16; combined serial-barrier tests 19/19; `ChannelMigrationTests` 5/5; AIP-10 batch regression 12/12; `SpiceSessionTests` 61/61; `DisplayChannelTests` 50/50; `git diff --check` | Effective full and implicit-mini serials advance after the physical batch handler and ACK succeed. A SET_ACK main or submessage excludes its complete physical batch from the new ACK window. A MIGRATE message may emit its triggered protocol ACK after entering migration state without opening ordinary client sends. Handler/transport failure, cancellation, and close terminate only dependent unsatisfied waiters, and a terminal connection rejects later client sends. Superseded receive tasks cannot poison a replacement connection or its shared barrier; an already-started Agent byte stream drains on its captured retiring connection before that transport closes, without delaying later target sends. Disconnect cancels that retirement wait, closes both retained source and target state, and cannot publish a late migration completion. `migrationRequested` remains recoverable. |
 | AIP-12 | 2026-08-27 | PR #22 | `swift test --disable-sandbox -Xswiftc -warnings-as-errors`; `DisplayImageCacheTests` 17/17; `DisplayChannelTests` 65/65 (one test executes 4 release cases); `SpiceSessionTests` 62/62; combined focused gate 144/144; message-framer/inbound-batch 12/12; connection-batch 3/3; 1,000-iteration immediate-promotion stress; `git diff --check` | One Session-owned actor coordinates every Display image reference. Each noncopyable mutation begins before asynchronous decode, stages its bitmap afterward, and uses consuming commit/abort so cache publication remains behind successful Surface work. Same-ID mutations run through a bounded FIFO instead of being rejected; cancellation, clear, and close release continuations and budgets exactly once. Cross-Display resolves remain bounded to 64 waiters and one cache-sized retained-byte budget. Active/queued mutation counts and retained/staged bytes have hard limits. A logical submessage accounts the complete physical batch storage retained by its `Data` slice, closing the gap between the wire-size limit and the cache budget. Targeted and global invalidation mark all active and queued work registered at their linearization point, preventing decode-time resurrection without retaining unknown-ID tombstones. AIP-11 barriers order `INVAL_ALL_PIXMAPS`; seamless rebinding retains the source cache, while replacement and teardown close exactly their owned cache. No performance claim is made before AIP-00. |
