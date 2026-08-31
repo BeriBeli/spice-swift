@@ -25,7 +25,6 @@ package final class SpiceLiveProcessGroup: Sendable {
 
     private struct Storage: Sendable {
         var cancellationRequested = false
-        var workerStarted = false
         var terminal: Result<TerminalResult, ProcessError>?
         var waiters: [CheckedContinuation<Result<TerminalResult, ProcessError>, Never>] = []
     }
@@ -134,10 +133,9 @@ package final class SpiceLiveProcessGroup: Sendable {
                 if requestCancellation {
                     storage.cancellationRequested = true
                 }
+                let shouldStart = storage.waiters.isEmpty
                 storage.waiters.append(continuation)
-                guard !storage.workerStarted else { return false }
-                storage.workerStarted = true
-                return true
+                return shouldStart
             }
             if let immediate {
                 continuation.resume(returning: immediate)
