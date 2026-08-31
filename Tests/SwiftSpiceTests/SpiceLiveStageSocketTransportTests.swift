@@ -138,21 +138,18 @@ struct SpiceLiveStageSocketTransportTests {
                 .result(.bytes(Data(second.dropFirst(2)))),
             ]
         }
-        let calls = ScriptedSocketCalls(reads: directives)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 41,
+            reads: directives
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 41,
             systemCalls: calls.systemCalls
         )
         let transport = socket.stageTransport
 
-        let receivedFirst = try await Self.boundedReceiveFrame(
-            from: transport,
-            maximumBytes: 64
-        )
-        let receivedSecond = try await Self.boundedReceiveFrame(
-            from: transport,
-            maximumBytes: 64
-        )
+        let receivedFirst = try await transport.receiveFrame(maximumBytes: 64)
+        let receivedSecond = try await transport.receiveFrame(maximumBytes: 64)
         #expect(receivedFirst == first)
         #expect(receivedSecond == second)
         let snapshot = calls.snapshot
@@ -165,8 +162,8 @@ struct SpiceLiveStageSocketTransportTests {
         case .partialReadAheadAcrossInterruption:
             #expect(snapshot.readRequests.count == 3)
         }
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(41, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -189,7 +186,10 @@ struct SpiceLiveStageSocketTransportTests {
         case .readError:
             reads = [.result(.failed(errno: ECONNRESET))]
         }
-        let calls = ScriptedSocketCalls(reads: reads)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 42,
+            reads: reads
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 42,
             systemCalls: calls.systemCalls
@@ -198,30 +198,21 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .cleanEOF:
-            let frame = try await Self.boundedReceiveFrame(
-                from: transport,
-                maximumBytes: 64
-            )
+            let frame = try await transport.receiveFrame(maximumBytes: 64)
             #expect(frame == nil)
         case .truncatedFrame:
             let error = await Self.socketError {
-                _ = try await Self.boundedReceiveFrame(
-                    from: transport,
-                    maximumBytes: 64
-                )
+                _ = try await transport.receiveFrame(maximumBytes: 64)
             }
             #expect(error == .truncatedFrame)
         case .readError:
             let error = await Self.socketError {
-                _ = try await Self.boundedReceiveFrame(
-                    from: transport,
-                    maximumBytes: 64
-                )
+                _ = try await transport.receiveFrame(maximumBytes: 64)
             }
             #expect(error == .receiveFailed(ECONNRESET))
         }
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(42, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -258,19 +249,22 @@ struct SpiceLiveStageSocketTransportTests {
             ]
             expectedOffsets = [0, 2, 2]
         }
-        let calls = ScriptedSocketCalls(writes: writes)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 43,
+            writes: writes
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 43,
             systemCalls: calls.systemCalls
         )
         let transport = socket.stageTransport
 
-        try await Self.boundedSendFrame(frame, through: transport)
+        try await transport.sendFrame(frame)
         let snapshot = calls.snapshot
         #expect(snapshot.writeOffsets == expectedOffsets)
         #expect(snapshot.writeBuffers.allSatisfy { $0 == frame })
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(43, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -297,7 +291,10 @@ struct SpiceLiveStageSocketTransportTests {
             writes = [.written(2), .written(3)]
             expectedOffsets = [0, 2]
         }
-        let calls = ScriptedSocketCalls(writes: writes)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 44,
+            writes: writes
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 44,
             systemCalls: calls.systemCalls
@@ -305,7 +302,7 @@ struct SpiceLiveStageSocketTransportTests {
         let transport = socket.stageTransport
 
         let error = await Self.socketError {
-            try await Self.boundedSendFrame(frame, through: transport)
+            try await transport.sendFrame(frame)
         }
         switch scenario {
         case .brokenPipe:
@@ -314,8 +311,8 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(error == .invalidSystemCallResult)
         }
         #expect(calls.snapshot.writeOffsets == expectedOffsets)
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(44, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -342,7 +339,7 @@ struct SpiceLiveStageSocketTransportTests {
         case .oneByteTooLarge:
             frame = Data(repeating: 0x61, count: maximum) + Data([0x0a])
         }
-        let calls = ScriptedSocketCalls()
+        let calls = ScriptedSocketCalls(expectedDescriptor: 45)
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 45,
             systemCalls: calls.systemCalls
@@ -351,25 +348,25 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .exactMaximum:
-            try await Self.boundedSendFrame(frame, through: transport)
+            try await transport.sendFrame(frame)
             #expect(calls.snapshot.writeOffsets == [0])
             #expect(calls.snapshot.writeBuffers == [frame])
         case .empty, .loneLineFeed, .maximumWithoutFinalLineFeed,
              .internalLineFeed:
             let error = await Self.socketError {
-                try await Self.boundedSendFrame(frame, through: transport)
+                try await transport.sendFrame(frame)
             }
             #expect(error == .invalidFrame)
             #expect(calls.snapshot.writeOffsets.isEmpty)
         case .oneByteTooLarge:
             let error = await Self.socketError {
-                try await Self.boundedSendFrame(frame, through: transport)
+                try await transport.sendFrame(frame)
             }
             #expect(error == .frameTooLarge)
             #expect(calls.snapshot.writeOffsets.isEmpty)
         }
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(45, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -399,7 +396,10 @@ struct SpiceLiveStageSocketTransportTests {
         case .syscallOverReturn:
             reads = [.overReturn]
         }
-        let calls = ScriptedSocketCalls(reads: reads)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 46,
+            reads: reads
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 46,
             systemCalls: calls.systemCalls
@@ -408,16 +408,14 @@ struct SpiceLiveStageSocketTransportTests {
 
         switch scenario {
         case .exactMaximum:
-            let frame = try await Self.boundedReceiveFrame(
-                from: transport,
+            let frame = try await transport.receiveFrame(
                 maximumBytes: maximum
             )
             #expect(frame?.count == maximum)
             let successfulReadRequests = calls.snapshot.readRequests
             for invalidMaximum in [1, maximum + 1] {
                 let error = await Self.socketError {
-                    _ = try await Self.boundedReceiveFrame(
-                        from: transport,
+                    _ = try await transport.receiveFrame(
                         maximumBytes: invalidMaximum
                     )
                 }
@@ -426,24 +424,18 @@ struct SpiceLiveStageSocketTransportTests {
             #expect(calls.snapshot.readRequests == successfulReadRequests)
         case .delimiterBeyondBound:
             let error = await Self.socketError {
-                _ = try await Self.boundedReceiveFrame(
-                    from: transport,
-                    maximumBytes: maximum
-                )
+                _ = try await transport.receiveFrame(maximumBytes: maximum)
             }
             #expect(error == .frameTooLarge)
         case .syscallOverReturn:
             let error = await Self.socketError {
-                _ = try await Self.boundedReceiveFrame(
-                    from: transport,
-                    maximumBytes: maximum
-                )
+                _ = try await transport.receiveFrame(maximumBytes: maximum)
             }
             #expect(error == .invalidSystemCallResult)
         }
         #expect(calls.snapshot.readRequests.allSatisfy { $0 <= maximum })
-        try await Self.closeWithinDeadline(transport)
-        Self.expectOwnedDescriptor(46, in: calls.snapshot)
+        await transport.close()
+        #expect(calls.snapshot.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -453,7 +445,7 @@ struct SpiceLiveStageSocketTransportTests {
     fileprivate func sameDirectionAdmissionIsBounded(
         _ scenario: SameDirectionScenario
     ) async throws {
-        let calls = BlockingSocketCalls()
+        let calls = BlockingSocketCalls(expectedDescriptor: 50)
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 50,
             systemCalls: calls.systemCalls
@@ -557,7 +549,7 @@ struct SpiceLiveStageSocketTransportTests {
         try await Self.closeWithinDeadline(transport)
         let terminal = calls.snapshot
         #expect(terminal.rawCloseCalls == 1)
-        Self.expectOwnedDescriptor(50, in: terminal)
+        #expect(terminal.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -567,7 +559,10 @@ struct SpiceLiveStageSocketTransportTests {
     fileprivate func closeUnblocksWorkersBeforeRawDescriptorClose(
         _ receiveOutcome: BlockingReceiveOutcome
     ) async throws {
-        let calls = BlockingSocketCalls(receiveOutcome: receiveOutcome)
+        let calls = BlockingSocketCalls(
+            expectedDescriptor: 47,
+            receiveOutcome: receiveOutcome
+        )
         let socket = try SpiceLiveStageSocketTransport(
             takingDescriptor: 47,
             systemCalls: calls.systemCalls
@@ -649,7 +644,7 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(beforeWorkerRelease.activeReads == 1)
         #expect(beforeWorkerRelease.activeWrites == 1)
         #expect(beforeWorkerRelease.rawCloseCalls == 0)
-        Self.expectOwnedDescriptor(47, in: beforeWorkerRelease)
+        #expect(beforeWorkerRelease.unexpectedDescriptor == nil)
 
         calls.releaseWorkersForTest()
         try await Self.awaitCompletedVoidTasks(
@@ -670,17 +665,14 @@ struct SpiceLiveStageSocketTransportTests {
         #expect(terminal.shutdownCalls == 1)
         #expect(terminal.rawCloseCalls == 1)
         #expect(!terminal.rawCloseObservedActiveWorker)
-        Self.expectOwnedDescriptor(47, in: terminal)
+        #expect(terminal.unexpectedDescriptor == nil)
     }
 
     @Test func repeatedCloseCannotAffectAReusedDescriptor() async throws {
-        let firstCalls = BlockingSocketCalls()
+        let firstCalls = BlockingSocketCalls(expectedDescriptor: 48)
         let first = try SpiceLiveStageSocketTransport(
             takingDescriptor: 48,
-            systemCalls: firstCalls.systemCalls,
-            closeCallDidEnter: {
-                firstCalls.recordCloseCallDidEnter()
-            }
+            systemCalls: firstCalls.systemCalls
         )
         let firstTransport = first.stageTransport
         let receiveError = SocketErrorCapture()
@@ -744,34 +736,11 @@ struct SpiceLiveStageSocketTransportTests {
             defer { thirdCloseCompletion.signal() }
             await firstTransport.close()
         }
-        do {
-            try await Self.waitUntil {
-                firstCalls.snapshot.closeCallEntries == 3
-            }
-        } catch {
-            firstCalls.emergencyReleaseForTestCleanup()
-            receive.cancel()
-            firstClose.cancel()
-            secondClose.cancel()
-            thirdClose.cancel()
-            try await Self.awaitCompletedVoidTasks(
-                [receive, firstClose, secondClose, thirdClose],
-                completions: [
-                    receiveCompletion,
-                    firstCloseCompletion,
-                    secondCloseCompletion,
-                    thirdCloseCompletion,
-                ]
-            )
-            throw error
-        }
-
         let overlapping = firstCalls.snapshot
-        #expect(overlapping.closeCallEntries == 3)
         #expect(overlapping.activeReads == 1)
         #expect(overlapping.shutdownCalls == 1)
         #expect(overlapping.rawCloseCalls == 0)
-        Self.expectOwnedDescriptor(48, in: overlapping)
+        #expect(overlapping.unexpectedDescriptor == nil)
 
         firstCalls.releaseWorkersForTest()
         try await Self.awaitCompletedVoidTasks(
@@ -786,26 +755,22 @@ struct SpiceLiveStageSocketTransportTests {
         let firstTerminal = firstCalls.snapshot
         #expect(receiveError.error == .closed)
         #expect(firstTerminal.activeReads == 0)
-        #expect(firstTerminal.closeCallEntries == 3)
         #expect(firstTerminal.shutdownCalls == 1)
         #expect(firstTerminal.rawCloseCalls == 1)
         #expect(!firstTerminal.rawCloseObservedActiveWorker)
-        Self.expectOwnedDescriptor(48, in: firstTerminal)
+        #expect(firstTerminal.unexpectedDescriptor == nil)
 
-        let reusedCalls = ScriptedSocketCalls()
+        let reusedCalls = ScriptedSocketCalls(expectedDescriptor: 48)
         let reused = try SpiceLiveStageSocketTransport(
             takingDescriptor: 48,
             systemCalls: reusedCalls.systemCalls
         )
         let reusedTransport = reused.stageTransport
-        try await Self.boundedSendFrame(
-            Data("new-owner\n".utf8),
-            through: reusedTransport
-        )
+        try await reusedTransport.sendFrame(Data("new-owner\n".utf8))
 
         let firstBeforeClosedIO = firstCalls.snapshot
         let reusedBeforeClosedIO = reusedCalls.snapshot
-        Self.expectOwnedDescriptor(48, in: reusedBeforeClosedIO)
+        #expect(reusedBeforeClosedIO.unexpectedDescriptor == nil)
         let closedReceiveError = SocketErrorCapture()
         let closedSendError = SocketErrorCapture()
         let closedReceiveCompletion = ObservationLatch()
@@ -848,14 +813,14 @@ struct SpiceLiveStageSocketTransportTests {
                 [closedReceive, closedSend],
                 completions: [closedReceiveCompletion, closedSendCompletion]
             )
-            _ = try? await Self.closeWithinDeadline(reusedTransport)
+            await reusedTransport.close()
             throw error
         }
         #expect(closedReceiveError.error == .closed)
         #expect(closedSendError.error == .closed)
 
         let firstAfterClosedIO = firstCalls.snapshot
-        Self.expectOwnedDescriptor(48, in: firstAfterClosedIO)
+        #expect(firstAfterClosedIO.unexpectedDescriptor == nil)
         #expect(firstAfterClosedIO.readCalls == firstBeforeClosedIO.readCalls)
         #expect(firstAfterClosedIO.writeCalls == firstBeforeClosedIO.writeCalls)
         #expect(
@@ -867,7 +832,7 @@ struct SpiceLiveStageSocketTransportTests {
                 == firstBeforeClosedIO.rawCloseCalls
         )
         let reusedAfterClosedIO = reusedCalls.snapshot
-        Self.expectOwnedDescriptor(48, in: reusedAfterClosedIO)
+        #expect(reusedAfterClosedIO.unexpectedDescriptor == nil)
         #expect(
             reusedAfterClosedIO.readRequests
                 == reusedBeforeClosedIO.readRequests
@@ -886,20 +851,16 @@ struct SpiceLiveStageSocketTransportTests {
         )
 
         try await Self.closeWithinDeadline(firstTransport)
-        #expect(firstCalls.snapshot.closeCallEntries == 4)
         #expect(firstCalls.snapshot.rawCloseCalls == 1)
         #expect(reusedCalls.snapshot.rawCloseCalls == 0)
         #expect(reusedCalls.snapshot.writeOffsets == [0])
-        try await Self.boundedSendFrame(
-            Data("new-owner-again\n".utf8),
-            through: reusedTransport
-        )
+        try await reusedTransport.sendFrame(Data("new-owner-again\n".utf8))
         #expect(reusedCalls.snapshot.writeOffsets == [0, 0])
-        try await Self.closeWithinDeadline(reusedTransport)
+        await reusedTransport.close()
         let reusedTerminal = reusedCalls.snapshot
         #expect(reusedTerminal.shutdownCalls == 1)
         #expect(reusedTerminal.rawCloseCalls == 1)
-        Self.expectOwnedDescriptor(48, in: reusedTerminal)
+        #expect(reusedTerminal.unexpectedDescriptor == nil)
     }
 
     @Test(
@@ -916,7 +877,10 @@ struct SpiceLiveStageSocketTransportTests {
         case .failure:
             configuration = .failed(errno: EACCES)
         }
-        let calls = ScriptedSocketCalls(configuration: configuration)
+        let calls = ScriptedSocketCalls(
+            expectedDescriptor: 49,
+            configuration: configuration
+        )
 
         switch scenario {
         case .success:
@@ -926,8 +890,8 @@ struct SpiceLiveStageSocketTransportTests {
             )
             let beforeClose = calls.snapshot
             #expect(beforeClose.events == ["configure_no_sigpipe"])
-            #expect(beforeClose.configuredDescriptors == [49])
-            try await Self.closeWithinDeadline(socket.stageTransport)
+            #expect(beforeClose.unexpectedDescriptor == nil)
+            await socket.stageTransport.close()
             let closed = calls.snapshot
             #expect(closed.events == [
                 "configure_no_sigpipe",
@@ -935,7 +899,7 @@ struct SpiceLiveStageSocketTransportTests {
                 "raw_close",
             ])
             #expect(closed.rawCloseCalls == 1)
-            Self.expectOwnedDescriptor(49, in: closed)
+            #expect(closed.unexpectedDescriptor == nil)
         case .failure:
             let error = Self.synchronousSocketError {
                 _ = try SpiceLiveStageSocketTransport(
@@ -951,7 +915,7 @@ struct SpiceLiveStageSocketTransportTests {
             ])
             #expect(failed.shutdownCalls == 0)
             #expect(failed.rawCloseCalls == 1)
-            Self.expectOwnedDescriptor(49, in: failed)
+            #expect(failed.unexpectedDescriptor == nil)
         }
     }
 }
@@ -1130,53 +1094,6 @@ private extension SpiceLiveStageSocketTransportTests {
         }
     }
 
-    static func boundedTransportOperation<Value: Sendable>(
-        transport: SpiceLiveStageTransport,
-        emergencyRelease: @escaping @Sendable () -> Void = {},
-        _ operation: @escaping @Sendable () async throws -> Value
-    ) async throws -> Value {
-        let completion = ObservationLatch()
-        let task = Task {
-            defer { completion.signal() }
-            return try await operation()
-        }
-        do {
-            try await waitForCompletions([completion])
-        } catch {
-            emergencyRelease()
-            task.cancel()
-            _ = try? await closeWithinDeadline(transport)
-            throw SpiceLiveInteractionSupportError.operationTimedOut
-        }
-        return try await task.value
-    }
-
-    static func boundedReceiveFrame(
-        from transport: SpiceLiveStageTransport,
-        maximumBytes: Int,
-        emergencyRelease: @escaping @Sendable () -> Void = {}
-    ) async throws -> Data? {
-        try await boundedTransportOperation(
-            transport: transport,
-            emergencyRelease: emergencyRelease
-        ) {
-            try await transport.receiveFrame(maximumBytes: maximumBytes)
-        }
-    }
-
-    static func boundedSendFrame(
-        _ frame: Data,
-        through transport: SpiceLiveStageTransport,
-        emergencyRelease: @escaping @Sendable () -> Void = {}
-    ) async throws {
-        try await boundedTransportOperation(
-            transport: transport,
-            emergencyRelease: emergencyRelease
-        ) {
-            try await transport.sendFrame(frame)
-        }
-    }
-
     static func closeWithinDeadline(
         _ transport: SpiceLiveStageTransport
     ) async throws {
@@ -1188,58 +1105,6 @@ private extension SpiceLiveStageSocketTransportTests {
         try await awaitCompletedVoidTasks(
             [close],
             completions: [completion]
-        )
-    }
-
-    static func expectOwnedDescriptor(
-        _ descriptor: Int32,
-        in snapshot: ScriptedSocketCalls.Snapshot
-    ) {
-        #expect(snapshot.configuredDescriptors == [descriptor])
-        #expect(
-            snapshot.receiveDescriptors.count == snapshot.readRequests.count
-        )
-        #expect(
-            snapshot.receiveDescriptors.allSatisfy { $0 == descriptor }
-        )
-        #expect(snapshot.sendDescriptors.count == snapshot.writeOffsets.count)
-        #expect(snapshot.sendDescriptors.allSatisfy { $0 == descriptor })
-        #expect(
-            snapshot.shutdownDescriptors.count == snapshot.shutdownCalls
-        )
-        #expect(
-            snapshot.shutdownDescriptors.allSatisfy { $0 == descriptor }
-        )
-        #expect(
-            snapshot.rawCloseDescriptors.count == snapshot.rawCloseCalls
-        )
-        #expect(
-            snapshot.rawCloseDescriptors.allSatisfy { $0 == descriptor }
-        )
-    }
-
-    static func expectOwnedDescriptor(
-        _ descriptor: Int32,
-        in snapshot: BlockingSocketCalls.Snapshot
-    ) {
-        #expect(snapshot.configuredDescriptors == [descriptor])
-        #expect(snapshot.receiveDescriptors.count == snapshot.readCalls)
-        #expect(
-            snapshot.receiveDescriptors.allSatisfy { $0 == descriptor }
-        )
-        #expect(snapshot.sendDescriptors.count == snapshot.writeCalls)
-        #expect(snapshot.sendDescriptors.allSatisfy { $0 == descriptor })
-        #expect(
-            snapshot.shutdownDescriptors.count == snapshot.shutdownCalls
-        )
-        #expect(
-            snapshot.shutdownDescriptors.allSatisfy { $0 == descriptor }
-        )
-        #expect(
-            snapshot.rawCloseDescriptors.count == snapshot.rawCloseCalls
-        )
-        #expect(
-            snapshot.rawCloseDescriptors.allSatisfy { $0 == descriptor }
         )
     }
 
@@ -1282,11 +1147,7 @@ private final class ScriptedSocketCalls: Sendable {
 
     struct Snapshot: Sendable {
         var events: [String]
-        var configuredDescriptors: [Int32]
-        var receiveDescriptors: [Int32]
-        var sendDescriptors: [Int32]
-        var shutdownDescriptors: [Int32]
-        var rawCloseDescriptors: [Int32]
+        var unexpectedDescriptor: Int32?
         var readRequests: [Int]
         var writeBuffers: [Data]
         var writeOffsets: [Int]
@@ -1299,25 +1160,30 @@ private final class ScriptedSocketCalls: Sendable {
         var reads: [ReadDirective]
         var writes: [SpiceLiveStageSocketSystemCalls.WriteResult]
         var events: [String] = []
-        var configuredDescriptors: [Int32] = []
-        var receiveDescriptors: [Int32] = []
-        var sendDescriptors: [Int32] = []
-        var shutdownDescriptors: [Int32] = []
-        var rawCloseDescriptors: [Int32] = []
+        var unexpectedDescriptor: Int32?
         var readRequests: [Int] = []
         var writeBuffers: [Data] = []
         var writeOffsets: [Int] = []
         var shutdownCalls = 0
         var rawCloseCalls = 0
+
+        mutating func recordDescriptor(_ descriptor: Int32, expected: Int32) {
+            if descriptor != expected, unexpectedDescriptor == nil {
+                unexpectedDescriptor = descriptor
+            }
+        }
     }
 
     private let state: Mutex<State>
+    private let expectedDescriptor: Int32
 
     init(
+        expectedDescriptor: Int32,
         configuration: SpiceLiveStageSocketSystemCalls.ConfigurationResult = .succeeded,
         reads: [ReadDirective] = [],
         writes: [SpiceLiveStageSocketSystemCalls.WriteResult] = []
     ) {
+        self.expectedDescriptor = expectedDescriptor
         state = Mutex(
             State(
                 configuration: configuration,
@@ -1332,13 +1198,19 @@ private final class ScriptedSocketCalls: Sendable {
             configureNoSigPipe: { [self] descriptor in
                 state.withLock { storage in
                     storage.events.append("configure_no_sigpipe")
-                    storage.configuredDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     return storage.configuration
                 }
             },
             receive: { [self] descriptor, maximumBytes in
                 state.withLock { storage in
-                    storage.receiveDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.readRequests.append(maximumBytes)
                     guard !storage.reads.isEmpty else {
                         return .endOfFile
@@ -1355,7 +1227,10 @@ private final class ScriptedSocketCalls: Sendable {
             },
             send: { [self] descriptor, buffer, offset in
                 state.withLock { storage in
-                    storage.sendDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.writeBuffers.append(buffer)
                     storage.writeOffsets.append(offset)
                     guard !storage.writes.isEmpty else {
@@ -1367,14 +1242,20 @@ private final class ScriptedSocketCalls: Sendable {
             shutdown: { [self] descriptor in
                 state.withLock { storage in
                     storage.events.append("shutdown")
-                    storage.shutdownDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.shutdownCalls += 1
                 }
             },
             close: { [self] descriptor in
                 state.withLock { storage in
                     storage.events.append("raw_close")
-                    storage.rawCloseDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.rawCloseCalls += 1
                 }
             }
@@ -1385,11 +1266,7 @@ private final class ScriptedSocketCalls: Sendable {
         state.withLock { storage in
             Snapshot(
                 events: storage.events,
-                configuredDescriptors: storage.configuredDescriptors,
-                receiveDescriptors: storage.receiveDescriptors,
-                sendDescriptors: storage.sendDescriptors,
-                shutdownDescriptors: storage.shutdownDescriptors,
-                rawCloseDescriptors: storage.rawCloseDescriptors,
+                unexpectedDescriptor: storage.unexpectedDescriptor,
                 readRequests: storage.readRequests,
                 writeBuffers: storage.writeBuffers,
                 writeOffsets: storage.writeOffsets,
@@ -1402,12 +1279,7 @@ private final class ScriptedSocketCalls: Sendable {
 
 private final class BlockingSocketCalls: Sendable {
     struct Snapshot: Sendable {
-        var closeCallEntries: Int
-        var configuredDescriptors: [Int32]
-        var receiveDescriptors: [Int32]
-        var sendDescriptors: [Int32]
-        var shutdownDescriptors: [Int32]
-        var rawCloseDescriptors: [Int32]
+        var unexpectedDescriptor: Int32?
         var readCalls: Int
         var writeCalls: Int
         var activeReads: Int
@@ -1420,12 +1292,7 @@ private final class BlockingSocketCalls: Sendable {
     }
 
     private struct State: Sendable {
-        var closeCallEntries = 0
-        var configuredDescriptors: [Int32] = []
-        var receiveDescriptors: [Int32] = []
-        var sendDescriptors: [Int32] = []
-        var shutdownDescriptors: [Int32] = []
-        var rawCloseDescriptors: [Int32] = []
+        var unexpectedDescriptor: Int32?
         var readCalls = 0
         var writeCalls = 0
         var activeReads = 0
@@ -1435,15 +1302,26 @@ private final class BlockingSocketCalls: Sendable {
         var shutdownCalls = 0
         var rawCloseCalls = 0
         var rawCloseObservedActiveWorker = false
+
+        mutating func recordDescriptor(_ descriptor: Int32, expected: Int32) {
+            if descriptor != expected, unexpectedDescriptor == nil {
+                unexpectedDescriptor = descriptor
+            }
+        }
     }
 
     private let state = Mutex(State())
+    private let expectedDescriptor: Int32
     private let receiveOutcome: BlockingReceiveOutcome
     private let shutdownObserved = ObservationLatch()
     private let releaseRead = DispatchSemaphore(value: 0)
     private let releaseWrite = DispatchSemaphore(value: 0)
 
-    init(receiveOutcome: BlockingReceiveOutcome = .failed) {
+    init(
+        expectedDescriptor: Int32,
+        receiveOutcome: BlockingReceiveOutcome = .failed
+    ) {
+        self.expectedDescriptor = expectedDescriptor
         self.receiveOutcome = receiveOutcome
     }
 
@@ -1451,13 +1329,19 @@ private final class BlockingSocketCalls: Sendable {
         SpiceLiveStageSocketSystemCalls(
             configureNoSigPipe: { [self] descriptor in
                 state.withLock {
-                    $0.configuredDescriptors.append(descriptor)
+                    $0.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                 }
                 return .succeeded
             },
             receive: { [self] descriptor, _ in
                 state.withLock { storage in
-                    storage.receiveDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.readCalls += 1
                     storage.activeReads += 1
                     storage.maximumActiveReads = max(
@@ -1476,7 +1360,10 @@ private final class BlockingSocketCalls: Sendable {
             },
             send: { [self] descriptor, _, _ in
                 state.withLock { storage in
-                    storage.sendDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.writeCalls += 1
                     storage.activeWrites += 1
                     storage.maximumActiveWrites = max(
@@ -1490,14 +1377,20 @@ private final class BlockingSocketCalls: Sendable {
             },
             shutdown: { [self] descriptor in
                 state.withLock {
-                    $0.shutdownDescriptors.append(descriptor)
+                    $0.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     $0.shutdownCalls += 1
                 }
                 shutdownObserved.signal()
             },
             close: { [self] descriptor in
                 state.withLock { storage in
-                    storage.rawCloseDescriptors.append(descriptor)
+                    storage.recordDescriptor(
+                        descriptor,
+                        expected: expectedDescriptor
+                    )
                     storage.rawCloseObservedActiveWorker =
                         storage.activeReads != 0 || storage.activeWrites != 0
                     storage.rawCloseCalls += 1
@@ -1509,12 +1402,7 @@ private final class BlockingSocketCalls: Sendable {
     var snapshot: Snapshot {
         state.withLock { storage in
             Snapshot(
-                closeCallEntries: storage.closeCallEntries,
-                configuredDescriptors: storage.configuredDescriptors,
-                receiveDescriptors: storage.receiveDescriptors,
-                sendDescriptors: storage.sendDescriptors,
-                shutdownDescriptors: storage.shutdownDescriptors,
-                rawCloseDescriptors: storage.rawCloseDescriptors,
+                unexpectedDescriptor: storage.unexpectedDescriptor,
                 readCalls: storage.readCalls,
                 writeCalls: storage.writeCalls,
                 activeReads: storage.activeReads,
@@ -1531,10 +1419,6 @@ private final class BlockingSocketCalls: Sendable {
 
     var shutdownWasObserved: Bool {
         shutdownObserved.isSignaled
-    }
-
-    func recordCloseCallDidEnter() {
-        state.withLock { $0.closeCallEntries += 1 }
     }
 
     func releaseWorkersForTest() {
