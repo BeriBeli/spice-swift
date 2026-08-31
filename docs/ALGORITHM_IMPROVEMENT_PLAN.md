@@ -6,7 +6,7 @@
 | Field | Value |
 | --- | --- |
 | Status | Active |
-| Plan version | 1.8 |
+| Plan version | 1.9 |
 | Swift baseline | `v0.2.7` / `2c577d7` |
 | Reference client | spice-gtk `88ad5f1` (v0.43/master) / spice-common `71e4570` (master), reverified 2026-08-27 |
 | Created | 2026-08-26 |
@@ -39,6 +39,11 @@ Preserve these invariants throughout:
 8. Keep at most two Metal commands in flight. A low-latency path may bypass a
    frame-clock wait only when command admission and drawable acquisition are
    both known not to block.
+9. Deep reasoning may discover additional complexity, but that complexity may
+   enter code only after an evidence threshold is met: a reproducible failure,
+   a review finding with a concrete counterexample, a measured bottleneck, or
+   an invariant that the current design cannot express or enforce. Otherwise,
+   record it as a candidate and keep the implementation minimal.
 
 ## Status model
 
@@ -883,10 +888,14 @@ behavior remain separate acceptance gates.
    the same branch as the work.
 3. Keep one primary item per branch unless the decision log explicitly records
    why two items are inseparable.
-4. Mark an item `done` only after its completion gate passes. Add an evidence
+4. Before adding an abstraction, state machine, concurrency path, or platform
+   seam, record the evidence that requires it and the smallest implementation
+   that closes that evidence. Speculative complexity remains a plan candidate,
+   not production code.
+5. Mark an item `done` only after its completion gate passes. Add an evidence
    row with the date, commit or PR, tests, benchmark artifact, and material
    deviations.
-5. If an assumption changes, update the decision log before changing the
+6. If an assumption changes, update the decision log before changing the
    implementation. Never silently weaken a limit or acceptance gate.
 
 ## Evidence log
@@ -965,3 +974,4 @@ behavior remain separate acceptance gates.
 | 2026-08-31 | AIP-00 | Close AIP-00h2a before implementing any stage transport, and keep AIP-00h2b local and ACK-gated | The new schema-2 execution identity prevents a campaign from starting with ambiguous binaries, runner, image, guest build, fixture, pointer mode, or protocol. The next layer may add only canonical bounded child events, synchronous recorder persistence, and exact-generation ACKs; actual duplex processes, SSH/RemoteRocky effects, resource collection, artifact publication, and paired execution remain later layers. |
 | 2026-08-31 | AIP-00 | Split AIP-00h2b into a synchronous durable gate and a later asynchronous driver | Canonical event identity, persist-before-ACK, exact ACK delivery, and durable-once terminal behavior can be proven without an async transport. AIP-00h2b1 therefore closes that synchronous state machine first; h2b2 may add only a Sendable transport abstraction and single-reader driver, while actual file descriptors, child processes, SSH/RemoteRocky, resources, and artifacts remain h2c. |
 | 2026-08-31 | AIP-00 | Close the local h2b driver before introducing OS resources, and split h2c into FD, process, and artifact ownership slices | The Sendable transport abstraction proves durable-before-ACK ordering, single-reader cancellation, EOF, delivery failure, and close-once behavior without conflating them with descriptor reuse, child reaping, resource collection, or artifact publication. AIP-00h2c-1 therefore owns only Darwin socket/FD framing, h2c-2 owns the local process group and unique `wait4`, and h2c-3 owns atomic artifact/index publication. SSH/RemoteRocky, the baseline overlay, and the real paired campaign remain exclusively h2d. |
+| 2026-08-31 | All | Require evidence before discovered complexity may enter code | Deep analysis may identify useful future abstractions, state machines, concurrency paths, or platform seams, but implementation requires a reproducible failure, concrete review counterexample, measured bottleneck, or unenforceable invariant. Each change records that evidence and the smallest closing implementation; unsupported complexity remains a plan candidate. |
