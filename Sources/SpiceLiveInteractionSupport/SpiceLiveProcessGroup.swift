@@ -33,7 +33,7 @@ package final class SpiceLiveProcessGroup: Sendable {
     private static let killGrace = Duration.milliseconds(500)
 
     package let processIdentifier: pid_t
-    package let processGroupIdentifier: pid_t
+    package var processGroupIdentifier: pid_t { processIdentifier }
 
     private let storage = Mutex(Storage())
     private let lifecycleQueue = DispatchQueue(
@@ -43,7 +43,6 @@ package final class SpiceLiveProcessGroup: Sendable {
 
     private init(processIdentifier: pid_t) {
         self.processIdentifier = processIdentifier
-        processGroupIdentifier = processIdentifier
     }
 
     package static func launch(
