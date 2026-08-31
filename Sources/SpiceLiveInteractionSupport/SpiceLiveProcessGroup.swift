@@ -170,8 +170,6 @@ package final class SpiceLiveProcessGroup: Sendable {
     }
 
     private func runLifecycle() throws(ProcessError) -> TerminalResult {
-        var terminationSent = false
-        var killSent = false
         var terminationDeadline: ContinuousClock.Instant?
         var killDeadline: ContinuousClock.Instant?
         var deferredFailure: ProcessError?
@@ -181,9 +179,8 @@ package final class SpiceLiveProcessGroup: Sendable {
             // anchors the PID/PGID. ECHILD fails before any group signal.
             let leaderExited = try observeLeaderExit()
             let cancellationRequested = storage.withLock(\.cancellationRequested)
-            if cancellationRequested, !terminationSent {
+            if cancellationRequested, terminationDeadline == nil {
                 deferredFailure = signalGroup(SIGTERM) ?? deferredFailure
-                terminationSent = true
                 terminationDeadline = ContinuousClock().now.advanced(
                     by: Self.terminationGrace
                 )
@@ -206,25 +203,21 @@ package final class SpiceLiveProcessGroup: Sendable {
                 return result
             }
 
-            if leaderExited, hasResidualMembers, !terminationSent {
+            if leaderExited, hasResidualMembers, terminationDeadline == nil {
                 deferredFailure = signalGroup(SIGTERM) ?? deferredFailure
-                terminationSent = true
                 terminationDeadline = ContinuousClock().now.advanced(
                     by: Self.terminationGrace
                 )
             }
 
-            if terminationSent,
-               !killSent,
-               let terminationDeadline,
+            if let terminationDeadline,
+               killDeadline == nil,
                ContinuousClock().now >= terminationDeadline {
                 deferredFailure = signalGroup(SIGKILL) ?? deferredFailure
-                killSent = true
                 killDeadline = ContinuousClock().now.advanced(by: Self.killGrace)
             }
 
-            if killSent,
-               let killDeadline,
+            if let killDeadline,
                ContinuousClock().now >= killDeadline {
                 let failure = deferredFailure ?? .teardownFailed(ETIMEDOUT)
                 deferredFailure = failure
