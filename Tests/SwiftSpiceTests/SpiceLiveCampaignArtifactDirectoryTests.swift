@@ -44,6 +44,8 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
         #expect(index.runCount == 20)
         #expect(index.runArtifacts.count == 20)
         #expect(Set(index.runArtifacts.map(\.relativePath)).count == 20)
+        #expect(index.terminalManifest.relativePath == "campaign-manifest.json")
+        #expect(index.report.relativePath == "report.json")
         let indexBytes = try Data(contentsOf: owner.indexURL)
         let canonicalIndexBytes = try Self.canonicalData(index)
         #expect(indexBytes == canonicalIndexBytes)
