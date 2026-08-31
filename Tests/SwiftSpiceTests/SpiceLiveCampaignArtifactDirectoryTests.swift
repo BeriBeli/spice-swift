@@ -53,6 +53,22 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
         for reference in references {
             try Self.expectReference(reference, in: directory)
         }
+        let terminalManifestURL = directory.appending(
+            path: index.terminalManifest.relativePath
+        )
+        let terminalManifestBytes = try Data(contentsOf: terminalManifestURL)
+        let expectedManifestBytes = try Self.canonicalData(finalized)
+        #expect(terminalManifestBytes == expectedManifestBytes)
+        let terminalManifest = try JSONDecoder().decode(
+            SpiceLiveCampaignManifest.self,
+            from: terminalManifestBytes
+        )
+        #expect(terminalManifest == finalized)
+        #expect(terminalManifest.state == .finalized)
+        #expect(terminalManifest.generation == 261)
+        #expect(terminalManifest.stages.count == 260)
+        #expect(terminalManifest.runs == finalized.runs)
+        #expect(terminalManifest.executionContractDigest == expectedContractDigest)
         for runIndex in plan.runs.indices {
             try Self.expectRunEnvelope(
                 index.runArtifacts[runIndex],
@@ -63,10 +79,13 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
             )
         }
         let reportURL = directory.appending(path: index.report.relativePath)
+        let reportBytes = try Data(contentsOf: reportURL)
         let report = try JSONDecoder().decode(
             SpiceLiveCampaignArtifactReportSnapshot.self,
-            from: Data(contentsOf: reportURL)
+            from: reportBytes
         )
+        let canonicalReportBytes = try Self.canonicalData(report)
+        #expect(reportBytes == canonicalReportBytes)
         let expectedReport = try SpicePairedInteractionArtifactEvaluator.evaluate(
             records: fixture.records,
             resourceSamples: fixture.resources,
@@ -253,6 +272,45 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
         #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
     }
 
+    @Test func lateReportCollisionNeverPublishesSuccessIndex() throws {
+        let fixture = try Self.fixture()
+        let plan = try Self.plan(fixture: fixture)
+        let directory = Self.directoryURL()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let owner = try SpiceLiveCampaignArtifactDirectory(
+            directoryURL: directory,
+            plan: plan,
+            pointerMode: .absolute
+        )
+        let recorder = try Self.recorder(owner: owner, plan: plan)
+        for runIndex in plan.runs.indices {
+            try Self.completeRun(runIndex, recorder: recorder, plan: plan)
+            try Self.recordRun(
+                runIndex,
+                owner: owner,
+                plan: plan,
+                fixture: fixture
+            )
+        }
+        let finalized = try recorder.finalize()
+        #expect(finalized.state == .finalized)
+        #expect(finalized.generation == 261)
+
+        let reportURL = directory.appending(path: "report.json")
+        let plantedReport = Data("{}".utf8)
+        try plantedReport.write(to: reportURL, options: [.withoutOverwriting])
+        #expect(chmod(reportURL.path, S_IRUSR | S_IWUSR) == 0)
+
+        #expect(throws: (any Error).self) { _ = try owner.publishSuccess() }
+        #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
+        let reportAfterFirstFailure = try Data(contentsOf: reportURL)
+        #expect(reportAfterFirstFailure == plantedReport)
+        #expect(throws: (any Error).self) { _ = try owner.publishSuccess() }
+        #expect(!FileManager.default.fileExists(atPath: owner.indexURL.path))
+        let reportAfterSecondFailure = try Data(contentsOf: reportURL)
+        #expect(reportAfterSecondFailure == plantedReport)
+    }
+
     @Test func interruptedOwnerCannotBeReopenedOrSynthesized() throws {
         let fixture = try Self.fixture()
         let plan = try Self.plan(fixture: fixture)
@@ -286,7 +344,7 @@ struct SpiceLiveCampaignArtifactDirectoryTests {
 }
 
 extension SpiceLiveCampaignArtifactDirectoryTests {
-    struct RunEnvelopeProbe: Decodable {
+    struct RunEnvelopeProbe: Codable {
         let schemaVersion: Int
         let logicalRunID: String
         let evidenceRunID: String
@@ -304,7 +362,7 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
         }
     }
 
-    struct ResourceSampleProbe: Decodable {
+    struct ResourceSampleProbe: Codable {
         let runID: String
         let cpuPercent: Double
         let peakRSSBytes: UInt64
@@ -316,7 +374,7 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
         }
     }
 
-    struct TeardownResultProbe: Decodable {
+    struct TeardownResultProbe: Codable {
         let status: Int32
         let userNanoseconds: UInt64
         let systemNanoseconds: UInt64
@@ -330,7 +388,7 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
         }
     }
 
-    struct ReferenceProbe: Decodable {
+    struct ReferenceProbe: Codable {
         let relativePath: String
         let sha256: String
         let byteCount: UInt64
@@ -557,10 +615,13 @@ extension SpiceLiveCampaignArtifactDirectoryTests {
     ) throws {
         #expect(reference.relativePath == String(format: "run-%02d.json", runIndex))
         let envelopeURL = directory.appending(path: reference.relativePath)
+        let envelopeBytes = try Data(contentsOf: envelopeURL)
         let envelope = try JSONDecoder().decode(
             RunEnvelopeProbe.self,
-            from: Data(contentsOf: envelopeURL)
+            from: envelopeBytes
         )
+        let canonicalEnvelopeBytes = try canonicalData(envelope)
+        #expect(envelopeBytes == canonicalEnvelopeBytes)
         let expectedEvidenceID = try evidenceID(runIndex).rawValue
         let sample = fixture.resources[runIndex]
         #expect(envelope.schemaVersion == 1)
