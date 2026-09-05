@@ -661,6 +661,20 @@ new real campaign:
    campaign. Only the completed AIP-00g report can admit an AIP-44 scheduling
    experiment.
 
+The h2d-1 lease and h2d-2 scripts now share a deterministic identity contract.
+Campaign scripts require six canonical identity fields plus explicit endpoint
+overrides, persist the identity in the existing run configuration before
+launch, and return canonical `run_evidence=` output. Bound starts require
+confirmed container absence; status and stop compare the recorded identity,
+container, image, and ports under the existing lifecycle lock. The legacy
+path remains available with all six identity variables unset. Script tests
+exercise the round-trip, input
+rejection, foreign or corrupt state, legacy endpoint protection, and a
+reproduced guest-manifest field collision that must fail before launch.
+This is local contract validation only. Structured SSH/tunnel execution, the
+baseline overlay, and the real paired campaign remain open; it does not admit
+an AIP-44 pacing experiment.
+
 The live Rocky marker also requires the pinned guest Xorg input driver
 `xf86-input-libinput=1.5.0-r0`. A guest image without that driver may accept
 SPICE keyboard or pointer traffic without emitting the XI2 event consumed by

@@ -5,8 +5,14 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 acquire_lifecycle_lock
 
+if [[ "${live_identity_count}" != 0 ]] && ! configured_container_absence_is_confirmed; then
+    echo "Live campaign start requires a fresh endpoint." >&2
+    exit 1
+fi
 if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
     echo "Performance endpoint is already running."
+    # status.sh takes its own lock and rechecks the current endpoint.
+    exec 9>&-
     exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
 fi
 
@@ -120,7 +126,9 @@ interaction_trace_path=${run_dir}/input-events.jsonl
 container=${PERF_CONTAINER}
 image=${PERF_IMAGE}
 EOF
+emit_live_identity >> "${run_dir}/configuration.txt"
 cat "${manifest}" >> "${run_dir}/configuration.txt"
+read_live_identity "${run_dir}" >/dev/null
 cp "${manifest}" "${run_dir}/guest-build-manifest.env"
 
 podman run --rm "${PERF_IMAGE}" qemu-system-x86_64 --version > "${run_dir}/versions.txt"
@@ -188,3 +196,4 @@ echo "Performance endpoint ready."
 echo "SPICE: 127.0.0.1:${PERF_SPICE_PORT} on $(hostname)"
 echo "Read the temporary ticket with remote/ticket.sh and keep it out of logs."
 echo "Run evidence: ${run_dir}"
+echo "run_evidence=${run_dir}"

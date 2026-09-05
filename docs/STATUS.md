@@ -237,6 +237,20 @@ Agent behavior, including system-trusted TLS.
   slice provides no live SPICE, latency, CPU/RSS acceptance, release, or
   AIP-44 improvement claim.
 
+- AIP-00h2d-2 now has local script identity validation on top of the h2d-1
+  lease in PRs #85/#86. Six canonical fields are persisted in the existing
+  private run configuration before launch and checked with container, image,
+  and ports under the lifecycle lock before status or stop. Bound starts
+  refuse an existing container; unset identity variables preserve legacy
+  behavior. Five new script tests
+  cover the identity round-trip, invalid input before effects, foreign or
+  corrupt recorded identity, legacy endpoint protection, and a reproduced
+  guest-manifest field collision. The complete strict Debug suite passed
+  874 tests; focused AddressSanitizer passed the nine script/lease tests.
+  This is deterministic local evidence, not a live SSH or paired-campaign
+  result. Tunnel/process execution and the baseline overlay remain pending;
+  AIP-00 and AIP-44 remain open.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and

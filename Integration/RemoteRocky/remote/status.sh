@@ -3,8 +3,13 @@
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
+acquire_lifecycle_lock
 require_running
 run_dir="$(current_run_dir)"
+identity="$(read_live_identity "${run_dir}")"
+if [[ -n "${identity}" ]]; then
+    printf '%s\n' "${identity}"
+fi
 echo "state=running"
 echo "container=${PERF_CONTAINER}"
 echo "spice=127.0.0.1:${PERF_SPICE_PORT}"
@@ -24,5 +29,5 @@ else
     echo "control_listener=missing" >&2
     port_status=1
 fi
-podman logs --tail 12 "${PERF_CONTAINER}"
+podman logs --tail 12 "${PERF_CONTAINER}" 9>&-
 exit "${port_status}"

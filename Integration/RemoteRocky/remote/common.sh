@@ -67,6 +67,31 @@ if [[ ! "${PERF_CONTROL_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] \
     exit 2
 fi
 
+live_identity_count=0
+for identity_presence in \
+    "${SWIFTSPICE_LIVE_CAMPAIGN_ID+x}" \
+    "${SWIFTSPICE_LIVE_LOGICAL_RUN_ID+x}" \
+    "${SWIFTSPICE_LIVE_VERSION+x}" \
+    "${SWIFTSPICE_LIVE_CLUSTER_ID+x}" \
+    "${SWIFTSPICE_LIVE_RUN_SEQUENCE+x}" \
+    "${SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST+x}"; do
+    if [[ "${identity_presence}" == x ]]; then
+        live_identity_count=$((live_identity_count + 1))
+    fi
+done
+if [[ "${live_identity_count}" != 0 ]]; then
+    if [[ "${live_identity_count}" != 6 || "${override_count}" != 5 \
+        || ! "${SWIFTSPICE_LIVE_CAMPAIGN_ID-}" =~ ^[0-9a-f]{16}$ \
+        || ! "${SWIFTSPICE_LIVE_LOGICAL_RUN_ID-}" =~ ^[0-9a-f]{16}$ \
+        || ! "${SWIFTSPICE_LIVE_VERSION-}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ \
+        || ! "${SWIFTSPICE_LIVE_CLUSTER_ID-}" =~ ^[0-9a-f]{16}$ \
+        || ! "${SWIFTSPICE_LIVE_RUN_SEQUENCE-}" =~ ^[1-9][0-9]*$ \
+        || ! "${SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST-}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Live identity requires six canonical fields and explicit endpoint overrides." >&2
+        exit 2
+    fi
+fi
+
 mkdir -p "${PERF_STATE}" "${PERF_LOGS}"
 chmod 0700 "${PERF_BASE}" "${PERF_STATE}" "${PERF_LOGS}"
 
@@ -82,7 +107,44 @@ current_run_dir() {
     fi
     local run_id
     run_id="$(<"${PERF_STATE}/current-run")"
+    if [[ "${live_identity_count}" != 0 \
+        && ! "${run_id}" =~ ^[0-9]{8}T[0-9]{6}Z\.[A-Za-z0-9]{6}$ ]]; then
+        echo "Live evidence must name one canonical run directory." >&2
+        return 1
+    fi
     printf '%s/%s\n' "${PERF_LOGS}" "${run_id}"
+}
+
+# The six lines are a canonical projection of configuration.txt. Keeping
+# them in one existing run record avoids a second identity owner or journal.
+emit_live_identity() {
+    [[ "${live_identity_count}" != 0 ]] || return 0
+    printf 'campaign_id=%s\nlogical_run_id=%s\nversion=%s\ncluster_id=%s\nrun_sequence=%s\nexecution_contract_digest=%s\n' \
+        "${SWIFTSPICE_LIVE_CAMPAIGN_ID}" \
+        "${SWIFTSPICE_LIVE_LOGICAL_RUN_ID}" \
+        "${SWIFTSPICE_LIVE_VERSION}" \
+        "${SWIFTSPICE_LIVE_CLUSTER_ID}" \
+        "${SWIFTSPICE_LIVE_RUN_SEQUENCE}" \
+        "${SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST}"
+}
+
+# Call under the lifecycle lock, before publishing status or stopping a run.
+# Compare stored evidence with the caller's expectation; never relabel it.
+read_live_identity() {
+    [[ "${live_identity_count}" != 0 ]] || return 0
+    local recorded endpoint
+    if ! endpoint="$(LC_ALL=C grep -E '^(spice_listen|control_listen|container|image)=' \
+        "$1/configuration.txt")" \
+        || [[ "${endpoint}" != "$(printf 'spice_listen=127.0.0.1:%s\ncontrol_listen=127.0.0.1:%s\ncontainer=%s\nimage=%s\n' \
+            "${PERF_SPICE_PORT}" "${PERF_CONTROL_PORT}" "${PERF_CONTAINER}" "${PERF_IMAGE}")" ]] \
+        || ! recorded="$(LC_ALL=C grep -E \
+        '^(campaign_id|logical_run_id|version|cluster_id|run_sequence|execution_contract_digest)=' \
+        "$1/configuration.txt")" \
+        || [[ "${recorded}" != "$(emit_live_identity)" ]]; then
+        echo "Recorded live identity is missing, malformed, or mismatched." >&2
+        return 1
+    fi
+    printf '%s\n' "${recorded}"
 }
 
 require_running() {
