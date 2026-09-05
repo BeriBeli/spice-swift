@@ -187,8 +187,12 @@ private extension SpiceLiveRemoteFixtureLeaseTests {
     enum ReservedResultMutation: CaseIterable {
         case missingReservedField
         case duplicateReservedField
-        case wrongRunIdentity
-        case wrongContract
+        case wrongCampaignID
+        case wrongLogicalRunID
+        case wrongVersion
+        case wrongClusterID
+        case wrongRunSequence
+        case wrongExecutionContractDigest
         case wrongContainer
         case wrongPorts
         case invalidStartEvidence
@@ -200,11 +204,21 @@ private extension SpiceLiveRemoteFixtureLeaseTests {
                 lines.removeAll { $0.hasPrefix("control_listener=") }
             case .duplicateReservedField:
                 lines.append("container=\(seed.configuration.container)")
-            case .wrongRunIdentity:
+            case .wrongCampaignID:
+                Self.replace("campaign_id", with: "b20000000000000f", in: &lines)
+            case .wrongLogicalRunID:
                 Self.replace("logical_run_id", with: "ffffffffffffffff", in: &lines)
+            case .wrongVersion:
                 Self.replace("version", with: "v9.9.9", in: &lines)
+            case .wrongClusterID:
                 Self.replace("cluster_id", with: "ffffffffffffffff", in: &lines)
-            case .wrongContract:
+            case .wrongRunSequence:
+                Self.replace(
+                    "run_sequence",
+                    with: String(seed.run.sequence + 1),
+                    in: &lines
+                )
+            case .wrongExecutionContractDigest:
                 Self.replace(
                     "execution_contract_digest",
                     with: String(repeating: "f", count: 64),
