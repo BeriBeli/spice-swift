@@ -2508,6 +2508,309 @@ struct RemoteRockyFixtureTests {
         }
     }
 
+    private static let liveIdentityEnvironment = [
+        "SWIFTSPICE_LIVE_CAMPAIGN_ID": "a20000000000000f",
+        "SWIFTSPICE_LIVE_LOGICAL_RUN_ID": "b20000000000000f",
+        "SWIFTSPICE_LIVE_VERSION": "v0.3.3",
+        "SWIFTSPICE_LIVE_CLUSTER_ID": "c20000000000000f",
+        "SWIFTSPICE_LIVE_RUN_SEQUENCE": "1",
+        "SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST": String(repeating: "d", count: 64),
+    ]
+
+    @Test func liveIdentityRoundTripsAndRequiresAFreshStart() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let identity = Self.liveIdentityEnvironment
+        let initialStop = try fixture.run(
+            "remote/stop.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        try #require(initialStop.status == 0)
+        try Data("2026-01-01T00:00:00Z\n".utf8)
+            .write(to: fixture.base.appending(path: "state/round-start"))
+        try Data("orphan-round\n".utf8)
+            .write(to: fixture.base.appending(path: "state/round-id"))
+        let start = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        try #require(start.status == 0)
+        let round = try fixture.run(
+            "remote/round.sh", arguments: ["begin", "fresh"], ssMode: "both",
+            additionalEnvironment: identity
+        )
+        #expect(round.status == 0)
+        #expect(round.output.contains("-fresh state=begun"))
+        let runID = try fixture.currentRunID()
+        let runDirectory = fixture.base.appending(path: "logs/\(runID)")
+        let configurationURL = runDirectory.appending(path: "configuration.txt")
+        let configuration = try String(contentsOf: configurationURL, encoding: .utf8)
+        let evidenceLine = "run_evidence=\(runDirectory.path)"
+        #expect(start.output.split(separator: "\n").filter { $0 == evidenceLine }.count == 1)
+
+        let status = try fixture.run(
+            "remote/status.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        try #require(status.status == 0)
+        #expect(status.output.split(separator: "\n").filter { $0 == evidenceLine }.count == 1)
+        for (key, value) in identity {
+            let field = key.dropFirst("SWIFTSPICE_LIVE_".count).lowercased()
+            let line = "\(field)=\(value)"
+            #expect(configuration.split(separator: "\n").filter { $0 == line }.count == 1)
+            #expect(status.output.split(separator: "\n").filter { $0 == line }.count == 1)
+        }
+
+        let repeatedStart = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        #expect(repeatedStart.status != 0)
+        #expect(try fixture.currentRunID() == runID)
+        #expect(try fixture.mockEventCount("detached") == 1)
+        #expect(try String(contentsOf: configurationURL, encoding: .utf8) == configuration)
+        let stop = try fixture.run(
+            "remote/stop.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        #expect(stop.status == 0)
+        #expect(!fixture.containerExists)
+    }
+
+    @Test func liveIdentityRejectsIncompleteOrMalformedInputsBeforeEffects() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let unusedBase = fixture.root.appending(path: "unused")
+        var identity = Self.liveIdentityEnvironment
+        identity["SWIFTSPICE_PERF_BASE"] = unusedBase.path
+        for key in Self.liveIdentityEnvironment.keys {
+            let missing = try fixture.run(
+                "remote/start.sh", ssMode: "both", additionalEnvironment: identity,
+                removingEnvironment: [key]
+            )
+            #expect(missing.status == 2)
+            var empty = identity
+            empty[key] = ""
+            let invalid = try fixture.run(
+                "remote/start.sh", ssMode: "both", additionalEnvironment: empty
+            )
+            #expect(invalid.status == 2)
+        }
+        for (key, value) in [
+            ("SWIFTSPICE_LIVE_CAMPAIGN_ID", "A20000000000000f"),
+            ("SWIFTSPICE_LIVE_LOGICAL_RUN_ID", "b20000000000000f\n"),
+            ("SWIFTSPICE_LIVE_VERSION", "v00.3.3"),
+            ("SWIFTSPICE_LIVE_CLUSTER_ID", "c2000000000000"),
+            ("SWIFTSPICE_LIVE_RUN_SEQUENCE", "01"),
+            ("SWIFTSPICE_LIVE_RUN_SEQUENCE", "0"),
+            ("SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST", String(repeating: "D", count: 64)),
+        ] {
+            var invalid = identity
+            invalid[key] = value
+            let result = try fixture.run(
+                "remote/start.sh", ssMode: "both", additionalEnvironment: invalid
+            )
+            #expect(result.status == 2)
+        }
+        let implicitEndpoint = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: identity,
+            removingEnvironment: [
+                "SWIFTSPICE_PERF_BASE", "SWIFTSPICE_PERF_CONTAINER", "SWIFTSPICE_PERF_IMAGE",
+                "SWIFTSPICE_PERF_SPICE_PORT", "SWIFTSPICE_PERF_CONTROL_PORT",
+            ]
+        )
+        #expect(implicitEndpoint.status == 2)
+        #expect(!fixture.didDetachContainer)
+        #expect(!FileManager.default.fileExists(atPath: unusedBase.path))
+        #expect(!FileManager.default.fileExists(atPath: fixture.mockState.appending(path: "commands").path))
+    }
+
+    @Test func liveIdentityRejectsForeignAndCorruptRecordedIdentity() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let identity = Self.liveIdentityEnvironment
+        let start = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: identity
+        )
+        try #require(start.status == 0)
+        let runID = try fixture.currentRunID()
+        let configurationURL = fixture.base.appending(path: "logs/\(runID)/configuration.txt")
+        let configuration = try String(contentsOf: configurationURL, encoding: .utf8)
+        let ticket = try fixture.ticket()
+
+        for (key, value) in identity {
+            var foreign = identity
+            switch key {
+            case "SWIFTSPICE_LIVE_VERSION": foreign[key] = "v9.9.9"
+            case "SWIFTSPICE_LIVE_RUN_SEQUENCE": foreign[key] = "2"
+            default: foreign[key] = String(repeating: "f", count: value.count)
+            }
+            for command in ["remote/status.sh", "remote/stop.sh"] {
+                let result = try fixture.run(command, ssMode: "both", additionalEnvironment: foreign)
+                #expect(result.status != 0)
+                #expect(fixture.isContainerRunning)
+                #expect(try fixture.ticket() == ticket)
+                #expect(try String(contentsOf: configurationURL, encoding: .utf8) == configuration)
+            }
+        }
+        for (key, value) in [
+            ("SWIFTSPICE_PERF_CONTAINER", "swiftspice-other"),
+            ("SWIFTSPICE_PERF_IMAGE", "localhost/swiftspice-other:local"),
+            ("SWIFTSPICE_PERF_SPICE_PORT", "6935"),
+            ("SWIFTSPICE_PERF_CONTROL_PORT", "6936"),
+        ] {
+            var foreign = identity
+            foreign[key] = value
+            for command in ["remote/status.sh", "remote/stop.sh"] {
+                let result = try fixture.run(command, ssMode: "both", additionalEnvironment: foreign)
+                #expect(result.status != 0)
+                #expect(fixture.isContainerRunning)
+                #expect(try fixture.ticket() == ticket)
+            }
+        }
+        for corrupted in [
+            configuration + "version=v0.3.3\n",
+            configuration.replacingOccurrences(of: "campaign_id=a20000000000000f\n", with: ""),
+            configuration.replacingOccurrences(of: "cluster_id=c20000000000000f", with: "cluster_id=ffffffffffffffff"),
+        ] {
+            try Data(corrupted.utf8).write(to: configurationURL)
+            for command in ["remote/status.sh", "remote/stop.sh"] {
+                let result = try fixture.run(command, ssMode: "both", additionalEnvironment: identity)
+                #expect(result.status != 0)
+                #expect(fixture.isContainerRunning)
+                #expect(try fixture.ticket() == ticket)
+                #expect(try String(contentsOf: configurationURL, encoding: .utf8) == corrupted)
+            }
+        }
+
+        // Even matching metadata outside the direct-child run directory
+        // cannot authorize a status result or a stop.
+        let foreignDirectory = fixture.root.appending(path: "foreign")
+        try FileManager.default.createDirectory(at: foreignDirectory, withIntermediateDirectories: true)
+        try Data(configuration.utf8).write(to: foreignDirectory.appending(path: "configuration.txt"))
+        try Data("../../foreign\n".utf8).write(to: fixture.base.appending(path: "state/current-run"))
+        for command in ["remote/status.sh", "remote/stop.sh"] {
+            let result = try fixture.run(command, ssMode: "both", additionalEnvironment: identity)
+            #expect(result.status != 0)
+            #expect(fixture.isContainerRunning)
+            #expect(try fixture.ticket() == ticket)
+        }
+    }
+
+    @Test func liveIdentityRejectsManifestFieldCollisionsBeforeLaunch() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let manifestURL = fixture.base.appending(path: "artifacts/build-manifest.env")
+        var manifest = try Data(contentsOf: manifestURL)
+        manifest.append(Data("version=v0.3.3\n".utf8))
+        try manifest.write(to: manifestURL)
+        let start = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: Self.liveIdentityEnvironment
+        )
+        #expect(start.status != 0)
+        #expect(!fixture.didDetachContainer)
+        #expect(!fixture.containerExists)
+        #expect(!fixture.stateFileExists("current-run"))
+        #expect(!fixture.stateFileExists("ticket"))
+    }
+
+    @Test func liveIdentityRejectsAReplacementContainerWithTheSameName() throws {
+        for running in [true, false] {
+            let fixture = try RemoteRockyFixture()
+            defer { fixture.remove() }
+            let identity = Self.liveIdentityEnvironment
+            let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: identity)
+            try #require(start.status == 0)
+            let runID = try fixture.currentRunID()
+            let ticket = try fixture.ticket()
+            // Podman may reuse the configured name, but a replacement gets a new ID.
+            try Data((String(repeating: "f", count: 64) + "\n").utf8)
+                .write(to: fixture.mockState.appending(path: "container-id"))
+            if !running {
+                try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
+            }
+            for command in ["remote/status.sh", "remote/stop.sh"] {
+                let result = try fixture.run(command, ssMode: "both", additionalEnvironment: identity)
+                #expect(result.status != 0)
+                #expect(fixture.containerExists)
+                #expect(fixture.isContainerRunning == running)
+                #expect(try fixture.ticket() == ticket)
+                #expect(try fixture.currentRunID() == runID)
+            }
+        }
+    }
+
+    @Test func liveIdentityStartPreservesAContainerCreatedAfterTheAbsenceCheck() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        var environment = Self.liveIdentityEnvironment
+        environment["MOCK_CREATE_CONTAINER_AFTER_ABSENCE"] = "1"
+        let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+        #expect(start.status != 0)
+        #expect(fixture.containerExists)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.didDetachContainer)
+    }
+
+    @Test func liveIdentityFailedTeardownPreservesARenamedContainerAndItsState() throws {
+        for running in [true, false] {
+            let fixture = try RemoteRockyFixture()
+            defer { fixture.remove() }
+            var environment = Self.liveIdentityEnvironment
+            let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+            try #require(start.status == 0)
+            let runID = try fixture.currentRunID()
+            let ticket = try fixture.ticket()
+            var renameEnvironment = environment
+            renameEnvironment["MOCK_RENAME_AFTER_RUNNING_INSPECT"] = "1"
+            let renamedStatus = try fixture.run(
+                "remote/status.sh", ssMode: "both", additionalEnvironment: renameEnvironment
+            )
+            #expect(renamedStatus.status != 0)
+            if !running {
+                try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
+            }
+            environment["MOCK_FAIL_STOP"] = "1"
+            environment["MOCK_FAIL_RM"] = "1"
+            let restart = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(restart.status != 0)
+            #expect(try fixture.ticket() == ticket)
+            #expect(try fixture.currentRunID() == runID)
+            let status = try fixture.run("remote/status.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(status.status != 0)
+            let stop = try fixture.run("remote/stop.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(stop.status != 0)
+            #expect(fixture.containerExists)
+            #expect(fixture.isContainerRunning == running)
+            #expect(try fixture.ticket() == ticket)
+            #expect(try fixture.currentRunID() == runID)
+        }
+    }
+
+    @Test func liveIdentityCannotAdoptALegacyEndpoint() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        let start = try fixture.run("remote/start.sh", ssMode: "both")
+        try #require(start.status == 0)
+        let runID = try fixture.currentRunID()
+        for command in ["remote/start.sh", "remote/status.sh", "remote/stop.sh"] {
+            let result = try fixture.run(
+                command, ssMode: "both", additionalEnvironment: Self.liveIdentityEnvironment
+            )
+            #expect(result.status != 0)
+            #expect(fixture.isContainerRunning)
+            #expect(try fixture.currentRunID() == runID)
+        }
+        let legacyStatus = try fixture.run("remote/status.sh", ssMode: "both")
+        #expect(legacyStatus.status == 0)
+        try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
+        let stoppedLegacyStart = try fixture.run(
+            "remote/start.sh", ssMode: "both", additionalEnvironment: Self.liveIdentityEnvironment
+        )
+        #expect(stoppedLegacyStart.status != 0)
+        #expect(fixture.containerExists)
+        #expect(try fixture.mockEventCount("detached") == 1)
+        #expect(try fixture.currentRunID() == runID)
+        let legacyStop = try fixture.run("remote/stop.sh", ssMode: "both")
+        #expect(legacyStop.status == 0)
+        #expect(!fixture.containerExists)
+    }
+
     @Test func isolatedEndpointOverridesNeverTargetTheDefaultContainer() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -3698,6 +4001,7 @@ private struct RemoteRockyFixture {
         set -euo pipefail
         state="${MOCK_PODMAN_STATE:?}"
         container="${SWIFTSPICE_PERF_CONTAINER:-swiftspice-perf-ab-qemu}"
+        container_id="$(cat "$state/container-id" 2>/dev/null || printf '%064d' 0)"
         command="${1:-}"
         shift || true
         printf '%s' "$command" >> "$state/commands"
@@ -3706,8 +4010,14 @@ private struct RemoteRockyFixture {
         case "$command" in
             container)
                 [[ "${1:-}" == exists ]]
-                [[ "${2:-}" == "$container" ]]
+                [[ "${2:-}" == "$container_id" || ( "${2:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 2 ]]
+                if [[ "${MOCK_CREATE_CONTAINER_AFTER_ABSENCE:-}" == 1 \
+                    && ! -d "$state/container" && ! -f "$state/created-after-absence" ]]; then
+                    mkdir "$state/container"
+                    : > "$state/created-after-absence"
+                    exit 1
+                fi
                 [[ -d "$state/container" ]]
                 ;;
             exec)
@@ -3802,17 +4112,29 @@ private struct RemoteRockyFixture {
                 ;;
             inspect)
                 [[ "${1:-}" == --format ]]
-                [[ "${2:-}" == '{{.State.Running}}' ]]
-                [[ "${3:-}" == "$container" ]]
+                [[ "${3:-}" == "$container_id" || ( "${3:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 3 ]]
+                if [[ "${2:-}" == '{{.Id}}' ]]; then
+                    [[ -d "$state/container" ]]
+                    printf '%s\n' "$container_id"
+                    exit 0
+                fi
+                [[ "${2:-}" == '{{.State.Running}}' ]]
                 if [[ -n "${MOCK_INSPECT_SIGNAL:-}" ]]; then
                     : > "$state/$MOCK_INSPECT_SIGNAL"
                 fi
-                [[ -f "$state/running" ]] && printf 'true\n'
+                if [[ -f "$state/running" ]]; then
+                    printf 'true\n'
+                    if [[ "${MOCK_RENAME_AFTER_RUNNING_INSPECT:-}" == 1 && "${3:-}" == "$container" ]]; then
+                        : > "$state/name-absent"
+                    fi
+                else
+                    exit 1
+                fi
                 ;;
             rm)
                 [[ "${1:-}" == --force ]]
-                [[ "${2:-}" == "$container" ]]
+                [[ "${2:-}" == "$container_id" || ( "${2:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 2 ]]
                 if [[ "${MOCK_FAIL_RM:-}" == 1 && -d "$state/container" ]]; then
                     : > "$state/rm-failed"
@@ -3824,7 +4146,7 @@ private struct RemoteRockyFixture {
             stop)
                 [[ "${1:-}" == --time ]]
                 [[ "${2:-}" == 10 ]]
-                [[ "${3:-}" == "$container" ]]
+                [[ "${3:-}" == "$container_id" || ( "${3:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 3 ]]
                 if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
                     : > "$state/stop-entered"
@@ -3860,7 +4182,8 @@ private struct RemoteRockyFixture {
                     mkdir "$state/container"
                     : > "$state/running"
                     printf 'detached\n' >> "$state/events"
-                    printf 'mock-container-id\n'
+                    printf '%s\n' "$container_id" > "$state/container-id"
+                    printf '%s\n' "$container_id"
                 elif [[ " $* " == *" qemu-system-x86_64 --version "* ]]; then
                     [[ "${1:-}" == --rm ]]
                     printf 'QEMU emulator version mock\n'
@@ -3883,7 +4206,7 @@ private struct RemoteRockyFixture {
                     trap 'rm -f "$state/log-follower-active"' EXIT
                 elif [[ "${1:-}" == --tail ]]; then
                     [[ "${2:-}" == 12 ]]
-                    [[ "${3:-}" == "$container" ]]
+                    [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
                     [[ $# == 3 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /usr/bin/tail -n "${2}" "${MOCK_CONTAINER_LOG_FILE}"
@@ -3891,7 +4214,7 @@ private struct RemoteRockyFixture {
                         printf 'PERF_READY resolution=1280x720\n'
                     fi
                 else
-                    [[ "${1:-}" == "$container" ]]
+                    [[ "${1:-}" == "$container" || "${1:-}" == "$container_id" ]]
                     [[ $# == 1 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /bin/cat "${MOCK_CONTAINER_LOG_FILE}"
