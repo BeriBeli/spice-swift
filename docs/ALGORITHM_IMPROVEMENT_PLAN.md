@@ -668,7 +668,9 @@ launch, and return canonical `run_evidence=` output. Bound starts require
 confirmed container absence; status and stop compare the recorded identity,
 container, image, and ports under the existing lifecycle lock. The original
 container ID also binds status and teardown, protecting a replacement that
-reuses the configured name. The legacy
+reuses the configured name. Startup cannot remove an unowned container, and
+teardown confirms both ID and name absence before clearing active state.
+The legacy
 path remains available with all six identity variables unset. Script tests
 exercise the round-trip, input rejection, foreign or corrupt state, legacy
 and replacement endpoint protection, and a

@@ -243,12 +243,13 @@ Agent behavior, including system-trusted TLS.
   and ports under the lifecycle lock before status or stop. The recorded
   container ID binds subsequent operations, rejecting same-name replacements.
   Bound starts refuse an existing container; unset identity variables preserve
-  legacy behavior. Six new script tests cover the identity round-trip,
+  legacy behavior. Eight new script tests cover the identity round-trip,
   invalid input before effects, foreign or
   corrupt recorded identity, legacy and replacement endpoint protection, and
-  a reproduced guest-manifest field collision. After the container-ID review
-  fix, the complete strict Debug suite passed 875 tests; focused Debug and
-  AddressSanitizer each passed ten script/lease tests.
+  a reproduced guest-manifest field collision. Review regressions also cover
+  startup name reuse before ownership and failed teardown of a renamed
+  container. The final strict Debug suite passed 877 tests; focused
+  AddressSanitizer passed twelve script/lease tests.
   This is deterministic local evidence, not a live SSH or paired-campaign
   result. Tunnel/process execution and the baseline overlay remain pending;
   AIP-00 and AIP-44 remain open.

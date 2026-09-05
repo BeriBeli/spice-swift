@@ -5,29 +5,42 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 acquire_lifecycle_lock
 
-if [[ "${live_identity_count}" != 0 ]] && ! configured_container_absence_is_confirmed; then
-    echo "Live campaign start requires a fresh endpoint." >&2
-    exit 1
-fi
-if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
-    echo "Performance endpoint is already running."
-    # status.sh takes its own lock and rechecks the current endpoint.
-    exec 9>&-
-    exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
+if [[ "${live_identity_count}" != 0 ]]; then
+    if ! configured_container_absence_is_confirmed; then
+        echo "Live campaign start requires a fresh endpoint." >&2
+        exit 1
+    fi
+    # No container is owned yet; a raced-in name must never be removed.
+    discard_inactive_state_locked
+else
+    if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
+        echo "Performance endpoint is already running."
+        # status.sh takes its own lock and rechecks the current endpoint.
+        exec 9>&-
+        exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
+    fi
+    remove_inactive_endpoint_locked
 fi
 
-remove_inactive_endpoint_locked
-
+container_id=""
 startup_complete=false
 cleanup_failed_start() {
     result=$?
     trap - EXIT HUP INT TERM
     if [[ "${startup_complete}" != true ]]; then
-        if stop_endpoint_locked; then
-            echo "Performance endpoint startup failed; active state was removed." >&2
+        local cleanup_target="${PERF_CONTAINER}"
+        if [[ "${live_identity_count}" != 0 ]]; then
+            cleanup_target="${container_id}"
+        fi
+        if [[ -n "${cleanup_target}" ]]; then
+            stop_endpoint_locked "${cleanup_target}" || exit 1
+        elif configured_container_absence_is_confirmed; then
+            discard_inactive_state_locked
         else
+            teardown_failed
             exit 1
         fi
+        echo "Performance endpoint startup failed; active state was removed." >&2
     fi
     exit "${result}"
 }
@@ -136,7 +149,7 @@ podman run --rm "${PERF_IMAGE}" dpkg-query -W libspice-server1 qemu-system-x86 q
     >> "${run_dir}/versions.txt"
 podman version >> "${run_dir}/versions.txt"
 
-container_id="$(podman run --detach \
+if ! container_id="$(podman run --detach \
     --name "${PERF_CONTAINER}" \
     --device /dev/kvm \
     --network host \
@@ -167,7 +180,15 @@ container_id="$(podman run --detach \
         -serial stdio \
         -monitor none \
         -no-reboot \
-        9>&-)"
+        9>&-)"; then
+    container_id=""
+    exit 1
+fi
+if [[ "${live_identity_count}" != 0 && ! "${container_id}" =~ ^[0-9a-f]{64}$ ]]; then
+    container_id=""
+    echo "Cannot establish live container ownership." >&2
+    exit 1
+fi
 printf '%s\n' "${container_id}" > "${run_dir}/container-id.txt"
 
 nohup podman logs --follow "${PERF_CONTAINER}" 9>&- > "${run_dir}/server.log" 2>&1 &

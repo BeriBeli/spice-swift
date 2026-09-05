@@ -60,7 +60,10 @@ identities fail before state directories or Podman effects. With all six
 unset, the legacy lifecycle remains available.
 
 Campaign start requires confirmed container absence; it never reuses or
-replaces an existing container, including a stopped one. Before launching
+replaces an existing container, including a stopped one. Before obtaining
+the new container's ID, startup and failure cleanup do not remove containers
+by name. An uncertain launch preserves active state for deliberate cleanup.
+Before launching
 QEMU, it writes the six fields in fixed order to the existing private
 `configuration.txt` as `campaign_id`, `logical_run_id`, `version`,
 `cluster_id`, `run_sequence`, and `execution_contract_digest`. It validates
@@ -69,12 +72,16 @@ that collides with a reserved identity key. Successful
 start emits exactly one machine-readable `run_evidence=` line in addition to
 the existing human-readable message.
 
-Status holds the lifecycle lock, checks the stored identity against the
+Status requires the configured container to be running, holds the lifecycle
+lock, checks the stored identity against the
 requested identity and stored container/image/ports against the requested
 endpoint, and returns the stored identity fields. It also compares the current
 container ID with the original ID already saved in `container-id.txt`;
 status and teardown address that ID so a reused name cannot transfer ownership.
-Campaign stop performs the same checks before touching an existing run; an unrecorded
+Teardown confirms both the target ID and configured name are absent before
+discarding active state, including when the original container was renamed.
+Campaign stop validates recorded identity and container ownership before
+touching an existing run, including a stopped or renamed owned container. An unrecorded
 container cannot be stopped through this mode. Missing, duplicate, or
 mismatched identity fields and a noncanonical evidence basename fail closed
 without relabeling or stopping another run. A first stop succeeds when both

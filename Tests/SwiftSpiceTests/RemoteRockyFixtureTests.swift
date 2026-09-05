@@ -2725,6 +2725,44 @@ struct RemoteRockyFixtureTests {
         }
     }
 
+    @Test func liveIdentityStartPreservesAContainerCreatedAfterTheAbsenceCheck() throws {
+        let fixture = try RemoteRockyFixture()
+        defer { fixture.remove() }
+        var environment = Self.liveIdentityEnvironment
+        environment["MOCK_CREATE_CONTAINER_AFTER_ABSENCE"] = "1"
+        let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+        #expect(start.status != 0)
+        #expect(fixture.containerExists)
+        #expect(!fixture.isContainerRunning)
+        #expect(!fixture.didDetachContainer)
+    }
+
+    @Test func liveIdentityFailedTeardownPreservesARenamedContainerAndItsState() throws {
+        for running in [true, false] {
+            let fixture = try RemoteRockyFixture()
+            defer { fixture.remove() }
+            var environment = Self.liveIdentityEnvironment
+            let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+            try #require(start.status == 0)
+            let runID = try fixture.currentRunID()
+            let ticket = try fixture.ticket()
+            try Data().write(to: fixture.mockState.appending(path: "name-absent"))
+            if !running {
+                try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
+            }
+            environment["MOCK_FAIL_STOP"] = "1"
+            environment["MOCK_FAIL_RM"] = "1"
+            let status = try fixture.run("remote/status.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(status.status != 0)
+            let stop = try fixture.run("remote/stop.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(stop.status != 0)
+            #expect(fixture.containerExists)
+            #expect(fixture.isContainerRunning == running)
+            #expect(try fixture.ticket() == ticket)
+            #expect(try fixture.currentRunID() == runID)
+        }
+    }
+
     @Test func liveIdentityCannotAdoptALegacyEndpoint() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -3953,8 +3991,14 @@ private struct RemoteRockyFixture {
         case "$command" in
             container)
                 [[ "${1:-}" == exists ]]
-                [[ "${2:-}" == "$container" ]]
+                [[ "${2:-}" == "$container_id" || ( "${2:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 2 ]]
+                if [[ "${MOCK_CREATE_CONTAINER_AFTER_ABSENCE:-}" == 1 \
+                    && ! -d "$state/container" && ! -f "$state/created-after-absence" ]]; then
+                    mkdir "$state/container"
+                    : > "$state/created-after-absence"
+                    exit 1
+                fi
                 [[ -d "$state/container" ]]
                 ;;
             exec)
@@ -4049,7 +4093,7 @@ private struct RemoteRockyFixture {
                 ;;
             inspect)
                 [[ "${1:-}" == --format ]]
-                [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
+                [[ "${3:-}" == "$container_id" || ( "${3:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 3 ]]
                 if [[ "${2:-}" == '{{.Id}}' ]]; then
                     [[ -d "$state/container" ]]
@@ -4064,7 +4108,7 @@ private struct RemoteRockyFixture {
                 ;;
             rm)
                 [[ "${1:-}" == --force ]]
-                [[ "${2:-}" == "$container" || "${2:-}" == "$container_id" ]]
+                [[ "${2:-}" == "$container_id" || ( "${2:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 2 ]]
                 if [[ "${MOCK_FAIL_RM:-}" == 1 && -d "$state/container" ]]; then
                     : > "$state/rm-failed"
@@ -4076,7 +4120,7 @@ private struct RemoteRockyFixture {
             stop)
                 [[ "${1:-}" == --time ]]
                 [[ "${2:-}" == 10 ]]
-                [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
+                [[ "${3:-}" == "$container_id" || ( "${3:-}" == "$container" && ! -f "$state/name-absent" ) ]] || exit 1
                 [[ $# == 3 ]]
                 if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
                     : > "$state/stop-entered"

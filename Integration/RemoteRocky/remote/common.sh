@@ -197,7 +197,7 @@ discard_inactive_state_locked() {
 
 configured_container_absence_is_confirmed() {
     local status=0
-    podman container exists "${PERF_CONTAINER}" >/dev/null 2>&1 || status=$?
+    podman container exists "${1:-${PERF_CONTAINER}}" >/dev/null 2>&1 || status=$?
     [[ "${status}" == 1 ]]
 }
 
@@ -210,8 +210,10 @@ teardown_failed() {
 # target container is not running. The configured name must also be absent
 # before stale active state is discarded.
 remove_inactive_endpoint_locked() {
-    podman rm --force "${1:-${PERF_CONTAINER}}" >/dev/null 2>&1 || true
-    if ! configured_container_absence_is_confirmed; then
+    local container_target="${1:-${PERF_CONTAINER}}"
+    podman rm --force "${container_target}" >/dev/null 2>&1 || true
+    if ! configured_container_absence_is_confirmed "${container_target}" \
+        || ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1
     fi
@@ -228,7 +230,8 @@ stop_endpoint_locked() {
     fi
     podman stop --time 10 "${container_target}" >/dev/null 2>&1 || true
     podman rm --force "${container_target}" >/dev/null 2>&1 || true
-    if ! configured_container_absence_is_confirmed; then
+    if ! configured_container_absence_is_confirmed "${container_target}" \
+        || ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1
     fi

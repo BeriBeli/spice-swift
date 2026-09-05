@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 acquire_lifecycle_lock
+require_running
 run_dir="$(current_run_dir)"
 identity="$(read_live_identity "${run_dir}")"
 container_target="${PERF_CONTAINER}"
