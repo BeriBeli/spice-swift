@@ -2699,6 +2699,32 @@ struct RemoteRockyFixtureTests {
         #expect(!fixture.stateFileExists("ticket"))
     }
 
+    @Test func liveIdentityRejectsAReplacementContainerWithTheSameName() throws {
+        for running in [true, false] {
+            let fixture = try RemoteRockyFixture()
+            defer { fixture.remove() }
+            let identity = Self.liveIdentityEnvironment
+            let start = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: identity)
+            try #require(start.status == 0)
+            let runID = try fixture.currentRunID()
+            let ticket = try fixture.ticket()
+            // Podman may reuse the configured name, but a replacement gets a new ID.
+            try Data((String(repeating: "f", count: 64) + "\n").utf8)
+                .write(to: fixture.mockState.appending(path: "container-id"))
+            if !running {
+                try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
+            }
+            for command in ["remote/status.sh", "remote/stop.sh"] {
+                let result = try fixture.run(command, ssMode: "both", additionalEnvironment: identity)
+                #expect(result.status != 0)
+                #expect(fixture.containerExists)
+                #expect(fixture.isContainerRunning == running)
+                #expect(try fixture.ticket() == ticket)
+                #expect(try fixture.currentRunID() == runID)
+            }
+        }
+    }
+
     @Test func liveIdentityCannotAdoptALegacyEndpoint() throws {
         let fixture = try RemoteRockyFixture()
         defer { fixture.remove() }
@@ -3918,6 +3944,7 @@ private struct RemoteRockyFixture {
         set -euo pipefail
         state="${MOCK_PODMAN_STATE:?}"
         container="${SWIFTSPICE_PERF_CONTAINER:-swiftspice-perf-ab-qemu}"
+        container_id="$(cat "$state/container-id" 2>/dev/null || printf '%064d' 0)"
         command="${1:-}"
         shift || true
         printf '%s' "$command" >> "$state/commands"
@@ -4022,9 +4049,14 @@ private struct RemoteRockyFixture {
                 ;;
             inspect)
                 [[ "${1:-}" == --format ]]
-                [[ "${2:-}" == '{{.State.Running}}' ]]
-                [[ "${3:-}" == "$container" ]]
+                [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
                 [[ $# == 3 ]]
+                if [[ "${2:-}" == '{{.Id}}' ]]; then
+                    [[ -d "$state/container" ]]
+                    printf '%s\n' "$container_id"
+                    exit 0
+                fi
+                [[ "${2:-}" == '{{.State.Running}}' ]]
                 if [[ -n "${MOCK_INSPECT_SIGNAL:-}" ]]; then
                     : > "$state/$MOCK_INSPECT_SIGNAL"
                 fi
@@ -4032,7 +4064,7 @@ private struct RemoteRockyFixture {
                 ;;
             rm)
                 [[ "${1:-}" == --force ]]
-                [[ "${2:-}" == "$container" ]]
+                [[ "${2:-}" == "$container" || "${2:-}" == "$container_id" ]]
                 [[ $# == 2 ]]
                 if [[ "${MOCK_FAIL_RM:-}" == 1 && -d "$state/container" ]]; then
                     : > "$state/rm-failed"
@@ -4044,7 +4076,7 @@ private struct RemoteRockyFixture {
             stop)
                 [[ "${1:-}" == --time ]]
                 [[ "${2:-}" == 10 ]]
-                [[ "${3:-}" == "$container" ]]
+                [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
                 [[ $# == 3 ]]
                 if [[ "${MOCK_HOLD_STOP:-}" == 1 ]]; then
                     : > "$state/stop-entered"
@@ -4080,7 +4112,8 @@ private struct RemoteRockyFixture {
                     mkdir "$state/container"
                     : > "$state/running"
                     printf 'detached\n' >> "$state/events"
-                    printf 'mock-container-id\n'
+                    printf '%s\n' "$container_id" > "$state/container-id"
+                    printf '%s\n' "$container_id"
                 elif [[ " $* " == *" qemu-system-x86_64 --version "* ]]; then
                     [[ "${1:-}" == --rm ]]
                     printf 'QEMU emulator version mock\n'
@@ -4103,7 +4136,7 @@ private struct RemoteRockyFixture {
                     trap 'rm -f "$state/log-follower-active"' EXIT
                 elif [[ "${1:-}" == --tail ]]; then
                     [[ "${2:-}" == 12 ]]
-                    [[ "${3:-}" == "$container" ]]
+                    [[ "${3:-}" == "$container" || "${3:-}" == "$container_id" ]]
                     [[ $# == 3 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /usr/bin/tail -n "${2}" "${MOCK_CONTAINER_LOG_FILE}"
@@ -4111,7 +4144,7 @@ private struct RemoteRockyFixture {
                         printf 'PERF_READY resolution=1280x720\n'
                     fi
                 else
-                    [[ "${1:-}" == "$container" ]]
+                    [[ "${1:-}" == "$container" || "${1:-}" == "$container_id" ]]
                     [[ $# == 1 ]]
                     if [[ -n "${MOCK_CONTAINER_LOG_FILE:-}" ]]; then
                         /bin/cat "${MOCK_CONTAINER_LOG_FILE}"

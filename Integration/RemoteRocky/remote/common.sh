@@ -147,8 +147,29 @@ read_live_identity() {
     printf '%s\n' "${recorded}"
 }
 
+# The configured name can be reused outside this lifecycle. Bind later
+# operations to the recorded ID, including when that container is now absent.
+read_live_container_id() {
+    local recorded observed
+    if ! recorded="$(cat "$1/container-id.txt")" \
+        || [[ ! "${recorded}" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "Recorded live container ID is missing or malformed." >&2
+        return 1
+    fi
+    if observed="$(podman inspect --format '{{.Id}}' "${PERF_CONTAINER}" 2>/dev/null)"; then
+        if [[ "${observed}" != "${recorded}" ]]; then
+            echo "Configured container no longer belongs to the recorded run." >&2
+            return 1
+        fi
+    elif ! configured_container_absence_is_confirmed; then
+        echo "Cannot verify the recorded live container." >&2
+        return 1
+    fi
+    printf '%s\n' "${recorded}"
+}
+
 require_running() {
-    if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" != true ]]; then
+    if [[ "$(podman inspect --format '{{.State.Running}}' "${1:-${PERF_CONTAINER}}" 2>/dev/null || true)" != true ]]; then
         echo "Performance endpoint is not running." >&2
         return 1
     fi
@@ -186,10 +207,10 @@ teardown_failed() {
 }
 
 # The caller must hold PERF_LIFECYCLE_LOCK and must have observed that the
-# configured container is not running. Removal is still confirmed before stale
-# active state is discarded.
+# target container is not running. The configured name must also be absent
+# before stale active state is discarded.
 remove_inactive_endpoint_locked() {
-    podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
+    podman rm --force "${1:-${PERF_CONTAINER}}" >/dev/null 2>&1 || true
     if ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1
@@ -200,13 +221,13 @@ remove_inactive_endpoint_locked() {
 # The caller must hold PERF_LIFECYCLE_LOCK. Keeping cleanup in-process lets a
 # failed start retain the lock until its container and active state are gone.
 stop_endpoint_locked() {
-    local run_dir
+    local run_dir container_target="${1:-${PERF_CONTAINER}}"
     run_dir="$(current_run_dir 2>/dev/null || true)"
     if [[ -n "${run_dir}" ]]; then
-        podman logs "${PERF_CONTAINER}" > "${run_dir}/server-final.log" 2>&1 || true
+        podman logs "${container_target}" > "${run_dir}/server-final.log" 2>&1 || true
     fi
-    podman stop --time 10 "${PERF_CONTAINER}" >/dev/null 2>&1 || true
-    podman rm --force "${PERF_CONTAINER}" >/dev/null 2>&1 || true
+    podman stop --time 10 "${container_target}" >/dev/null 2>&1 || true
+    podman rm --force "${container_target}" >/dev/null 2>&1 || true
     if ! configured_container_absence_is_confirmed; then
         teardown_failed
         return 1

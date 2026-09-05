@@ -71,8 +71,10 @@ the existing human-readable message.
 
 Status holds the lifecycle lock, checks the stored identity against the
 requested identity and stored container/image/ports against the requested
-endpoint, and returns the stored identity fields. Campaign stop performs
-the same identity check before touching an existing run; an unrecorded
+endpoint, and returns the stored identity fields. It also compares the current
+container ID with the original ID already saved in `container-id.txt`;
+status and teardown address that ID so a reused name cannot transfer ownership.
+Campaign stop performs the same checks before touching an existing run; an unrecorded
 container cannot be stopped through this mode. Missing, duplicate, or
 mismatched identity fields and a noncanonical evidence basename fail closed
 without relabeling or stopping another run. A first stop succeeds when both

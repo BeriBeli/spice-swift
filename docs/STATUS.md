@@ -240,13 +240,15 @@ Agent behavior, including system-trusted TLS.
 - AIP-00h2d-2 now has local script identity validation on top of the h2d-1
   lease in PRs #85/#86. Six canonical fields are persisted in the existing
   private run configuration before launch and checked with container, image,
-  and ports under the lifecycle lock before status or stop. Bound starts
-  refuse an existing container; unset identity variables preserve legacy
-  behavior. Five new script tests
-  cover the identity round-trip, invalid input before effects, foreign or
-  corrupt recorded identity, legacy endpoint protection, and a reproduced
-  guest-manifest field collision. The complete strict Debug suite passed
-  874 tests; focused AddressSanitizer passed the nine script/lease tests.
+  and ports under the lifecycle lock before status or stop. The recorded
+  container ID binds subsequent operations, rejecting same-name replacements.
+  Bound starts refuse an existing container; unset identity variables preserve
+  legacy behavior. Six new script tests cover the identity round-trip,
+  invalid input before effects, foreign or
+  corrupt recorded identity, legacy and replacement endpoint protection, and
+  a reproduced guest-manifest field collision. After the container-ID review
+  fix, the complete strict Debug suite passed 875 tests; focused Debug and
+  AddressSanitizer each passed ten script/lease tests.
   This is deterministic local evidence, not a live SSH or paired-campaign
   result. Tunnel/process execution and the baseline overlay remain pending;
   AIP-00 and AIP-44 remain open.

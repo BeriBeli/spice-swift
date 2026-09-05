@@ -666,10 +666,12 @@ Campaign scripts require six canonical identity fields plus explicit endpoint
 overrides, persist the identity in the existing run configuration before
 launch, and return canonical `run_evidence=` output. Bound starts require
 confirmed container absence; status and stop compare the recorded identity,
-container, image, and ports under the existing lifecycle lock. The legacy
+container, image, and ports under the existing lifecycle lock. The original
+container ID also binds status and teardown, protecting a replacement that
+reuses the configured name. The legacy
 path remains available with all six identity variables unset. Script tests
-exercise the round-trip, input
-rejection, foreign or corrupt state, legacy endpoint protection, and a
+exercise the round-trip, input rejection, foreign or corrupt state, legacy
+and replacement endpoint protection, and a
 reproduced guest-manifest field collision that must fail before launch.
 This is local contract validation only. Structured SSH/tunnel execution, the
 baseline overlay, and the real paired campaign remain open; it does not admit
