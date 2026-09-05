@@ -59,7 +59,8 @@ explicit endpoint configuration above. Partial, empty, or noncanonical
 identities fail before state directories or Podman effects. With all six
 unset, the legacy lifecycle remains available.
 
-Campaign start requires confirmed container absence; it never reuses or
+Campaign start requires an absent active-run record and confirmed container
+absence; it never reuses or
 replaces an existing container, including a stopped one. Before obtaining
 the new container's ID, startup and failure cleanup do not remove containers
 by name. An uncertain launch preserves active state for deliberate cleanup.

@@ -9,7 +9,7 @@ if [[ "${live_identity_count}" != 0 ]]; then
     if [[ -e "${PERF_STATE}/current-run" ]]; then
         run_dir="$(current_run_dir)"
         read_live_identity "${run_dir}" >/dev/null
-        container_target="$(read_live_container_id "${run_dir}")"
+        container_target="$(read_live_container_id "${run_dir}" allow-absent)"
     elif ! configured_container_absence_is_confirmed; then
         echo "Cannot stop a live endpoint without recorded ownership." >&2
         exit 1

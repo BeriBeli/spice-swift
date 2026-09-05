@@ -6,12 +6,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 acquire_lifecycle_lock
 
 if [[ "${live_identity_count}" != 0 ]]; then
-    if ! configured_container_absence_is_confirmed; then
+    if [[ -e "${PERF_STATE}/current-run" ]] || ! configured_container_absence_is_confirmed; then
         echo "Live campaign start requires a fresh endpoint." >&2
         exit 1
     fi
-    # No container is owned yet; a raced-in name must never be removed.
-    discard_inactive_state_locked
+    # Existing ownership is retired by stop.sh, never by a fresh start.
 else
     if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
         echo "Performance endpoint is already running."

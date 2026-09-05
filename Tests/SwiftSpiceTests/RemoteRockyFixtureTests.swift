@@ -2746,12 +2746,21 @@ struct RemoteRockyFixtureTests {
             try #require(start.status == 0)
             let runID = try fixture.currentRunID()
             let ticket = try fixture.ticket()
-            try Data().write(to: fixture.mockState.appending(path: "name-absent"))
+            var renameEnvironment = environment
+            renameEnvironment["MOCK_RENAME_AFTER_RUNNING_INSPECT"] = "1"
+            let renamedStatus = try fixture.run(
+                "remote/status.sh", ssMode: "both", additionalEnvironment: renameEnvironment
+            )
+            #expect(renamedStatus.status != 0)
             if !running {
                 try FileManager.default.removeItem(at: fixture.mockState.appending(path: "running"))
             }
             environment["MOCK_FAIL_STOP"] = "1"
             environment["MOCK_FAIL_RM"] = "1"
+            let restart = try fixture.run("remote/start.sh", ssMode: "both", additionalEnvironment: environment)
+            #expect(restart.status != 0)
+            #expect(try fixture.ticket() == ticket)
+            #expect(try fixture.currentRunID() == runID)
             let status = try fixture.run("remote/status.sh", ssMode: "both", additionalEnvironment: environment)
             #expect(status.status != 0)
             let stop = try fixture.run("remote/stop.sh", ssMode: "both", additionalEnvironment: environment)
@@ -4104,7 +4113,14 @@ private struct RemoteRockyFixture {
                 if [[ -n "${MOCK_INSPECT_SIGNAL:-}" ]]; then
                     : > "$state/$MOCK_INSPECT_SIGNAL"
                 fi
-                [[ -f "$state/running" ]] && printf 'true\n'
+                if [[ -f "$state/running" ]]; then
+                    printf 'true\n'
+                    if [[ "${MOCK_RENAME_AFTER_RUNNING_INSPECT:-}" == 1 && "${3:-}" == "$container" ]]; then
+                        : > "$state/name-absent"
+                    fi
+                else
+                    exit 1
+                fi
                 ;;
             rm)
                 [[ "${1:-}" == --force ]]

@@ -148,7 +148,8 @@ read_live_identity() {
 }
 
 # The configured name can be reused outside this lifecycle. Bind later
-# operations to the recorded ID, including when that container is now absent.
+# operations to the recorded ID. Only teardown allows an absent name so it
+# can still retire the recorded ID and state after a rename or removal.
 read_live_container_id() {
     local recorded observed
     if ! recorded="$(cat "$1/container-id.txt")" \
@@ -161,7 +162,7 @@ read_live_container_id() {
             echo "Configured container no longer belongs to the recorded run." >&2
             return 1
         fi
-    elif ! configured_container_absence_is_confirmed; then
+    elif [[ "${2:-}" != allow-absent ]] || ! configured_container_absence_is_confirmed; then
         echo "Cannot verify the recorded live container." >&2
         return 1
     fi
