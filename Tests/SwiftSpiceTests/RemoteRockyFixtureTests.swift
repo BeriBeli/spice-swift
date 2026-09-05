@@ -2525,10 +2525,20 @@ struct RemoteRockyFixtureTests {
             "remote/stop.sh", ssMode: "both", additionalEnvironment: identity
         )
         try #require(initialStop.status == 0)
+        try Data("2026-01-01T00:00:00Z\n".utf8)
+            .write(to: fixture.base.appending(path: "state/round-start"))
+        try Data("orphan-round\n".utf8)
+            .write(to: fixture.base.appending(path: "state/round-id"))
         let start = try fixture.run(
             "remote/start.sh", ssMode: "both", additionalEnvironment: identity
         )
         try #require(start.status == 0)
+        let round = try fixture.run(
+            "remote/round.sh", arguments: ["begin", "fresh"], ssMode: "both",
+            additionalEnvironment: identity
+        )
+        #expect(round.status == 0)
+        #expect(round.output.contains("-fresh state=begun"))
         let runID = try fixture.currentRunID()
         let runDirectory = fixture.base.appending(path: "logs/\(runID)")
         let configurationURL = runDirectory.appending(path: "configuration.txt")

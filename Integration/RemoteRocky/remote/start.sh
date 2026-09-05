@@ -10,7 +10,8 @@ if [[ "${live_identity_count}" != 0 ]]; then
         echo "Live campaign start requires a fresh endpoint." >&2
         exit 1
     fi
-    # Existing ownership is retired by stop.sh, never by a fresh start.
+    # The active-record check keeps prior ownership out of this cleanup.
+    discard_inactive_state_locked
 else
     if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
         echo "Performance endpoint is already running."
