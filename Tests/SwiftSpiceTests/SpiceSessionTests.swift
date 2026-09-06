@@ -1180,8 +1180,9 @@ struct SpiceSessionTests {
         await display.enqueue(encodeMini(id: 304, body: sessionCachedCopyBody(
             descriptorID: 0xc001
         )))
-        for _ in 0..<1_000 {
-            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
+        let resolveDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await imageCache.diagnosticsSnapshot().pendingWaiterCount != 1,
+              ContinuousClock.now < resolveDeadline {
             await Task.yield()
         }
         #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
@@ -1208,8 +1209,9 @@ struct SpiceSessionTests {
                 return .failure(.invalidState)
             }
         }
-        for _ in 0..<1_000 {
-            if await imageCache.diagnosticsSnapshot().queuedMutationCount == 1 { break }
+        let mutationDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await imageCache.diagnosticsSnapshot().queuedMutationCount != 1,
+              ContinuousClock.now < mutationDeadline {
             await Task.yield()
         }
         var diagnostics = await imageCache.diagnosticsSnapshot()
