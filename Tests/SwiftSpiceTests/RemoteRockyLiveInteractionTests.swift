@@ -727,6 +727,154 @@ struct RemoteRockyLiveInteractionTests {
         #expect(decoded == record)
     }
 
+    @Test(arguments: [
+        "LocalForward 127.0.0.1:46321 127.0.0.1:46322",
+        "RemoteForward 127.0.0.1:46323 127.0.0.1:46324",
+        "DynamicForward 127.0.0.1:46325",
+    ])
+    func tunnelRejectsHostConfiguredForwards(_ forwarding: String) async throws {
+        let fixture = try SpiceLiveScriptFixture("exit 0")
+        defer { fixture.remove() }
+        let sshConfig = fixture.directory.appending(path: "ssh_config")
+        try Data("""
+        Host rocky9
+            HostName 127.0.0.1
+            ProxyCommand /usr/bin/false
+            \(forwarding)
+
+        """.utf8).write(to: sshConfig)
+        let configuration = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        await #expect(throws: SpiceLiveInteractionSupportError.invalidIsolatedConfiguration) {
+            try await configuration.withSSHTunnel(
+                runner: SpiceLiveProcessRunner(
+                    executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
+                    argumentPrefix: ["-F", sshConfig.path]
+                )
+            ) {
+                Issue.record("operation entered with an inherited forwarding")
+            }
+        }
+    }
+
+    @Test func tunnelReadinessScopesTheOperationAndReapsItsProcess() async throws {
+        let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
+        directory=$(/usr/bin/dirname "$0")
+        /usr/bin/printf '%s\\n' "$@" > "$directory/arguments"
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
+        if read -r input; then exit 19; fi
+        /usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'
+        exec /bin/sleep 30
+        """)
+        defer { fixture.remove() }
+        let configuration = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        let value = try await configuration.withSSHTunnel(
+            runner: SpiceLiveProcessRunner(executableURL: fixture.executableURL)
+        ) {
+            let arguments = try String(
+                contentsOf: fixture.directory.appending(path: "arguments"), encoding: .utf8
+            ).split(separator: "\n").map(String.init)
+            #expect(arguments.suffix(3) == ["-L", "127.0.0.1:6235:127.0.0.1:6135", "rocky9"])
+            #expect(arguments.contains("ExitOnForwardFailure=yes"))
+            #expect(arguments.contains("ControlPath=none"))
+            #expect(arguments.contains("ForkAfterAuthentication=no"))
+            return 42
+        }
+        #expect(value == 42)
+        let pid = try #require(pid_t(String(
+            contentsOf: fixture.directory.appending(path: "pid"), encoding: .utf8
+        ).trimmingCharacters(in: .whitespacesAndNewlines)))
+        expectNoSurvivingProcesses([pid])
+    }
+
+    @Test(arguments: ["invalid", "eof", "timeout", "cancel"])
+    func tunnelStartupFailureNeverAdmitsTheOperation(_ failure: String) async throws {
+        let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
+        directory=$(/usr/bin/dirname "$0")
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
+        case "$1" in
+          invalid) /usr/bin/printf 'INVALID\\n' ;;
+          eof) exit 17 ;;
+        esac
+        exec /bin/sleep 30
+        """)
+        defer { fixture.remove() }
+        let configuration = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        let task = Task {
+            try await configuration.withSSHTunnel(
+                runner: SpiceLiveProcessRunner(
+                    executableURL: fixture.executableURL, argumentPrefix: [failure]
+                ),
+                startupTimeout: failure == "timeout" ? .milliseconds(100) : .seconds(5)
+            ) {
+                Issue.record("operation entered without SSH readiness")
+            }
+        }
+        defer { task.cancel() }
+        if failure == "cancel" {
+            _ = try await fixture.waitForFile("pid")
+            task.cancel()
+        }
+        await #expect(throws: (any Error).self) { try await task.value }
+        // A startup timeout can expire before the child is first scheduled.
+        let pidFile = fixture.directory.appending(path: "pid")
+        if FileManager.default.fileExists(atPath: pidFile.path) {
+            let pid = try #require(pid_t(String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)))
+            expectNoSurvivingProcesses([pid])
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func tunnelExitOrParentCancellationAbortsTheRunningOperation(
+        cancelParent: Bool
+    ) async throws {
+        let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
+        directory=$(/usr/bin/dirname "$0")
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
+        /usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'
+        while [ ! -f "$directory/exit" ]; do /bin/sleep 0.01; done
+        exit 17
+        """)
+        defer { fixture.remove() }
+        let configuration = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        let task = Task {
+            try await configuration.withSSHTunnel(
+                runner: SpiceLiveProcessRunner(executableURL: fixture.executableURL)
+            ) {
+                try Data().write(to: fixture.directory.appending(path: "entered"))
+                try await Task.sleep(for: .seconds(30))
+                Issue.record("operation survived tunnel loss")
+            }
+        }
+        defer {
+            task.cancel()
+            try? Data().write(to: fixture.directory.appending(path: "exit"))
+        }
+        _ = try await fixture.waitForFile("entered")
+        if cancelParent {
+            task.cancel()
+        } else {
+            try Data().write(to: fixture.directory.appending(path: "exit"))
+        }
+        await #expect(throws: (any Error).self) { try await task.value }
+        let pid = try #require(pid_t(String(
+            contentsOf: fixture.directory.appending(path: "pid"), encoding: .utf8
+        ).trimmingCharacters(in: .whitespacesAndNewlines)))
+        expectNoSurvivingProcesses([pid])
+    }
+
     private func completedClusterSteps(
         _ clusterID: String
     ) throws -> [SpiceLiveInteractionClusterPlan.Step] {
@@ -777,7 +925,7 @@ struct RemoteRockyLiveInteractionTests {
     }
 }
 
-private struct SpiceLiveScriptFixture {
+struct SpiceLiveScriptFixture {
     let directory: URL
     let executableURL: URL
 
@@ -796,6 +944,19 @@ private struct SpiceLiveScriptFixture {
             remove()
             throw SpiceLiveInteractionSupportError.childFailed
         }
+    }
+
+    func waitForFile(_ name: String) async throws -> URL {
+        let url = directory.appending(path: name)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while !FileManager.default.fileExists(atPath: url.path) {
+            guard clock.now < deadline else {
+                throw SpiceLiveInteractionSupportError.operationTimedOut
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return url
     }
 
     func remove() {
