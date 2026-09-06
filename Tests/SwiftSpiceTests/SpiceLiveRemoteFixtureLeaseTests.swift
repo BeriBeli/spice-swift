@@ -58,6 +58,95 @@ struct SpiceLiveRemoteFixtureLeaseTests {
         #expect(seed.recorder.snapshot.state == .recording)
     }
 
+    @Test func executesStructuredCommandsAndPersistsEachValidatedResult() async throws {
+        let seed = try Self.seed()
+        defer { Self.remove(seed.output) }
+        let fixture = try SpiceLiveScriptFixture("""
+        directory=$(/usr/bin/dirname "$0")
+        for argument do command=$argument; done
+        script=${command##*/}
+        /usr/bin/printf '%s\\n' "$@" > "$directory/$script.arguments"
+        /bin/cat "$directory/$script.output"
+        """)
+        defer { fixture.remove() }
+        let lease = try Self.lease(seed)
+        let runner = SpiceLiveProcessRunner(executableURL: fixture.executableURL)
+        let outputs = [[], Self.startLines(seed), Self.healthLines(seed)]
+        let scripts = ["stop.sh", "start.sh", "status.sh"]
+        let stages: [SpiceLiveAttemptStage] = [.fixtureStop, .fixtureStart, .fixtureHealth]
+        for index in scripts.indices {
+            try Data(Self.result(lines: outputs[index]).standardOutput.utf8).write(
+                to: fixture.directory.appending(path: "\(scripts[index]).output")
+            )
+            try await lease.executeNext(within: .seconds(5), runner: runner)
+            let arguments = try String(
+                contentsOf: fixture.directory.appending(path: "\(scripts[index]).arguments"),
+                encoding: .utf8
+            ).split(separator: "\n").map(String.init)
+            #expect(arguments == Self.expectedArguments(seed: seed, script: scripts[index]))
+            try Self.expectDurable(
+                seed, generation: UInt64(index + 1), stages: Array(stages.prefix(index + 1)),
+                evidenceRunID: index == 0 ? nil : Self.evidenceID
+            )
+        }
+        await #expect(throws: (any Error).self) {
+            try await lease.executeNext(runner: runner)
+        }
+    }
+
+    @Test(arguments: ["spawn", "nonzero", "timeout"])
+    func executionFailureIsDurableAndCannotBeRetried(_ failure: String) async throws {
+        let seed = try Self.seed()
+        defer { Self.remove(seed.output) }
+        let fixture = try SpiceLiveScriptFixture(
+            failure == "timeout" ? "exec /bin/sleep 30" : "exit 17"
+        )
+        defer { fixture.remove() }
+        let runner = SpiceLiveProcessRunner(executableURL: failure == "spawn"
+            ? fixture.directory.appending(path: "missing") : fixture.executableURL)
+        let lease = try Self.lease(seed)
+        let command = try lease.nextCommand()
+        let before = try Data(contentsOf: seed.output)
+        await #expect(throws: (any Error).self) {
+            try await lease.executeNext(within: .milliseconds(100), runner: runner)
+        }
+        try Self.expectTerminalAndStable(
+            lease, seed: seed, failedCommand: command, bytesBeforeFailure: before,
+            expectedGeneration: 1, expectedFailedStage: .fixtureStop
+        )
+        await #expect(throws: (any Error).self) {
+            try await lease.executeNext(runner: runner)
+        }
+    }
+
+    @Test func pendingExecutionRejectsConcurrentEffectsAndCancellationFailsClosed() async throws {
+        let seed = try Self.seed()
+        defer { Self.remove(seed.output) }
+        let fixture = try SpiceLiveScriptFixture("""
+        directory=$(/usr/bin/dirname "$0")
+        /usr/bin/touch "$directory/entered"
+        exec /bin/sleep 30
+        """)
+        defer { fixture.remove() }
+        let lease = try Self.lease(seed)
+        let command = try lease.nextCommand()
+        let before = try Data(contentsOf: seed.output)
+        let runner = SpiceLiveProcessRunner(executableURL: fixture.executableURL)
+        let pending = Task { try await lease.executeNext(within: .seconds(5), runner: runner) }
+        defer { pending.cancel() }
+        _ = try await fixture.waitForFile("entered")
+        await #expect(throws: (any Error).self) { try await lease.executeNext(runner: runner) }
+        #expect(throws: (any Error).self) { _ = try lease.nextCommand() }
+        #expect(throws: (any Error).self) { try lease.accept(result: Self.result(), for: command) }
+        #expect(try Data(contentsOf: seed.output) == before)
+        pending.cancel()
+        await #expect(throws: (any Error).self) { try await pending.value }
+        try Self.expectTerminalAndStable(
+            lease, seed: seed, failedCommand: command, bytesBeforeFailure: before,
+            expectedGeneration: 1, expectedFailedStage: .fixtureStop
+        )
+    }
+
     @Test(arguments: ReservedResultMutation.allCases)
     fileprivate func malformedOrMismatchedReservedResultPermanentlyFailsClosed(
         _ mutation: ReservedResultMutation
@@ -395,7 +484,14 @@ private extension SpiceLiveRemoteFixtureLeaseTests {
 
     static func expectedArguments(seed: Seed, script: String) -> [String] {
         [
-            "-o", "BatchMode=yes", seed.configuration.sshHost, "/usr/bin/env",
+            "-T", "-o", "BatchMode=yes",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "ControlPersist=no",
+            "-o", "ForkAfterAuthentication=no",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "PermitLocalCommand=no",
+            seed.configuration.sshHost, "/usr/bin/env",
             "SWIFTSPICE_PERF_BASE=\(seed.configuration.base)",
             "SWIFTSPICE_PERF_CONTAINER=\(seed.configuration.container)",
             "SWIFTSPICE_PERF_IMAGE=\(seed.configuration.image)",

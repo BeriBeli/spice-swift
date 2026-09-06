@@ -16,6 +16,7 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
         case invalidConfiguration
         case invalidCommand
         case invalidResult
+        case operationInProgress
         case terminal
     }
 
@@ -48,6 +49,7 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
     private struct State: Sendable {
         var operation: Operation? = .stop
         var evidenceRunID: SpiceLiveEvidenceRunID?
+        var executing = false
     }
 
     private let configuration: SpiceRemoteLiveConfiguration
@@ -91,6 +93,7 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
 
     package func nextCommand() throws -> Command {
         try state.withLock { state in
+            guard !state.executing else { throw LeaseError.operationInProgress }
             guard let operation = state.operation else {
                 throw LeaseError.terminal
             }
@@ -103,43 +106,90 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
         for command: Command
     ) throws {
         try state.withLock { state in
-            guard let operation = state.operation else {
-                throw LeaseError.terminal
-            }
-            guard command == self.command(for: operation) else {
-                state.operation = nil
-                try recorder.failClosedAfterExternalBoundary()
-                throw LeaseError.invalidCommand
-            }
-
-            let evidenceRunID: SpiceLiveEvidenceRunID?
-            do {
-                evidenceRunID = try validate(
-                    result: result,
-                    operation: operation,
-                    expectedEvidenceRunID: state.evidenceRunID
-                )
-            } catch {
-                try fail(operation: operation, state: &state)
-                throw error
-            }
-
-            do {
-                try recorder.record(
-                    run: run,
-                    stage: operation.stage,
-                    outcome: .succeeded,
-                    evidenceRunID: evidenceRunID
-                )
-            } catch {
-                state.operation = nil
-                throw error
-            }
-            if let evidenceRunID {
-                state.evidenceRunID = evidenceRunID
-            }
-            state.operation = operation.next
+            guard !state.executing else { throw LeaseError.operationInProgress }
+            try accept(result: result, for: command, state: &state)
         }
+    }
+
+    /// Executes one command and persists its validated result before admitting
+    /// the next operation. An uncertain external result is terminal, not retryable.
+    package func executeNext(
+        within timeout: Duration = .seconds(90),
+        runner: SpiceLiveProcessRunner? = nil
+    ) async throws {
+        guard timeout > .zero else { throw LeaseError.invalidConfiguration }
+        let command = try state.withLock { state in
+            guard !state.executing else { throw LeaseError.operationInProgress }
+            guard let operation = state.operation else { throw LeaseError.terminal }
+            state.executing = true
+            return self.command(for: operation)
+        }
+
+        let result: SpiceLiveProcessResult
+        do {
+            try Task.checkCancellation()
+            let commandRunner = runner ?? SpiceLiveProcessRunner(
+                executableURL: command.executableURL
+            )
+            let child = try commandRunner.launch(arguments: command.arguments)
+            result = try await child.finish(within: timeout)
+            try Task.checkCancellation()
+        } catch {
+            try state.withLock { state in
+                state.executing = false
+                if let operation = state.operation {
+                    try fail(operation: operation, state: &state)
+                }
+            }
+            throw error
+        }
+        try state.withLock { state in
+            state.executing = false
+            try accept(result: result, for: command, state: &state)
+        }
+    }
+
+    private func accept(
+        result: SpiceLiveProcessResult,
+        for command: Command,
+        state: inout State
+    ) throws {
+        guard let operation = state.operation else {
+            throw LeaseError.terminal
+        }
+        guard command == self.command(for: operation) else {
+            state.operation = nil
+            try recorder.failClosedAfterExternalBoundary()
+            throw LeaseError.invalidCommand
+        }
+
+        let evidenceRunID: SpiceLiveEvidenceRunID?
+        do {
+            evidenceRunID = try validate(
+                result: result,
+                operation: operation,
+                expectedEvidenceRunID: state.evidenceRunID
+            )
+        } catch {
+            try fail(operation: operation, state: &state)
+            throw error
+        }
+
+        do {
+            try recorder.record(
+                run: run,
+                stage: operation.stage,
+                outcome: .succeeded,
+                evidenceRunID: evidenceRunID
+            )
+        } catch {
+            state.operation = nil
+            throw error
+        }
+        if let evidenceRunID {
+            state.evidenceRunID = evidenceRunID
+        }
+        state.operation = operation.next
     }
 
     private func fail(
@@ -158,7 +208,14 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
         Command(
             executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
             arguments: [
-                "-o", "BatchMode=yes", configuration.sshHost, "/usr/bin/env",
+                "-T", "-o", "BatchMode=yes",
+                "-o", "ControlMaster=no",
+                "-o", "ControlPath=none",
+                "-o", "ControlPersist=no",
+                "-o", "ForkAfterAuthentication=no",
+                "-o", "ClearAllForwardings=yes",
+                "-o", "PermitLocalCommand=no",
+                configuration.sshHost, "/usr/bin/env",
                 "SWIFTSPICE_PERF_BASE=\(configuration.base)",
                 "SWIFTSPICE_PERF_CONTAINER=\(configuration.container)",
                 "SWIFTSPICE_PERF_IMAGE=\(configuration.image)",
