@@ -731,7 +731,8 @@ struct RemoteRockyLiveInteractionTests {
         let fixture = try SpiceLiveScriptFixture("""
         directory=$(/usr/bin/dirname "$0")
         /usr/bin/printf '%s\\n' "$@" > "$directory/arguments"
-        /usr/bin/printf '%s\\n' "$$" > "$directory/pid"
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
         if read -r input; then exit 19; fi
         /usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'
         exec /bin/sleep 30
@@ -761,7 +762,8 @@ struct RemoteRockyLiveInteractionTests {
     func tunnelStartupFailureNeverAdmitsTheOperation(_ failure: String) async throws {
         let fixture = try SpiceLiveScriptFixture("""
         directory=$(/usr/bin/dirname "$0")
-        /usr/bin/printf '%s\\n' "$$" > "$directory/pid"
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
         case "$1" in
           invalid) /usr/bin/printf 'INVALID\\n' ;;
           eof) exit 17 ;;
@@ -781,12 +783,18 @@ struct RemoteRockyLiveInteractionTests {
             }
         }
         defer { task.cancel() }
-        let pidFile = try await fixture.waitForFile("pid")
-        if failure == "cancel" { task.cancel() }
+        if failure == "cancel" {
+            _ = try await fixture.waitForFile("pid")
+            task.cancel()
+        }
         await #expect(throws: (any Error).self) { try await task.value }
-        let pid = try #require(pid_t(String(contentsOf: pidFile, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)))
-        expectNoSurvivingProcesses([pid])
+        // A startup timeout can expire before the child is first scheduled.
+        let pidFile = fixture.directory.appending(path: "pid")
+        if FileManager.default.fileExists(atPath: pidFile.path) {
+            let pid = try #require(pid_t(String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)))
+            expectNoSurvivingProcesses([pid])
+        }
     }
 
     @Test(arguments: [false, true])
@@ -795,7 +803,8 @@ struct RemoteRockyLiveInteractionTests {
     ) async throws {
         let fixture = try SpiceLiveScriptFixture("""
         directory=$(/usr/bin/dirname "$0")
-        /usr/bin/printf '%s\\n' "$$" > "$directory/pid"
+        /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
+        /bin/mv "$directory/pid.tmp" "$directory/pid"
         /usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'
         while [ ! -f "$directory/exit" ]; do /bin/sleep 0.01; done
         exit 17
