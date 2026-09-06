@@ -13,6 +13,23 @@ extension SpiceRemoteLiveConfiguration {
             throw SpiceLiveInteractionSupportError.invalidIsolatedConfiguration
         }
         try Task.checkCancellation()
+        let clock = ContinuousClock()
+        let startupDeadline = clock.now.advanced(by: startupTimeout)
+        // Inspect the same host/options before adding our one local forward.
+        // ClearAllForwardings=yes would also remove the requested command-line -L.
+        let inspection = try runner.launch(arguments: ["-G"] + sshTunnelOptions + [sshHost])
+        let configuration = try await inspection.finish(within: startupTimeout)
+        guard configuration.status == 0,
+              !configuration.outputLines.contains(where: { line in
+                  let key = line.split(whereSeparator: \.isWhitespace).first
+                  return key == "localforward" || key == "remoteforward" || key == "dynamicforward"
+              }) else {
+            throw SpiceLiveInteractionSupportError.invalidIsolatedConfiguration
+        }
+        try Task.checkCancellation()
+        guard clock.now < startupDeadline else {
+            throw SpiceLiveInteractionSupportError.operationTimedOut
+        }
         let (process, transport) = try launchSSHTunnel(runner: runner)
         let readyFrame = Data("SWIFTSPICE_TUNNEL_READY\n".utf8)
 
@@ -23,7 +40,11 @@ extension SpiceRemoteLiveConfiguration {
                     return .failure(SpiceLiveInteractionSupportError.childFailed)
                 }
                 group.addTask {
-                    let frame = try await withSpiceLiveTimeout(startupTimeout) {
+                    let remainingStartupTime = clock.now.duration(to: startupDeadline)
+                    guard remainingStartupTime > .zero else {
+                        throw SpiceLiveInteractionSupportError.operationTimedOut
+                    }
+                    let frame = try await withSpiceLiveTimeout(remainingStartupTime) {
                         try await withTaskCancellationHandler {
                             try await transport.receiveFrame(maximumBytes: readyFrame.count)
                         } onCancel: {
@@ -61,6 +82,20 @@ extension SpiceRemoteLiveConfiguration {
         }
     }
 
+    private var sshTunnelOptions: [String] {
+        [
+            "-N", "-T",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ClearAllForwardings=no",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "ControlPersist=no",
+            "-o", "ForkAfterAuthentication=no",
+            "-o", "PermitLocalCommand=yes",
+            "-o", "LocalCommand=/usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'",
+        ]
+    }
+
     private func launchSSHTunnel(
         runner: SpiceLiveProcessRunner
     ) throws -> (SpiceLiveProcessGroup, SpiceLiveStageTransport) {
@@ -84,16 +119,7 @@ extension SpiceRemoteLiveConfiguration {
 
         let process = try SpiceLiveProcessGroup.launch(
             executableURL: runner.executableURL,
-            arguments: runner.argumentPrefix + [
-                "-N", "-T",
-                "-o", "ExitOnForwardFailure=yes",
-                "-o", "ClearAllForwardings=no",
-                "-o", "ControlMaster=no",
-                "-o", "ControlPath=none",
-                "-o", "ControlPersist=no",
-                "-o", "ForkAfterAuthentication=no",
-                "-o", "PermitLocalCommand=yes",
-                "-o", "LocalCommand=/usr/bin/printf 'SWIFTSPICE_TUNNEL_READY\\n'",
+            arguments: runner.argumentPrefix + sshTunnelOptions + [
                 "-L", "127.0.0.1:\(endpointPort):127.0.0.1:\(spicePort)",
                 sshHost,
             ],

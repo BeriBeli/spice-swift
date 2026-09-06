@@ -727,8 +727,40 @@ struct RemoteRockyLiveInteractionTests {
         #expect(decoded == record)
     }
 
+    @Test(arguments: [
+        "LocalForward 127.0.0.1:46321 127.0.0.1:46322",
+        "RemoteForward 127.0.0.1:46323 127.0.0.1:46324",
+        "DynamicForward 127.0.0.1:46325",
+    ])
+    func tunnelRejectsHostConfiguredForwards(_ forwarding: String) async throws {
+        let fixture = try SpiceLiveScriptFixture("exit 0")
+        defer { fixture.remove() }
+        let sshConfig = fixture.directory.appending(path: "ssh_config")
+        try Data("""
+        Host rocky9
+            HostName 127.0.0.1
+            ProxyCommand /usr/bin/false
+            \(forwarding)
+
+        """.utf8).write(to: sshConfig)
+        let configuration = try SpiceRemoteLiveConfiguration(environment: validEnvironment)
+        await #expect(throws: SpiceLiveInteractionSupportError.invalidIsolatedConfiguration) {
+            try await configuration.withSSHTunnel(
+                runner: SpiceLiveProcessRunner(
+                    executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
+                    argumentPrefix: ["-F", sshConfig.path]
+                )
+            ) {
+                Issue.record("operation entered with an inherited forwarding")
+            }
+        }
+    }
+
     @Test func tunnelReadinessScopesTheOperationAndReapsItsProcess() async throws {
         let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
         directory=$(/usr/bin/dirname "$0")
         /usr/bin/printf '%s\\n' "$@" > "$directory/arguments"
         /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
@@ -761,6 +793,9 @@ struct RemoteRockyLiveInteractionTests {
     @Test(arguments: ["invalid", "eof", "timeout", "cancel"])
     func tunnelStartupFailureNeverAdmitsTheOperation(_ failure: String) async throws {
         let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
         directory=$(/usr/bin/dirname "$0")
         /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
         /bin/mv "$directory/pid.tmp" "$directory/pid"
@@ -802,6 +837,9 @@ struct RemoteRockyLiveInteractionTests {
         cancelParent: Bool
     ) async throws {
         let fixture = try SpiceLiveScriptFixture("""
+        for argument do
+            if [ "$argument" = "-G" ]; then exit 0; fi
+        done
         directory=$(/usr/bin/dirname "$0")
         /usr/bin/printf '%s\\n' "$$" > "$directory/pid.tmp"
         /bin/mv "$directory/pid.tmp" "$directory/pid"

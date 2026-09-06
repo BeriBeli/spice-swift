@@ -259,7 +259,9 @@ Agent behavior, including system-trusted TLS.
   reject concurrent effects, persist success before advancing, and fail
   durably without retry on uncertain results. Tunnel startup waits for a fixed
   SSH forwarding callback; SSH exit aborts the running operation, and every
-  return joins socket close and process-group teardown. Local real-child tests
+  return joins socket close and process-group teardown. A bounded `ssh -G`
+  preflight rejects inherited forwards before connecting; real OpenSSH tests
+  cover local, remote, and dynamic forwarding. Local real-child tests
   cover structured arguments, durable results, failure, cancellation, and
   process reaping using an SSH stand-in. The campaign CLI/child stage-protocol
   wiring, isolated baseline overlay, and real 20-boot/60-action campaign are

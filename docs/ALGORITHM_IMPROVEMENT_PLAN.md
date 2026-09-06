@@ -682,7 +682,10 @@ before advancing. Spawn, timeout, cancellation, nonzero exit, or invalid output
 makes the attempt durably terminal without retry. A scoped foreground SSH
 tunnel uses a fixed local readiness callback after forwarding setup, monitors
 SSH exit throughout the operation, and joins socket close and process-group
-teardown before returning. It disables SSH multiplexing and backgrounding to
+teardown before returning. A bounded `ssh -G` preflight rejects inherited
+forwards before connecting, sharing the forwarding startup deadline; real
+OpenSSH configuration tests cover local, remote, and dynamic forwarding.
+It disables SSH multiplexing and backgrounding to
 retain process ownership; finite fixture commands also disable forwarding and
 local commands. Local real-child tests exercise these boundaries with an SSH
 stand-in. No live SSH or Rocky campaign was run for this slice.

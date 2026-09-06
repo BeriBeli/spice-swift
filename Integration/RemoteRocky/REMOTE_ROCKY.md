@@ -102,9 +102,12 @@ execution or manual completion while a command is running is rejected.
 
 `SpiceRemoteLiveConfiguration.withSSHTunnel` owns a foreground SSH process group
 for one cancellation-cooperative async operation. It requires the configured
-local endpoint to be `127.0.0.1`, waits at most 20 seconds by default for a fixed
-SSH local callback after forwarding setup, and aborts the operation if SSH
-exits. The callback proves local forwarding setup; fixture health still proves
+local endpoint to be `127.0.0.1`. Before connecting, it evaluates `ssh -G`
+and rejects any inherited `LocalForward`, `RemoteForward`, or `DynamicForward`;
+use an alias without configured forwards. Authentication and proxy settings
+continue to come from the configured host. Configuration inspection and the
+fixed SSH local callback after forwarding setup share a default 20-second
+startup deadline. The scope aborts the operation if SSH exits. The callback proves local forwarding setup; fixture health still proves
 the remote destination. The scope closes its readiness socket and joins
 bounded process teardown before returning. Multiplexing and backgrounding are
 disabled so the scope retains ownership. These APIs have local stand-in child
