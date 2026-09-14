@@ -42,7 +42,80 @@ trailing slashes, repeated slashes, and dot segments are rejected rather than
 normalized to a potentially different lifecycle identity. With all five unset,
 the historical default lifecycle remains unchanged.
 
-Connect one client at a time through an SSH tunnel:
+For a campaign-owned endpoint, also pass all six identity variables in every
+start, status, and stop invocation:
+
+| Variable | Canonical value |
+| --- | --- |
+| `SWIFTSPICE_LIVE_CAMPAIGN_ID` | 16 lowercase hexadecimal characters |
+| `SWIFTSPICE_LIVE_LOGICAL_RUN_ID` | 16 lowercase hexadecimal characters |
+| `SWIFTSPICE_LIVE_VERSION` | `vMAJOR.MINOR.PATCH`, without leading zeroes |
+| `SWIFTSPICE_LIVE_CLUSTER_ID` | 16 lowercase hexadecimal characters |
+| `SWIFTSPICE_LIVE_RUN_SEQUENCE` | Positive decimal integer, without leading zeroes |
+| `SWIFTSPICE_LIVE_EXECUTION_CONTRACT_DIGEST` | 64 lowercase hexadecimal characters |
+
+Any provided identity variable requires the other five and the complete
+explicit endpoint configuration above. Partial, empty, or noncanonical
+identities fail before state directories or Podman effects. With all six
+unset, the legacy lifecycle remains available.
+
+Campaign start requires an absent active-run record and confirmed container
+absence; it never reuses or
+replaces an existing container, including a stopped one. Before obtaining
+the new container's ID, startup and failure cleanup do not remove containers
+by name. An uncertain launch preserves active state for deliberate cleanup.
+Before launching
+QEMU, it writes the six fields in fixed order to the existing private
+`configuration.txt` as `campaign_id`, `logical_run_id`, `version`,
+`cluster_id`, `run_sequence`, and `execution_contract_digest`. It validates
+the combined configuration before launch, rejecting a guest-manifest field
+that collides with a reserved identity key. Successful
+start emits exactly one machine-readable `run_evidence=` line in addition to
+the existing human-readable message.
+
+Status requires the configured container to be running, holds the lifecycle
+lock, checks the stored identity against the
+requested identity and stored container/image/ports against the requested
+endpoint, and returns the stored identity fields. It also compares the current
+container ID with the original ID already saved in `container-id.txt`;
+status and teardown address that ID so a reused name cannot transfer ownership.
+Teardown confirms both the target ID and configured name are absent before
+discarding active state, including when the original container was renamed.
+Campaign stop validates recorded identity and container ownership before
+touching an existing run, including a stopped or renamed owned container. An unrecorded
+container cannot be stopped through this mode. Missing, duplicate, or
+mismatched identity fields and a noncanonical evidence basename fail closed
+without relabeling or stopping another run. A first stop succeeds when both
+the endpoint and its active-run record are absent. An incompatible old
+endpoint requires deliberate cleanup through its original lifecycle before a
+new campaign can begin.
+
+These script semantics are covered by the local RemoteRocky fixture tests;
+they are not evidence of a live SSH campaign, a baseline measurement overlay,
+or a latency improvement.
+
+The package support API `SpiceLiveRemoteFixtureLease.executeNext` runs one
+fixed stop/start/status command with bounded output and a default 90-second
+completion bound. It persists the validated result before admitting the next
+command and makes any uncertain result terminal without retry. It overrides
+`RemoteCommand` so an alias's login command cannot conflict with the fixed
+fixture script. Concurrent execution or manual completion while a command is
+running is rejected.
+
+`SpiceRemoteLiveConfiguration.withSSHTunnel` owns a foreground SSH process group
+for one cancellation-cooperative async operation. It requires the configured
+local endpoint to be `127.0.0.1`. Before connecting, it evaluates `ssh -G`
+and rejects any inherited `LocalForward`, `RemoteForward`, or `DynamicForward`;
+use an alias without configured forwards. Authentication and proxy settings
+continue to come from the configured host. Configuration inspection and the
+fixed SSH local callback after forwarding setup share a default 20-second
+startup deadline. The scope aborts the operation if SSH exits. The callback proves local forwarding setup; fixture health still proves
+the remote destination. The scope closes its readiness socket and joins
+bounded process teardown before returning. Multiplexing and backgrounding are
+disabled so the scope retains ownership. These APIs have local stand-in child
+coverage; the campaign CLI and child stage protocol are not wired to them yet.
+
+For the existing manual workflow, connect one client at a time through an SSH tunnel:
 
 ```sh
 ssh -N -L 15935:127.0.0.1:5935 "${SWIFTSPICE_ROCKY_SSH_HOST}"

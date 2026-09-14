@@ -237,6 +237,36 @@ Agent behavior, including system-trusted TLS.
   slice provides no live SPICE, latency, CPU/RSS acceptance, release, or
   AIP-44 improvement claim.
 
+- AIP-00h2d-2 now has local script identity validation on top of the h2d-1
+  lease in PRs #85/#86. Six canonical fields are persisted in the existing
+  private run configuration before launch and checked with container, image,
+  and ports under the lifecycle lock before status or stop. The recorded
+  container ID binds subsequent operations, rejecting same-name replacements.
+  Bound starts refuse an existing container; unset identity variables preserve
+  legacy behavior. Eight new script tests cover the identity round-trip,
+  invalid input before effects, foreign or
+  corrupt recorded identity, legacy and replacement endpoint protection, and
+  a reproduced guest-manifest field collision. Review regressions also cover
+  startup name reuse before ownership and failed teardown of a renamed
+  container. The final strict Debug suite passed 877 tests; focused
+  AddressSanitizer passed twelve script/lease tests.
+  This is deterministic local evidence, not a live SSH or paired-campaign
+  result. The next support boundary is recorded below; AIP-00 and AIP-44
+  remain open.
+
+- AIP-00h2d-3 adds bounded execution to the remote fixture lease and a scoped
+  foreground SSH tunnel. Commands claim their lease operation before launch,
+  reject concurrent effects, persist success before advancing, and fail
+  durably without retry on uncertain results. Tunnel startup waits for a fixed
+  SSH forwarding callback; SSH exit aborts the running operation, and every
+  return joins socket close and process-group teardown. A bounded `ssh -G`
+  preflight rejects inherited forwards before connecting; real OpenSSH tests
+  cover local, remote, and dynamic forwarding. Local real-child tests
+  cover structured arguments, durable results, failure, cancellation, and
+  process reaping using an SSH stand-in. The campaign CLI/child stage-protocol
+  wiring, isolated baseline overlay, and real 20-boot/60-action campaign are
+  still pending. This slice makes no live SSH, performance, or AIP-44 claim.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and

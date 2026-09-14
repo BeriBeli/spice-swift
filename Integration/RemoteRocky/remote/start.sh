@@ -5,23 +5,42 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
 acquire_lifecycle_lock
 
-if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
-    echo "Performance endpoint is already running."
-    exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
+if [[ "${live_identity_count}" != 0 ]]; then
+    if [[ -e "${PERF_STATE}/current-run" ]] || ! configured_container_absence_is_confirmed; then
+        echo "Live campaign start requires a fresh endpoint." >&2
+        exit 1
+    fi
+    # The active-record check keeps prior ownership out of this cleanup.
+    discard_inactive_state_locked
+else
+    if [[ "$(podman inspect --format '{{.State.Running}}' "${PERF_CONTAINER}" 2>/dev/null || true)" == true ]]; then
+        echo "Performance endpoint is already running."
+        # status.sh takes its own lock and rechecks the current endpoint.
+        exec 9>&-
+        exec "$(dirname "${BASH_SOURCE[0]}")/status.sh"
+    fi
+    remove_inactive_endpoint_locked
 fi
 
-remove_inactive_endpoint_locked
-
+container_id=""
 startup_complete=false
 cleanup_failed_start() {
     result=$?
     trap - EXIT HUP INT TERM
     if [[ "${startup_complete}" != true ]]; then
-        if stop_endpoint_locked; then
-            echo "Performance endpoint startup failed; active state was removed." >&2
+        local cleanup_target="${PERF_CONTAINER}"
+        if [[ "${live_identity_count}" != 0 ]]; then
+            cleanup_target="${container_id}"
+        fi
+        if [[ -n "${cleanup_target}" ]]; then
+            stop_endpoint_locked "${cleanup_target}" || exit 1
+        elif configured_container_absence_is_confirmed; then
+            discard_inactive_state_locked
         else
+            teardown_failed
             exit 1
         fi
+        echo "Performance endpoint startup failed; active state was removed." >&2
     fi
     exit "${result}"
 }
@@ -120,7 +139,9 @@ interaction_trace_path=${run_dir}/input-events.jsonl
 container=${PERF_CONTAINER}
 image=${PERF_IMAGE}
 EOF
+emit_live_identity >> "${run_dir}/configuration.txt"
 cat "${manifest}" >> "${run_dir}/configuration.txt"
+read_live_identity "${run_dir}" >/dev/null
 cp "${manifest}" "${run_dir}/guest-build-manifest.env"
 
 podman run --rm "${PERF_IMAGE}" qemu-system-x86_64 --version > "${run_dir}/versions.txt"
@@ -128,7 +149,7 @@ podman run --rm "${PERF_IMAGE}" dpkg-query -W libspice-server1 qemu-system-x86 q
     >> "${run_dir}/versions.txt"
 podman version >> "${run_dir}/versions.txt"
 
-container_id="$(podman run --detach \
+if ! container_id="$(podman run --detach \
     --name "${PERF_CONTAINER}" \
     --device /dev/kvm \
     --network host \
@@ -159,7 +180,15 @@ container_id="$(podman run --detach \
         -serial stdio \
         -monitor none \
         -no-reboot \
-        9>&-)"
+        9>&-)"; then
+    container_id=""
+    exit 1
+fi
+if [[ "${live_identity_count}" != 0 && ! "${container_id}" =~ ^[0-9a-f]{64}$ ]]; then
+    container_id=""
+    echo "Cannot establish live container ownership." >&2
+    exit 1
+fi
 printf '%s\n' "${container_id}" > "${run_dir}/container-id.txt"
 
 nohup podman logs --follow "${PERF_CONTAINER}" 9>&- > "${run_dir}/server.log" 2>&1 &
@@ -188,3 +217,4 @@ echo "Performance endpoint ready."
 echo "SPICE: 127.0.0.1:${PERF_SPICE_PORT} on $(hostname)"
 echo "Read the temporary ticket with remote/ticket.sh and keep it out of logs."
 echo "Run evidence: ${run_dir}"
+echo "run_evidence=${run_dir}"
