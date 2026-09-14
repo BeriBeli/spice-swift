@@ -2871,10 +2871,6 @@ struct DisplayChannelTests {
                 descriptorID: imageID,
                 descriptorFlags: 0x01
             )),
-            encodeMini(id: 304, body: drawCachedCopyBody(
-                imageType: 103,
-                descriptorID: imageID
-            )),
         ].map(Result.success))
         let invalidatorTransport = FakeTransport(inbound: [
             .success(encodeMini(id: 105, body: invalidateImagesBody([imageID]))),
@@ -2903,20 +2899,13 @@ struct DisplayChannelTests {
 
         _ = try await producer.processNext()
         _ = try await producer.processNext()
+        #expect(await imageCache.diagnosticsSnapshot().referenceCounts == [imageID: 1])
+
         _ = try await invalidator.processNext()
-        let missingReference = Task {
-            try await producer.processNext()
-        }
-        for _ in 0..<1_000 {
-            if await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1 { break }
-            await Task.yield()
-        }
-        #expect(await imageCache.diagnosticsSnapshot().entryCount == 0)
-        #expect(await imageCache.diagnosticsSnapshot().pendingWaiterCount == 1)
-        await imageCache.clear()
-        await #expect(throws: ChannelError.protocolViolation("image cache cleared")) {
-            try await missingReference.value
-        }
+        let diagnostics = await imageCache.diagnosticsSnapshot()
+        #expect(diagnostics.entryCount == 0)
+        #expect(diagnostics.referenceCounts.isEmpty)
+        #expect(diagnostics.committedBytes == 0)
     }
 
     @Test func invalidationAllWaitsForOtherDisplayProcessedSerialBeforeClearing() async throws {

@@ -47,12 +47,40 @@ package final class SpiceLiveProcessGroup: Sendable {
 
     package static func launch(
         executableURL: URL,
-        arguments: [String]
+        arguments: [String],
+        standardInput: Int32? = nil,
+        standardOutput: Int32? = nil,
+        standardError: Int32? = nil
     ) throws -> SpiceLiveProcessGroup {
         let executablePath = executableURL.path
         let allArguments = [executablePath] + arguments
-        guard !allArguments.contains(where: { $0.utf8.contains(0) }) else {
+        let redirections = [
+            (standardInput, STDIN_FILENO),
+            (standardOutput, STDOUT_FILENO),
+            (standardError, STDERR_FILENO),
+        ]
+        let sources = redirections.compactMap(\.0)
+        guard !allArguments.contains(where: { $0.utf8.contains(0) }),
+              sources.allSatisfy({ $0 > STDERR_FILENO }) else {
             throw ProcessError.invalidArgument
+        }
+
+        // Sources are borrowed until spawn returns. Duplicate every stream
+        // before closing the originals in the child, including shared sources.
+        var actions: posix_spawn_file_actions_t? = nil
+        let actionInitialization = posix_spawn_file_actions_init(&actions)
+        guard actionInitialization == 0 else {
+            throw ProcessError.spawnFailed(actionInitialization)
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        for (source, destination) in redirections {
+            guard let source else { continue }
+            let result = posix_spawn_file_actions_adddup2(&actions, source, destination)
+            guard result == 0 else { throw ProcessError.spawnFailed(result) }
+        }
+        for source in Set(sources) {
+            let result = posix_spawn_file_actions_addclose(&actions, source)
+            guard result == 0 else { throw ProcessError.spawnFailed(result) }
         }
 
         var attributes: posix_spawnattr_t? = nil
@@ -99,7 +127,7 @@ package final class SpiceLiveProcessGroup: Sendable {
             posix_spawn(
                 &processIdentifier,
                 executablePath,
-                nil,
+                &actions,
                 &attributes,
                 arguments.baseAddress,
                 environ
