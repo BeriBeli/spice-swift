@@ -675,9 +675,24 @@ path remains available with all six identity variables unset. Script tests
 exercise the round-trip, input rejection, foreign or corrupt state, legacy
 and replacement endpoint protection, and a
 reproduced guest-manifest field collision that must fail before launch.
-This is local contract validation only. Structured SSH/tunnel execution, the
-baseline overlay, and the real paired campaign remain open; it does not admit
-an AIP-44 pacing experiment.
+The h2d-3 support boundary now executes each lease command through the existing
+bounded process runner. It claims the operation before launching, rejects
+concurrent execution or manual completion, and persists a validated result
+before advancing. Spawn, timeout, cancellation, nonzero exit, or invalid output
+makes the attempt durably terminal without retry. A scoped foreground SSH
+tunnel uses a fixed local readiness callback after forwarding setup, monitors
+SSH exit throughout the operation, and joins socket close and process-group
+teardown before returning. A bounded `ssh -G` preflight rejects inherited
+forwards before connecting, sharing the forwarding startup deadline; real
+OpenSSH configuration tests cover local, remote, and dynamic forwarding.
+It disables SSH multiplexing and backgrounding to
+retain process ownership; finite fixture commands also disable forwarding and
+local commands. Local real-child tests exercise these boundaries with an SSH
+stand-in. No live SSH or Rocky campaign was run for this slice.
+
+The campaign CLI and child stage-protocol wiring, isolated baseline overlay,
+and real paired campaign remain open. These support APIs do not close h2d or
+admit an AIP-44 pacing experiment.
 
 The live Rocky marker also requires the pinned guest Xorg input driver
 `xf86-input-libinput=1.5.0-r0`. A guest image without that driver may accept
