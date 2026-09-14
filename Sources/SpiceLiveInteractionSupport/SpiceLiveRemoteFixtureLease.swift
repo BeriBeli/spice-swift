@@ -215,6 +215,7 @@ package final class SpiceLiveRemoteFixtureLease: Sendable {
                 "-o", "ForkAfterAuthentication=no",
                 "-o", "ClearAllForwardings=yes",
                 "-o", "PermitLocalCommand=no",
+                "-o", "RemoteCommand=none",
                 configuration.sshHost, "/usr/bin/env",
                 "SWIFTSPICE_PERF_BASE=\(configuration.base)",
                 "SWIFTSPICE_PERF_CONTAINER=\(configuration.container)",

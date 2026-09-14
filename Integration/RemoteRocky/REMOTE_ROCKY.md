@@ -97,8 +97,10 @@ or a latency improvement.
 The package support API `SpiceLiveRemoteFixtureLease.executeNext` runs one
 fixed stop/start/status command with bounded output and a default 90-second
 completion bound. It persists the validated result before admitting the next
-command and makes any uncertain result terminal without retry. Concurrent
-execution or manual completion while a command is running is rejected.
+command and makes any uncertain result terminal without retry. It overrides
+`RemoteCommand` so an alias's login command cannot conflict with the fixed
+fixture script. Concurrent execution or manual completion while a command is
+running is rejected.
 
 `SpiceRemoteLiveConfiguration.withSSHTunnel` owns a foreground SSH process group
 for one cancellation-cooperative async operation. It requires the configured

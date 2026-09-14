@@ -94,6 +94,23 @@ struct SpiceLiveRemoteFixtureLeaseTests {
         }
     }
 
+    @Test func fixtureCommandsOverrideHostConfiguredRemoteCommand() async throws {
+        let seed = try Self.seed()
+        defer { Self.remove(seed.output) }
+        let sshConfig = seed.output.deletingLastPathComponent().appending(path: "ssh_config")
+        try Data("Host *\n    RemoteCommand /usr/bin/true\n".utf8).write(to: sshConfig)
+        let lease = try Self.lease(seed)
+        // -G checks the actual command/configuration combination without connecting.
+        let runner = SpiceLiveProcessRunner(
+            executableURL: URL(fileURLWithPath: "/usr/bin/ssh"),
+            argumentPrefix: ["-G", "-F", sshConfig.path]
+        )
+        try await lease.executeNext(within: .seconds(5), runner: runner)
+        try Self.expectDurable(
+            seed, generation: 1, stages: [.fixtureStop], evidenceRunID: nil
+        )
+    }
+
     @Test(arguments: ["spawn", "nonzero", "timeout"])
     func executionFailureIsDurableAndCannotBeRetried(_ failure: String) async throws {
         let seed = try Self.seed()
@@ -491,6 +508,7 @@ private extension SpiceLiveRemoteFixtureLeaseTests {
             "-o", "ForkAfterAuthentication=no",
             "-o", "ClearAllForwardings=yes",
             "-o", "PermitLocalCommand=no",
+            "-o", "RemoteCommand=none",
             seed.configuration.sshHost, "/usr/bin/env",
             "SWIFTSPICE_PERF_BASE=\(seed.configuration.base)",
             "SWIFTSPICE_PERF_CONTAINER=\(seed.configuration.container)",
