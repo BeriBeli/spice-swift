@@ -12,6 +12,5 @@ swift test --disable-sandbox \
     --scratch-path "$SCRATCH_PATH" \
     --no-parallel \
     --sanitize address \
-    -Xswiftc -warnings-as-errors \
-    -q
+    -Xswiftc -warnings-as-errors
 printf '[address-sanitizer] passed\n'
