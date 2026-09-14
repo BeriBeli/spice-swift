@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-14
+
+### Fixed
+
+- Derive held Shift, Control, Option, and Command keys from AppKit modifier
+  flags instead of treating every flags-changed event as a physical key.
+  Synthetic events with virtual key code zero no longer insert an extra `a`;
+  automated shortcuts and Backspace now preserve their intended key sequence.
+- Preserve independent left/right modifiers when device flags are available,
+  avoid duplicate transitions for repeated state reports, and release held
+  modifiers on focus loss. Key-up events do not restore stale modifier flags.
+
+### Release scope
+
+- Includes the current `main` changes since 0.3.4, including interaction
+  measurement tooling for durable campaign artifacts, stage acknowledgements,
+  and bounded socket/process ownership, together with the keyboard fix and
+  regression tests.
+- The existing real-device audio, live WebDAV, and paired interaction-latency
+  validation limits documented for 0.3.4 continue to apply.
+
 ## [0.3.4] — 2026-08-30
 
 ### Added
@@ -387,7 +408,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/BeriBeli/spice-swift/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/BeriBeli/spice-swift/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/BeriBeli/spice-swift/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/BeriBeli/spice-swift/compare/v0.3.1...v0.3.2

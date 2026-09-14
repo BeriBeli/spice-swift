@@ -1325,15 +1325,55 @@ package final class SpiceFramebufferView: NSView {
     }
 
     package override func flagsChanged(with event: NSEvent) {
-        guard let scanCode = MacXTScanCode.map[event.keyCode] else {
-            super.flagsChanged(with: event)
-            return
+        // Synthetic modifier events may use keyCode 0. It is not an A key
+        // event: derive the held modifiers from the event flags instead.
+        // These device masks are NX_DEVICE*KEYMASK from IOLLEvent.h.
+        let groups: [(flag: NSEvent.ModifierFlags, left: UInt32, right: UInt32,
+                      leftMask: UInt, rightMask: UInt)] = [
+            (.shift,   0x2a,  0x36, 0x0002, 0x0004),
+            (.control, 0x1d, 0x11d, 0x0001, 0x2000),
+            (.option,  0x38, 0x138, 0x0020, 0x0040),
+            (.command, 0x15b, 0x15c, 0x0008, 0x0010),
+        ]
+        let flags = event.modifierFlags
+        var desired: Set<UInt32> = []
+        let managed = Set(groups.flatMap { [$0.left, $0.right] })
+
+        for group in groups where flags.contains(group.flag) {
+            let hasLeft = flags.rawValue & group.leftMask != 0
+            let hasRight = flags.rawValue & group.rightMask != 0
+            if hasLeft || hasRight {
+                // Preserve both sides for real keyboard events.
+                if hasLeft { desired.insert(group.left) }
+                if hasRight { desired.insert(group.right) }
+            } else {
+                // Automation may provide only aggregate flags. Preserve an
+                // already-held side; otherwise use the left modifier.
+                let held = pressedScanCodes.intersection([group.left, group.right])
+                desired.formUnion(held.isEmpty ? [group.left] : held)
+            }
         }
-        if pressedScanCodes.insert(scanCode).inserted {
-            onInput(.keyDown(scanCode: scanCode))
-        } else {
+
+        let held = pressedScanCodes.intersection(managed)
+        for scanCode in held.subtracting(desired).sorted() {
             pressedScanCodes.remove(scanCode)
             onInput(.keyUp(scanCode: scanCode))
+        }
+        for scanCode in desired.subtracting(held).sorted() {
+            pressedScanCodes.insert(scanCode)
+            onInput(.keyDown(scanCode: scanCode))
+        }
+
+        // Keep the existing Caps Lock handling separate from held modifiers.
+        // No ordinary key is eligible for this flagsChanged path.
+        if event.keyCode == 57 {
+            let scanCode: UInt32 = 0x3a
+            if pressedScanCodes.insert(scanCode).inserted {
+                onInput(.keyDown(scanCode: scanCode))
+            } else {
+                pressedScanCodes.remove(scanCode)
+                onInput(.keyUp(scanCode: scanCode))
+            }
         }
     }
 
