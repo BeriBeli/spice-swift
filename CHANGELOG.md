@@ -21,8 +21,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ### Release scope
 
-- Based on the exact `v0.3.4` source with the keyboard fix and regression tests.
-  Subsequent unreleased measurement-tool changes from `main` are not included.
+- Includes the current `main` changes since 0.3.4, including interaction
+  measurement tooling for durable campaign artifacts, stage acknowledgements,
+  and bounded socket/process ownership, together with the keyboard fix and
+  regression tests.
 - The existing real-device audio, live WebDAV, and paired interaction-latency
   validation limits documented for 0.3.4 continue to apply.
 
