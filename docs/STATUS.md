@@ -87,6 +87,156 @@ Agent behavior, including system-trusted TLS.
   still time out fail-closed. A new campaign identity will not start until that
   deterministic gate and exact-head review pass.
 
+- AIP-00g is now merged on PRs #59-#60 as main commit `21ed862`. The pure
+  package gate fixes ten adjacent paired clusters, 20 fresh-boot runs with a
+  five/five counterbalanced version order, 13 successful stages per run and a
+  260-entry ledger, exactly 60 canonical valid records, 20 finite CPU/RSS
+  samples, and 20 unique typed RemoteRocky evidence IDs. Any failed,
+  incomplete, missing, duplicate, reordered, noncanonical, mismatched, or extra
+  input is terminal; there is no automatic retry or evidence replacement.
+  Focused Debug, Release, and AddressSanitizer gates passed 8/8, and Apple
+  Silicon CI run `33306335910` passed build, full tests, AddressSanitizer, and
+  coverage with no exact-head review findings. This is structural validation,
+  not live evidence. AIP-00h must still persist real-time stages and an atomic
+  artifact manifest, sequence the immutable plan, and own RemoteRocky/process
+  effects before a new 20-run campaign starts. AIP-00 and AIP-44 remain open;
+  no latency improvement is claimed.
+
+- AIP-00h1 is now merged on PRs #62-#63 as main commit `c508718`. The
+  real-time recorder owns one exclusive recording manifest, validates each
+  candidate through the existing campaign state machine, synchronously writes
+  exactly one canonical generation, and only then swaps its in-memory state.
+  Persistence uncertainty poisons the recorder; reopen converts a durable
+  recording prefix to a terminal interruption, while failed, interrupted, and
+  finalized manifests are re-synced before recovery returns. The writer uses a
+  private mode-0600 regular file, bounded canonical JSON, in-process and
+  cross-process locking, generation CAS, component-wise `openat`/
+  `O_NOFOLLOW`, and temp-fsync/rename/directory-fsync publication. Two review
+  P2s were fixed test-first: uncertain terminal recovery now closes the
+  directory-sync window, and full plan replay rejects a foreign campaign
+  ledger entry before replacement. Focused strict Debug, Release, and
+  AddressSanitizer passed 10/10; final CI run `33314950299` passed build,
+  public API, full tests, AddressSanitizer, and coverage, and exact-head review
+  found no issues. This is local persistence closure, not live evidence.
+  AIP-00h2 must next bind Release binaries, runner, remote image/guest build,
+  fixture/control sources, pointer mode, and stage protocol in a typed
+  execution contract; then add the ACK-gated runner, atomic artifact index,
+  structured RemoteRocky adapter, baseline overlay, and real paired campaign.
+  AIP-00 and AIP-44 remain open, with no latency improvement claimed.
+
+- AIP-00h2a is now merged on PRs #65-#66 as main commit `381e31e`. Manifest
+  schema 2 requires an immutable 15-field execution contract covering both
+  Release binaries and source commits, the runner, remote image and guest
+  build, fixture and control inputs, pointer mode, and typed stage protocol.
+  Missing, null, duplicate, aliased, conflicting, or noncanonical identities
+  fail closed. Historical schema-1 classification is read-only and preserves
+  bytes, inode, mode, size, mtime, and directory entries, including the prior
+  writer's literal-slash encoding. The slash compatibility defect found in
+  review was fixed test-first. Strict local Debug and Release passed 17/17,
+  the AddressSanitizer contract suite passed 7/7, and the Release live product
+  built. Combined Apple Silicon CI run `33321040969` passed build, public API,
+  full tests, AddressSanitizer, and coverage in 16m21s; exact combined-head
+  review found no issue, all three historical threads are resolved, and none
+  remain unresolved. This is local identity/admission closure only. AIP-00h2b
+  must next add bounded canonical stage events and persist-before-ACK gating;
+  duplex processes, RemoteRocky, resource samples, atomic artifacts, baseline
+  overlay, and the real paired campaign remain h2c/h2d. AIP-00 and AIP-44
+  remain open, with no Rocky, external-SPICE, latency, CPU/RSS, or release
+  improvement claimed.
+
+- AIP-00h2b1 is now merged on PRs #68-#69 as main commit `1d3674f`. The local
+  stage protocol admits only canonical single-line v1 frames of at most 4 KiB
+  and binds the full campaign/run/evidence/action/stage/sequence/manifest-
+  generation identity. The durable gate enforces the exact nine child stages,
+  creates a pending ACK only after synchronous manifest persistence, and
+  advances only after exact ACK delivery. Invalid identity or order, replay,
+  stale generation, persistence uncertainty, ACK failure, EOF, and cancellation
+  are terminal with zero retry and at most one durable terminal successor. The
+  10-test suite includes 79 malformed event/ACK frames. Four review findings
+  strengthened all 15 ACK fields, meaningful oversized JSON, repeated no-retry
+  persistence proof, and EOF/cancel without a pending ACK; each was fixed
+  test-first, replied to, and resolved. Local Debug, Release, and focused ASan
+  passed 10/10, with h1/h2a regression for an independently verified 47/47.
+  Combined Apple Silicon CI run `33326178174` passed build, public API, full
+  tests, AddressSanitizer, and coverage in 17m49s; exact combined-head review
+  found no issue and unresolved threads are zero. This is local codec/gate
+  closure only. AIP-00h2b2 must next add a Sendable transport abstraction and
+  single-reader driver; actual duplex FDs/processes, fixture teardown, `wait4`,
+  artifacts, SSH/RemoteRocky, baseline overlay, and paired execution remain
+  h2c/h2d. No live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
+  claimed.
+
+- AIP-00h2b2 is now merged on PRs #71-#72 as main commit `3e69c03`. A
+  Sendable closure-backed transport and single-reader actor driver now carry
+  each canonical event through synchronous durable gate acceptance, exact ACK
+  transmission, and delivery confirmation. Run-task cancellation terminates
+  receive or send operations that only unblock on close; cancellation wins
+  over a simultaneous nil receive, and transport errors cannot impersonate the
+  driver's internal control-flow errors. The focused gate passed 16 tests / 28
+  executions in strict Debug, strict Release, and AddressSanitizer.
+  Cancellation-to-nil passed 20/20 repetitions and all nine driver-error
+  impersonation cases failed closed. Three Sources review findings were fixed
+  test-first, replied to, and resolved. Combined Apple Silicon CI run
+  `33337686652`, job `99327451720`, passed build, public API, full tests,
+  AddressSanitizer, and coverage in 17m9s; exact combined-head review of
+  `3ab4a2e` found no issue and unresolved threads are zero. This is local
+  transport/driver closure only. No actual FD/process/SSH/RemoteRocky,
+  artifact, live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
+  claimed by this slice.
+
+- AIP-00h2c-1 is now merged on PRs #74 and #77 as main commit `5a91fac`.
+  The Darwin socket transport owns one descriptor, configures
+  `SO_NOSIGPIPE`, preserves bounded canonical LF framing with EINTR retry and
+  write-all offsets, and admits one receive plus one send. Explicit async close
+  uses shutdown to unblock admitted workers and defers raw close until they
+  drain; deinitialization may directly raw-close only when no worker is active.
+  Both paths claim raw close exactly once. Repeated close and later reuse of
+  the same descriptor number cannot affect a new owner. The final AGENTS.md
+  simplification removed speculative
+  scripted-operation watchdogs and a production test observer while retaining
+  real FD and blocked-worker failure cleanup. Focused strict Debug, Release,
+  AddressSanitizer, and ThreadSanitizer each passed 11 tests / 30 executions;
+  ThreadSanitizer passed 20 repetitions; related h1/h2a/h2b1/h2b2 regression
+  passed 43 tests in Debug and Release; and the Release interaction product
+  built. Combined Apple Silicon CI run `33351342144`, job `99365206363`,
+  passed every gate in 13m51s, and exact combined-head review found no issue.
+  AIP-00h2c-2 and h2c-3 are now closed below; h2d is the next boundary for
+  baseline-overlay plus real paired Rocky execution. This slice starts no
+  child process and provides no `wait4`, artifact, SSH/RemoteRocky, live SPICE,
+  latency, CPU/RSS, release, or AIP-44 improvement evidence.
+
+- AIP-00h2c-2 is now merged on PRs #79 and #80 as main commit `f6dedd2`.
+  `SpiceLiveProcessGroup` atomically creates an independent child process
+  group with an empty signal mask, converges concurrent `finish()` and
+  `cancel()` calls on one lifecycle, validates ownership before group signals,
+  performs bounded TERM-to-KILL cleanup including leader-first exit, and
+  publishes one cached terminal result from one EINTR-safe `wait4` plus copied
+  Sendable resource scalars. Six real-process tests preserve bounded cleanup
+  through assertion and external-reap failure paths. Exact combined-head CI
+  run `33367824639`, job `99412152419`, passed every gate in 14m00s; exact
+  review of `a588b85` was clean. Three C findings removed ten net lines of
+  duplicate state. An unbounded post-reap cleanup owner remained D because no
+  reproducible signalable leak was provided and repeated group signaling after
+  leader reap creates PGID-reuse risk. AIP-00h2c-3 is now closed below; h2d is
+  the next boundary. This slice contains no artifact, SSH/RemoteRocky, live
+  SPICE, latency, CPU/RSS acceptance, release, or AIP-44 improvement claim.
+
+- AIP-00h2c-3 is now merged on PRs #82 and #83 as main commit `a56c890`.
+  One exclusive private directory owner binds the fixed canonical run records
+  and envelopes, resource samples, successful teardown results, finalized
+  manifest, aggregate report, and success index. Manifest and artifact I/O
+  retain the same directory inode; success revalidates every fixed run object
+  and publishes the index last. Post-record evidence mutation and original-path
+  replacement fail terminally without scanning, recovery, retry, or synthesized
+  success. Focused strict Debug, Release, and AddressSanitizer each passed 9
+  tests / 15 executions. Combined Apple Silicon CI run `33377358455`, job
+  `99441731841`, passed every gate in 18m54s; exact review of `ba854ca` was
+  clean, and both review-found Sources threads were resolved. The complete h2c
+  local execution boundary is closed. AIP-00h2d must next add structured SSH,
+  tunnel, fixture, baseline-overlay, and real paired Rocky execution. This
+  slice provides no live SPICE, latency, CPU/RSS acceptance, release, or
+  AIP-44 improvement claim.
+
 - AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
   ring and publishes staged packet metadata or an O(1) overflow bank swap under
   the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
