@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix synthetic periods translated as keypad Delete
+
 ## [0.4.1] — 2026-09-16
 
 ### Fixed
