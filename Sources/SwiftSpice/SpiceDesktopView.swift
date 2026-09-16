@@ -1311,6 +1311,7 @@ package final class SpiceFramebufferView: NSView {
             super.keyDown(with: event)
             return
         }
+        synchronizeModifiers(event.modifierFlags)
         pressedScanCodes.insert(scanCode)
         onInput(.keyDown(scanCode: scanCode))
     }
@@ -1325,6 +1326,21 @@ package final class SpiceFramebufferView: NSView {
     }
 
     package override func flagsChanged(with event: NSEvent) {
+        synchronizeModifiers(event.modifierFlags)
+        // Keep the existing Caps Lock handling separate from held modifiers.
+        // No ordinary key is eligible for this flagsChanged path.
+        if event.keyCode == 57 {
+            let scanCode: UInt32 = 0x3a
+            if pressedScanCodes.insert(scanCode).inserted {
+                onInput(.keyDown(scanCode: scanCode))
+            } else {
+                pressedScanCodes.remove(scanCode)
+                onInput(.keyUp(scanCode: scanCode))
+            }
+        }
+    }
+
+    private func synchronizeModifiers(_ flags: NSEvent.ModifierFlags) {
         // Synthetic modifier events may use keyCode 0. It is not an A key
         // event: derive the held modifiers from the event flags instead.
         // These device masks are NX_DEVICE*KEYMASK from IOLLEvent.h.
@@ -1335,7 +1351,6 @@ package final class SpiceFramebufferView: NSView {
             (.option,  0x38, 0x138, 0x0020, 0x0040),
             (.command, 0x15b, 0x15c, 0x0008, 0x0010),
         ]
-        let flags = event.modifierFlags
         var desired: Set<UInt32> = []
         let managed = Set(groups.flatMap { [$0.left, $0.right] })
 
@@ -1362,18 +1377,6 @@ package final class SpiceFramebufferView: NSView {
         for scanCode in desired.subtracting(held).sorted() {
             pressedScanCodes.insert(scanCode)
             onInput(.keyDown(scanCode: scanCode))
-        }
-
-        // Keep the existing Caps Lock handling separate from held modifiers.
-        // No ordinary key is eligible for this flagsChanged path.
-        if event.keyCode == 57 {
-            let scanCode: UInt32 = 0x3a
-            if pressedScanCodes.insert(scanCode).inserted {
-                onInput(.keyDown(scanCode: scanCode))
-            } else {
-                pressedScanCodes.remove(scanCode)
-                onInput(.keyUp(scanCode: scanCode))
-            }
         }
     }
 

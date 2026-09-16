@@ -66,6 +66,42 @@ struct SpiceKeyboardInputTests {
         ])
     }
 
+    @Test func keyDownRecoversModifiersWithoutAFlagsChangedNotification() throws {
+        let (view, recorder) = fixture()
+        defer { view.prepareForDismantle() }
+        // Focus can enter the view with Shift already held. Conversely, a
+        // modifier release can happen while another window owns focus.
+        view.keyDown(with: try event(.keyDown, keyCode: 27, flags: .shift))
+        view.keyUp(with: try event(.keyUp, keyCode: 27, flags: .shift))
+        view.keyDown(with: try event(.keyDown, keyCode: 24))
+        view.keyUp(with: try event(.keyUp, keyCode: 24))
+        #expect(recorder.inputs == [
+            .keyDown(scanCode: 0x2a), .keyDown(scanCode: 0x0c), .keyUp(scanCode: 0x0c),
+            .keyUp(scanCode: 0x2a), .keyDown(scanCode: 0x0d), .keyUp(scanCode: 0x0d),
+        ])
+    }
+
+    @Test func syntheticPunctuationPreservesShiftAndEveryKeyEdge() throws {
+        let (view, recorder) = fixture()
+        defer { view.prepareForDismantle() }
+        // Captured Computer Use sequence for '.', '_', '|'. Key-up flags
+        // remain stale after the preceding flagsChanged releases Shift.
+        for (keyCode, flags) in [(UInt16(47), NSEvent.ModifierFlags()),
+                                 (27, .shift), (42, .shift)] {
+            view.flagsChanged(with: try event(.flagsChanged, flags: flags))
+            view.keyDown(with: try event(.keyDown, keyCode: keyCode, flags: flags))
+            view.flagsChanged(with: try event(.flagsChanged))
+            view.keyUp(with: try event(.keyUp, keyCode: keyCode, flags: flags))
+        }
+        #expect(recorder.inputs == [
+            .keyDown(scanCode: 0x34), .keyUp(scanCode: 0x34),
+            .keyDown(scanCode: 0x2a), .keyDown(scanCode: 0x0c),
+            .keyUp(scanCode: 0x2a), .keyUp(scanCode: 0x0c),
+            .keyDown(scanCode: 0x2a), .keyDown(scanCode: 0x2b),
+            .keyUp(scanCode: 0x2a), .keyUp(scanCode: 0x2b),
+        ])
+    }
+
     @Test func repeatedModifierFlagsDoNotToggleKeys() throws {
         let (view, recorder) = fixture()
         view.flagsChanged(with: try event(.flagsChanged, flags: .shift))

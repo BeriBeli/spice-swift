@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover held Shift, Control, Option, and Command state from key-down flags
+  when a modifier-change notification is missing, including when focus enters
+  with a modifier already held. Preserve independent left/right modifiers and
+  avoid restoring stale modifier flags from synthetic key-up events.
+- Cover synthetic punctuation input (`.`, `_`, `|`) and missing modifier
+  notifications with keyboard regressions. A live Maspice terminal test verified
+  20 lines of 85 characters each, including repeated `. _ | = +` sequences.
+
 ## [0.4.0] — 2026-09-14
 
 ### Fixed
