@@ -21,12 +21,13 @@ struct SpiceKeyboardInputTests {
     private func event(
         _ type: NSEvent.EventType,
         keyCode: UInt16 = 0,
-        flags: NSEvent.ModifierFlags = []
+        flags: NSEvent.ModifierFlags = [],
+        characters: String = ""
     ) throws -> NSEvent {
         try #require(NSEvent.keyEvent(
             with: type, location: .zero, modifierFlags: flags,
             timestamp: 0, windowNumber: 0, context: nil,
-            characters: "", charactersIgnoringModifiers: "",
+            characters: characters, charactersIgnoringModifiers: characters,
             isARepeat: false, keyCode: keyCode
         ))
     }
@@ -99,6 +100,29 @@ struct SpiceKeyboardInputTests {
             .keyUp(scanCode: 0x2a), .keyUp(scanCode: 0x0c),
             .keyDown(scanCode: 0x2a), .keyDown(scanCode: 0x2b),
             .keyUp(scanCode: 0x2a), .keyUp(scanCode: 0x2b),
+        ])
+    }
+
+    @Test(arguments: [UInt16(47), 65])
+    func syntheticPeriodDoesNotDependOnGuestNumLock(keyCode: UInt16) throws {
+        let (view, recorder) = fixture()
+        defer { view.prepareForDismantle() }
+        // Computer Use can choose either virtual key for the same Unicode
+        // period. Its keypad alias has no numericPad flag.
+        view.keyDown(with: try event(.keyDown, keyCode: keyCode, characters: "."))
+        view.keyUp(with: try event(.keyUp, keyCode: keyCode, characters: "."))
+        #expect(recorder.inputs == [
+            .keyDown(scanCode: 0x34), .keyUp(scanCode: 0x34),
+        ])
+    }
+
+    @Test func physicalKeypadDecimalPreservesItsScanCode() throws {
+        let (view, recorder) = fixture()
+        defer { view.prepareForDismantle() }
+        view.keyDown(with: try event(.keyDown, keyCode: 65, flags: .numericPad, characters: "."))
+        view.keyUp(with: try event(.keyUp, keyCode: 65, flags: .numericPad, characters: "."))
+        #expect(recorder.inputs == [
+            .keyDown(scanCode: 0x53), .keyUp(scanCode: 0x53),
         ])
     }
 
