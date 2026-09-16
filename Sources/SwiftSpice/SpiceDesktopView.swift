@@ -1307,7 +1307,7 @@ package final class SpiceFramebufferView: NSView {
     }
 
     package override func keyDown(with event: NSEvent) {
-        guard let scanCode = MacXTScanCode.map[event.keyCode] else {
+        guard let scanCode = MacXTScanCode.scanCode(for: event) else {
             super.keyDown(with: event)
             return
         }
@@ -1317,7 +1317,7 @@ package final class SpiceFramebufferView: NSView {
     }
 
     package override func keyUp(with event: NSEvent) {
-        guard let scanCode = MacXTScanCode.map[event.keyCode] else {
+        guard let scanCode = MacXTScanCode.scanCode(for: event) else {
             super.keyUp(with: event)
             return
         }
@@ -1768,6 +1768,19 @@ private enum SpiceFrameDrawing {
 }
 
 package enum MacXTScanCode {
+    static func scanCode(for event: NSEvent) -> UInt32? {
+        // Text synthesis can emit '.' as keypad decimal without numericPad.
+        // Sending 0x53 would produce KP_Delete when guest Num Lock is off.
+        // Keep physical keypad keys and modified shortcuts on the raw map.
+        if event.keyCode == 65, event.characters == ".",
+           event.modifierFlags.intersection([
+               .numericPad, .shift, .control, .option, .command,
+           ]).isEmpty {
+            return 0x34
+        }
+        return map[event.keyCode]
+    }
+
     // macOS virtual key code to PC XT set-1 scan code. Extended E0 codes use
     // bit 8, matching spice-gtk's public scancode convention.
     static let map: [UInt16: UInt32] = [
