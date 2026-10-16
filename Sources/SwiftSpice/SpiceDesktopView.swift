@@ -849,6 +849,10 @@ package final class SpiceFramebufferView: NSView {
         subscription?.setDemand(demand)
         switch demand {
         case .none:
+            // Resuming demand republishes the authoritative frame, even when
+            // the guest revision has not changed. That new publication needs
+            // its own acknowledgement to release the publisher's backpressure.
+            acknowledgedRevision = nil
             readyLatch.discard()
             presentationPacing.reset()
             pauseDisplayLinkIfIdle()

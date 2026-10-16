@@ -7,6 +7,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Acknowledge a republished frame after desktop visibility resumes, even when
+  its guest revision is unchanged. This releases publication backpressure and
+  prevents remote display updates from stalling after native full-screen or
+  Space transitions, including full screen on an external display.
+
+### Validation
+
+- Added a regression covering repeated hide/show transitions with an unchanged
+  frame revision. The regression fails without the fix; all 897 tests passed
+  with warnings treated as errors.
+- The user confirmed that clicking the remote desktop in external-display
+  full screen refreshed normally in the corrected Maspice test build.
+
 ## [0.4.2] — 2026-09-16
 
 ### Fixed
