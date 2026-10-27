@@ -297,6 +297,10 @@ struct DisplayChannelTests {
         let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 3)
         try await transport.connect()
         let decoder = GatedPatternJPEGDecoder()
+        let clock = RecordingDisplayMultimediaClock(
+            initialTime: 0,
+            forcedLateWaitTargets: [1, 2]
+        )
         let channel = DisplayChannel(
             connection: ChannelConnection(
                 key: ChannelKey(type: 2, id: 0),
@@ -304,6 +308,7 @@ struct DisplayChannelTests {
                 headerMode: .mini
             ),
             jpegDecoder: decoder,
+            multimediaClock: clock,
             framePublicationInterval: .zero
         )
         let events = AsyncStream.makeStream(
@@ -523,6 +528,10 @@ struct DisplayChannelTests {
         let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 4)
         try await transport.connect()
         let decoder = GatedPatternJPEGDecoder()
+        let clock = RecordingDisplayMultimediaClock(
+            initialTime: 0,
+            forcedLateWaitTargets: [2]
+        )
         let channel = DisplayChannel(
             connection: ChannelConnection(
                 key: ChannelKey(type: 2, id: 0),
@@ -530,6 +539,7 @@ struct DisplayChannelTests {
                 headerMode: .mini
             ),
             jpegDecoder: decoder,
+            multimediaClock: clock,
             framePublicationInterval: .zero
         )
         let events = AsyncStream.makeStream(
@@ -1156,12 +1166,13 @@ struct DisplayChannelTests {
         #expect(try await channel.snapshot(surfaceID: 1) == beforeLateFrame)
     }
 
-    @Test func dropsMJPEGThatBecomesLateDuringDecodeWithoutSurfaceMutation() async throws {
+    @Test(arguments: [false, true])
+    func presentsMJPEGThatBecomesLateDuringDecodeOrWait(advanceDuringDecode: Bool) async throws {
         let clock = RecordingDisplayMultimediaClock(
             initialTime: 100,
-            forcedLateWaitTargets: [110]
+            forcedLateWaitTargets: advanceDuringDecode ? [] : [110]
         )
-        let decoder = CountingPatternJPEGDecoder()
+        let decoder = GatedPatternJPEGDecoder()
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
                 surfaceID: 1,
@@ -1199,10 +1210,20 @@ struct DisplayChannelTests {
 
         #expect(try await channel.processNext() == .surfaceCreated(1))
         #expect(try await channel.processNext() == .ignored(122))
-        let before = try await channel.snapshot(surfaceID: 1)
-        #expect(try await channel.processNext() == .ignored(123))
-        #expect(await decoder.decodeCount == 1)
-        #expect(try await channel.snapshot(surfaceID: 1) == before)
+        let render = Task { try await channel.processNext() }
+        await decoder.waitUntilFirstDecodeStarts()
+        if advanceDuringDecode {
+            await clock.reset(to: 111)
+        }
+        await decoder.releaseFirstDecode()
+
+        #expect(try await render.value == frameChanged(surfaceID: 1, revision: 1))
+        #expect(await decoder.payloads == [Data([1])])
+        #expect(await clock.waitedTargets == [110])
+        let frame = try await channel.snapshot(surfaceID: 1)
+        #expect(frame.revision == 1)
+        #expect(pixel(frame, x: 0, y: 0) == [10, 0, 0, 255])
+        await channel.close()
     }
 
     @Test func failedMJPEGFrameIsTransactionalAndTerminatesTheChannel() async throws {
@@ -3179,7 +3200,7 @@ struct DisplayChannelTests {
         }
     }
 
-    @Test func decodesAndCommitsRealQUICWithBottomUpRows() async throws {
+    @Test func decodesAndCommitsRealQUICWithCanvasRowOrder() async throws {
         let compressed = try #require(Data(base64Encoded:
             "UVVJQwAAAAADAAAABwAAAAUAAAAAgICAAAARAAAAQADrWlqj21pvW9bb1noBut62UlVc1+PJalyyGk9WD5DVeNOvJavjKWqcshpPVsaT1XhZfYCsGuf9OpPVeIo1nqzGIKvxZL9OVh+eosZ5q/FkNTxZjSdW48lqAAAAQAAAAAA="
         ))
@@ -3221,11 +3242,10 @@ struct DisplayChannelTests {
         _ = try await channel.processNext()
         _ = try await channel.processNext()
 
-        var expected = Data(capacity: reference.count)
-        let rowBytes = 7 * 4
-        for row in (0..<5).reversed() {
-            expected.append(reference[(row * rowBytes)..<((row + 1) * rowBytes)])
-        }
+        // spice-gtk decodes into the logical first row of a negative-stride
+        // Pixman image. Our positive-stride buffer has that same logical row
+        // order; reversing it would vertically flip each individual tile.
+        var expected = reference
         for alphaOffset in stride(from: 3, to: expected.count, by: 4) {
             expected[alphaOffset] = 0xff
         }

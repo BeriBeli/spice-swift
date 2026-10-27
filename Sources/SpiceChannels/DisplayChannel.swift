@@ -992,7 +992,15 @@ package actor DisplayChannel: SpiceManagedChannel {
             } catch {
                 throw .protocolViolation("multimedia clock wait failed: \(error)")
             }
-            guard timing == .due else {
+            switch timing {
+            case .due:
+                break
+            case .late where stream.codec == .mjpeg:
+                // Like spice-gtk's built-in MJPEG callback, finish an admitted
+                // frame even if decode or timer wakeup crossed its timestamp.
+                // Stream order and Surface mutation barriers still apply below.
+                break
+            case .early, .late:
                 return nil
             }
         }

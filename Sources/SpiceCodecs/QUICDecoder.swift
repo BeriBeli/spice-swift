@@ -90,7 +90,10 @@ package struct SpiceQUICDecoder: SpiceImageDecoder {
             width: width,
             height: height,
             bytesPerRow: width * 4,
-            topDown: false,
+            // The shim writes with a positive stride. spice-gtk instead writes
+            // from Pixman's logical first row with its negative stride; both
+            // place the first decoded row at the logical top of the image.
+            topDown: true,
             alphaMode: decoded.sourceType == 5 ? .straight : .opaque,
             pixelsBGRA: decoded.pixelsBGRA
         )

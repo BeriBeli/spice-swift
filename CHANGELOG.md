@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve QUIC's logical row order when drawing its positive-stride decoded
+  buffer. Treating that buffer as bottom-up vertically flipped individual
+  image tiles, producing displaced strips in mixed QUIC/GLZ display updates.
+  Installed-app visual validation remains pending.
+- Publish valid MJPEG frames that become late during decoding or timer wakeup,
+  rather than requiring an exact millisecond match after decoding. Keep future
+  frame pacing, pre-decode late drops, stream order, and Surface mutation barriers.
+  Live VDI latency improvement remains unverified.
+
 ## [0.4.3] — 2026-10-16
 
 ### Fixed

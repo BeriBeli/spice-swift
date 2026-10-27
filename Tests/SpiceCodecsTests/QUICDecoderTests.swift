@@ -17,7 +17,7 @@ struct QUICDecoderTests {
             )
             #expect(decoded.width == fixture.width)
             #expect(decoded.height == fixture.height)
-            #expect(!decoded.topDown)
+            #expect(decoded.topDown)
             #expect(decoded.alphaMode == (fixture.format == "rgba" ? .straight : .opaque))
             #expect(decoded.pixelsBGRA == expected, Comment(rawValue: fixture.generator))
         }
