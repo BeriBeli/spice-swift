@@ -1,7 +1,9 @@
 .build/
 .swiftpm/
 DerivedData/
-Integration/AppleContainer/Artifacts/
 *.xcodeproj/
 xcuserdata/
 .DS_Store
+.benchmarkBaselines/
+# Only the opt-in benchmark configuration resolves external packages.
+/Package.resolved

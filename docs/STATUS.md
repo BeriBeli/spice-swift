@@ -1,1449 +1,220 @@
-# Current milestone and validation evidence
-
-This document is the detailed engineering ledger for the current implementation.
-For setup and first use, start with the [project README](../README.md). See
-[ARCHITECTURE.md](ARCHITECTURE.md) for stable design rules and
-[ROADMAP.md](ROADMAP.md) for pending acceptance gates. Active protocol,
-rendering, and ownership corrections are tracked in the
-[algorithm improvement plan](ALGORITHM_IMPROVEMENT_PLAN.md).
-
-Local tests, independent fixtures, and external interoperability are reported
-separately. A locally implemented feature remains pending until its required
-external gate is complete. The repository-backed Apple/container QEMU gate now
-covers a booted arm64 guest plus live Main, Display, Cursor, Inputs, and selected
-Agent behavior, including system-trusted TLS.
-
-## Navigation
-
-- [Stage B: connection and live QEMU closure](#stage-b-local-closure)
-- [Stage C: basic desktop](#stage-c-delivered-so-far)
-- [Stage D: compressed display](#stage-d-delivered-so-far)
-- [Stage E: audio and Agent integration](#stage-e-local-closure)
-- [Stage F: video, migration, and peripheral channels](#stage-f-advanced-video-groundwork)
-- [Acceptance commands](#acceptance-commands)
-
-## Algorithm plan execution
-
-- AIP-00c resumed after the Mac session was unlocked. The dedicated
-  `spice-live-interaction` AppKit executable now has live schema-2 evidence that
-  binds one direct-session click and unique guest marker through the exact
-  SwiftSpice frame identity, selected-ready, selection, Metal commit, and
-  actual AppKit presented callback. The pre-atomic Rocky run at
-  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260829T141056Z.dWq0dC`
-  produced ten valid records; its ready-to-selection p50/p95 was
-  0.039/8.044 ms. The guest marker now builds its complete binary grid in one
-  native `XImage` and publishes one `XPutImage`, removing the per-cell
-  foreground/fill request pairs. The adjacent atomic-marker run at
-  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260830T011820Z.L5b0o6`
-  produced seven valid records with ready-to-selection p50/p95/max
-  0.041/0.043/0.043 ms, while input-to-presented p50/p95 remained
-  125.466/213.059 ms. This means the older one-tick tail is not sufficient
-  evidence for an AIP-44 pacing change. `presentedTime == 0` is rejected as a
-  dropped drawable; one bounded authoritative latest-only retry is allowed
-  without idle commits or exceeding two GPU commands in flight. Eight further
-  cold starts still reached two commits with no presented callback and failed
-  before arm. AIP-00d now serializes a fixed click/key/motion cluster in one
-  visible Session and admits the next action only after exact presentation and
-  remote append. Rocky run
-  `/home/beribeli/swiftspice-aip00b/perf-ab/logs/20260830T021418Z.037hAL`
-  retained successful cluster `0000000000000008`: all three schema-2 records
-  are valid, with directional input-to-presented times 197.254/107.894/216.268
-  ms and ready-to-selection times 0.010/8.195/0.012 ms for click/key/motion.
-  Markerless drawable retries no longer contaminate a later exact marker;
-  relative motion alone requires the SPICE motion ACK, while absolute tablet
-  motion is closed by guest marker and exact-presented evidence. AIP-00 is
-  still in progress: direct Session inputs bypass AppKit receipt, and ten
-  paired click/key/motion clusters for `v0.2.7` and current `v0.3.x` remain
-  required. AIP-00e now rejects the paired artifact unless it contains exactly
-  ten canonical clusters, two exact versions, 20 unique runs arranged as
-  adjacent same-cluster pairs with exactly five baseline-first and five
-  candidate-first pairs, and 60 valid plan-derived click/key/motion records. It
-  reports Hyndman-Fan type-7 p50/p95 plus same-cluster signed deltas; complete
-  CPU/RSS samples are
-  independent guardrails and never filter latency records. The strict focused
-  gate passed 11 tests / 29 parameterized cases. An unchanged `v0.2.7`
-  `2c577d7` worktree also completed a Release build under the current Swift 6.3
-  toolchain. Its exact-correlation measurement overlay and the live paired
-  collection are the next AIP-00 gates; no AIP-44 pacing change is admitted.
-  That isolated overlay is now split across stacked PRs #53-#55: exact
-  presenter-owned correlation, canonical JSONL/campaign planning, and the
-  foreground `v0.2.7` executable. Their combined review-fix gate passed the
-  four focused suites 33/33 in strict Debug, strict Release, and
-  AddressSanitizer, plus the strict Release product build. The stack remains
-  measurement-only and does not import current scheduling or drawable-recovery
-  algorithms into the baseline.
-
-- Two subsequent baseline smoke campaigns produced no admissible interaction
-  observation. Campaign `2aacf4a6e32fb809` stopped before executable launch
-  after the readiness probe rejected an otherwise bindable SSH forward. Fresh
-  campaign `322ad5e20a210030` verified the Rocky container and visible AppKit
-  subscription, then stopped at `initial_presentation` with one Metal commit,
-  zero presented callbacks, no armed input, and an empty remote JSONL file.
-  This is a pre-arm reliability failure, not latency data. AIP-00f therefore
-  adds only a once-bounded authoritative-latest request after visible demand,
-  a real post-baseline commit, and still-zero presentations 250 ms after the
-  harness first observes that commit. Baseline and candidate use the same
-  duration and start event. The request remains outside trace creation and must
-  still time out fail-closed. A new campaign identity will not start until that
-  deterministic gate and exact-head review pass.
-
-- AIP-00g is now merged on PRs #59-#60 as main commit `21ed862`. The pure
-  package gate fixes ten adjacent paired clusters, 20 fresh-boot runs with a
-  five/five counterbalanced version order, 13 successful stages per run and a
-  260-entry ledger, exactly 60 canonical valid records, 20 finite CPU/RSS
-  samples, and 20 unique typed RemoteRocky evidence IDs. Any failed,
-  incomplete, missing, duplicate, reordered, noncanonical, mismatched, or extra
-  input is terminal; there is no automatic retry or evidence replacement.
-  Focused Debug, Release, and AddressSanitizer gates passed 8/8, and Apple
-  Silicon CI run `33306335910` passed build, full tests, AddressSanitizer, and
-  coverage with no exact-head review findings. This is structural validation,
-  not live evidence. AIP-00h must still persist real-time stages and an atomic
-  artifact manifest, sequence the immutable plan, and own RemoteRocky/process
-  effects before a new 20-run campaign starts. AIP-00 and AIP-44 remain open;
-  no latency improvement is claimed.
-
-- AIP-00h1 is now merged on PRs #62-#63 as main commit `c508718`. The
-  real-time recorder owns one exclusive recording manifest, validates each
-  candidate through the existing campaign state machine, synchronously writes
-  exactly one canonical generation, and only then swaps its in-memory state.
-  Persistence uncertainty poisons the recorder; reopen converts a durable
-  recording prefix to a terminal interruption, while failed, interrupted, and
-  finalized manifests are re-synced before recovery returns. The writer uses a
-  private mode-0600 regular file, bounded canonical JSON, in-process and
-  cross-process locking, generation CAS, component-wise `openat`/
-  `O_NOFOLLOW`, and temp-fsync/rename/directory-fsync publication. Two review
-  P2s were fixed test-first: uncertain terminal recovery now closes the
-  directory-sync window, and full plan replay rejects a foreign campaign
-  ledger entry before replacement. Focused strict Debug, Release, and
-  AddressSanitizer passed 10/10; final CI run `33314950299` passed build,
-  public API, full tests, AddressSanitizer, and coverage, and exact-head review
-  found no issues. This is local persistence closure, not live evidence.
-  AIP-00h2 must next bind Release binaries, runner, remote image/guest build,
-  fixture/control sources, pointer mode, and stage protocol in a typed
-  execution contract; then add the ACK-gated runner, atomic artifact index,
-  structured RemoteRocky adapter, baseline overlay, and real paired campaign.
-  AIP-00 and AIP-44 remain open, with no latency improvement claimed.
-
-- AIP-00h2a is now merged on PRs #65-#66 as main commit `381e31e`. Manifest
-  schema 2 requires an immutable 15-field execution contract covering both
-  Release binaries and source commits, the runner, remote image and guest
-  build, fixture and control inputs, pointer mode, and typed stage protocol.
-  Missing, null, duplicate, aliased, conflicting, or noncanonical identities
-  fail closed. Historical schema-1 classification is read-only and preserves
-  bytes, inode, mode, size, mtime, and directory entries, including the prior
-  writer's literal-slash encoding. The slash compatibility defect found in
-  review was fixed test-first. Strict local Debug and Release passed 17/17,
-  the AddressSanitizer contract suite passed 7/7, and the Release live product
-  built. Combined Apple Silicon CI run `33321040969` passed build, public API,
-  full tests, AddressSanitizer, and coverage in 16m21s; exact combined-head
-  review found no issue, all three historical threads are resolved, and none
-  remain unresolved. This is local identity/admission closure only. AIP-00h2b
-  must next add bounded canonical stage events and persist-before-ACK gating;
-  duplex processes, RemoteRocky, resource samples, atomic artifacts, baseline
-  overlay, and the real paired campaign remain h2c/h2d. AIP-00 and AIP-44
-  remain open, with no Rocky, external-SPICE, latency, CPU/RSS, or release
-  improvement claimed.
-
-- AIP-00h2b1 is now merged on PRs #68-#69 as main commit `1d3674f`. The local
-  stage protocol admits only canonical single-line v1 frames of at most 4 KiB
-  and binds the full campaign/run/evidence/action/stage/sequence/manifest-
-  generation identity. The durable gate enforces the exact nine child stages,
-  creates a pending ACK only after synchronous manifest persistence, and
-  advances only after exact ACK delivery. Invalid identity or order, replay,
-  stale generation, persistence uncertainty, ACK failure, EOF, and cancellation
-  are terminal with zero retry and at most one durable terminal successor. The
-  10-test suite includes 79 malformed event/ACK frames. Four review findings
-  strengthened all 15 ACK fields, meaningful oversized JSON, repeated no-retry
-  persistence proof, and EOF/cancel without a pending ACK; each was fixed
-  test-first, replied to, and resolved. Local Debug, Release, and focused ASan
-  passed 10/10, with h1/h2a regression for an independently verified 47/47.
-  Combined Apple Silicon CI run `33326178174` passed build, public API, full
-  tests, AddressSanitizer, and coverage in 17m49s; exact combined-head review
-  found no issue and unresolved threads are zero. This is local codec/gate
-  closure only. AIP-00h2b2 must next add a Sendable transport abstraction and
-  single-reader driver; actual duplex FDs/processes, fixture teardown, `wait4`,
-  artifacts, SSH/RemoteRocky, baseline overlay, and paired execution remain
-  h2c/h2d. No live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
-  claimed.
-
-- AIP-00h2b2 is now merged on PRs #71-#72 as main commit `3e69c03`. A
-  Sendable closure-backed transport and single-reader actor driver now carry
-  each canonical event through synchronous durable gate acceptance, exact ACK
-  transmission, and delivery confirmation. Run-task cancellation terminates
-  receive or send operations that only unblock on close; cancellation wins
-  over a simultaneous nil receive, and transport errors cannot impersonate the
-  driver's internal control-flow errors. The focused gate passed 16 tests / 28
-  executions in strict Debug, strict Release, and AddressSanitizer.
-  Cancellation-to-nil passed 20/20 repetitions and all nine driver-error
-  impersonation cases failed closed. Three Sources review findings were fixed
-  test-first, replied to, and resolved. Combined Apple Silicon CI run
-  `33337686652`, job `99327451720`, passed build, public API, full tests,
-  AddressSanitizer, and coverage in 17m9s; exact combined-head review of
-  `3ab4a2e` found no issue and unresolved threads are zero. This is local
-  transport/driver closure only. No actual FD/process/SSH/RemoteRocky,
-  artifact, live SPICE, latency, CPU/RSS, release, or AIP-44 improvement is
-  claimed by this slice.
-
-- AIP-00h2c-1 is now merged on PRs #74 and #77 as main commit `5a91fac`.
-  The Darwin socket transport owns one descriptor, configures
-  `SO_NOSIGPIPE`, preserves bounded canonical LF framing with EINTR retry and
-  write-all offsets, and admits one receive plus one send. Explicit async close
-  uses shutdown to unblock admitted workers and defers raw close until they
-  drain; deinitialization may directly raw-close only when no worker is active.
-  Both paths claim raw close exactly once. Repeated close and later reuse of
-  the same descriptor number cannot affect a new owner. The final AGENTS.md
-  simplification removed speculative
-  scripted-operation watchdogs and a production test observer while retaining
-  real FD and blocked-worker failure cleanup. Focused strict Debug, Release,
-  AddressSanitizer, and ThreadSanitizer each passed 11 tests / 30 executions;
-  ThreadSanitizer passed 20 repetitions; related h1/h2a/h2b1/h2b2 regression
-  passed 43 tests in Debug and Release; and the Release interaction product
-  built. Combined Apple Silicon CI run `33351342144`, job `99365206363`,
-  passed every gate in 13m51s, and exact combined-head review found no issue.
-  AIP-00h2c-2 and h2c-3 are now closed below; h2d is the next boundary for
-  baseline-overlay plus real paired Rocky execution. This slice starts no
-  child process and provides no `wait4`, artifact, SSH/RemoteRocky, live SPICE,
-  latency, CPU/RSS, release, or AIP-44 improvement evidence.
-
-- AIP-00h2c-2 is now merged on PRs #79 and #80 as main commit `f6dedd2`.
-  `SpiceLiveProcessGroup` atomically creates an independent child process
-  group with an empty signal mask, converges concurrent `finish()` and
-  `cancel()` calls on one lifecycle, validates ownership before group signals,
-  performs bounded TERM-to-KILL cleanup including leader-first exit, and
-  publishes one cached terminal result from one EINTR-safe `wait4` plus copied
-  Sendable resource scalars. Six real-process tests preserve bounded cleanup
-  through assertion and external-reap failure paths. Exact combined-head CI
-  run `33367824639`, job `99412152419`, passed every gate in 14m00s; exact
-  review of `a588b85` was clean. Three C findings removed ten net lines of
-  duplicate state. An unbounded post-reap cleanup owner remained D because no
-  reproducible signalable leak was provided and repeated group signaling after
-  leader reap creates PGID-reuse risk. AIP-00h2c-3 is now closed below; h2d is
-  the next boundary. This slice contains no artifact, SSH/RemoteRocky, live
-  SPICE, latency, CPU/RSS acceptance, release, or AIP-44 improvement claim.
-
-- AIP-00h2c-3 is now merged on PRs #82 and #83 as main commit `a56c890`.
-  One exclusive private directory owner binds the fixed canonical run records
-  and envelopes, resource samples, successful teardown results, finalized
-  manifest, aggregate report, and success index. Manifest and artifact I/O
-  retain the same directory inode; success revalidates every fixed run object
-  and publishes the index last. Post-record evidence mutation and original-path
-  replacement fail terminally without scanning, recovery, retry, or synthesized
-  success. Focused strict Debug, Release, and AddressSanitizer each passed 9
-  tests / 15 executions. Combined Apple Silicon CI run `33377358455`, job
-  `99441731841`, passed every gate in 18m54s; exact review of `ba854ca` was
-  clean, and both review-found Sources threads were resolved. The complete h2c
-  local execution boundary is closed. AIP-00h2d must next add structured SSH,
-  tunnel, fixture, baseline-overlay, and real paired Rocky execution. This
-  slice provides no live SPICE, latency, CPU/RSS acceptance, release, or
-  AIP-44 improvement claim.
-
-- AIP-00h2d-2 now has local script identity validation on top of the h2d-1
-  lease in PRs #85/#86. Six canonical fields are persisted in the existing
-  private run configuration before launch and checked with container, image,
-  and ports under the lifecycle lock before status or stop. The recorded
-  container ID binds subsequent operations, rejecting same-name replacements.
-  Bound starts refuse an existing container; unset identity variables preserve
-  legacy behavior. Eight new script tests cover the identity round-trip,
-  invalid input before effects, foreign or
-  corrupt recorded identity, legacy and replacement endpoint protection, and
-  a reproduced guest-manifest field collision. Review regressions also cover
-  startup name reuse before ownership and failed teardown of a renamed
-  container. The final strict Debug suite passed 877 tests; focused
-  AddressSanitizer passed twelve script/lease tests.
-  This is deterministic local evidence, not a live SSH or paired-campaign
-  result. The next support boundary is recorded below; AIP-00 and AIP-44
-  remain open.
-
-- AIP-00h2d-3 adds bounded execution to the remote fixture lease and a scoped
-  foreground SSH tunnel. Commands claim their lease operation before launch,
-  reject concurrent effects, persist success before advancing, and fail
-  durably without retry on uncertain results. Tunnel startup waits for a fixed
-  SSH forwarding callback; SSH exit aborts the running operation, and every
-  return joins socket close and process-group teardown. A bounded `ssh -G`
-  preflight rejects inherited forwards before connecting; real OpenSSH tests
-  cover local, remote, and dynamic forwarding. Local real-child tests
-  cover structured arguments, durable results, failure, cancellation, and
-  process reaping using an SSH stand-in. The campaign CLI/child stage-protocol
-  wiring, isolated baseline overlay, and real 20-boot/60-action campaign are
-  still pending. This slice makes no live SSH, performance, or AIP-44 claim.
-
-- AIP-42 is complete on PR #47. Playback now pulls from a fixed-capacity PCM
-  ring and publishes staged packet metadata or an O(1) overflow bank swap under
-  the short realtime gate; it no longer schedules one `AVAudioPCMBuffer` and
-  completion task per packet. Capture reuses fixed 1,024-frame conversion
-  chunks, supports larger interleaved and planar Core Audio callbacks, and
-  materializes packet `Data` only through a two-phase async dequeue lease.
-  Queue ownership is bounded to 16 MiB and 262,144 slots, with one additional
-  16 MiB playback staging bank. The 38-test focused gate passed in Debug,
-  Release, ThreadSanitizer, and AddressSanitizer; Apple Silicon CI run
-  `33247879206` passed build, public API, full tests, complete AddressSanitizer,
-  and coverage. This closes the deterministic allocation and movement gate
-  without claiming measured audio latency or device performance; real-device
-  behavior remains part of AIP-90.
-
-- AIP-43 is complete on PR #48. Blocking WebDAV filesystem work now runs on a
-  width-two executor with 64-job and 256 MiB retained-storage limits. One
-  client's filesystem operations and complete response sends remain ordered,
-  while unrelated clients overlap; close, cancellation, failed delivery,
-  Session identity changes, and same-ID filesystem or suspended-sender
-  retirement suppress stale work with exactly-once accounting. `HEAD` is
-  metadata-only with exact `Content-Length`; depth-one `PROPFIND` enumerates
-  lazily, stops at the response limit, and retains at most 4,096 child
-  fragments. The existing synchronous public API is unchanged. Focused WebDAV
-  Debug and Release gates passed 20/20, and the related 33-execution filter
-  passed under ThreadSanitizer and AddressSanitizer. Apple Silicon CI run
-  `33251870601`, job `99098817923`, passed build, public API, full tests,
-  AddressSanitizer, and coverage in 11m45s; exact implementation-head review
-  found no major issue after all three successor P1 threads were fixed, replied
-  to with source/test evidence, and resolved, and all four retained Draft #35
-  constraints were rechecked. This is a deterministic completion only; no
-  throughput or live-interoperability claim is made before AIP-90.
-
-- AIP-10 is locally complete. Full-header messages are first validated as one
-  owned physical batch, then list submessages are dispatched in wire-list order
-  before the optional main-message prefix. `SPICE_MSG_LIST` itself is not
-  exposed as a logical protocol message.
-- Submessage bodies are ranges into the physical body owner. Parsing rejects
-  more than 4,096 entries, truncation, checked-arithmetic overflow, metadata or
-  main-prefix references, and duplicate or overlapping records before any
-  logical message is delivered.
-- ACK flow control now counts one unit per physical message across all active
-  channels. An empty list dispatches no fake logical message but still completes
-  its physical ACK unit.
-- Focused AIP-10 evidence is `InboundMessageBatchTests` (9 tests, including 14
-  malformed-list argument cases) and `ChannelConnectionBatchTests` (3 tests),
-  plus the successful Apple Silicon SwiftPM CI on PR #20.
-- AIP-11 is locally complete. Full and implicit-mini serials advance once per
-  physical message only after every logical handler and required ACK succeed.
-  Empty lists complete immediately without a fake logical message.
-- Handler or transport failure, run-task cancellation, and connection close
-  terminate unsatisfied waiters for that channel. Waiter cancellation and an
-  unrelated channel failure remain isolated. A recoverable migration request
-  completes its physical serial without poisoning the source connection. If
-  that MIGRATE message reaches the ACK window, its protocol ACK is still sent
-  after migration state begins while ordinary client sends remain blocked.
-- Focused AIP-11 evidence is `ProcessedSerialBarrierTests` (16 tests), the
-  combined serial-barrier selection (19 tests), the AIP-10 batch regression
-  (12 tests), `ChannelMigrationTests` (5 tests), `SpiceSessionTests` (61 tests),
-  `DisplayChannelTests` (50 tests), and the full warnings-as-errors test gate.
-  Replacement connections retain
-  their processed-serial barrier when superseded receive tasks unwind, while
-  already-started Agent byte streams drain on their captured retiring connection
-  before its transport closes; later target sends do not extend that retirement
-  fence. Disconnect cancels the retirement waiter, closes its retained source,
-  and suppresses a late migration-completed event. Terminal connections reject
-  raw and typed client sends without writing. Live peer closure remains part of
-  AIP-90.
-- AIP-23 is locally complete. When IOSurface is canonical and Data is stale,
-  fill, same-Surface COPY_BITS, bitmap DRAW_COPY, and dual-canonical
-  cross-Surface DRAW_COPY run against an in-place unleased slot or a synchronized
-  immutable candidate. A held published lease remains byte-exact and pool
-  exhaustion falls back atomically to Data.
-- Candidate synchronization is the only suspension point in the direct CPU
-  path. Surface operation locks plus lifecycle/revision/current-identity checks
-  guard the commit, and unsafe pointers remain inside synchronous IOSurface lock
-  closures. Internal catch-up damage resets at direct commit; publication damage
-  survives mismatched requests and is consumed exactly once by a matching
-  snapshot.
-- Focused AIP-23 evidence is six tests / nine parameter cases,
-  `SurfaceStoreTests` 46/46, AddressSanitizer `SurfaceStoreTests` 46/46,
-  `SurfacePublicationDamageTests` 3/3, `DisplayChannelTests` 71/71, and the full
-  Swift 6 warnings-as-errors test gate. The pre-fix focused gate produced 24
-  issues; all are closed on PR #26. No throughput claim is made before AIP-00.
-- AIP-30 is locally complete. `OwnedBytes` and checked `WireSlice` ranges carry
-  immutable receive ownership across actors, while non-escaping Swift `Span`
-  views perform synchronous scalar parsing. Production channels pass slices;
-  Display payloads materialize Data only at their existing codec boundaries.
-- `MessageFramer` now uses a bounded head-index segment queue. Contiguous bodies
-  copy zero bytes, fragmented bodies coalesce once, consumed owners release
-  immediately, and received bytes are never compacted. A malformed batch is
-  validated before cursor advancement and a retry neither consumes its physical
-  boundary nor repeats its coalescing copy.
-- The receive queue independently caps live segments at 4,096, closing the
-  tiny-read owner-allocation amplification identified by latest-head review.
-  The limit is checked before owner allocation, failure does not change bytes,
-  diagnostics, or cursor state, and consumed/reset slots immediately restore
-  capacity.
-- Focused AIP-30 evidence includes `MessageFramerTests` 13 declarations / 18
-  executions, `SpiceWireTests` 35 declarations / about 53 executions,
-  `SpiceProtocolTests` 46/46, `ChannelConnectionBatchTests` 3/3,
-  `DisplayChannelTests` 71 declarations / 84 executions, focused ASan, generated
-  source and Public API checks, and the full Swift 6 warnings-as-errors gate.
-  Independent tests caught and closed physical-boundary consumption, a segment
-  boundary trap, hidden retention of consumed owners, and unbounded live segment
-  metadata. No throughput claim is made before AIP-00.
-
-## Stage B local closure
-
-- Swift 6 actor-based TCP and TLS transport using Network.framework.
-- System certificate validation by default and an explicitly named insecure
-  policy reserved for tests.
-- Caller-anchored private PKI supports both modern hostname/SAN/EKU validation
-  and an explicit virt-viewer-compatible full `host-subject` policy for legacy
-  certificates. Fixed-date local fixtures cover chain, subject, and validity
-  failures; the reported real Ravada endpoint remains an external acceptance
-  gate.
-- SPICE Link handshake, Full/Mini header negotiation, and ticket authentication.
-- RSA-OAEP-SHA1 ticket encryption with the reference trailing NUL convention.
-- Main Init, Attach Channels, Channel List, Ping/Pong, and ACK flow control.
-- ChannelFactory authenticates every discovered channel with the Main session ID.
-- Session-scoped credential storage supplies per-channel temporary password
-  copies and clears retained bytes when the Session disconnects or fails.
-- Disconnect and cancellation during channel attachment close Main, attached,
-  and currently attaching transports.
-- `spice-probe` provides the TCP/TLS integration entrypoint.
-
-## Stage B live QEMU closure
-
-- Apple/container 1.2 ran an arm64 QEMU 8.2.2 endpoint with KVM using a custom
-  Linux 6.18.5 kernel built from Apple containerization 0.40.1. `/dev/kvm` and
-  the KVM guest virtual-timer interrupt were present inside the container.
-- Host loopback publishing connected `127.0.0.1:15930` to the container SPICE
-  listener. A correct ticket completed Main Init and Channel List; an incorrect
-  ticket was rejected by QEMU with code 7.
-- The live Main transcript reported Display type 2 id 0, Cursor type 4 id 0,
-  and Inputs type 3 id 0.
-- A self-signed container TLS listener completed the same handshake with the
-  explicitly test-only insecure trust policy. No certificate was installed in
-  the macOS system or user trust store.
-- A system-trust connection to that untrusted certificate now surfaces its
-  terminal TLS trust error instead of hiding it behind the 10-second
-  establishment timeout. A silent peer that never completes TLS still follows
-  the bounded timeout path; both state paths have local regression coverage.
-- After explicit authorization, a one-day local CA was temporarily installed as
-  a trust root in the login keychain. macOS SSL evaluation accepted its
-  IP-address leaf for `127.0.0.1`, and the normal `--tls` probe authenticated
-  Main plus independently attached Display 2/0, Cursor 4/0, and Inputs 3/0
-  channels. The test CA was then deleted by its exact SHA-1 fingerprint;
-  keychain lookup returned not-found and the leaf returned
-  `CSSMERR_TP_NOT_TRUSTED`, confirming that no temporary trust remains.
-- QEMU's 256,000-byte bandwidth-probe PING padding exposed and closed a decoder
-  interoperability bug; PING now decodes its fixed prefix while other generated
-  messages retain strict trailing-byte rejection.
-- A minimal Alpine initramfs booted under nested KVM with Apple's custom arm64
-  kernel, virtio-gpu framebuffer, virtio keyboard, and virtio mouse. The guest
-  reached a 1280x800 framebuffer and continuously changed its tty0 contents.
-- Live Display initially stalled because the client omitted
-  `SPICE_MSGC_DISPLAY_INIT`. The generated 14-byte client message and Display
-  bootstrap are now implemented and covered by a wire test. A subsequent live
-  probe received one monitor configuration and 135 immutable 1280x800 frames.
-- The same probe received a Cursor initialization, keyboard modifier state, and
-  two mouse-motion acknowledgements. The guest's raw input device recorded the
-  injected A-key transition as EV_KEY code 30, proving the Inputs path reached
-  the booted guest rather than ending at the SPICE server.
-- `Integration/AppleContainer` now retains the QEMU/SPICE Containerfile, pinned
-  Alpine 3.22.5 initramfs recipe, guest init, lifecycle cleanup, live probe, and
-  guest-side scan-code assertion. The Alpine source archive is verified against
-  SHA-256 `3fbc6285032ed46821b511292633d7b2a6306a2e254f590e92bdafff56cf2f70`;
-  generated artifacts remain ignored. The custom Apple containerization 0.40.1
-  / Linux 6.18.5 KVM kernel remains an explicit external input because it is a
-  29 MB locally built artifact.
-- A clean initramfs regenerated by that recipe passed the strict harness with
-  ticket authentication, two Display/Cursor channels, two monitor
-  configurations, 57 immutable frames including the live 1280x800 framebuffer,
-  keyboard-modifier state, two mouse-motion acknowledgements, and a guest raw
-  `EV_KEY` code-30 value-1 record.
-- A richer pinned Alpine 3.22 Agent initramfs now adds Xorg 21.1.19,
-  spice-vdagent 0.22.1, xrandr, and xclip. One combined live run closed exact
-  30-byte host-to-guest file transfer, 26-byte host-to-guest and 27-byte
-  guest-to-host UTF-8 clipboard payloads, two Display heads, Inputs delivery,
-  and an applied 1440x600 XRandR layout composed from 800x600 and 640x480
-  outputs.
-- Linux spice-vdagent advertises clipboard-by-demand without the obsolete
-  legacy clipboard bit. Clipboard readiness now follows that interoperable
-  capability shape and has a focused regression test.
-- For virtio-gpu, spice-server intercepts `VD_AGENT_MONITORS_CONFIG` and calls
-  QEMU's `client_monitors_config` UI-info path instead of forwarding the packet
-  to guest vdagent; an Agent reply is therefore absent by design. QEMU trace
-  recorded head 1 as 640x480 and head 0 as 800x600, connector hotplug reached
-  Xorg, and the bare guest's explicit auto-layout policy applied both outputs.
-  Display Channel messages then reported both heads and produced frames.
-- The topology change also showed that spice-server may re-emit Cursor Init on
-  an existing Cursor Channel. Cursor Init is now an authoritative state/cache
-  reset, with a regression test, rather than a false protocol failure.
-
-## Stage B external TLS gate closure
-
-- Both trust directions are now closed: a temporarily system-trusted local chain
-  completes normal `--tls` Main and child-channel attachment, while the same
-  self-managed chain fails after trust removal. Terminal certificate/trust
-  `.waiting` errors propagate as TLS failures, while a genuinely stalled
-  handshake remains covered by the bounded negative-timeout listener test.
-
-## Stage C delivered so far
-
-- Generated and dispatched Display Surface Create (314) and Destroy (315).
-- Bounded actor-isolated SurfaceStore for 32-bit xRGB and ARGB surfaces.
-- RAW 32-bit bitmap draw-copy with top-down and bottom-up row orientation.
-- Solid fill and overlap-safe COPY_BITS execution primitives.
-- Immutable frame snapshots for the later presentation/coalescing boundary.
-- Bounds, stride, allocation-limit, duplicate-surface, and malformed-input tests.
-- Source-validated wire models for DisplayBase, signed Rect/Point, inline Clip
-  rectangles, Brush, QMask, Image descriptors, RAW Bitmap, and Surface images.
-- Strict decoding for COPY_BITS (104), DRAW_FILL (302), and DRAW_COPY (304),
-  including relative image offsets and bounded pointer payload validation.
-- DisplayChannel dispatch into SurfaceStore with bounded canonical clip regions,
-  solid PUT fills, one-to-one RAW/surface DRAW_COPY, COPY_BITS, Ping/Pong, and
-  ACK handling. `PixelRegion` computes `destination ∩ surfaceBounds ∩
-  union(clips)` as ordered y bands with sorted disjoint x intervals. Nil/single
-  clips stay inline; multi-clip normalization uses compressed x coordinates, a
-  y sweep, and a lazy range-add coverage tree. Input is capped at 4,096 clips
-  and output at 65,536 segments before Surface mutation. Each non-empty wire
-  fill or copy validates the complete region and commits one Surface revision,
-  mutation generation, and transaction; empty or failed regions commit none.
-  Same-Surface copy then uses quadrant-safe segment order and direction-aware
-  row `memmove`; cross-Surface copy reads directly from its synchronized source.
-  No Surface copy allocates area-sized staging, contiguous non-overlapping
-  rectangles use one bulk call, and fill segments use the arm64 NEON kernel.
-- A complete Mini-header transcript test from Surface Create through real draw
-  wire bodies to the expected framebuffer and Surface Destroy.
-- An external JSON golden-frame fixture that replays Surface Create, DRAW_FILL,
-  RAW DRAW_COPY, and COPY_BITS and verifies the exact BGRA framebuffer.
-- Generated Inputs client/server messages plus an actor-isolated Inputs channel
-  for physical PC scan-code transitions, lock modifiers, relative/absolute
-  pointer motion, button masks, and server motion acknowledgements.
-- Strict Cursor Init/Reset/Set/Move/Hide/Trail and cache-invalidation decoding,
-  with bounded cursor-shape caching and actor-isolated visible cursor state.
-- Session channel dispatch now constructs Display, Inputs, and Cursor actors;
-  unsupported channel types remain passive authenticated connections.
-- Session now supervises Main, Display, Inputs, and Cursor receive loops after
-  bootstrap. A channel failure cancels its peers, closes every connection,
-  clears credentials, and publishes a typed failure event.
-- The public Session event stream is reserved for ordered control state:
-  display configuration, keyboard modifiers, mouse-motion acknowledgements,
-  migration, failure, and disconnect. Frame, surface-lifecycle, cursor, and
-  pointer-mode state use the stable `SpiceDesktopSource` instead of the event
-  mailbox or SwiftUI Observation.
-- Display commands always advance the canonical Surface and its damage journal.
-  A visible desktop subscription enables snapshot preparation; hidden,
-  occluded, detached, or zero-size views suppress snapshots without pausing
-  protocol drawing. Each Surface keeps at most one prepared frame and one
-  latest pending revision. Consumption unlocks the next preparation, while a
-  lifecycle change, damage-history gap, or visibility resume forces full
-  damage. Exact lifecycle/revision matching suppresses stale snapshots.
-- `SpiceDesktopView` is a thin `NSViewRepresentable` around one private AppKit
-  framebuffer view. It owns a normally paused `NSView` display link and an
-  explicit-draw `MTKView`; the ready latch selects at most the newest desktop
-  revision per display tick. It also handles first-responder state, physical
-  macOS-keycode to PC-XT mapping, relative or absolute pointer input, buttons,
-  and scroll-wheel events.
-
-Inputs transports physical key transitions, not Unicode text or IME
-composition. The AppKit bridge uses `NSCursor` for supported absolute alpha
-cursors and a cached Core Animation overlay for captured relative cursors, so a
-cursor-only update does not redraw the framebuffer. Other cursor pixel formats
-remain pending; color8 and color24 payloads are explicitly rejected until their
-palette/pixel formats are implemented.
-
-## Deferred Stage C enhancements
-
-- Add scaled DRAW_COPY, pattern brushes, masks, and additional ROP operations.
-- Add a sample SwiftUI application scene and observable connection model on top
-  of the library-level bridge.
-- Add native host-cursor replacement and remaining decoded cursor format
-  conversion.
-- Add focus/capture policy, mouse-motion ACK backpressure, and richer keyboard
-  edge recovery around the AppKit input bridge.
-
-## Stage D delivered so far
-
-- Added the independent `SpiceCodecs` target with a Sendable async decoder
-  interface, typed codec errors, immutable BGRA output, and explicit encoded,
-  decoded, and dimension limits.
-- Added strict Display wire decoding for `SPICE_IMAGE_TYPE_JPEG` (105), including
-  bounded `data_size` handling and truncated-payload rejection.
-- Added a TurboJPEG decoder using `@concurrent`; socket parsing and Surface
-  mutation remain serialized in DisplayChannel while CPU decode runs outside
-  its inherited actor executor.
-- Added a `CTurboJPEG` SwiftPM binary target backed by the package's arm64
-  static XCFramework. All C handles and unsafe buffer access are isolated in
-  the `SpiceCodecInterop` target.
-- TurboJPEG validates the JPEG header dimensions before writing into a bounded,
-  preallocated destination and treats decoder warnings as failures. RGB-family
-  inputs decode directly to BGRA; CMYK/YCCK inputs use TurboJPEG's required
-  four-component output followed by a bounded, rounded CMYK-to-BGRA conversion.
-- DisplayChannel accepts an injected JPEG decoder and commits decoded pixels to
-  SurfaceStore only after full decode and validation. A failed decode leaves the
-  destination Surface byte-for-byte unchanged.
-- Added checked-in JPEG plus RGB goldens generated by libjpeg-turbo 3.2.0,
-  along with bounds, truncated-corpus, ICC-marker, and warning-path tests.
-
-The TurboJPEG backend is byte-for-byte identical to six checked-in
-libjpeg-turbo 3.2.0 goldens covering baseline 4:4:4, grayscale, 4:2:0,
-progressive encoding, odd dimensions, CMYK, and an ICC-profile-bearing image.
-The ICC case verifies transport and decoding of the profile-bearing JPEG; the
-decoder does not currently perform ICC color management. Removing the terminal
-EOI from a valid JPEG exercises libjpeg-turbo's warning path, and both the codec
-boundary and a real DisplayChannel integration test confirm rejection without
-Surface mutation. The local Stage D JPEG acceptance gate is closed.
-
-The TurboJPEG portion is statically linked from the checked-in, reproducible
-native dependency artifact.
-
-### LZ RGB-family slice
-
-- Added strict Display wire support for `SPICE_IMAGE_TYPE_LZ_RGB` (101) using
-  the protocol's bounded BinaryData payload.
-- Added a Swift 6 SPICE LZ 1.1 decoder for RGB16, RGB24, RGB32, RGBA, XXXA,
-  and A8 streams. It validates the big-endian
-  magic/version/type/dimensions/stride/top-down header, writes each plane
-  directly into one preallocated `Data` backing, validates every
-  literal/back-reference, and rejects truncation and trailing bytes.
-- Overlapping color references copy one initialized period and then double it
-  with bounded bulk copies. Alpha references use the existing strided overlap
-  kernel in one Swift-to-C call. Per-decode diagnostics record output backing,
-  temporary decoded storage, reference calls, and copied bytes without global
-  mutable state.
-- Added independent fixtures for all six supported formats, generated offline
-  by the fixed `spice-common` C `lz.c` encoder/decoder. Swift output matches all
-  reference BGRA bytes exactly, including overlapping back-reference behavior.
-- Codec output now records whether alpha is meaningful. Display and
-  SurfaceStore preserve it only for an ARGB source copied into an ARGB Surface;
-  xRGB destinations remain opaque.
-- LZ DRAW_COPY follows the same transactional boundary as JPEG: only a fully
-  decoded immutable image reaches SurfaceStore.
-
-The LZ RGB family is locally closed.
-
-### LZ palette slice
-
-`SPICE_IMAGE_TYPE_LZ_PLT` and its palette path are also locally closed:
-
-- Added strict `SPICE_IMAGE_TYPE_LZ_PLT` parsing for canonical inline-palette
-  pointers and cached palette IDs, with bounded entry and compressed-data sizes.
-- Added PLT1 LE/BE, PLT4 LE/BE, and PLT8 expansion. Five independent
-  `spice-common` fixtures match visible BGRA pixels byte-for-byte, including
-  packed-row padding.
-- Palette LZ first decodes exact packed bytes into the prefix of the final BGRA
-  `Data`, then walks rows and packed columns backwards to expand in place from
-  a precomputed byte-to-BGRA lookup table. The reverse walk preserves packed
-  cross-row references and partial row tails without a second decoded backing;
-  diagnostics distinguish lookup expansions and visible pixels.
-- DisplayChannel uses a bounded palette cache, commits `PAL_CACHE_ME` only after
-  successful decode/render, resolves `PAL_FROM_CACHE`, and handles palette 107,
-  palette-all 108, and Display RESET 103 invalidation.
-- Missing palettes, malformed streams, invalid indices, bad pointers, and every
-  truncated fixture fail without changing the Surface or populating the cache.
-
-### QUIC exact slice
-
-- Added strict `SPICE_IMAGE_TYPE_QUIC` BinaryData parsing and a bounded async
-  decoder for GRAY, RGB16, RGB24, RGB32, and RGBA.
-- The exact backend uses the `spice-common` QUIC implementation supplied by the
-  package from `spice-gtk` 0.42. A C-only shim copies input to aligned words, catches the
-  backend's non-returning error callback with `setjmp`/`longjmp`, rejects
-  warnings, and writes only into a preallocated BGRA buffer. Swift never holds
-  a QUIC context or C pointer.
-- Five independent 7x5 fixtures generated by the same C encoder/decoder match
-  byte-for-byte. Every truncated byte prefix and a mutated magic corpus return
-  typed errors without crashing.
-- Display treats the shim's positive-stride QUIC output as top-down and preserves
-  RGBA alpha semantics. spice-gtk's `canvas_get_quic` decodes into the logical
-  first row of a negative-stride Pixman image; that storage choice does not
-  require flipping the shim's output. The previous bottom-up flag inverted
-  individual image tiles. A failed decode leaves the destination Surface unchanged.
-- A live 32x111 QUIC wallpaper tile captured on 2026-10-27 produced identical
-  bytes with the shim and with the upstream Canvas's negative-stride write
-  followed by logical-row normalization. The corrected codec and Display
-  regression expectations fail with the old orientation flag. A warnings-as-errors
-  build and all 897 tests passed with `--no-parallel`. Installed-app visual
-  validation remains pending; the running application was not replaced.
-
-### Image cache slice
-
-- Corrected the source-backed image type values to `SURFACE` 104 and `JPEG`
-  105; `FROM_CACHE` 103 and `FROM_CACHE_LOSSLESS` 106 are now descriptor-only
-  image references.
-- One Session-owned `DisplayImageCache` actor now serves every Display channel;
-  palette caches remain Display-local. RAW, JPEG, LZ palette/RGB, and QUIC
-  sources are decoded once per command, even when several clip rectangles are
-  present. Standalone package-level Display channels own and close their private
-  fallback cache, while one channel cannot close an injected Session cache.
-- `CACHE_ME` and `CACHE_REPLACE_ME` register a noncopyable mutation before
-  asynchronous source resolution or decode, stage the decoded bitmap afterward,
-  and consume it through commit or abort around the Surface transaction. This
-  makes invalidation during decode visible before late cache publication while
-  preserving the rule that commit cannot throw after Surface success. Same-ID
-  mutations acquire their active slot through a bounded, cancellation-safe FIFO
-  rather than failing merely because another Display is decoding the same ID.
-  When the command is a logical submessage, its retained-byte charge is the
-  complete physical batch body backing the shared `Data` slice, not merely the
-  logical body length.
-  Outcome counters distinguish committed, concurrently invalidated, and
-  teardown-discarded mutations.
-- `CACHE_REPLACE_ME` accepts only a lossless source replacing a committed lossy
-  representation. `FROM_CACHE_LOSSLESS` suspends across Display channels until
-  that replacement commits. Missing references likewise resolve asynchronously;
-  waits are cancellation-safe, limited to 64, and may retain no more than one
-  cache byte budget in aggregate. Clear and Session close resume every waiter
-  exactly once.
-- Repeated `CACHE_ME` and targeted invalidation retain compatible reference-count
-  semantics. Invalidation marks all currently active and queued bounded
-  mutations, so earlier work cannot resurrect invalidated state and fresh or
-  nonexistent IDs leave no retained tombstones. Active/queued counts,
-  mutation-retained message bytes, staged bitmap bytes, and resolver-retained
-  bytes all have hard limits. Cancellation, clear, and Session close resume and
-  release queued work exactly once. Dimension disagreement, invalid flags,
-  decode failure, and capacity overflow fail without publishing cache state.
-- Display `INVAL_LIST` 105 invalidates the Session entry for every Display.
-  `INVAL_ALL_PIXMAPS` 106 first observes the AIP-11 processed-serial requirements,
-  then clears the Session cache. RESET 103 preserves that image cache while
-  clearing the Display-local palette cache. Seamless and semi-seamless rebinding
-  retain the source cache; full replacement and disconnect close it.
-
-### GLZ RGB and dictionary slice
-
-- Added strict `SPICE_IMAGE_TYPE_GLZ_RGB` (102) BinaryData parsing and Display
-  execution for RGB16, RGB24, RGB32, and RGBA streams.
-- The pure-Swift decoder validates the 33-byte big-endian GLZ header, dimensions,
-  stride, image IDs, window-head distance, every literal, same-image reference,
-  cross-image reference, and exact stream consumption before publishing output.
-- The GLZ dictionary is an actor shared by all Display channels in one Session.
-  It supports out-of-order IDs, contiguous tail-gap closure, protocol-directed
-  window eviction, image/byte limits, and atomic commit only after full decode.
-- A four-image literal/cross-image RGB32/RGBA sequence was checked against the
-  exported spice-common decoder from spice-gtk 0.42.3 and is stored as an
-  offline golden fixture. RGB16/RGB24 and malformed/truncated cases have focused
-  coverage; failed input leaves the dictionary unchanged.
-- Multi-Display out-of-order references now suspend on the shared actor until
-  the referenced image commits, matching spice-gtk's coroutine wait semantics.
-  Wait count and retained decoded bytes are bounded; cancellation, dictionary
-  clear, and already-evicted references terminate without leaking continuations.
-- The expanded corpus covers 8,192- and 131,073-pixel same-image offsets
-  (including the bit-17 very-long form), image distances 300 and 70,000
-  (including two extension bytes), out-of-order gap closure, repeated
-  window-head rollover, retained-edge references, and rejected references
-  immediately beyond the advertised history. All four extreme offset/distance
-  streams match spice-common output.
-- A reverse-started 20-image dependency chain exercises suspended cross-image
-  decode, actor reentrancy, ordered commit, and repeated dictionary eviction.
-  Every dependent resolves to the source pixels, the retained window edge stays
-  readable, and the immediately evicted history fails without another wait.
-- Full and Mini header paths publish explicit or implicit server serials to a
-  session-wide cancellation-safe barrier only after the complete physical
-  message has been processed. `INVAL_ALL_PIXMAPS` therefore waits through
-  related handler work before invalidating the Session-scoped image cache.
-
-### ZLIB GLZ slice
-
-- Added strict `SPICE_IMAGE_TYPE_ZLIB_GLZ_RGB` (107) parsing for separate
-  compressed `data_size` and exact uncompressed `glz_data_size` bounds.
-- A small CZlib shim owns `z_stream` and requires `Z_STREAM_END`, exact output
-  length, and full compressed-input consumption. Swift allocates only the
-  prevalidated declared output size; oversized expansion requests are rejected
-  before allocation.
-- Inflated bytes feed the same Session-shared GLZ actor, so wrapped and
-  unwrapped images share cross-image dictionary references and eviction state.
-- The checked-in zlib/GLZ fixture matches spice-gtk 0.42.3's exported zlib and
-  GLZ decoders. Every compressed prefix, trailing input, incorrect declared
-  size, invalid zlib data, and over-limit expansion fail without changing the
-  Surface or GLZ dictionary.
-
-### MJPEG stream lifecycle slice
-
-- Added strict current-wire decoding for Stream Create 122, Data 123, Clip 124,
-  Destroy 125, Destroy All 126, and Data Sized 316. Stream IDs are restricted to
-  the protocol's `[0, 64)` range; flags, codec enums, dimensions, clip counts,
-  payload lengths, truncation, and trailing bytes are validated before state is
-  changed.
-- Display Link advertises `SIZED_STREAM`, `MULTI_CODEC`, and `CODEC_MJPEG`.
-  H.264 or H.265 is added only by the corresponding explicit endpoint policy;
-  the two advanced codecs are mutually exclusive. VP8, VP9, and stream
-  reporting remain unadvertised.
-- DisplayChannel owns at most 64 active stream records. Duplicate creation,
-  unknown data/clip/destroy, capacity overflow, unsupported codecs, and invalid
-  Surface destinations are typed protocol failures. RESET, Surface Destroy,
-  explicit Destroy, and Destroy All release the relevant state.
-- Each MJPEG stream owns one persistent TurboJPEG handle and at most three
-  IOSurface-backed BGRA buffers. Stream decoding enables fast DCT/upsampling and
-  writes directly into a locked buffer; standalone JPEG continues through the
-  bit-exact decoder. A session-wide limiter permits at most two concurrent
-  MJPEG decodes, and pool pressure takes a bounded Data fallback without
-  waiting. Normal frames use create-time geometry; sized frames carry their own
-  dimensions and destination. TOP_DOWN and bottom-up streams follow
-  spice-common's row semantics.
-- The Metal compositor performs BGRA-to-BGRA nearest scaling and clip writes
-  directly into a candidate Surface. The existing actor-isolated Data path is
-  the nonblocking fallback. A malformed JPEG, invalid bitmap, bad geometry, or
-  capacity failure leaves the previous Surface unchanged. Empty clips advance
-  stream order without publishing a redundant frame.
-- A session-wide multimedia clock is anchored from `MAIN_INIT.multimedia_time`
-  against `ContinuousClock` and reset by strict Main message 106 decoding.
-  Display channels share that clock. Timestamp comparison uses wrapping UInt32
-  subtraction interpreted as Int32, so ordinary counter wraparound preserves
-  early/late ordering.
-- Frames are sequence-guarded across async decode. Due frames present
-  immediately, future frames decode and then wait until their multimedia
-  timestamp, and already-late MJPEG frames are dropped before TurboJPEG work.
-  Once admitted, an MJPEG frame that becomes late during decode/wait can still
-  commit, matching spice-gtk's built-in MJPEG callback policy. Stream generation,
-  frame order, Surface video sequence, and mutation barriers still reject stale
-  work. Advanced video retains its existing late-frame policy. Main clock resets
-  are observed by active waits when they resume.
-- Audio-driven latency correction remains part of Stage E Playback integration;
-  this slice establishes the shared clock and video scheduling boundary only.
-- Focused lifecycle coverage includes clip changes that affect only subsequent
-  frames, 2x2 to 4x4 scaling, Data Sized overrides, bottom-up partial sources,
-  failed-decode recovery, stream capacity, Destroy, and Destroy All.
-
-Development and release products now statically link the checked-in arm64
-artifacts for libjpeg-turbo, spice-common QUIC, usbredir, and libusb. The QUIC
-slice no longer pulls in spice-gtk or GLib. `Scripts/verify-native-closure.sh`
-rejects Homebrew, local build-tree, and other non-relocatable load paths.
-
-## Stage D local closure
-
-JPEG, LZ, QUIC, the Session image cache, GLZ/dictionary, ZLIB GLZ, and MJPEG
-stream scheduling satisfy their local Stage D gates: exact reference output,
-bounded malformed-input handling, transactional cache publication, and bounded
-cross-Display resolve/invalidation semantics. Multi-Display cache lifecycle is
-covered across seamless, semi-seamless, switch-host, and disconnect paths.
-
-Live multi-Display/video interoperability remains part of the deferred QEMU
-acceptance gate rather than evidence supplied by the local corpus.
-
-## Stage E local closure
-
-### Playback protocol and synchronization boundary
-
-- Playback Link advertises only the implemented `VOLUME` and `LATENCY`
-  capabilities. CELT 0.5.1 and Opus remain unadvertised and are rejected if a
-  server sends them anyway.
-- Added strict bounded wire decoding for DATA 101, MODE 102, START 103, STOP
-  104, VOLUME 105, MUTE 106, and LATENCY 107. Packet payloads are capped at
-  256 KiB; mode data, enums, channel counts, truncation, and trailing bytes are
-  validated before channel state changes.
-- The live QEMU gate exposed two schema mistakes hidden by the original local
-  fixtures. Current spice-common defines `audio_data_mode` as `enum16`, and
-  Playback START includes a trailing `uint32 time`; the decoder and Record MODE
-  encoder now match that upstream wire layout, with exact-body regressions.
-- PlaybackChannel implements the protocol ordering rules: supported MODE before
-  START, DATA only while active, and STOP only from the active state. The local
-  slice supports RAW signed 16-bit little-endian PCM from 8 to 192 kHz and at most
-  eight channels. PCM packets must align to complete interleaved sample frames.
-- `SpiceSession.playbackEvents` is a dedicated 32-entry newest-first bounded
-  stream, separate from UI/session events, so slow audio consumption cannot
-  create unbounded memory or duplicate PCM into the display event queue.
-- `PLAYBACK_LATENCY` is surfaced as the server's minimum-buffer hint. It is not
-  treated as measured device delay. A host sink reports its actual queued delay
-  through `reportPlaybackDelay(milliseconds:)`; PlaybackChannel then anchors the
-  shared multimedia clock to `last_packet_time - actual_delay`, matching the
-  SPICE audio/video synchronization model.
-
-### Bounded AVAudioEngine playback sink
-
-- `SpiceAudioPlaybackSink` consumes the dedicated Playback stream and schedules
-  interleaved RAW S16LE buffers on `AVAudioPlayerNode`. The source format is
-  connected through `AVAudioEngine.mainMixerNode`, leaving conversion to the
-  current output-device format to the engine.
-- Queue state is bounded by a configurable duration (500 ms by default). It
-  honors the server minimum-latency hint as the startup waterline, drops a
-  packet that alone exceeds the whole budget, and on aggregate overflow flushes
-  older scheduled audio in favor of the newest packet. Generation tags make
-  callbacks from flushed buffers harmless.
-- A drained player is stopped so its sample timeline is reset; the next packet
-  rebuilds the configured startup buffer and restarts playback. Sink events
-  expose starts, stops, overflows, oversized drops, underruns, and engine errors.
-- Every 50 ms by default, the sink derives remaining frames from
-  `AVAudioPlayerNode.playerTime` (falling back to queued frames before rendering)
-  and reports that measured queue delay through `SpiceSession`. Mute and SPICE
-  volume are applied at the player node; the current single-node backend uses
-  the average for a multi-channel volume vector rather than a per-channel gain
-  matrix.
-- `SpiceAudioPlaybackSink.statistics()` exposes monotonic scheduled packet and
-  frame counts for non-GUI acceptance without copying PCM into a second stream
-  consumer.
-
-The bounded queue, stale-callback rejection, underrun recovery, delay math, and
-exact PCM buffer population are covered deterministically. Playback is also
-live-closed through the independent Rocky x86_64 audio fixture: QEMU 8.2.2 and
-spice-server 0.15.1 exposed an ICH9 HDA duplex device, the guest generated an
-880 Hz S16LE stream, and SwiftSpice observed RAW 48 kHz stereo START,
-`mute=false`, then scheduled a 480-frame packet in AVAudioEngine. Evidence is in
-the remote run `audio-live/logs/20260801T025001Z`. Human-audible output and
-device route changes still require operator/hardware acceptance.
-
-### Record protocol and bounded AVAudioEngine capture source
-
-- Record Channel strictly decodes server START 101, STOP 102, VOLUME 103, and
-  MUTE 104. RAW S16LE streams are limited to 1 to 8 channels and 8 to 192 kHz;
-  duplicate START, STOP while inactive, DATA while inactive, and incomplete
-  interleaved PCM frames fail the channel.
-- Client capture traffic enforces the protocol sequence RAW MODE 102,
-  START_MARK 103, then timestamped DATA 101. Mode/start marking is tied to a
-  server-started stream and cannot be repeated or bypassed.
-- `SpiceSession.recordEvents` is a dedicated 32-entry oldest-first control
-  stream. Overflow is fatal instead of silently losing START/STOP state, while
-  PCM travels directly from the capture sender to RecordChannel and is capped
-  at 256 KiB per packet.
-- `SpiceAudioCaptureSource` installs a tap only for an active server-requested
-  stream, converts the default macOS input format to the requested interleaved
-  S16LE format, and hands packets to async transport through a mutex-protected
-  duration-bounded queue (500 ms by default). Aggregate overflow discards the
-  oldest packets to bound latency and reports the dropped duration.
-- Core Audio callbacks do not create one Task per buffer. A newest-one signal
-  wakes one async drain, so callback rate cannot create unbounded task or PCM
-  accumulation. Conversion failures and channel failures stop the active tap
-  and are published through source events.
-- Record volume/mute messages are decoded and surfaced, but their capability is
-  not advertised and software input gain is not yet applied. CELT/Opus are also
-  unadvertised. An embedding app must provide `NSMicrophoneUsageDescription`,
-  user-visible capture state, and consent handling.
-
-Wire/state/queue behavior is covered locally. The client-to-guest Record wire is
-also live-closed with a deterministic non-microphone source: SwiftSpice received
-RAW 48 kHz stereo START, sent 144,000 frames using 16-bit MODE/START_MARK/DATA,
-and the Alpine guest completed a 2,880,000-byte `arecord` artifact with SHA-256
-`312d8ac05afe6a46da9aac84169a3d022ceca4e9dacd7280f2c1cecc7306b4e5`.
-That differs from an all-zero artifact of the same size. Evidence is in remote
-run `audio-live/logs/20260801T025212Z`. Actual microphone permission and input
-route conversion remain `pending_hardware`; the synthetic gate does not claim
-physical microphone coverage.
-
-### Main/Agent transport and UTF-8 clipboard
-
-- Main Link now advertises only `SPICE_MAIN_CAP_AGENT_CONNECTED_TOKENS` from the
-  implemented Main capability set. Main Init and both connected notification
-  variants seed explicit Agent connection/token state; duplicate or
-  out-of-order connect, disconnect, token, and data messages fail the channel.
-- `AGENT_START` is the first client Agent message and grants the server an
-  eight-packet receive window. Every accepted server packet consumes and then
-  replenishes one token. Client sends are preflighted against their complete
-  fragment count, so insufficient tokens cannot produce a partial logical
-  message.
-- Added bounded VDAgent stream framing: 20-byte little-endian headers, 2048-byte
-  SPICE packet fragments, 16 MiB logical-data ceiling, headers/payloads split at
-  arbitrary packet boundaries, multiple logical messages per packet, and
-  preservation of unknown protocol/type values. Bootstrap queues at most 64
-  Agent events and 16 MiB of Agent payload before Channels List arrives.
-- `SpiceSession.agentEvents` is a dedicated 64-entry oldest-first stream. Agent
-  control/data events never share the frame-coalescing path; if its bounded
-  consumer queue fills, the session fails instead of silently losing clipboard
-  protocol state.
-- The framing work uncovered and fixed `ByteReader` bulk reads against a
-  non-zero-index `Data` slice. A regression test now covers that path.
-- VDAgent capability negotiation advertises clipboard, clipboard-by-demand,
-  monitor integration, and file-transfer detailed-error decoding. The state
-  machine implements symmetric UTF-8
-  GRAB/REQUEST/DATA/RELEASE ownership, rejects unsolicited or invalid UTF-8
-  payloads, bounds text to the 16 MiB Agent envelope minus its four-byte type,
-  suppresses pasteboard echo, and reoffers unchanged local text after reconnect.
-- `SpiceAgentManager` consumes the dedicated Agent event stream, retries an
-  announcement held back by exhausted client tokens, polls the general macOS
-  pasteboard at a configurable 250 ms default, and provides `publish(_:)` for an
-  immediate path. All `NSPasteboard` access is isolated in a small `@MainActor`
-  bridge, and pasteboard write refusal is surfaced as a failure event.
-- Main Init's initial Agent-connected state is now published into
-  `SpiceSession.agentEvents`, so a manager started immediately after `connect`
-  does not depend on a later connected notification.
-- Dynamic resolution now encodes the exact single-monitor
-  `VD_AGENT_MONITORS_CONFIG` layout (height precedes width on wire), advertises
-  MONITORS_CONFIG and REPLY without claiming sparse/position support, and
-  strictly decodes the matching `VD_AGENT_REPLY`. Legacy peers retain the
-  protocol-defined baseline monitor/reply capabilities until they explicitly
-  announce otherwise.
-- `requestResolution(width:height:)` validates UInt32 dimensions, serializes
-  requests behind Agent tokens, keeps only the newest resize while a reply is
-  pending, and requeues the active request across Agent reconnect. Its event
-  stream distinguishes queued, sent, acknowledged, rejected, unsupported, and
-  transport/protocol failures.
-- Multi-monitor requests now use explicit IDs and signed positions. The Agent
-  manager validates unique IDs and wire ranges, inserts 0x0 placeholders for
-  missing/disabled IDs only when sparse configuration is negotiated, and sets
-  USE_POS only when the peer advertises monitor-position support. Continuous
-  layout changes still coalesce to the latest complete configuration.
-- Display Link advertises `SPICE_DISPLAY_CAP_MONITORS_CONFIG`. Message 317 is
-  decoded as the authoritative `count/max_allowed/QXLHead[]` result with a
-  256-head bound, exact body sizing, unique IDs, nonzero geometry, and checked
-  coordinate extents. Empty notifications are acknowledged but do not replace
-  the last useful layout.
-- `SpiceSessionEvent.displayConfiguration` publishes the actual guest monitors,
-  surface IDs, positions, dimensions, flags, maximum supported heads, and the
-  originating Display Channel ID. This preserves the Linux multi-head/single-
-  channel versus Windows multi-device/channel distinction.
-
-### Bounded, explicitly authorized file transfer
-
-- Added strict codecs for `VD_AGENT_FILE_XFER_START`, `STATUS`, and `DATA`,
-  including all status values plus packed GLib-I/O and free-space details.
-  Metadata contains only a validated basename and UInt64 byte size; separators,
-  control characters, dot paths, leading/trailing whitespace, oversized names,
-  and inconsistent chunk lengths are rejected.
-- `SpiceAgentManager.sendFile(at:name:)` is the sole initiation path. It accepts
-  one regular file selected by the application, never scans directories or
-  reacts to clipboard/drag state automatically, and waits for an explicit peer
-  capability announcement that does not contain `FILE_XFER_DISABLED`.
-- A transfer sends START, waits for `CAN_SEND_DATA`, reads at most one bounded
-  chunk off the manager actor, then sends DATA. Chunks are capped at 16,000
-  bytes so a complete Agent message fits the common eight-token window; token
-  exhaustion sends no partial message and is retried by the existing Agent
-  work loop.
-- At most four transfers and one pending chunk per transfer are retained by
-  default. Source size defaults to an 8 GiB policy ceiling. A file truncated or
-  made unreadable during transfer produces a client ERROR status rather than
-  leaving a guest transfer ID hanging.
-- Completion requires a guest SUCCESS after all declared bytes are sent.
-  Application cancellation before START is purely local; after START it sends
-  CANCELLED. Disconnect fails active transfers. Detailed status, progress, and
-  terminal results use a dedicated bounded `fileTransferEvents` stream.
-- Standard VDAgent file transfer is host-to-guest. Unsolicited guest START/DATA
-  is rejected as a protocol error; this implementation never derives or writes
-  a host path from guest data. Security-scoped URL acquisition and release stay
-  under embedding-application control.
-
-Clipboard integration remains UTF-8 text only. Images, clipboard
-selection/serial extensions, and a committed-text paste-keystroke workflow are
-not implemented. File transfer is a separate explicit host-to-guest path.
-Inputs remains physical PC scan-code transport; VDAgent UTF-8 clipboard is a
-separate data path and is not guest IME composition synchronization. Automatic
-general-pasteboard synchronization is privacy-sensitive and must be exposed as
-such by an embedding application.
-
-## Stage F advanced-video groundwork
-
-- Added a bounded Annex-B parser for H.264 and H.265. It accepts three- and
-  four-byte start codes, validates forbidden/header fields, caps encoded bytes,
-  NAL size, and NAL count, and rejects empty/trailing units.
-- AVC SPS/PPS/SPS-extension and HEVC VPS/SPS/PPS are separated from picture
-  data. Remaining units are converted to CoreMedia's four-byte big-endian
-  length-prefixed sample representation. Picture and random-access NALs are
-  classified without parsing unbounded Exp-Golomb payloads.
-- Added the isolated `SpiceVideoToolbox` target. Its actor accumulates parameter
-  sets, creates the matching CoreMedia format description, and owns a
-  synchronous, ordered `VTDecompressionSession`. It requests real-time,
-  Metal-compatible, IOSurface-backed NV12 and emits a package-only frame that
-  retains the immutable `CVPixelBuffer`. Every plane, stride, matrix, and range
-  is bounded; `copyBGRA()` is a one-time lazy cached fallback. The decoder
-  checks `UsingHardwareAcceleratedVideoDecoder` and rejects software or
-  unqueryable sessions. Unsupported formats and unavailable hardware become
-  typed codec failures. Parameter-set replacement creates and validates the new
-  session before atomically swapping it with the old one; a failed creation
-  remains marked for retry on the next frame.
-- DisplayChannel now owns an advanced decoder per H.264/H.265 stream, routes
-  decoded output first through the package-only native Metal compositor and
-  then, when required, through the existing BGRA clip/scale transaction,
-  and closes decoder sessions on stream/surface destruction, RESET, destroy-all,
-  or channel close. Already-late inter-frame video is still submitted so codec
-  reference state and in-band parameter sets advance, but its decoded image is
-  intentionally not committed. Frame-local mapping/format errors fall back for
-  that frame; pipeline or command-execution failure permanently disables Metal
-  for the current stream generation. Every advanced CPU fallback is counted.
-- Added reproducible FFmpeg 8.1.2 software reference fixtures for H.264 High,
-  H.264 Baseline, and H.265 Main at 128x128. The Baseline stream changes SPS/PPS
-  on an existing decoder and proves session replacement. Real VideoToolbox
-  output matches independent FFmpeg software-decoded BGRA with exact geometry
-  and alpha and a maximum RGB delta of four from YUV conversion rounding.
-- The safe-default Display Link remains exactly `SIZED_STREAM`,
-  `MONITORS_CONFIG`, `MULTI_CODEC`, and `CODEC_MJPEG` (`0x303`). An explicit
-  endpoint policy may add either `CODEC_H264` (`0xb03`) or `CODEC_H265`
-  (`0x4303`). The local encoded/decode backend corpus gate is closed for both
-  codecs.
-- A Rocky x86_64 live probe confirmed that Ubuntu's spice-server 0.15.1 accepts
-  an H.264 preference and creates real `x264enc` streams. Its unconstrained
-  `videoconvert`, however, negotiates Y444 and emits H.264 High 4:4:4, which
-  macOS VideoToolbox rejects with status `-8969`. The experimental capability
-  advertisement is therefore not the default. A separate guest stream-device
-  probe then supplied deterministic 1280x720 yuv420p H.264 Constrained Baseline
-  through the unmodified server. With explicit H.264 policy and the stream
-  active, SwiftSpice published 360 aggregate Display frames in eight seconds
-  without a decode/session failure; the server observed
-  `h264=1 streaming=1`. The default-policy negative gate observed
-  `h264=0 streaming=0`. The same fixture supplied deterministic 1280x720
-  yuv420p H.265 Main. With explicit H.265 policy, SwiftSpice again published
-  360 aggregate Display frames in eight seconds without a decode/session
-  failure; the server observed `h265=1 selected=h265 streaming=1`. Its default
-  negative gate observed `h264=0 h265=0 selected=none streaming=0`. The
-  loopback-only reproduction fixture is under `Integration/RemoteRocky/Video`.
-  These retained runs prove protocol advertisement and VideoToolbox decode;
-  they predate, and therefore do not prove, the revisioned IOSurface/Metal
-  composition path below.
-- Added an isolated `SpiceIOSurface` ownership target and a default
-  triple-buffer frame pool keyed by geometry and 32-bit BGRA pixel format.
-  Allocation is bounded by frame count and bytes; idle mismatched entries may
-  be evicted, while exhaustion by live readers immediately returns the existing
-  immutable `Data` frame instead of blocking the Display receive loop.
-- Each published frame holds an immutable IOSurface read lease. The pool cannot
-  recycle that surface until the last copied/coalesced/presented frame releases
-  it. `SpiceFrame` exposes IOSurface identity and geometry while preserving
-  immutable packed-BGRA semantics and existing semantic equality; its `Data`
-  readback is generated on first CPU access and then cached.
-- Real IOSurface allocation, lock/copy/unlock, byte-exact readback, exhaustion
-  fallback, and post-release reuse are covered by local tests.
-- The current Apple Silicon backing is a per-Surface revision ring, enabled only
-  when the device reports unified memory, Apple GPU family 7 or newer, and a
-  real IOSurface texture probe succeeds. Every Surface has at most three slots,
-  including retired slots still held by old frames, under one process-wide
-  256 MiB IOSurface allocation budget shared with the legacy snapshot pool.
-- A published canonical slot is immutable while any frame or GPU presentation
-  lease is live. After all leases release, validated CPU-only damage may reuse
-  it in place; native-video and other fallible GPU writes always use a distinct
-  candidate. Lagging candidates catch up from bounded revision damage history
-  with at most 64 losslessly coalesced rectangles. A cheap rectangle-area upper
-  bound avoids unnecessary union work; exact sweep-line union coverage reaches
-  the 50-percent threshold before the journal becomes a full upload.
-  Three live consumer leases cause an immediate Data snapshot fallback rather
-  than a Display wait; cached legacy slots are purged before pressure demotes
-  the revisioned path. Resize, store close, and same-ID recreation retire slots
-  without invalidating old frames. Store close first enters a terminal state,
-  rejects new operations, drains every in-flight per-Surface tail, and lets
-  concurrent close callers observe the same completed teardown.
-- The session-wide CPU budget counts every live canonical Surface across all
-  Display channels. A Data fallback snapshot makes an independent packed-BGRA
-  copy at the publication boundary, so a caller retaining only `pixels` cannot
-  participate in a later canonical Surface COW. Desktop backlog remains bounded
-  by one prepared frame, one latest pending revision, and each subscriber's
-  `bufferingNewest(1)` stream.
-- `SpiceMetalCompositor` maps NV12 Y as `r8Unorm` and UV as `rg8Unorm`; one
-  command encoder applies BT.601/709, video/full range, top/bottom orientation,
-  nearest scaling, all clips, and writes the candidate IOSurface. The source
-  pixel buffer and texture wrappers live through command completion, and a
-  candidate becomes canonical only after successful completion. Unknown color
-  matrices and odd NV12 geometry use the CPU reference path.
-- `DisplayFramePublisher` uses metadata-only descriptors and exact
-  lifecycle/revision snapshots. `SpiceFrame.pixels` preserves immutable
-  packed-BGRA semantics through a shared one-time lazy cache; a normal Metal
-  viewer does not materialize it.
-- Aggregate diagnostics cover damage and copy bytes, CPU materialization, pool
-  exhaustion and leases, GPU copies/errors, native/fallback video, publisher
-  demand suppression/coalescing, desktop-source delivery, display-link wakeups,
-  texture-cache behavior, GPU-busy skips, Metal presentation failures, MJPEG
-  allocation/reuse, and actual VideoToolbox hardware selection. Bounded
-  content-free histograms expose publisher and Metal commit/completion/presented
-  timing without retaining individual samples or per-frame logs.
-  `spice-probe --require-native-video` turns the zero-BGRA and zero-GPU-error
-  expectations into a live gate. Fault-injection regressions prove failed VT
-  session creation and unsupported formats become typed codec failures, while a
-  Metal command error disables only the current stream generation before CPU
-  fallback.
-- The SwiftPM `CompileMetalShaders` build-tool plugin produces the resource
-  `.metallib`; package consumers receive it through SwiftPM. The native artifact
-  closure verifier requires exact arm64 static frameworks and rejects absolute
-  build-machine or Homebrew paths.
-- `SpiceDesktopView` keeps a narrow `NSViewRepresentable` and AppKit responder
-  boundary. Its private framebuffer view owns a normally paused display link
-  and explicit-draw `MTKView`. IOSurface-backed BGRA frames reuse up to three
-  texture wrappers and are sampled directly by one full-screen-triangle pass;
-  1:1/integer scaling is nearest and other scaling is linear. There is no MPS,
-  blit-only presentation, depth/MSAA attachment, or intermediate texture.
-  CPU-only frames continue through the AppKit/CGImage fallback.
-- The command-buffer completion callback retains the source `SpiceFrame`, so an
-  in-flight GPU read cannot race frame-pool recycling. At most two commands are
-  in flight; a busy GPU skips the tick rather than blocking the main actor.
-  `CAMetalDrawable` presented handlers record confirmed on-screen latency.
-- IOSurface now chooses its aligned row stride rather than inheriting the packed
-  CPU stride. Real Metal tests map IOSurfaces, exercise compositor writes and
-  direct render-pipeline presentation, and verify byte-exact BGRA where the
-  operation is required to be exact. CPU-only rejection and the complete
-  existing suite are also covered.
-- Added the `spice-viewer` SwiftPM GUI executable as a project-local debug and
-  integration client, with terminal logging and native-closure verification
-  scripts for its library dependencies.
-- The validation host drives synthetic 640×360 BGRA SurfaceStore frames with an
-  absolute-deadline 30 fps schedule. Window-level inspection confirmed animated
-  Metal output, aspect-fit presentation, and a measured 29.3 fps submission
-  rate. Unified logging confirmed one host-start event and one transition to
-  `Metal IOSurface` without noisy per-frame logging.
-- Promoted `spice-viewer` to a session-driven macOS viewer while retaining the
-  synthetic mode as `Offline Validation`. `Remote Session` exposes validated
-  host/port input, TCP, system-trust TLS, and explicitly unsafe test TLS, plus a
-  non-persisted ticket password and connection/error state.
-- The viewer owns one supervised control-event task and passes the stable
-  session desktop source directly to `SpiceDesktopView`; frames, cursor, and
-  pointer mode never become observed application properties. Input enters one
-  bounded 256-event FIFO and one sequential sender task rather than creating a
-  task per key or pointer event.
-- Real-window inspection covered mode switching, the session form, immediate
-  connection cancellation, local validation errors, and continued IOSurface
-  Metal presentation near 30 fps. The endpoint/TLS mapping has focused tests;
-  the complete local suite passed 194 tests in 45 suites at that slice.
-- Added cancellable connection lifecycle hardening. Each attempt has a 10-second
-  deadline, and optional reconnect makes at most five retries with bounded
-  1/2/4/8/16-second backoff. Disconnect, mode changes, and window closure cancel
-  both active establishment and backoff immediately.
-- Fixed `NetworkSpiceTransport` establishment cancellation at the transport
-  boundary. It now starts TCP/TLS with a non-suspending empty idempotent send,
-  observes channel state, and terminates the wait through its AsyncStream when
-  the caller task is cancelled; it does not attempt a second blocking graceful
-  close on an unestablished channel.
-- Endpoint profiles persist only normalized name, host, port, and TLS mode.
-  Passwords remain transient within the active connection lifecycle and are
-  absent from both profile JSON and unified logs.
-- Added bounded unified telemetry in `Profiles`, `Navigation`, and `Session`
-  categories. Live log inspection confirmed profile load, mode selection,
-  connection attempts, timeout, retry scheduling, and user cancellation without
-  endpoint or credential disclosure.
-- The viewer now discovers Playback channel 0 after session bootstrap and only
-  then attaches `SpiceAudioPlaybackSink`. Its connected status bar surfaces
-  format/mute state plus bounded resynchronization, oversized-drop, underrun,
-  and dropped-duration counters. Sink failures enter the same visible bounded
-  state instead of being hidden in a detached task.
-- Disconnect, retry, mode changes, and window closure cancel the playback event
-  supervisor and stop the sink before releasing the session. A real disconnected
-  app launch produced no Playback attachment log, confirming that AVAudioEngine
-  is not initialized before a Playback channel exists. That slice's
-  warnings-as-errors gate passed 199 tests in 47 suites.
-- The viewer now treats Record availability and microphone consent as separate
-  states. Discovering Record channel 0 exposes `Mic Off` but does not query
-  permission or construct `SpiceAudioCaptureSource`; Enable Mic is the only path
-  that requests access and attaches the source. Permission wait can be cancelled,
-  and an independent request generation rejects late authorization results after
-  cancellation, disconnect, retry, or mode changes.
-- Record status exposes permission denial/restriction, server start/stop, format,
-  mute, capture failure, overflow count, and dropped duration. Disconnection
-  stops the source before releasing the session and resets to per-session opt-in.
-  The staged app contains `NSMicrophoneUsageDescription`; launch logs contain no
-  permission request or Record attachment. That slice's warnings-as-errors gate
-  passed 201 tests in 48 suites.
-- The viewer now exposes Agent UTF-8 clipboard as a per-session explicit opt-in.
-  Before opt-in it drains the bounded `agentEvents` stream so a long-running
-  session cannot fail merely because Agent control traffic has no consumer, but
-  the drain discards events and never calls `SpicePasteboardBridge`. Enabling
-  clipboard waits for that drain to terminate before handing the single stream
-  to `SpiceAgentManager`; disabling performs the inverse handoff.
-- Clipboard status surfaces negotiation readiness, host/guest ownership using
-  byte counts only, oversized local rejects, and failures. It never retains or
-  logs clipboard text. The UI and diagnostics explicitly identify this as
-  VDAgent UTF-8 data transfer rather than Inputs scan codes or guest IME state.
-  Disconnect, retry, and mode changes stop the manager before the session. A
-  staged-app launch emitted no Clipboard telemetry or manager attachment. That
-  slice's warnings-as-errors gate passed 203 tests in 49 suites.
-- Refactored the viewer to keep one shared `SpiceAgentManager` for Agent control,
-  monitor, clipboard, and file-transfer work. Its pasteboard policy is now
-  mutable and protocol-visible: disabled mode advertises monitor/reply/sparse-
-  monitor/file-transfer detailed-error support without clipboard/by-demand,
-  ignores stale guest clipboard commands, and gates `synchronizePasteboard()`
-  and `publish(_:)` before the AppKit bridge. Enabling/disabling reannounces the
-  matching capabilities without replacing the Agent event consumer.
-- Added explicitly authorized host-to-guest file selection through one narrow
-  `NSOpenPanel` bridge. The panel accepts one regular file; the manager opens it
-  while its security-scoped access is active, then owns the bounded reader.
-  Viewer state retains at most eight entries and exposes queued, guest approval,
-  progress, completion, failure, and cancellation. File names are visible in
-  the user's menu but logs contain only transfer IDs and byte counts.
-- A file-transfer menu provides Send File and per-active-transfer cancellation.
-  It is available independently of clipboard opt-in and never changes the
-  pasteboard policy. The staged app builds and launches without implicit
-  Clipboard or file-transfer telemetry. That slice's warnings-as-errors gate
-  passed 206 tests in 50 suites.
-- Added a dedicated monitor popover backed by the shared Agent manager. It
-  groups monitor IDs, surfaces, positions, and dimensions by Display Channel ID,
-  retains the last useful inventory across empty notifications, and exposes a
-  validated single-monitor width/height request without enabling clipboard.
-- Resolution lifecycle state distinguishes queued, sent, acknowledged,
-  rejected, unsupported, failed, and applied. Agent acknowledgement never
-  mutates the inventory; only a subsequent matching Display Channel notification
-  marks the request applied. Focused state tests cover this authority boundary.
-  The staged viewer builds and launches cleanly, and the current
-  warnings-as-errors gate passed 209 tests in 51 suites.
-- Added a complete multi-monitor draft editor with add/remove rows, explicit
-  0...255 IDs, positive UInt32 dimensions, and signed Int32 positions. A new
-  Agent support stream reports baseline versus explicit monitor, sparse-ID, and
-  position capabilities; the editor gates submission locally while the manager
-  retains its wire-level validation.
-- A single Display Channel draft preserves its monitor IDs. Multiple Display
-  Channels are flattened deterministically and assigned sequential request IDs
-  with an explicit warning because channel-local IDs cannot be assumed to map
-  losslessly to VDAgent request indexes. Multi-monitor requests are marked
-  applied only after a matching authoritative inventory. The current
-  warnings-as-errors gate passes 214 tests in 52 suites.
-- Added strict Main migration decoding for BEGIN, BEGIN_SEAMLESS, CANCEL,
-  SWITCH_HOST, END, and destination seamless ACK/NACK, plus exact client
-  CONNECTED, CONNECT_ERROR, END, DST_DO_SEAMLESS, and CONNECTED_SEAMLESS reply
-  encoding. Destination host and certificate-subject C strings are bounded to
-  4096 bytes, require final NUL without embedded NUL, require valid UTF-8, and
-  reject destinations with no usable port.
-- Added a generation-tagged migration handoff coordinator. A newer BEGIN first
-  cancels the old preparation, late completion is ignored, CANCEL releases both
-  preparing and prepared targets, and END is a protocol violation until a target
-  is ready. Public session events expose preparing, ready, cancelled, committing,
-  switching, completed, and failed phases without logging destination details.
-- The session owns and cancels the handoff task across replacement, disconnect,
-  and receive failure. Connection bootstrap now produces a locally owned
-  prepared session without mutating the active Main/child Channel set. Migration
-  targets correctly reuse the source session ID and source Channel inventory;
-  they do not wait for a second MAIN_INIT/CHANNELS_LIST. A target becomes ready
-  only after every source child Channel is authenticated and constructed;
-  preparation failure or cancellation closes only those target transports and
-  leaves source supervision running.
-- Semi-seamless END first writes client MIGRATE_END to the prepared target, then
-  atomically replaces the Main/child Channel set and starts its supervision
-  before closing the source set. A dual-session fixture proves that subsequent
-  Main events and Inputs writes use the target while source Inputs stay closed.
-  Separate fixtures prove failed and cancelled preparation rollback. Existing
-  TLS sessions cannot be downgraded to a plaintext migration port, and an
-  unverified certificate subject is rejected. A target-only Main Link advertises
-  the requested migration capabilities; when the target server confirms seamless
-  support, the client sends DST_DO_SEAMLESS with the exact source version and
-  strictly accepts only ACK/NACK before reporting CONNECTED_SEAMLESS or falling
-  back to CONNECTED. Ordinary source Main Links now advertise both semi-seamless
-  and seamless migration after state-preserving connection rebinding closed the
-  remaining local handoff boundary.
-  Common-Channel migration is now implemented as a strict connection-level
-  boundary: MIGRATE accepts only NEED_FLUSH/NEED_DATA_TRANSFER, blocks later
-  ordinary writes immediately, sends FLUSH_MARK before reading optional opaque
-  MIGRATE_DATA, and rejects missing, unsolicited, or misordered state packets.
-  The session waits for Main and every source child Channel before forwarding
-  each opaque state body to its matching target connection and atomically
-  adopting the target set. A partial flush followed by CANCEL reopens only the
-  paused source connections and keeps the source usable. Prepared migration
-  actors are no longer adopted: after an exact inventory check, authenticated
-  target connections are rebound onto the existing Main, Display, Cursor,
-  Inputs, Playback, Record, and passive actors. Source connections are then
-  closed, preserving Display surfaces/image cache, Cursor cache/snapshot, Inputs
-  button state, Main Agent token/decoder state, active audio state, and the shared
-  multimedia clock. The Session image cache follows the same ownership boundary:
-  seamless and semi-seamless rebinding retain it, while `SWITCH_HOST` performs
-  full-session replacement and closes the source cache. The current
-  warnings-as-errors gate passes, including `SpiceSessionTests` 62/62.
-
-## Stage F peripheral-channel local closure
-
-- Smartcard implements strict VSCARD 0.0.2 framing for reader/card/APDU/error/
-  flush traffic, bounded payloads, a serialized control queue, migration-safe
-  connection rebinding, and Session supervision. Reader and card ownership is
-  application-explicit; the library never enumerates or opens host smartcards.
-- USB redirection uses the generic SpiceVMC Channel plus an exact
-  `libusbredirhost`/libusb C backend. It bounds every guest/host packet and pump
-  interval, applies the guest filter, and requires an application-selected
-  bus/address before opening a device. A raw packet bridge remains available to
-  applications that own another backend.
-- WebDAV strictly decodes Port initialization/events and incrementally
-  demultiplexes bounded client streams. The optional native DAV class-1 server
-  requires an explicit root, defaults to read-only, supports PROPFIND/GET/HEAD,
-  and enables PUT/MKCOL/DELETE/file COPY/MOVE only under an explicit read-write
-  policy. Canonical containment and symlink checks prevent root escape. The raw
-  request/response bridge remains available when no native backend is attached.
-- Session owns the optional USB/WebDAV backends, cancels pumps and clears client
-  state on disconnect/failure, and preserves state across seamless connection
-  rebinding. Focused tests prove that no card, USB device, or filesystem root is
-  selected implicitly.
-- Guest WebDAV mounting is live-closed on the independent Rocky x86_64 fixture.
-  SwiftSpice authenticated through an SSH tunnel to QEMU 8.2.2 and
-  spice-server 0.15.1, attached an explicit read-only root over
-  `org.spice-space.webdav.0`, and an Alpine 3.22 guest running spice-webdavd
-  3.0-r4 and davfs2 1.6.1-r2 completed both a direct HTTP GET and a davfs2
-  mount/read. The guest observed 31 bytes with SHA-256
-  `492d1e4f0bc7e1ce3ae8d06e597d4197dbe5029ff75956f720938f940499b297`.
-  The reproducible, loopback-only fixture and lifecycle commands are under
-  `Integration/RemoteRocky/WebDAV`; run evidence is stored remotely per run.
-
-## Apple Silicon optimization acceptance status
-
-- The 0.2 display refactor is locally covered for latest-only desktop delivery,
-  hidden-demand snapshot suppression and full-damage resume, one-shot
-  display-link scheduling, cursor-only updates, texture-cache bounds, two-frame
-  GPU back-pressure, MJPEG handle/buffer reuse, pre-decode late drop, and typed
-  VideoToolbox hardware/format failures. Its live 60-second idle/occluded CPU
-  targets and the new active comparison against spice-gtk have not yet been
-  measured; the older benchmark below is retained as historical evidence, not
-  a result for the refactored presenter.
-- The retained 2026-08-01 development-tree five-second Rocky smoke used an
-  arm64 Release probe containing the then-uncommitted publisher revision-race
-  fixes. It predates `v0.2.7` and is not current performance evidence. That
-  probe published 52.0 fps versus 49.2 fps for spice-client-glib2, a passing 1.056911
-  ratio. Ready-frame (0.772646), p95 (0.673903), and RSS (0.658301) also passed.
-  Publisher stale snapshots fell from the earlier 48/261 (18.39%) sample to
-  0/265. CPU per frame remained the blocking metric at 1.451688 ms versus
-  1.206650 ms, a failing 1.203073 ratio. CPU materialization, pool exhaustion,
-  GPU copy, GPU errors, and pending evictions were zero. Because the smoke still
-  failed, the formal ten alternating pairs of 30 seconds were not started.
-  Retained evidence, the tested probe hash, and exact collection paths are
-  documented in `Benchmarks/RESULTS_ROCKY8_2026-08-01.md`.
-- On the current M4 Pro host, the strict final-tree Rocky native-video gate
-  passed both codecs. H.264 decoded 233 frames with 14 native Metal
-  compositions; H.265 decoded 233 with 28 native compositions. Both selected a
-  hardware VideoToolbox session and reported zero VT/general BGRA materialization,
-  fallback, GPU error, stream-generation disable, and pool exhaustion. The
-  server independently reported `selected=h264 streaming=1` and
-  `selected=h265 streaming=1`.
-- SwiftSpice now has an explicit Apple Silicon-only product contract: non-arm64
-  compilation is rejected, native dependencies contain only arm64, release
-  staging builds only arm64, and the closure verifier rejects any extra slice.
-  The final `--package` gate passes with one arm64 executable slice, the staged
-  shader bundle, recursive native-closure checks, and an ad hoc signature.
-  There is no valid Developer ID identity on this host, so Developer ID signing,
-  notarization, Gatekeeper distribution acceptance, and launch on a clean Apple
-  Silicon macOS 26 machine remain external release gates.
-- The current M4 Pro host (macOS 26.6, 24 GiB unified memory, 16-core GPU) has
-  passed focused Metal/IOSurface tests, the hardware VideoToolbox gate, exact
-  arm64 packaging, and a synthetic real-window Metal launch. M1 plus real-host
-  1080p/4K, fixed 60 Hz/ProMotion, resize/occlusion, at least 95 percent source
-  presentation, zero GPU errors, and zero normal-viewer BGRA materialization
-  remain external acceptance gates. The current Apple/container live gate also
-  still needs its custom KVM kernel and local QEMU image restored before rerun.
-
-The listener-independent Stage F implementation is locally closed. The current
-warnings-as-errors gate runs every test without exclusions. The current Rocky
-yuv420p H.264/H.265 native composition gate is closed; broader codec profiles,
-resolutions, and display behavior remain part of the real-host gate. Smartcard
-hardware, a redirected USB device, human-audible Playback/device route
-switching, physical microphone capture, and migration remain explicit external
-gates rather than locally validated claims.
-
-## Source baseline
-
-```text
-Package: spice-protocol 0.14.5
-URL: https://www.spice-space.org/download/releases/spice-protocol-0.14.5.tar.xz
-SHA-256: baf58449f6e89d19f475899ad5fb9196fdc46c03cc53233f4e39cf2978f9cff7
-License: BSD-3-Clause
-```
-
-QUIC backend:
-
-```text
-Package: spice-gtk 0.42 source release (spice-common QUIC implementation)
-Linkage: package-provided arm64 static XCFramework
-License: LGPL-2.1-or-later
-```
-
-## Acceptance commands
-
-The current trusted baseline passes warnings-as-errors tests without
-exclusions, security-focused Clang analysis of the owned C shims, the complete
-AddressSanitizer suite, and a 62 percent merged production-source line coverage
-minimum. The `SwiftSpice` library build, generated-protocol consistency check,
-and exact-arm64 native artifact closure verification also pass.
-
-```sh
-swift build --disable-sandbox -Xswiftc -warnings-as-errors
-swift test --disable-sandbox -Xswiftc -warnings-as-errors
-swift package --allow-writing-to-package-directory generate-spice-protocol --check
-./Scripts/build-lib.sh
-./Scripts/analyze-c-shims.sh
-./Scripts/test-address-sanitizer.sh
-./Scripts/check-code-coverage.sh
-```
-
-The repository-backed Apple/container live gate is:
-
-```sh
-Integration/AppleContainer/build-qemu-image.sh
-Integration/AppleContainer/build-guest-initramfs.sh
-Integration/AppleContainer/run-live-closure.sh
-
-# Rich Agent closure (file transfer, clipboard, and two-head layout)
-Integration/AppleContainer/build-agent-initramfs.sh
-SWIFTSPICE_GUEST_INITRAMFS="$PWD/Integration/AppleContainer/Artifacts/agent-initramfs.cpio.gz" \
-SWIFTSPICE_REQUIRE_AGENT=1 \
-SWIFTSPICE_EXERCISE_FILE_TRANSFER=1 \
-SWIFTSPICE_EXERCISE_CLIPBOARD=1 \
-SWIFTSPICE_EXERCISE_MONITOR_CONFIGURATION=1 \
-SWIFTSPICE_GUEST_SETTLE_SECONDS=5 \
-Integration/AppleContainer/run-live-closure.sh
-```
-
-The live script requires the custom nested-virtualization kernel described in
-`Integration/AppleContainer/APPLE_CONTAINER.md`. Its base gate validates ticket
-authentication, Display/Cursor/Inputs observations, and guest receipt of the
-injected physical A-key scan code. The richer opt-in gate additionally validates
-Agent file transfer, bidirectional UTF-8 clipboard, QEMU UI-info monitor
-configuration, and the final XRandR layout. It does not install or change macOS
-CA trust.
-
-When a server becomes available:
-
-```sh
-SPICE_PASSWORD='...' swift run spice-probe HOST PORT
-SPICE_PASSWORD='...' swift run spice-probe HOST TLS_PORT --tls
-```
+# Current implementation and validation status
+
+Reviewed against the working tree on 2026-11-01. `VERSION` identifies **0.4.4**;
+the JPEG/MJPEG Neon backend, stream-feedback and display-layout work below are **unreleased**.
+Validation results are dated by implementation task; historical test counts
+describe those runs rather than the current package.
+
+For setup, use the [README](../README.md). Stable design rules live in
+[ARCHITECTURE.md](ARCHITECTURE.md). This page records implementation and known
+validation limits; it is not a queue of inherited development tasks.
+
+## Swift production core (2026-11-01)
+
+The `SwiftSpice` product uses `Sources/SwiftSpice` and the Swift protocol,
+transport, channel, codec and renderer targets. Viewer offline rendering uses
+`SurfaceStore`; the probe reuses the package's input exercise plan. The Zig
+core and its Swift bindings are maintained separately in `libmaspice`; this
+repository contains no duplicate core, artifact, generator mode or validation
+pipeline for that implementation.
+
+QUIC remains the spice-gtk C codec. JPEG/MJPEG Neon, Display stream feedback,
+dynamic resolution fixes, local benchmarks and the removal of remote campaign
+tooling are retained.
+
+Local verification of the restored package passed:
+
+- A fresh warnings-as-errors SwiftPM build of the library, Viewer and Probe,
+  plus the standalone public API consumer build.
+- All **727** tests, followed by all 727 under AddressSanitizer.
+- Protocol generation consistency, C-shim static analysis, native dependency
+  closure, and the QUIC C consumer/oracle validation described below.
+- Coverage: **80.61%** lines, **82.37%** functions and **72.97%** regions;
+  the unchanged 62% line-coverage floor passed.
+
+These are local checks; no new live-peer, physical-screen or remote CI run was
+performed for this restoration.
+
+## Dynamic resolution fixes (2026-11-01)
+
+The Swift display-layout coordinator sends the latest monitor layout without
+requiring an Agent reply to the previous layout. Unacknowledged overlapping
+sends make reply correlation ambiguous until the next Agent connection; late
+replies cannot acknowledge or reject the newest size. The viewer accepts an
+authoritative Display update without requiring an Agent ACK first, and a later
+ACK cannot undo an already applied status.
+
+Regression tests cover coalesced updates, overlapping unacknowledged requests,
+late/duplicate replies, reconnect and viewer completion from Display updates.
+These are local checks; fresh live-guest resolution acceptance remains separate.
+
+## Toolchain and dependency refresh (2026-10-30)
+
+The package and public API consumer now require Swift tools 6.4. Local checks
+used Xcode 27.1 / Apple Swift 6.4 on the M4 Pro host. CI selects the same Xcode
+on the `xcode-27` hosted image; that remote CI run has not been performed here.
+libjpeg-turbo is now 3.2.1. Current QUIC provenance and validation are recorded
+in the spice-gtk C section below.
+usbredir 0.15.0, libusb 1.0.30 and the optional benchmark 1.38.1 remain current.
+The libusb build disables the SDK 27-only `pipe2` probe to retain macOS 26 support.
+
+- The complete `make all` baseline passed: warnings-as-errors library/public API
+  builds, generated-source consistency, C analysis, native closure, all **725**
+  current tests, all 725 under AddressSanitizer, and coverage (**80.52%** lines,
+  above the unchanged 62% floor). The smaller count than the historical 908-test
+  run below reflects the retired remote campaign targets.
+- Fresh ASan-instrumented libjpeg-turbo 3.2.1 scalar and Neon builds passed all
+  **20** exact-pixel/guard/padding/alpha comparisons.
+- Maspice's 55 application tests passed against this local checkout as well as
+  the pinned 0.4.4 release. Its latest Sparkle 2.10.1 Release app assembly,
+  relocatability audit and ad hoc signature verification passed.
+
+## Production spice-gtk C QUIC (2026-11-01)
+
+`CSpiceQUIC.xcframework` is rebuilt from the checksum-verified spice-gtk 0.42
+archive and its unchanged spice-common C codec. The bounded BGRA bridge,
+grayscale cleanup fix and top-down orientation remain.
+
+Current C ABI/sanitizer checks live in `Tests/CSpiceQUICTests` and run through
+`Scripts/validate-quic.sh`, `make all` and CI. The archive records upstream and
+owned-source provenance.
+
+Local verification passed:
+
+- QUIC artifact rebuild, source/binary/header provenance, native dependency
+  closure and C static analysis.
+- **864** native C pixel/guard cases and **96** allocation-failure trials,
+  plus streaming/callback/cleanup checks. ASan/UBSan cover the consumer and
+  independent source-built C oracle; the shipped archive is not instrumented.
+- All **5** QUIC decoder/Display regression tests passed under Swift ASan,
+  including logical row order and malformed-input Surface rollback.
+
+These are local artifact/application checks; no new live-peer, physical-screen
+or release acceptance is implied.
+
+## Feature evidence
+
+| Area | Recorded evidence | Still pending |
+| --- | --- | --- |
+| Main, TCP/TLS, ticket authentication, Display, Cursor, Inputs | Local tests and live QEMU/SPICE desktop and trusted-TLS checks | Fresh peer checks use an externally supplied SPICE endpoint |
+| JPEG, LZ, GLZ, ZLIB-GLZ, QUIC, MJPEG | Bounded decoders, independent golden fixtures, transactional Surface tests; latest JPEG and feedback evidence below | Installed-app QUIC orientation check and actual-session MJPEG quality/latency validation |
+| H.264/H.265 | Explicit opt-in VideoToolbox decode and Rocky yuv420p native-Metal interoperability on M4 Pro | Broader profiles/resolutions and real-window hardware matrix; MJPEG remains the default |
+| IOSurface/Metal desktop | Revisioned publication, bounded native composition, focused tests and M4 Pro window evidence | M1, real 1080p/4K, fixed 60 Hz/ProMotion, resize/occlusion and fresh comparative performance |
+| Agent | Rich-guest clipboard, file transfer and monitor-layout checks | Fresh peer validation requires a guest with Agent support |
+| Playback/Record | Local protocol, preallocated rings and deterministic host-adapter tests | Audible playback, route switching and physical microphone capture |
+| WebDAV | Earlier Rocky direct GET and davfs2 mount/read evidence; bounded executor changes tested locally | The executor path has not been revalidated against a live guest |
+| Smartcard, USB, migration | Local protocol/state-machine tests | Real devices and live semi-seamless/seamless migration |
+| Distribution | Recorded arm64 packaging, closure and ad hoc signing checks | Developer ID, notarization, Gatekeeper and a clean Apple Silicon macOS 26 host |
+
+Local implementation, deterministic tests, live interoperability, hardware
+validation, and performance measurements are separate claims. A passing result
+for an earlier implementation does not verify every subsequent release.
+
+## Local performance tooling
+
+The opt-in `SpiceBenchmarks` executable replaces remote benchmark orchestration
+with fixed local codec, wire, protocol, and Surface workloads. See the
+[benchmark guide](../Benchmarks/BENCHMARKS.md) for measurement boundaries and
+same-machine baseline comparisons. `spice-probe`, viewer presentation diagnostics,
+and local frame-correlation tests remain available for live-session investigation.
+Local timings do not establish end-to-end interaction latency or peer interoperability.
+
+## JPEG/MJPEG Neon backend (2026-10-30)
+
+The first follow-up batch to the 0.4.4 source comparison enables and requires
+libjpeg-turbo 3.2.0's arm64 Neon backend. The historical `WITH_SIMD=OFF` setting
+has no recorded failure rationale; the current arm64-only target builds the
+upstream intrinsics without NASM/Yasm. Source version/checksum, quality flags,
+headers, license and minimum macOS 26.0 target are unchanged. QUIC and USB
+artifacts, stream scheduling, generation/order checks and Surface mutation
+barriers are unchanged. The preceding STREAM_REPORT work is preserved.
+
+The native build now supports `--jpeg-only`, pins upstream's date-dependent
+build string, normalizes archive timestamps/uid/gid and records source,
+compiler/SDK/configuration and archive SHA-256. Independent build directories
+produced byte-identical artifact files/symlinks. Closure checks verify the hash
+and exact-quality Neon kernels; an isolated replacement with the old scalar
+archive was rejected. See [the complete source investigation, raw measurements
+and reproduction commands](../Benchmarks/NativeJPEG/README.md).
+
+Validation completed:
+
+- Warnings-as-errors build and all **908 serial tests** passed. The expanded
+  MJPEG golden test exercises all six fixtures through IOSurface and forced
+  Data paths, including CMYK, grayscale, progressive and ICC-bearing data,
+  with a reused handle across format/geometry changes.
+- The first full run had one untouched Remote Rocky script fixture timeout
+  while other native checks were running. A subsequent complete serial run
+  without those overlapping checks passed; no timeout or assertion was weakened.
+- `Scripts/test-address-sanitizer.sh` passed all **908 tests**. Separately, fresh
+  fully ASan-instrumented scalar/Neon native libraries and the C harness passed
+  all **20** small/odd/1080p/4K format comparisons, guard, row-padding and alpha
+  checks. These are distinct sanitizer boundaries.
+- The shipped Release archive matched the scalar baseline byte-for-byte for
+  all 20 synthetic cases. The separate upstream Neon Release build passed
+  **332/332** CTest tests.
+- `Scripts/build-lib.sh`, C-shim static analysis, standalone harness static
+  analysis, native closure, and protocol generation consistency checks passed.
+- On the measured M4 Pro host (macOS 27.2, Clang 21.0.0, SDK 27.0), quality-80
+  4:2:0 full-frame decoding used median **7.436 → 4.304 CPU ms/frame** at
+  1920×1080 and **30.208 → 17.594 CPU ms/frame** at 3840×2160. Five alternating
+  trials each decoded 30 complete frames after warmup; exact same encoded
+  inputs, accurate inverse DCT and fancy upsampling were used for both builds.
+  Raw CPU/wall times, frame counts and image/artifact hashes are retained.
+
+These are local codec results, not user-session latency, displayed FPS or
+spice-gtk comparison claims. Actual-server quality recovery, M1 and real-window
+1080p/4K validation remain pending. No installed Maspice application was
+replaced/launched, and the current remote desktop was not operated or
+reconnected. No push, tag or release was made. Drawing/RAW/cursor compatibility,
+motion ACK flow control and codec-policy visibility remain later scoped work.
+
+## Display stream feedback correction (2026-10-30)
+
+SwiftSpice now advertises and implements `STREAM_REPORT`, following spice-gtk
+0.43 arrival-margin accounting. See [the comparison](STREAM_FEEDBACK.md) for the
+protocol contract and the spice-server 0.15.2 rate-control path that otherwise
+cannot receive positive recovery feedback.
+
+Validation completed:
+
+- All 908 tests passed with `swift test --disable-sandbox --no-parallel
+  -Xswiftc -warnings-as-errors`, including the existing admitted-late-frame,
+  frame-order and Surface mutation-barrier regressions. The first parallel run
+  encountered timeout failures in untouched filesystem/WebDAV and remote-script
+  fixture tests; the repository CI/release serial invocation passed in full.
+- Warnings-as-errors build and protocol generation consistency check passed.
+- A task-isolated Linux container built the official spice-server 0.15.2
+  `server/tests/test-display-streaming` peer. The built `spice-probe` connected
+  over a loopback-only listener; the installed Maspice session was not used.
+- The unmodified streaming scenario accepted feedback and the probe exited
+  successfully after 25 seconds. A second 35-second scenario set the fixture's
+  `sized` flag to 1 and `test->wakeup_ms` to 40 to extend continuous video.
+  Both used `SPICE_BIT_RATE=1`, a low initial bandwidth estimate rather than
+  an imposed network rate limit; the server encoder/feedback code was unmodified.
+- In the extended scenario, the peer accepted 54 reports covering 270 arrivals,
+  with zero reported late arrivals and no report-ID mismatch. It logged 12
+  bitrate increases, from an initial stream allocation of 0.80 Mbps to 1.92
+  Mbps. JPEG quality evaluation fell to 20 and ultimately selected 80.
+  The client recorded 96 native video compositions and zero GPU errors, then
+  disconnected successfully. This is protocol/rate-recovery evidence, not an
+  end-to-end latency benchmark or a comparison against another client.
+
+The remote server's version and reason for its initial quality downshift remain
+unknown. Recovery in the user's actual session is still pending a separate test
+build. No installed application was replaced, and no release was published.
+
+## Verification entry points
+
+[README build and test instructions](../README.md#build-and-test), the
+[Makefile](../Makefile), and [CI workflow](../.github/workflows/ci.yml) define the
+current local checks. `make all` runs the aggregate gate, including the public
+API consumer, serial tests, C analysis, AddressSanitizer and coverage.
+
+Performance and native dependency checks are documented separately:
+
+- [Local benchmark suite](../Benchmarks/BENCHMARKS.md)
+- [Native artifact provenance](../Artifacts/NATIVE_DEPENDENCIES.md)
+
+Live validation uses an externally configured endpoint with `spice-probe` or
+the actual client. Earlier passing runs do not prove current host or peer behavior.

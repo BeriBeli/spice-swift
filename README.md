@@ -1,7 +1,7 @@
 # SwiftSpice
 
-SwiftSpice is a native Swift 6 implementation of the SPICE client protocol for
-Apple Silicon Macs. The repository contains a reusable library, a SwiftUI/AppKit
+SwiftSpice is a native Swift 6 SPICE client for Apple Silicon Macs.
+The repository contains a reusable library, a SwiftUI/AppKit
 viewer, and a command-line integration probe. It does not depend on GLib.
 
 The protocol baseline is `spice-protocol` 0.14.5. The project currently covers
@@ -21,16 +21,17 @@ advertised on the wire after their interoperability requirements are met.
 | UTF-8 clipboard, file transfer, and monitor configuration | Implemented and exercised with the richer Agent guest |
 | Playback and Record | Implemented locally; audible playback and microphone capture remain external hardware gates |
 | Smartcard and USB redirection | Implemented locally; real devices remain external gates |
-| WebDAV | Explicit-root server and guest direct GET plus davfs2 mount/read are closed against the Rocky fixture |
+| WebDAV | Explicit-root server has earlier Rocky direct GET and davfs2 mount/read evidence; the bounded executor has local tests and awaits fresh live acceptance |
 | Semi-seamless and seamless migration | Implemented locally; live migration interoperability remains pending |
 
 SPICE input messages carry physical PC scan codes. They do not transport
 Unicode text or synchronize an IME composition session. UTF-8 text uses the
 separate SPICE Agent clipboard path.
 
-QUIC images use the exact `spice-common` 0.42 backend supplied as a static
-XCFramework by this package, behind a bounded C shim that owns
-alignment and non-local error handling. GRAY, RGB16, RGB24, RGB32, and RGBA
+QUIC images use the [upstream C codec](Sources/CSpiceQUIC/README.md) from
+spice-gtk 0.42's spice-common sources, supplied as a static XCFramework.
+No spice-gtk installation, GTK or GLib is needed by consumers.
+A bounded C bridge owns alignment and non-local error handling. GRAY, RGB16, RGB24, RGB32, and RGBA
 have byte-exact fixtures; malformed payloads remain transactional at the
 Display boundary.
 
@@ -41,7 +42,7 @@ pending gates.
 
 - Apple Silicon (arm64); Intel Macs are not supported
 - macOS 26 or later
-- Swift 6.3 and Xcode 26.6
+- Swift 6.4 and Xcode 27.1 or later
 - The Xcode Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)
 
 The package includes macOS static XCFrameworks for libjpeg-turbo, spice-common
@@ -50,14 +51,14 @@ builds are rejected. Builds do not require Homebrew or `pkg-config`. The
 artifacts are reproducible from pinned, checksum-verified upstream sources with
 `Scripts/build-native-dependencies.sh`; licenses and provenance are recorded in
 `THIRD_PARTY_NOTICES.md`.
-The SwiftPM build-tool plugin compiles the package shader into a resource
-`.metallib`; it does not search the working directory or Homebrew at runtime.
+The SwiftPM build-tool plugin compiles the package shaders into resource
+`.metallib` files; it does not search the working directory or Homebrew at runtime.
 
 ## Build and test
 
 ```sh
 swift build --disable-sandbox -Xswiftc -warnings-as-errors
-swift test --disable-sandbox -Xswiftc -warnings-as-errors
+swift test --disable-sandbox --no-parallel -Xswiftc -warnings-as-errors
 swift package --allow-writing-to-package-directory generate-spice-protocol --check
 ./Scripts/build-lib.sh
 ./Scripts/analyze-c-shims.sh
@@ -90,6 +91,10 @@ make coverage
 make debug
 make all
 ```
+
+`make quic` (also available as `make quic-artifact`) checks the shipped QUIC C
+ABI against an independent upstream C build, with sanitizer and pixel/guard
+checks. See the [native QUIC tests](Tests/CSpiceQUICTests/README.md) for details.
 
 ## Maintenance scripts
 
@@ -248,8 +253,13 @@ matches the complete ordered leaf subject; it does not fall back to insecure
 trust. The `--tls-insecure-for-testing-only` option remains limited to
 self-signed local test servers.
 
-For the nested QEMU live-validation harness, see the
-[Apple/container guide](Integration/AppleContainer/APPLE_CONTAINER.md).
+The probe connects to an endpoint you supply; the repository does not provision
+remote VMs. For repeatable local performance comparisons, use
+[the benchmark suite](Benchmarks/BENCHMARKS.md):
+
+```sh
+make benchmark
+```
 
 ## Repository layout
 
@@ -260,9 +270,8 @@ Plugins/          SwiftPM command and build-tool plugins
 ProtocolSchema/   Pinned source for generated protocol declarations
 Scripts/          Repository-wide build, packaging, and verification commands
 Artifacts/        Reproducible native XCFramework dependencies
-Integration/      Host-specific live interoperability fixtures
-Benchmarks/       Performance tools and retained result summaries
-docs/             Architecture, status, roadmap, and repository guidance
+Benchmarks/       Local performance workloads and native codec validation
+docs/             Architecture, status, and repository guidance
 ```
 
 The public `SwiftSpice` target is a facade over smaller wire, protocol,
@@ -274,9 +283,7 @@ transport, channel, codec, rendering, and Apple integration targets. See the
 
 - [Documentation index](docs/INDEX.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Status and validation evidence](docs/STATUS.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Algorithm improvement plan](docs/ALGORITHM_IMPROVEMENT_PLAN.md)
+- [Current status and validation evidence](docs/STATUS.md)
 - [Repository layout](docs/REPOSITORY_LAYOUT.md)
 
 ## License

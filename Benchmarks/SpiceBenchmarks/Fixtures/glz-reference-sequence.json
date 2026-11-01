@@ -1,0 +1,33 @@
+{
+  "generator": "spice-common decode-glz.c from spice-gtk 0.42.3",
+  "entries": [
+    {
+      "format": "rgb32-literal",
+      "width": 2,
+      "height": 1,
+      "compressedBase64": "ICBaTAABAAEYAAAAAgAAAAEAAAAIAAAAAAAAAAAAAAAAAQECAwQFBg==",
+      "expectedBGRABase64": "AQIDAAQFBgA="
+    },
+    {
+      "format": "rgb32-cross-image",
+      "width": 2,
+      "height": 1,
+      "compressedBase64": "ICBaTAABAAEYAAAAAgAAAAEAAAAIAAAAAAAAAAEAAAABQAAB",
+      "expectedBGRABase64": "AQIDAAQFBgA="
+    },
+    {
+      "format": "rgba-literal",
+      "width": 3,
+      "height": 1,
+      "compressedBase64": "ICBaTAABAAEZAAAAAwAAAAEAAAAMAAAAAAAAAAIAAAACAgECAwQFBgcICQIgQIA=",
+      "expectedBGRABase64": "AQIDIAQFBkAHCAmA"
+    },
+    {
+      "format": "rgba-cross-image",
+      "width": 3,
+      "height": 1,
+      "compressedBase64": "ICBaTAABAAEZAAAAAwAAAAEAAAAMAAAAAAAAAAMAAAADYAABIAAB",
+      "expectedBGRABase64": "AQIDIAQFBkAHCAmA"
+    }
+  ]
+}

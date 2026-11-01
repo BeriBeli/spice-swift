@@ -1,82 +1,100 @@
-# Live SPICE performance comparison
+# Local performance benchmarks
 
-This directory contains a low-noise, headless comparison between SwiftSpice and
-the installed `spice-client-glib-2.0` reference client. It is an engineering
-performance gate, not a claim that the two event models are ABI-equivalent.
+The opt-in `SpiceBenchmarks` target uses
+[ordo-one/benchmark](https://github.com/ordo-one/benchmark) 1.38.1. It measures
+fixed local workloads in Release mode on the same Apple Silicon/macOS toolchain
+as the library. No SPICE server, SSH host, VM image, GLib client, or guest reset
+script is needed.
 
-Both clients connect separately to the same resettable QEMU/SPICE workload. The
-reference collector coalesces `display-invalidate` signals on a 16 ms cadence,
-matching SwiftSpice's default frame-coalescing interval. Each process prints one
-JSON object after the observation interval; frame-by-frame logging is disabled.
-
-Build the two collectors on macOS:
+## Run and compare
 
 ```sh
-swift build -c release --product spice-probe
-cc -O2 -Wall -Wextra -Werror \
-  Benchmarks/Reference/spice_glib_bench.c \
-  $(pkg-config --cflags --libs spice-client-glib-2.0) \
-  -o /private/tmp/spice-glib-bench
+./Scripts/benchmark.sh list
+./Scripts/benchmark.sh run
+./Scripts/benchmark.sh run --filter 'JPEG/.*'
+./Scripts/benchmark.sh baseline update before
+# Make the code change, keeping inputs and machine configuration the same.
+./Scripts/benchmark.sh baseline compare before
 ```
 
-Open an SSH tunnel to a SPICE listener bound to loopback on the remote host,
-then run the clients one at a time. The ticket is read from `SPICE_PASSWORD` and
-must not be placed on the command line or committed to an output file.
+`make benchmark` runs the suite; `make benchmark ARGS="list"` lists it.
+The script resolves the repository root, enables `SWIFTSPICE_BENCHMARKS=1`, and
+uses `.build/benchmarks` for its build products, with Swift warnings treated as
+errors. Ordinary `swift build` and
+`swift test` do not include the benchmark target or its external dependencies.
+The first benchmark invocation downloads the pinned package and its dependencies.
+Baselines live in ignored `.benchmarkBaselines/`; retain them locally for
+same-machine comparisons, not as universal pass/fail limits.
+
+Export a result with the benchmark tool's standard format:
 
 ```sh
-SPICE_PASSWORD='...' .build/release/spice-probe \
-  127.0.0.1 15930 --observe-seconds 30 --benchmark-json
-
-SPICE_PASSWORD='...' /private/tmp/spice-glib-bench 127.0.0.1 15930 30
+./Scripts/benchmark.sh run --format jmh --path .build/benchmark-results
 ```
 
-Reset the guest workload between clients and alternate their order. Use at
-least ten paired runs for a non-inferiority decision. Compare paired bootstrap
-confidence intervals rather than a single run. Frame counts are comparable
-only for the fixed 16 ms publication cadence; the raw GLib `invalidations`
-counter is diagnostic and has no direct SwiftSpice equivalent.
-CPU time is reported both per process and per published frame. The normalized
-metric prevents a client that publishes far fewer frames from appearing more
-efficient merely because it performs less display work.
-Use `ready_frame_ms` for the cross-client startup comparison: it spans process
-connection initiation through the first 16 ms publication tick. `connect_ms`
-and `first_frame_ms` expose client-specific phase boundaries and are diagnostic,
-because SwiftSpice session readiness and GLib primary-surface creation are not
-the same API event.
+The default metrics are wall time, process CPU time, throughput, and allocation count.
+The framework's allocation interposer is enabled in this benchmark executable;
+its overhead is part of both sides of a comparison. Measurements include five
+warmup iterations and up to two seconds or 1,000 outer iterations per case.
+Fast wire and reference-image cases use 1,000 inner operations and report
+per-operation scaled results. No performance threshold is enforced until a
+representative baseline and a justified tolerance have been established.
 
-`run_live_pairs.sh` automates optimized builds, alternating client order, JSON
-validation, and macOS `time -lp` resource capture. It refuses to overwrite an
-existing output directory. It also rejects samples with fewer than two frames
-so that a dead or static workload cannot produce a false non-inferiority pass
-without masking a genuinely slow client. If the guest
-exposes a reset command, provide a
-small executable wrapper with `SWIFTSPICE_BENCH_RESET_SCRIPT`; the runner calls
-it as `RESET_SCRIPT RUN_NUMBER CLIENT` before every measurement.
-For server-side log slicing, `SWIFTSPICE_BENCH_HOOK_SCRIPT` receives
-`before|after RUN_NUMBER CLIENT`; its `after` phase also runs when a measured
-client exits unsuccessfully.
+## Workloads and measurement boundaries
 
-Set `SWIFTSPICE_BENCH_VIDEO_CODEC=h264` or `h265` for the real native-video
-gate. The Swift sample then also requires decoded VT frames, at least one native
-Metal composition, zero BGRA materializations/fallback frames, zero GPU errors,
-and zero permanent stream-generation disables. Hardware decoding itself is
-reported as hardware/software/query counters but is not required: VideoToolbox
-may legitimately select its software decoder.
+| Cases | Timed work |
+| --- | --- |
+| JPEG, 1080p and 4K | One accurate-quality decode of fixed quality-80, 4:2:0 input |
+| MJPEG, 1080p and 4K | One decode using a warm stream handle and its IOSurface pool; fallback fails setup |
+| LZ and QUIC references | Decode the small independent correctness fixtures; these measure per-image overhead, not full-screen throughput |
+| GLZ reference sequence | Decode an ordered literal/cross-image sequence with a fresh dictionary per iteration |
+| Wire, 64 KiB | Frame one mini-header message from contiguous input or 1 KiB chunks, including partial-message polling |
+| Protocol Ping | Decode a fixed server Ping body through the production decoder |
+| Surface, 1080p and 4K | Full fill, 64×64 update, COPY_BITS, IOSurface snapshot publication, or first CPU readback |
+
+Fixture loading, input hashing, golden-result checks, Surface creation/seeding,
+and cleanup are outside measurement windows. Surface operations start with fresh
+state; CPU readback uses a fresh frame so it cannot accidentally measure the
+cached `Data` accessor. Publication measures Surface-to-frame work, not a Metal
+drawable or physical screen presentation. Errors fail the run instead of
+silently replacing a missing native path with a different workload.
+
+Record the commit (including whether it is dirty), Swift/Xcode version, macOS,
+hardware, and workload selection alongside exported results. Compare on the same
+machine with similar power/thermal conditions and no competing heavy workload.
+A local microbenchmark does not establish network latency, input-to-visible
+latency, or interoperability. For those investigations, connect `spice-probe` or
+the actual client to an explicitly selected endpoint and profile that session.
+The repository does not provision or manage remote test machines.
+
+## Input provenance
+
+`SpiceBenchmarks/Fixtures` contains:
+
+- Exact copies of `lz-rgb32-6x3.json`, `quic-rgb32-7x5.json`, and
+  `glz-reference-sequence.json` from `Tests/SpiceCodecsTests/Fixtures`. Their
+  embedded generator metadata identifies the independent spice-common source.
+  Keep these copies identical when updating the canonical test fixtures.
+- `jpeg-manifest.json` records encoded-file and decoded packed-BGRA SHA-256
+  values for deterministic 1920×1080 and 3840×2160 JPEGs. The benchmark script
+  generates them in `.build/benchmark-fixtures` using `NativeJPEG/jpeg-check.c`,
+  subsampling `2`, quality `80`, and progressive mode `0`; setup verifies both
+  hashes. The images are not stored in the repository.
+
+To regenerate a JPEG using the checked-in native artifact:
 
 ```sh
-SPICE_PASSWORD='...' \
-SWIFTSPICE_BENCH_RESET_SCRIPT=/private/tmp/reset-spice-workload \
-Benchmarks/run_live_pairs.sh 127.0.0.1 15930 10 30 \
-  /private/tmp/swiftspice-live-results
-
-uv run Benchmarks/analyze.py /private/tmp/swiftspice-live-results
+xcrun clang -O3 -std=c17 -Wall -Wextra -Werror \
+  -I Artifacts/CTurboJPEG.xcframework/macos-arm64/CTurboJPEG.framework/Headers \
+  Benchmarks/NativeJPEG/jpeg-check.c \
+  Artifacts/CTurboJPEG.xcframework/macos-arm64/CTurboJPEG.framework/Versions/A/CTurboJPEG \
+  -o .build/jpeg-check
+.build/jpeg-check generate .build/jpeg-1920x1080.jpg 1920 1080 2 80 0
+.build/jpeg-check decode .build/jpeg-1920x1080.jpg .build/jpeg-1920x1080.bgra 1
+shasum -a 256 .build/jpeg-1920x1080.jpg .build/jpeg-1920x1080.bgra
 ```
 
-The analyzer exits nonzero when any confidence-interval gate fails. A formal
-decision uses exactly `10` pairs of `30` seconds and should pass
-`--expected-pairs 10`; shorter runs are smoke tests only.
-
-This headless gate covers connection, wire processing, codec execution, Surface
-mutation, snapshot publication, and coalescing. It does not cover AppKit/GTK
-window composition, actual drawable presentation, audio-device latency, or
-input-to-photon latency; those remain separate real-window gates.
+Use 3840 and 2160 for the 4K case. Both widths have tightly packed 64-byte-aligned
+BGRA rows, so the harness output hash is the same layout as `pixelsBGRA`.
+The separate [NativeJPEG validation](NativeJPEG/README.md) retains scalar/Neon
+comparisons and fully instrumented native ASan coverage.

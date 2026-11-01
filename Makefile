@@ -8,7 +8,7 @@ export CLANG_MODULE_CACHE_PATH SWIFTPM_MODULECACHE_OVERRIDE
 
 .DEFAULT_GOAL := help
 
-.PHONY: help prepare doctor build debug test test-public-api protocol analyze sanitize coverage audit all release check-version clean distclean
+.PHONY: help prepare doctor build debug test test-public-api benchmark protocol analyze sanitize coverage audit quic quic-artifact all release check-version clean distclean
 
 help: ## Show this help
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z0-9_-]+:.*## /{printf "  \033[36m%-16s\033[0m %s\n",$$1,$$2}' $(MAKEFILE_LIST)
@@ -35,6 +35,9 @@ test-public-api: prepare ## Compile the standalone public API consumer
 		--package-path Tests/PublicAPIConsumer \
 		-Xswiftc -warnings-as-errors
 
+benchmark: ## Run local Release benchmarks (ARGS passes benchmark CLI options)
+	@./Scripts/benchmark.sh $(ARGS)
+
 protocol: prepare ## Verify generated protocol sources are current
 	@swift package --allow-writing-to-package-directory generate-spice-protocol --check
 
@@ -50,11 +53,18 @@ coverage: prepare ## Enforce the production-source line coverage baseline
 audit: ## Verify checked-in native dependencies are arm64 and relocatable
 	@./Scripts/verify-native-closure.sh --artifacts-only
 
+quic: ## Validate the shipped spice-gtk QUIC C artifact with sanitizers
+	@./Scripts/validate-quic.sh
+
+quic-artifact: ## Check the shipped QUIC ABI against upstream C, with sanitizers
+	@./Scripts/validate-quic.sh
+
 all: ## Run environment, metadata, generation, build, API, and test gates
 	@$(MAKE) doctor
 	@$(MAKE) check-version
 	@$(MAKE) protocol
 	@$(MAKE) analyze
+	@$(MAKE) quic-artifact
 	@$(MAKE) build
 	@$(MAKE) test-public-api
 	@$(MAKE) test

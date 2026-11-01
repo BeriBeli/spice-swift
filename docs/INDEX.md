@@ -8,21 +8,17 @@ or connect the library to a SPICE endpoint.
 | Document | Contents |
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Module boundaries, concurrency, protocol safety, rendering, and host-resource rules |
-| [STATUS.md](STATUS.md) | Detailed implementation evidence and the boundary between local and external validation |
-| [ROADMAP.md](ROADMAP.md) | Pending work, external gates, and acceptance commands |
-| [ALGORITHM_IMPROVEMENT_PLAN.md](ALGORITHM_IMPROVEMENT_PLAN.md) | Active algorithm work, dependencies, completion gates, and evidence log |
+| [STATUS.md](STATUS.md) | Current implementation, recent evidence, and remaining validation limits |
+| [STREAM_FEEDBACK.md](STREAM_FEEDBACK.md) | Display stream-report contract, source comparison, and validation |
 | [REPOSITORY_LAYOUT.md](REPOSITORY_LAYOUT.md) | Directory ownership and file-placement rules |
 
 ## Operational guides
 
 | Document | Contents |
 | --- | --- |
-| [APPLE_CONTAINER.md](../Integration/AppleContainer/APPLE_CONTAINER.md) | Local nested QEMU Display, Inputs, and Agent validation |
-| [REMOTE_ROCKY.md](../Integration/RemoteRocky/REMOTE_ROCKY.md) | Remote Rocky performance fixture |
-| [AUDIO.md](../Integration/RemoteRocky/Audio/AUDIO.md) | Live Playback and Record fixture |
-| [VIDEO.md](../Integration/RemoteRocky/Video/VIDEO.md) | Live H.264 and H.265 fixture |
-| [WEBDAV.md](../Integration/RemoteRocky/WebDAV/WEBDAV.md) | Live guest WebDAV mount fixture |
-| [BENCHMARKS.md](../Benchmarks/BENCHMARKS.md) | Performance comparison and analysis workflow |
+| [BENCHMARKS.md](../Benchmarks/BENCHMARKS.md) | Local Release workloads, baseline comparison, and input provenance |
+| [Native JPEG measurements](../Benchmarks/NativeJPEG/README.md) | Scalar/Neon correctness, native ASan, and same-load decode measurements |
+| [QUIC codec contract](../Sources/CSpiceQUIC/README.md) | spice-gtk C codec, bounded application bridge, provenance and native validation |
 | [NATIVE_DEPENDENCIES.md](../Artifacts/NATIVE_DEPENDENCIES.md) | Reproducible native XCFramework inputs |
 
 ## Status language

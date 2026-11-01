@@ -7,6 +7,46 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Continue sending the latest display layout when the guest omits Agent replies.
+  Ignore replies whose request cannot be identified after overlapping sends,
+  and let an authoritative Display update complete the viewer's pending status.
+
+### Changed
+
+- Require Swift tools 6.4 throughout the package and public API consumer; use
+  Xcode 27.1 for CI and update checkout to 7.0.1.
+- Update libjpeg-turbo to 3.2.1 with the existing Neon configuration.
+  Retain macOS 26 compatibility when configuring
+  libusb with the macOS 27 SDK.
+- Keep production QUIC on spice-gtk 0.42's upstream C codec.
+  Preserve the bounded C bridge, grayscale cleanup
+  fix, source/binary provenance and independent C/sanitizer checks in
+  [the native tests](Tests/CSpiceQUICTests/README.md).
+
+- Replace machine-specific VM/SSH benchmark campaigns with opt-in local Release
+  benchmarks for codecs, wire parsing, and Surface operations using a pinned
+  benchmark framework. Remove the old integration provisioning, comparison
+  scripts, and campaign-only executable/support targets; retain `spice-probe`,
+  local presentation diagnostics, and NativeJPEG validation.
+
+- Enable libjpeg-turbo's arm64 Neon backend for JPEG/MJPEG while retaining
+  accurate DCT and high-quality chroma upsampling. Pin and record native build
+  provenance, normalize archive metadata, and verify the backend in closure
+  checks. Extend exact-pixel MJPEG coverage through IOSurface and Data paths;
+  add reproducible scalar/Neon correctness, native ASan and decode benchmarks.
+  See [the measured scope and limitations](Benchmarks/NativeJPEG/README.md).
+
+### Fixed
+
+- Restore adaptive video feedback by advertising and implementing Display stream
+  reports, following spice-gtk's arrival-margin/window semantics. Missing positive
+  feedback prevents the MJPEG bitrate-increase path in spice-server 0.15.2 from
+  running after server-side rate reductions. Preserve frame order and Surface
+  mutation barriers; remote-session visual improvement remains unverified.
+  See [the source comparison and validation contract](docs/STREAM_FEEDBACK.md).
+
 ## [0.4.4] — 2026-10-27
 
 ### Fixed

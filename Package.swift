@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 
 import PackageDescription
 
@@ -11,7 +11,6 @@ let package = Package(
         .library(name: "SwiftSpice", targets: ["SwiftSpice"]),
         .executable(name: "spice-probe", targets: ["SpiceProbe"]),
         .executable(name: "spice-viewer", targets: ["SpiceViewer"]),
-        .executable(name: "spice-live-interaction", targets: ["SpiceLiveInteraction"]),
     ],
     targets: [
         .target(
@@ -137,14 +136,6 @@ let package = Package(
             name: "SpiceViewer",
             dependencies: ["SpiceRenderer", "SwiftSpice"]
         ),
-        .target(
-            name: "SpiceLiveInteractionSupport",
-            dependencies: ["SwiftSpice"]
-        ),
-        .executableTarget(
-            name: "SpiceLiveInteraction",
-            dependencies: ["SpiceLiveInteractionSupport", "SwiftSpice"]
-        ),
         .executableTarget(
             name: "SpiceProtocolGenerator"
         ),
@@ -227,7 +218,6 @@ let package = Package(
         .testTarget(
             name: "SwiftSpiceTests",
             dependencies: [
-                "SpiceLiveInteractionSupport",
                 "SwiftSpice",
                 "SpiceChannels",
                 "SpiceCore",
@@ -237,7 +227,8 @@ let package = Package(
                 "SpiceTestSupport",
                 "SpiceTransport",
                 "SpiceWire",
-            ]
+            ],
+            exclude: ["Fixtures"]
         ),
         .testTarget(
             name: "SpiceViewerTests",
@@ -246,3 +237,21 @@ let package = Package(
     ],
     swiftLanguageModes: [.v6]
 )
+
+// Local performance tools are opt-in and never dependencies of SwiftSpice.
+if Context.environment["SWIFTSPICE_BENCHMARKS"] == "1" {
+    package.dependencies.append(.package(
+        url: "https://github.com/ordo-one/benchmark.git",
+        exact: "1.38.1"
+    ))
+    package.targets.append(.executableTarget(
+        name: "SpiceBenchmarks",
+        dependencies: [
+            .product(name: "Benchmark", package: "benchmark"),
+            "SpiceCodecs", "SpiceProtocol", "SpiceRenderer", "SpiceWire",
+        ],
+        path: "Benchmarks/SpiceBenchmarks",
+        resources: [.process("Fixtures")],
+        plugins: [.plugin(name: "BenchmarkPlugin", package: "benchmark")]
+    ))
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "file": "jpeg-1920x1080.jpg",
+    "width": 1920,
+    "height": 1080,
+    "encodedSHA256": "5ea5924b11180cc7636c4608b4ab3e889bf6c03f6d47cfa93ae8bf18eba89c67",
+    "decodedSHA256": "82158588ab1cd16dbe3877863c25da7b2b2e16c9fb51ecbc2cfb2b9f683dcb75"
+  },
+  {
+    "file": "jpeg-3840x2160.jpg",
+    "width": 3840,
+    "height": 2160,
+    "encodedSHA256": "ddbc968614121dbfac91e21630ab487507f222b0f92c875b13215fccfbfcb0bc",
+    "decodedSHA256": "6bd422aa0dc93cba83d9569d383234a85614ec4cfba0aaeb6ec242d3b3a70b22"
+  }
+]

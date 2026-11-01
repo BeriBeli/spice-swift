@@ -1,8 +1,8 @@
 # SwiftSpice architecture
 
 This document describes the architecture implemented in the repository and the
-rules for extending it. Validation evidence lives in [STATUS.md](STATUS.md), and
-planned work lives in [ROADMAP.md](ROADMAP.md).
+rules for extending it. Validation evidence and known limits live in
+[STATUS.md](STATUS.md).
 
 ## Goals
 
@@ -83,6 +83,13 @@ The session model has three consequences:
 Lower-level targets must not import the public facade or application target.
 Unsafe pointers, C handles, AppKit objects, and device APIs stay in narrow
 platform or interop modules.
+
+The QUIC binary target contains the unchanged spice-common C encoder/decoder
+from spice-gtk 0.42. `Sources/CSpiceQUIC` supplies its standalone declarations
+and bounded BGRA bridge. `SpiceCodecInterop` connects the Swift decoders to this
+artifact, preserving the public codec errors and logical row order. The build
+does not link GTK or GLib. Source provenance and verification are described in
+the [codec boundary](../Sources/CSpiceQUIC/README.md).
 
 ## Concurrency and ownership
 
@@ -260,10 +267,10 @@ VideoToolbox native frames and CoreVideo handles remain package-only. The
 compositor maps NV12 Y/UV planes and performs color conversion, orientation,
 nearest scaling, clipping, and candidate write in one command encoder. MJPEG
 streams keep one TurboJPEG handle and a three-buffer IOSurface-backed BGRA pool;
-fast DCT and upsampling apply only to streams, while standalone JPEG stays
-bit-exact. At most two MJPEG decodes run concurrently per session. TurboJPEG
-writes directly into a locked buffer and the compositor copies/clips/scales it
-into the Surface without an intermediate full-frame `Data`; unavailable pool or
+both standalone JPEG and streams use accurate integer DCT and high-quality
+chroma upsampling through the arm64 Neon backend. At most two MJPEG decodes
+run concurrently per session. TurboJPEG writes directly into a locked buffer
+and the compositor copies/clips/scales it into the Surface without an intermediate full-frame `Data`; unavailable pool or
 pipeline resources take the existing bounded Data fallback without waiting.
 
 Unknown video color matrices, odd NV12 geometry, and frame-local mapping
@@ -370,9 +377,8 @@ Verification is layered because no single test proves protocol compatibility:
 - Offline golden fixtures compare codec and renderer output with independent C
   or FFmpeg references.
 - Viewer tests cover application state without requiring a live listener.
-- The Apple/container harness exercises selected paths against QEMU,
-  spice-server, and spice-vdagent.
+- The optional local benchmark target measures fixed codec, wire, and Surface
+  workloads. `spice-probe` exercises a separately supplied live SPICE endpoint.
 
 Passing local tests is recorded separately from live interoperability. See
-[STATUS.md](STATUS.md) for the current evidence and [ROADMAP.md](ROADMAP.md) for
-the remaining acceptance gates.
+[STATUS.md](STATUS.md) for the current evidence and known validation limits.

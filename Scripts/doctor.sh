@@ -31,7 +31,7 @@ else
     fail "unsupported architecture $architecture" "SwiftSpice supports Apple Silicon only."
 fi
 
-developer_directory="$(xcode-select -p 2>/dev/null || true)"
+developer_directory="${DEVELOPER_DIR:-$(xcode-select -p 2>/dev/null || true)}"
 if [[ "$developer_directory" == */Xcode*.app/Contents/Developer ]]; then
     pass "full Xcode selected ($developer_directory)"
 else
@@ -42,19 +42,19 @@ swift_line="$(swift --version 2>/dev/null | head -1 || true)"
 swift_version="$(printf '%s\n' "$swift_line" | sed -nE 's/.*Swift version ([0-9]+\.[0-9]+).*/\1/p')"
 if [[ -n "$swift_version" ]] && awk -v version="$swift_version" 'BEGIN {
     split(version, parts, ".")
-    exit !(parts[1] > 6 || (parts[1] == 6 && parts[2] >= 3))
+    exit !(parts[1] > 6 || (parts[1] == 6 && parts[2] >= 4))
 }'; then
-    pass "Swift $swift_version (6.3+)"
+    pass "Swift $swift_version (6.4+)"
 else
-    fail "Swift 6.3+ required (got: ${swift_line:-unknown})" "select Xcode 26.3 or later."
+    fail "Swift 6.4+ required (got: ${swift_line:-unknown})" "select Xcode 27.1 or later."
 fi
 
 sdk_version="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)"
 sdk_major="${sdk_version%%.*}"
-if [[ -n "$sdk_major" && "$sdk_major" -ge 26 ]] 2>/dev/null; then
-    pass "macOS SDK $sdk_version (26+)"
+if [[ -n "$sdk_major" && "$sdk_major" -ge 27 ]] 2>/dev/null; then
+    pass "macOS SDK $sdk_version (27+)"
 else
-    fail "macOS 26+ SDK not found" "install and select Xcode 26 or later."
+    fail "macOS 27+ SDK not found" "install and select Xcode 27.1 or later."
 fi
 
 metal_path="$(xcrun -f metal 2>/dev/null || true)"
