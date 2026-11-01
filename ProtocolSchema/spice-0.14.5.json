@@ -203,6 +203,32 @@
       ]
     },
     {
+      "name": "SpiceMsgDisplayStreamActivateReport",
+      "direction": "serverDisplay",
+      "messageID": 319,
+      "fields": [
+        { "name": "streamID", "type": "uint32" },
+        { "name": "uniqueID", "type": "uint32" },
+        { "name": "maximumWindowSize", "type": "uint32" },
+        { "name": "timeoutMilliseconds", "type": "uint32" }
+      ]
+    },
+    {
+      "name": "SpiceMsgcDisplayStreamReport",
+      "direction": "clientDisplay",
+      "messageID": 102,
+      "fields": [
+        { "name": "streamID", "type": "uint32" },
+        { "name": "uniqueID", "type": "uint32" },
+        { "name": "startFrameMultimediaTime", "type": "uint32" },
+        { "name": "endFrameMultimediaTime", "type": "uint32" },
+        { "name": "frameCount", "type": "uint32" },
+        { "name": "dropCount", "type": "uint32" },
+        { "name": "lastFrameDelay", "type": "int32" },
+        { "name": "audioDelay", "type": "uint32" }
+      ]
+    },
+    {
       "name": "SpiceMsgcDisplayInit",
       "direction": "clientDisplay",
       "messageID": 101,

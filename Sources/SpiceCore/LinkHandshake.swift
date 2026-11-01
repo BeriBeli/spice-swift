@@ -64,6 +64,7 @@ package struct LinkRequest: Sendable, Equatable {
             var display = CapabilitySet<DisplayCapability>()
             display.insert(.sizedStream)
             display.insert(.monitorsConfig)
+            display.insert(.streamReport)
             display.insert(.multiCodec)
             display.insert(.codecMJPEG)
             if advertisesH264 {

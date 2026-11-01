@@ -873,7 +873,7 @@ package final class ViewerStore {
         case .queued:
             monitorLogger.info("Display configuration queued")
         case .sent:
-            monitorLogger.info("Display configuration sent; waiting for Agent reply")
+            monitorLogger.info("Display configuration sent; waiting for Display update")
         case .acknowledged:
             monitorLogger.info("Display configuration acknowledged; waiting for Display update")
         case .rejected:

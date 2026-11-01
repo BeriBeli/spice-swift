@@ -86,6 +86,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         var lastPresentedSequence: UInt64
         var lastMultimediaTime: UInt32?
         var metalCompositorDisabled: Bool
+        var reportWindow: DisplayStreamReportWindow?
     }
 
     private struct PendingMJPEGFrame: Sendable {
@@ -387,7 +388,18 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await createStream(create)
             try await acknowledgeIfNeeded()
             return .ignored(framed.type)
+        case let .displayStreamActivateReport(activation):
+            guard streams[activation.streamID] != nil else {
+                throw .protocolViolation("report activation for unknown stream \(activation.streamID)")
+            }
+            streams[activation.streamID]?.reportWindow = .init(activation: activation)
+            try await acknowledgeIfNeeded()
+            return .ignored(framed.type)
         case let .displayStreamData(data):
+            let reportConnection = connection
+            let report = await streamArrivalReport(
+                streamID: data.streamID, multimediaTime: data.multimediaTime
+            )
             if let runGeneration,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
@@ -398,6 +410,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                     data: data.data,
                     receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
                 )
+                if let report { try await reportConnection.send(report) }
                 try await acknowledgeIfNeeded()
                 return .ignored(framed.type)
             }
@@ -408,10 +421,15 @@ package actor DisplayChannel: SpiceManagedChannel {
                 data: data.data,
                 videoSequence: try reserveVideoSequence(streamID: data.streamID)
             )
+            if let report { try await reportConnection.send(report) }
             let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
             return event
         case let .displayStreamDataSized(data):
+            let reportConnection = connection
+            let report = await streamArrivalReport(
+                streamID: data.streamID, multimediaTime: data.multimediaTime
+            )
             if let runGeneration,
                streams[data.streamID]?.codec == .mjpeg {
                 try await enqueueMJPEGFrame(
@@ -422,6 +440,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                     data: data.data,
                     receivedAt: currentMessageReceivedAt ?? diagnosticsClock.now
                 )
+                if let report { try await reportConnection.send(report) }
                 try await acknowledgeIfNeeded()
                 return .ignored(framed.type)
             }
@@ -432,6 +451,7 @@ package actor DisplayChannel: SpiceManagedChannel {
                 data: data.data,
                 videoSequence: try reserveVideoSequence(streamID: data.streamID)
             )
+            if let report { try await reportConnection.send(report) }
             let event = frameEvent(surfaceRevision, ignoredType: framed.type)
             try await acknowledgeIfNeeded()
             return event
@@ -761,7 +781,35 @@ package actor DisplayChannel: SpiceManagedChannel {
             preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
         )
         connection = replacement
+        // Report IDs/windows belong to the sending peer, not the preserved
+        // Surface or decoder. Wait for activation from the migration target.
+        for id in Array(streams.keys) {
+            streams[id]?.reportWindow = nil
+        }
         return previous
+    }
+
+    private func streamArrivalReport(
+        streamID: UInt32, multimediaTime: UInt32
+    ) async -> SpiceMsgcDisplayStreamReport? {
+        guard let stream = streams[streamID],
+              let activation = stream.reportWindow?.activation,
+              let multimediaClock
+        else { return nil }
+        let origin = connection
+        let receivedAt = currentMessageReceivedAt ?? diagnosticsClock.now
+        let margin = await multimediaClock.timing(for: multimediaTime).streamReportMargin
+        let audioDelay = await multimediaClock.playbackDelayMilliseconds() ?? UInt32.max
+        guard connection === origin,
+              var current = streams[streamID], current.generation == stream.generation,
+              current.reportWindow?.activation == activation
+        else { return nil }
+        let report = current.reportWindow?.record(
+            multimediaTime: multimediaTime, margin: margin,
+            audioDelay: audioDelay, now: receivedAt
+        )
+        streams[streamID] = current
+        return report
     }
 
     private func createStream(_ create: SpiceDisplayStreamCreate) async throws(ChannelError) {

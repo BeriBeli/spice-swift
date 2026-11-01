@@ -812,6 +812,112 @@ package struct SpiceMsgDisplaySurfaceDestroy: SpiceGeneratedMessage {
     }
 }
 
+package struct SpiceMsgDisplayStreamActivateReport: SpiceGeneratedMessage {
+    package static let direction: SpiceMessageDirection = .serverDisplay
+    package static let messageID: UInt16? = 319
+    package static let minimumWireSize = 16
+
+    package let streamID: UInt32
+    package let uniqueID: UInt32
+    package let maximumWindowSize: UInt32
+    package let timeoutMilliseconds: UInt32
+
+    package init(
+        streamID: UInt32,
+        uniqueID: UInt32,
+        maximumWindowSize: UInt32,
+        timeoutMilliseconds: UInt32
+    ) {
+        self.streamID = streamID
+        self.uniqueID = uniqueID
+        self.maximumWindowSize = maximumWindowSize
+        self.timeoutMilliseconds = timeoutMilliseconds
+    }
+
+    package static func decode(
+        from reader: inout ByteReader
+    ) throws(WireError) -> Self {
+        return Self(
+            streamID: try reader.readUInt32LE(),
+            uniqueID: try reader.readUInt32LE(),
+            maximumWindowSize: try reader.readUInt32LE(),
+            timeoutMilliseconds: try reader.readUInt32LE()
+        )
+    }
+
+    package func encode(
+        to writer: inout ByteWriter
+    ) throws(WireError) {
+        writer.writeUInt32LE(streamID)
+        writer.writeUInt32LE(uniqueID)
+        writer.writeUInt32LE(maximumWindowSize)
+        writer.writeUInt32LE(timeoutMilliseconds)
+    }
+}
+
+package struct SpiceMsgcDisplayStreamReport: SpiceGeneratedMessage {
+    package static let direction: SpiceMessageDirection = .clientDisplay
+    package static let messageID: UInt16? = 102
+    package static let minimumWireSize = 32
+
+    package let streamID: UInt32
+    package let uniqueID: UInt32
+    package let startFrameMultimediaTime: UInt32
+    package let endFrameMultimediaTime: UInt32
+    package let frameCount: UInt32
+    package let dropCount: UInt32
+    package let lastFrameDelay: Int32
+    package let audioDelay: UInt32
+
+    package init(
+        streamID: UInt32,
+        uniqueID: UInt32,
+        startFrameMultimediaTime: UInt32,
+        endFrameMultimediaTime: UInt32,
+        frameCount: UInt32,
+        dropCount: UInt32,
+        lastFrameDelay: Int32,
+        audioDelay: UInt32
+    ) {
+        self.streamID = streamID
+        self.uniqueID = uniqueID
+        self.startFrameMultimediaTime = startFrameMultimediaTime
+        self.endFrameMultimediaTime = endFrameMultimediaTime
+        self.frameCount = frameCount
+        self.dropCount = dropCount
+        self.lastFrameDelay = lastFrameDelay
+        self.audioDelay = audioDelay
+    }
+
+    package static func decode(
+        from reader: inout ByteReader
+    ) throws(WireError) -> Self {
+        return Self(
+            streamID: try reader.readUInt32LE(),
+            uniqueID: try reader.readUInt32LE(),
+            startFrameMultimediaTime: try reader.readUInt32LE(),
+            endFrameMultimediaTime: try reader.readUInt32LE(),
+            frameCount: try reader.readUInt32LE(),
+            dropCount: try reader.readUInt32LE(),
+            lastFrameDelay: try reader.readInt32LE(),
+            audioDelay: try reader.readUInt32LE()
+        )
+    }
+
+    package func encode(
+        to writer: inout ByteWriter
+    ) throws(WireError) {
+        writer.writeUInt32LE(streamID)
+        writer.writeUInt32LE(uniqueID)
+        writer.writeUInt32LE(startFrameMultimediaTime)
+        writer.writeUInt32LE(endFrameMultimediaTime)
+        writer.writeUInt32LE(frameCount)
+        writer.writeUInt32LE(dropCount)
+        writer.writeInt32LE(lastFrameDelay)
+        writer.writeUInt32LE(audioDelay)
+    }
+}
+
 package struct SpiceMsgcDisplayInit: SpiceGeneratedMessage {
     package static let direction: SpiceMessageDirection = .clientDisplay
     package static let messageID: UInt16? = 101

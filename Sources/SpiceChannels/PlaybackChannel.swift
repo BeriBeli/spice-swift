@@ -114,6 +114,7 @@ package actor PlaybackChannel: SpiceManagedChannel {
         mode = nil
         configuration = nil
         lastPacketTime = nil
+        await multimediaClock.stopPlayback()
         await connection.close()
     }
 
@@ -180,6 +181,7 @@ package actor PlaybackChannel: SpiceManagedChannel {
             }
             configuration = nil
             lastPacketTime = nil
+            await multimediaClock.stopPlayback()
             return .stopped
         case let .volume(volume):
             return .volumeChanged(volume)

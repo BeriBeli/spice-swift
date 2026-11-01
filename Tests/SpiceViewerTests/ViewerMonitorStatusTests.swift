@@ -4,6 +4,23 @@ import Testing
 
 @Suite("Viewer monitor status")
 struct ViewerMonitorStatusTests {
+    @Test("Display can confirm a sent request without any Agent reply")
+    func confirmsSentRequestWithoutReply() {
+        let requested = SpiceDisplayConfiguration(width: 1_920, height: 1_080)
+        var status = ViewerMonitorStatus()
+        status.consumeRequest(.sent(requested))
+        #expect(status.requestIsActive)
+        status.consumeAuthoritative(SpiceGuestDisplayConfiguration(
+            channelID: 0, maximumAllowed: 1,
+            monitors: [.init(id: 0, surfaceID: 0, x: 0, y: 0,
+                             width: 1_920, height: 1_080, flags: 0)]
+        ))
+        #expect(status.requestPhase == .applied(requested))
+        #expect(!status.requestIsActive)
+        status.consumeRequest(.acknowledged(requested))
+        #expect(status.requestPhase == .applied(requested))
+    }
+
     @Test("Display inventory remains authoritative after Agent acknowledgement")
     func keepsAuthoritativeInventory() {
         let actual = SpiceGuestDisplayConfiguration(

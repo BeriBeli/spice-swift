@@ -4,6 +4,14 @@ package enum MultimediaFrameTiming: Sendable, Equatable {
     case early(milliseconds: UInt32)
     case due
     case late(milliseconds: UInt32)
+
+    package var streamReportMargin: Int32 {
+        switch self {
+        case let .early(milliseconds): Int32(clamping: milliseconds)
+        case .due: 0
+        case let .late(milliseconds): Int32(clamping: -Int64(milliseconds))
+        }
+    }
 }
 
 package enum MultimediaTimestamp {
@@ -27,6 +35,13 @@ package protocol MultimediaClockScheduling: Sendable {
     func synchronize(playbackTime: UInt32, delayMilliseconds: UInt32) async
     func timing(for multimediaTime: UInt32) async -> MultimediaFrameTiming
     func wait(until multimediaTime: UInt32) async throws -> MultimediaFrameTiming
+    func playbackDelayMilliseconds() async -> UInt32?
+    func stopPlayback() async
+}
+
+extension MultimediaClockScheduling {
+    package func playbackDelayMilliseconds() async -> UInt32? { nil }
+    package func stopPlayback() async {}
 }
 
 /// Session-wide SPICE multimedia clock anchored to a monotonic local clock.
@@ -36,6 +51,7 @@ package actor MultimediaClock: MultimediaClockScheduling {
     private let clock = ContinuousClock()
     private var anchorInstant: ContinuousClock.Instant
     private var anchorTime: UInt32
+    private var playbackDelay: UInt32?
 
     package init(initialTime: UInt32 = 0) {
         anchorInstant = clock.now
@@ -49,6 +65,15 @@ package actor MultimediaClock: MultimediaClockScheduling {
 
     package func synchronize(playbackTime: UInt32, delayMilliseconds: UInt32) {
         reset(to: playbackTime &- delayMilliseconds)
+        playbackDelay = delayMilliseconds
+    }
+
+    package func playbackDelayMilliseconds() async -> UInt32? {
+        playbackDelay
+    }
+
+    package func stopPlayback() async {
+        playbackDelay = nil
     }
 
     package func timing(for multimediaTime: UInt32) -> MultimediaFrameTiming {

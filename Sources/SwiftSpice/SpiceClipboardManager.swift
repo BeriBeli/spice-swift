@@ -1134,9 +1134,7 @@ public actor SpiceAgentManager {
         expectedConnectionGeneration: UInt64? = nil
     ) async {
         guard let configuration = displayCoordinator.didReceiveReply() else {
-            emitDisplay(.protocolFailure(.invalidAgentReply(
-                "reply received without an in-flight request"
-            )))
+            // Late/duplicate replies cannot be assigned to a newer layout.
             return
         }
         switch reply.status {

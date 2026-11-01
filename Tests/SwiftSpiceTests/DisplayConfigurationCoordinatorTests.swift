@@ -3,7 +3,7 @@ import Testing
 
 @Suite("Dynamic resolution request coalescing")
 struct DisplayConfigurationCoordinatorTests {
-    @Test func keepsOnlyLatestResizeWhileWaitingForReply() throws {
+    @Test func sendsLatestResizeWithoutWaitingForReply() {
         var coordinator = DisplayConfigurationCoordinator()
         let first = SpiceDisplayConfiguration(width: 1_024, height: 768)
         let intermediate = SpiceDisplayConfiguration(width: 1_280, height: 800)
@@ -15,9 +15,35 @@ struct DisplayConfigurationCoordinatorTests {
         coordinator.queue(intermediate)
         coordinator.queue(latest)
 
-        #expect(coordinator.nextToSend == nil)
+        #expect(coordinator.nextToSend == latest)
+        coordinator.didSend(latest)
+        #expect(coordinator.didReceiveReply() == nil)
+        #expect(coordinator.didReceiveReply() == nil)
+        #expect(coordinator.inFlight == latest)
+        coordinator.disconnected()
+        #expect(coordinator.nextToSend == latest)
+        coordinator.didSend(latest)
+        #expect(coordinator.didReceiveReply() == latest)
+    }
+
+    @Test func serializedRepliesRemainCorrelatedAndResetStartsFresh() {
+        var coordinator = DisplayConfigurationCoordinator()
+        let first = SpiceDisplayConfiguration(width: 800, height: 600)
+        let latest = SpiceDisplayConfiguration(width: 1_920, height: 1_080)
+        coordinator.queue(first)
+        coordinator.didSend(first)
+        coordinator.queue(latest)
         #expect(coordinator.didReceiveReply() == first)
         #expect(coordinator.nextToSend == latest)
+        coordinator.didSend(latest)
+        coordinator.queue(first)
+        coordinator.didSend(first)
+        coordinator.reset()
+        #expect(coordinator.nextToSend == nil)
+        #expect(coordinator.didReceiveReply() == nil)
+        coordinator.queue(latest)
+        coordinator.didSend(latest)
+        #expect(coordinator.didReceiveReply() == latest)
     }
 
     @Test func reconnectRequeuesInFlightRequestUnlessNewerRequestExists() {

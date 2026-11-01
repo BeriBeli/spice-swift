@@ -38,9 +38,13 @@ package struct ViewerMonitorStatus: Sendable, Equatable {
     package mutating func consumeAuthoritative(_ configuration: SpiceGuestDisplayConfiguration) {
         guard !configuration.monitors.isEmpty else { return }
         configurationsByChannel[configuration.channelID] = configuration
-        if case let .acknowledged(requested) = requestPhase,
-           authoritativeInventoryMatches(requested) {
-            requestPhase = .applied(requested)
+        switch requestPhase {
+        case let .sent(requested), let .acknowledged(requested):
+            if authoritativeInventoryMatches(requested) {
+                requestPhase = .applied(requested)
+            }
+        default:
+            break
         }
     }
 
@@ -51,6 +55,7 @@ package struct ViewerMonitorStatus: Sendable, Equatable {
         case let .sent(configuration):
             requestPhase = .sent(configuration)
         case let .acknowledged(configuration):
+            if requestPhase == .applied(configuration) { return }
             requestPhase = .acknowledged(configuration)
         case let .rejected(configuration):
             requestPhase = .rejected(configuration)
@@ -90,7 +95,7 @@ package struct ViewerMonitorStatus: Sendable, Equatable {
         case let .queued(configuration):
             "Queued \(Self.dimensions(configuration))"
         case let .sent(configuration):
-            "Sent \(Self.dimensions(configuration)); waiting for Agent reply"
+            "Sent \(Self.dimensions(configuration)); waiting for authoritative Display update"
         case let .acknowledged(configuration):
             "Agent acknowledged \(Self.dimensions(configuration)); waiting for authoritative Display update"
         case let .applied(configuration):

@@ -170,6 +170,7 @@ package actor InputsChannel: SpiceManagedChannel {
              .displayInvalidatePalette,
              .displayInvalidateAllPalettes,
              .displayStreamCreate,
+             .displayStreamActivateReport,
              .displayStreamData,
              .displayStreamDataSized,
              .displayStreamClip,

@@ -93,7 +93,10 @@ public enum SpiceDisplayConfigurationError: Error, Sendable, Equatable,
 
 public enum SpiceDisplayConfigurationEvent: Sendable, Equatable {
     case queued(SpiceDisplayConfiguration)
+    /// Sent to the transport; authoritative Display events confirm application.
     case sent(SpiceDisplayConfiguration)
+    /// Optional Agent reply, emitted only while its request is unambiguous.
+    /// Guests may apply the configuration without sending this event.
     case acknowledged(SpiceDisplayConfiguration)
     case rejected(SpiceDisplayConfiguration)
     case unsupported(SpiceDisplayConfiguration)
@@ -104,13 +107,16 @@ public enum SpiceDisplayConfigurationEvent: Sendable, Equatable {
 package struct DisplayConfigurationCoordinator: Sendable {
     private(set) package var desired: SpiceDisplayConfiguration?
     private(set) package var inFlight: SpiceDisplayConfiguration?
+    // Agent replies have no request identity. After overlapping unacknowledged
+    // sends, correlation stays ambiguous until the next Agent connection.
+    private var repliesAmbiguous = false
 
     package mutating func queue(_ configuration: SpiceDisplayConfiguration) {
         desired = configuration
     }
 
     package var nextToSend: SpiceDisplayConfiguration? {
-        inFlight == nil ? desired : nil
+        desired
     }
 
     package mutating func didSend(_ configuration: SpiceDisplayConfiguration) {
@@ -118,15 +124,18 @@ package struct DisplayConfigurationCoordinator: Sendable {
             return
         }
         desired = nil
+        if inFlight != nil { repliesAmbiguous = true }
         inFlight = configuration
     }
 
     package mutating func didReceiveReply() -> SpiceDisplayConfiguration? {
+        guard !repliesAmbiguous else { return nil }
         defer { inFlight = nil }
         return inFlight
     }
 
     package mutating func disconnected() {
+        repliesAmbiguous = false
         if desired == nil {
             desired = inFlight
         }
@@ -138,6 +147,7 @@ package struct DisplayConfigurationCoordinator: Sendable {
     }
 
     package mutating func reset() {
+        repliesAmbiguous = false
         desired = nil
         inFlight = nil
     }

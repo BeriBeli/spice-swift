@@ -50,6 +50,7 @@ package enum SpiceServerMessage: Sendable, Equatable {
     case displayInvalidatePalette(UInt64)
     case displayInvalidateAllPalettes
     case displayStreamCreate(SpiceDisplayStreamCreate)
+    case displayStreamActivateReport(SpiceMsgDisplayStreamActivateReport)
     case displayStreamData(SpiceDisplayStreamData)
     case displayStreamDataSized(SpiceDisplayStreamDataSized)
     case displayStreamClip(SpiceDisplayStreamClip)
@@ -254,6 +255,10 @@ package enum SpiceServerMessageDecoder {
             case 317:
                 return .displayMonitorsConfiguration(
                     try SpiceDisplayMonitorCodec.decode(body)
+                )
+            case 319:
+                return .displayStreamActivateReport(
+                    try decodeBody(SpiceMsgDisplayStreamActivateReport.self, from: body)
                 )
             default:
                 break

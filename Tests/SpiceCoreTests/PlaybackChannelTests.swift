@@ -8,6 +8,32 @@ import Testing
 
 @Suite("Playback Channel")
 struct PlaybackChannelTests {
+    @Test(arguments: [false, true])
+    func feedbackAudioDelayClearsWhenPlaybackEnds(closeChannel: Bool) async throws {
+        let clock = MultimediaClock()
+        let transport = FakeTransport(inbound: [
+            .success(encodeMini(id: 102, body: modeBody(time: 100, mode: 1))),
+            .success(encodeMini(id: 103, body: startBody(channels: 2, format: 1, frequency: 48_000))),
+            .success(encodeMini(id: 101, body: dataBody(time: 120, bytes: Data(repeating: 0, count: 8)))),
+            .success(encodeMini(id: 104, body: Data())),
+        ])
+        try await transport.connect()
+        let channel = PlaybackChannel(
+            connection: ChannelConnection(key: .init(type: 5, id: 0), transport: transport, headerMode: .mini),
+            multimediaClock: clock
+        )
+        for _ in 0..<3 { _ = try await channel.processNext() }
+        try await channel.reportDelay(milliseconds: 20)
+        #expect(await clock.playbackDelayMilliseconds() == 20)
+        if closeChannel {
+            await channel.close()
+        } else {
+            _ = try await channel.processNext()
+        }
+        #expect(await clock.playbackDelayMilliseconds() == nil)
+        await channel.close()
+    }
+
     @Test func executesRawS16LifecycleAndSynchronizesActualSinkDelay() async throws {
         let clock = RecordingPlaybackClock()
         let inbound = [
