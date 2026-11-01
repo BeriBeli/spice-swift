@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-11-01
+
 ### Fixed
 
 - Continue sending the latest display layout when the guest omits Agent replies.
@@ -496,7 +498,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/BeriBeli/spice-swift/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/BeriBeli/spice-swift/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/BeriBeli/spice-swift/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/BeriBeli/spice-swift/compare/v0.4.1...v0.4.2
