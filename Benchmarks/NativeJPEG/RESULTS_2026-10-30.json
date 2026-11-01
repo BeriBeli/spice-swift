@@ -1,0 +1,886 @@
+{
+  "asan": false,
+  "archive_sha256": "fbb21708cbe5a84e2d5a86d80dfdc9186a35c337a3b2b873e7aeda9906e4069e",
+  "source_sha256": "6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "hardware": "Apple M4 Pro",
+  "os": "27.2",
+  "cases": [
+    {
+      "width": 1,
+      "height": 1,
+      "subsampling": 0,
+      "progressive": false,
+      "jpeg_sha256": "2436255ccea1a3be48f393ecbcb34a4416ec928f1745071938c20374d72b9aa1",
+      "bgra_sha256": "1e7e47bc602be5d487d1d1574874e7b2778a1bf049ac9e57531c6de0ad301b69",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.01,
+            "wall_ms_per_frame": 0.01
+          }
+        ],
+        "neon": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.01,
+            "wall_ms_per_frame": 0.011
+          }
+        ]
+      }
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "subsampling": 1,
+      "progressive": false,
+      "jpeg_sha256": "0304552274d6a5621afcbd1594033a1b971e8f3cc6024aa50c867980bef5cca0",
+      "bgra_sha256": "1e7e47bc602be5d487d1d1574874e7b2778a1bf049ac9e57531c6de0ad301b69",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.004,
+            "wall_ms_per_frame": 0.005
+          }
+        ],
+        "neon": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.01,
+            "wall_ms_per_frame": 0.011
+          }
+        ]
+      }
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "subsampling": 2,
+      "progressive": false,
+      "jpeg_sha256": "0da7affc540268b2de1e6b285085b937b5951e11e2016a6b54b1589b304d8ef3",
+      "bgra_sha256": "1e7e47bc602be5d487d1d1574874e7b2778a1bf049ac9e57531c6de0ad301b69",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.007,
+            "wall_ms_per_frame": 0.008
+          }
+        ],
+        "neon": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.009,
+            "wall_ms_per_frame": 0.011
+          }
+        ]
+      }
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "subsampling": 3,
+      "progressive": false,
+      "jpeg_sha256": "26c1758a024cf8c97f8eb6f3b521551df59ecabf8b386e607577da7ddc1376ad",
+      "bgra_sha256": "374795a4cb3cefbdb718e14159ce2b34764131f942b6da57d8ce18f8a7f4eac9",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.003,
+            "wall_ms_per_frame": 0.003
+          }
+        ],
+        "neon": [
+          {
+            "width": 1,
+            "height": 1,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.004,
+            "wall_ms_per_frame": 0.005
+          }
+        ]
+      }
+    },
+    {
+      "width": 9,
+      "height": 7,
+      "subsampling": 0,
+      "progressive": false,
+      "jpeg_sha256": "65f943bf3880d07bcbc97b8e40b303eafd434324d754e2096d5399dff439f2a3",
+      "bgra_sha256": "a83f9765c48952feafe08eab1f7a9aacab1bd6beddd051d2fb6589c5c06bee23",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.01,
+            "wall_ms_per_frame": 0.009
+          }
+        ],
+        "neon": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.009,
+            "wall_ms_per_frame": 0.009
+          }
+        ]
+      }
+    },
+    {
+      "width": 9,
+      "height": 7,
+      "subsampling": 1,
+      "progressive": false,
+      "jpeg_sha256": "0d92fa33b7bb7c862afdf20321bd071b32e291b1f08b01fde480242b3b5c4e8d",
+      "bgra_sha256": "9003ba07fe4fd92ccac3a4e1697ce85fca78ffaae33fa14130e83dd85241b436",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.008,
+            "wall_ms_per_frame": 0.008
+          }
+        ],
+        "neon": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.004,
+            "wall_ms_per_frame": 0.005
+          }
+        ]
+      }
+    },
+    {
+      "width": 9,
+      "height": 7,
+      "subsampling": 2,
+      "progressive": false,
+      "jpeg_sha256": "4aa6caf9a4ecbdce729d1d2b1847a74091f538e718f0f841c9bb941682464b22",
+      "bgra_sha256": "121355d70a85f10f617a22b0abe4716cf2ff742a65b06e03c6ff1ccbb8d90b43",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.006,
+            "wall_ms_per_frame": 0.005
+          }
+        ],
+        "neon": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.006,
+            "wall_ms_per_frame": 0.006
+          }
+        ]
+      }
+    },
+    {
+      "width": 9,
+      "height": 7,
+      "subsampling": 3,
+      "progressive": false,
+      "jpeg_sha256": "d3fa24c05b3d6f33bcc3da32d8de5fa6fe3575bf88058e0787aacf26e02b82c7",
+      "bgra_sha256": "ae853e23e66f4fe3244515a01a8f81c4dd75c6fe7e6cb524abb0f0b6be6cdbf1",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.003,
+            "wall_ms_per_frame": 0.004
+          }
+        ],
+        "neon": [
+          {
+            "width": 9,
+            "height": 7,
+            "stride": 64,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.007,
+            "wall_ms_per_frame": 0.006
+          }
+        ]
+      }
+    },
+    {
+      "width": 65,
+      "height": 33,
+      "subsampling": 0,
+      "progressive": true,
+      "jpeg_sha256": "cd580a54618e6b18c758ecdc87868447dbfadaa8321e191c67016f764c2bfe20",
+      "bgra_sha256": "435ca75e512c7a6c070fc6b231c114161fb83085d0acfe302ce1adb4594a487b",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.027,
+            "wall_ms_per_frame": 0.026
+          }
+        ],
+        "neon": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.018,
+            "wall_ms_per_frame": 0.018
+          }
+        ]
+      }
+    },
+    {
+      "width": 65,
+      "height": 33,
+      "subsampling": 1,
+      "progressive": true,
+      "jpeg_sha256": "b5259185e6056e47670a727f85a7460c230af9fd5e7f27f5d7efeddb4704e551",
+      "bgra_sha256": "59b7347a423edff2ba28f36a7a2325fc720521160cf0803f4bc20d56cf835aa7",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.024,
+            "wall_ms_per_frame": 0.027
+          }
+        ],
+        "neon": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.018,
+            "wall_ms_per_frame": 0.018
+          }
+        ]
+      }
+    },
+    {
+      "width": 65,
+      "height": 33,
+      "subsampling": 2,
+      "progressive": true,
+      "jpeg_sha256": "3301edf54366f49385289ecebb07941d37269918f938588e6628eff42b54c586",
+      "bgra_sha256": "30afc04b5bbf11809b50b1da57fb8548ebf59d07ebfab49700dfc90d857b6caa",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.021,
+            "wall_ms_per_frame": 0.022
+          }
+        ],
+        "neon": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.016,
+            "wall_ms_per_frame": 0.017
+          }
+        ]
+      }
+    },
+    {
+      "width": 65,
+      "height": 33,
+      "subsampling": 3,
+      "progressive": true,
+      "jpeg_sha256": "4a738be6dd2b9563f7929d5e1fa5c600c6082825c26213e3c3e09fdaf2b0c76d",
+      "bgra_sha256": "5e0a0e048a156ba07f8e7c2f9291c9200956ad440dca4caf867e22e5ce1f93d2",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.012,
+            "wall_ms_per_frame": 0.012
+          }
+        ],
+        "neon": [
+          {
+            "width": 65,
+            "height": 33,
+            "stride": 320,
+            "frames": 1,
+            "cpu_ms_per_frame": 0.012,
+            "wall_ms_per_frame": 0.012
+          }
+        ]
+      }
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "subsampling": 0,
+      "progressive": false,
+      "jpeg_sha256": "49aab576d7c07836b3700b76d8143a465d4f5d56911d0c260b79355f85527887",
+      "bgra_sha256": "3761cbc32d597611c0ad8903eb220dd0bd2f23cc73310f90431c00a9a910f055",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 11.1357,
+            "wall_ms_per_frame": 11.163733
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 11.005733,
+            "wall_ms_per_frame": 11.026367
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 11.1587,
+            "wall_ms_per_frame": 11.195933
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 11.059633,
+            "wall_ms_per_frame": 11.0768
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 10.9521,
+            "wall_ms_per_frame": 10.9608
+          }
+        ],
+        "neon": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.0038,
+            "wall_ms_per_frame": 7.013633
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.021667,
+            "wall_ms_per_frame": 7.035267
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.0718,
+            "wall_ms_per_frame": 7.088133
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.1624,
+            "wall_ms_per_frame": 7.1978
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 6.9808,
+            "wall_ms_per_frame": 6.987767
+          }
+        ]
+      }
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "subsampling": 1,
+      "progressive": false,
+      "jpeg_sha256": "bc46a831fa33af3b6bd312cb316a9c41aaababfbd06b7274a69f2f033b8550e2",
+      "bgra_sha256": "9fba79f61435cf4849ba91c5930d5531b54d48b07495d4b115d9a3f3aff68dec",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 1,
+            "cpu_ms_per_frame": 8.458,
+            "wall_ms_per_frame": 8.462
+          }
+        ],
+        "neon": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 1,
+            "cpu_ms_per_frame": 5.434,
+            "wall_ms_per_frame": 5.435
+          }
+        ]
+      }
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "subsampling": 2,
+      "progressive": false,
+      "jpeg_sha256": "5ea5924b11180cc7636c4608b4ab3e889bf6c03f6d47cfa93ae8bf18eba89c67",
+      "bgra_sha256": "82158588ab1cd16dbe3877863c25da7b2b2e16c9fb51ecbc2cfb2b9f683dcb75",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.411133,
+            "wall_ms_per_frame": 7.415233
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.428433,
+            "wall_ms_per_frame": 7.4325
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.450933,
+            "wall_ms_per_frame": 7.4578
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.4355,
+            "wall_ms_per_frame": 7.441333
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 7.4392,
+            "wall_ms_per_frame": 7.446833
+          }
+        ],
+        "neon": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 4.302467,
+            "wall_ms_per_frame": 4.304633
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 4.2864,
+            "wall_ms_per_frame": 4.288133
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 4.322767,
+            "wall_ms_per_frame": 4.327367
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 4.310033,
+            "wall_ms_per_frame": 4.3124
+          },
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 30,
+            "cpu_ms_per_frame": 4.3045,
+            "wall_ms_per_frame": 4.3085
+          }
+        ]
+      }
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "subsampling": 3,
+      "progressive": false,
+      "jpeg_sha256": "b03ff94a700de38ed854b2251f1945c640f29210758e73d504ed7e1578141a1d",
+      "bgra_sha256": "1e1d3f54b2b8eb50c87aae4760c3b5dba26ffd0ff229af68c1748d5cbaf13c81",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 1,
+            "cpu_ms_per_frame": 3.505,
+            "wall_ms_per_frame": 3.507
+          }
+        ],
+        "neon": [
+          {
+            "width": 1920,
+            "height": 1080,
+            "stride": 7680,
+            "frames": 1,
+            "cpu_ms_per_frame": 2.517,
+            "wall_ms_per_frame": 2.519
+          }
+        ]
+      }
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "subsampling": 0,
+      "progressive": false,
+      "jpeg_sha256": "0d02b4f6cfc07acc4807940b5f946e8a6ce2d582c1d0c51a1fab172ff1d0f234",
+      "bgra_sha256": "78a6e8a9b329116aeee161b73441cf42103f4f0ef641c4a11a24552f4f4cbff1",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 44.115333,
+            "wall_ms_per_frame": 44.1615
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 44.396467,
+            "wall_ms_per_frame": 44.504333
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 44.321933,
+            "wall_ms_per_frame": 44.3952
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 44.551967,
+            "wall_ms_per_frame": 44.811567
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 44.249667,
+            "wall_ms_per_frame": 44.3444
+          }
+        ],
+        "neon": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 28.455933,
+            "wall_ms_per_frame": 28.518067
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 28.423033,
+            "wall_ms_per_frame": 28.481333
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 28.600367,
+            "wall_ms_per_frame": 28.6636
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 28.673033,
+            "wall_ms_per_frame": 28.763467
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 28.692233,
+            "wall_ms_per_frame": 28.771467
+          }
+        ]
+      }
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "subsampling": 1,
+      "progressive": false,
+      "jpeg_sha256": "4e505ee3338b4ca5e9380425980cd83d43a39adca6aab6aa270047cb180c1294",
+      "bgra_sha256": "bac33cb1a94073be8d5afc65ce68826687e3d56ca7a4c843068d5d05006524f0",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 1,
+            "cpu_ms_per_frame": 34.691,
+            "wall_ms_per_frame": 34.708
+          }
+        ],
+        "neon": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 1,
+            "cpu_ms_per_frame": 22.063,
+            "wall_ms_per_frame": 22.149
+          }
+        ]
+      }
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "subsampling": 2,
+      "progressive": false,
+      "jpeg_sha256": "ddbc968614121dbfac91e21630ab487507f222b0f92c875b13215fccfbfcb0bc",
+      "bgra_sha256": "6bd422aa0dc93cba83d9569d383234a85614ec4cfba0aaeb6ec242d3b3a70b22",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 29.9136,
+            "wall_ms_per_frame": 29.946867
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 30.235467,
+            "wall_ms_per_frame": 30.295167
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 30.2078,
+            "wall_ms_per_frame": 30.2781
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 30.2916,
+            "wall_ms_per_frame": 30.365733
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 30.151767,
+            "wall_ms_per_frame": 30.194833
+          }
+        ],
+        "neon": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 17.593767,
+            "wall_ms_per_frame": 17.6413
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 17.622667,
+            "wall_ms_per_frame": 17.652733
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 17.556333,
+            "wall_ms_per_frame": 17.608933
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 17.6458,
+            "wall_ms_per_frame": 17.6969
+          },
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 30,
+            "cpu_ms_per_frame": 17.494967,
+            "wall_ms_per_frame": 17.5139
+          }
+        ]
+      }
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "subsampling": 3,
+      "progressive": false,
+      "jpeg_sha256": "be5fe8d7e98ab164188e3eafeaeb7907a2cf20563de4fba55c1a90e1ab9eb385",
+      "bgra_sha256": "b00ce915129c1c1c0290981779bd3dace194426edfeea9eac20b9c7fe021551f",
+      "bit_exact": true,
+      "samples": {
+        "scalar": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 1,
+            "cpu_ms_per_frame": 13.859,
+            "wall_ms_per_frame": 13.888
+          }
+        ],
+        "neon": [
+          {
+            "width": 3840,
+            "height": 2160,
+            "stride": 15360,
+            "frames": 1,
+            "cpu_ms_per_frame": 10.789,
+            "wall_ms_per_frame": 10.797
+          }
+        ]
+      }
+    }
+  ]
+}

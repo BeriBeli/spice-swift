@@ -164,25 +164,32 @@ struct JPEGDecoderTests {
         await decoder.close()
     }
 
-    @Test func mjpegStreamPreservesExactJPEGColor() async throws {
-        let fixture = try loadFixture(named: "jpeg-420-9x7")
-        let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
-        let expectedRGB = try #require(Data(base64Encoded: fixture.expectedRGBBase64))
-        let expectedBGRA = bgra(fromRGB: expectedRGB)
+    @Test(arguments: [0, 3])
+    func mjpegStreamPreservesExactJPEGColor(poolCapacity: Int) async throws {
         let decoder = try SpiceMJPEGStreamDecoder(
             limiter: SpiceMJPEGDecodeLimiter(),
-            poolCapacity: 0
+            poolCapacity: poolCapacity
         )
-
-        let frame = try await decoder.decodeVideoFrame(
-            descriptor: SpiceCodecImageDescriptor(
-                width: fixture.width,
-                height: fixture.height
-            ),
-            payload: jpeg
-        )
-        let actual = try frame.copyBGRA().pixelsBGRA
-        #expect(actual == expectedBGRA)
+        // Exercise both padded IOSurface rows and the packed Data fallback,
+        // reusing the same handle across subsampling/color/geometry changes.
+        for fixture in try loadFixtures() {
+            let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
+            let expectedRGB = try #require(Data(base64Encoded: fixture.expectedRGBBase64))
+            let frame = try await decoder.decodeVideoFrame(
+                descriptor: SpiceCodecImageDescriptor(
+                    width: fixture.width,
+                    height: fixture.height
+                ),
+                payload: jpeg
+            )
+            #expect((frame is SpiceMJPEGFrame) == (poolCapacity > 0))
+            let actual = try frame.copyBGRA().pixelsBGRA
+            #expect(actual == bgra(fromRGB: expectedRGB), Comment(rawValue: fixture.generator))
+        }
+        let diagnostics = await decoder.diagnosticsSnapshot()
+        #expect(diagnostics.handleCreationCount == 1)
+        #expect(poolCapacity == 0 ? diagnostics.ioSurfaceFrameCount == 0
+            : diagnostics.dataFallbackCount == 0)
         await decoder.close()
     }
 

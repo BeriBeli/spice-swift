@@ -2,10 +2,18 @@
 set -euo pipefail
 
 # Rebuild the checked-in, relocatable macOS static dependency artifacts from
-# pinned upstream source releases. Homebrew is deliberately neither queried nor
-# used as an input. CMake is only a build-time tool for libjpeg-turbo.
+# pinned upstream sources, including spice-gtk's QUIC C codec. Homebrew runtime
+# libraries are never inputs. CMake is a maintainer-only JPEG build tool.
+
+if [[ "$#" -gt 1 || ( "$#" -eq 1 && "$1" != "--jpeg-only" && "$1" != "--quic-only" ) ]]; then
+    echo "usage: build-native-dependencies.sh [--jpeg-only|--quic-only]" >&2
+    exit 2
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--quic-only" ]]; then
+    exec "$ROOT_DIR/Scripts/build-quic-native.sh"
+fi
 OUTPUT_DIR="$ROOT_DIR/Artifacts"
 WORK_DIR="${SWIFTSPICE_NATIVE_WORK_DIR:-$(mktemp -d /private/tmp/swiftspice-native.XXXXXX)}"
 MACOS_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
@@ -15,15 +23,10 @@ AR="$(xcrun --sdk macosx --find ar)"
 RANLIB="$(xcrun --sdk macosx --find ranlib)"
 PARALLEL_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '4')"
 
-JPEG_VERSION="3.2.0"
+JPEG_VERSION="3.2.1"
 JPEG_ARCHIVE="libjpeg-turbo-$JPEG_VERSION.tar.gz"
 JPEG_URL="https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$JPEG_VERSION/$JPEG_ARCHIVE"
-JPEG_SHA256="6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e"
-
-SPICE_GTK_VERSION="0.42"
-SPICE_GTK_ARCHIVE="spice-gtk-$SPICE_GTK_VERSION.tar.xz"
-SPICE_GTK_URL="https://www.spice-space.org/download/gtk/$SPICE_GTK_ARCHIVE"
-SPICE_GTK_SHA256="9380117f1811ad1faa1812cb6602479b6290d4a0d8cc442d44427f7f6c0e7a58"
+JPEG_SHA256="c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f"
 
 USBREDIR_VERSION="0.15.0"
 USBREDIR_ARCHIVE="usbredir-$USBREDIR_VERSION.tar.xz"
@@ -122,40 +125,73 @@ require_tool cmake
 require_tool xcodebuild
 
 fetch_verified "$JPEG_URL" "$JPEG_ARCHIVE" "$JPEG_SHA256"
-fetch_verified "$SPICE_GTK_URL" "$SPICE_GTK_ARCHIVE" "$SPICE_GTK_SHA256"
-fetch_verified "$USBREDIR_URL" "$USBREDIR_ARCHIVE" "$USBREDIR_SHA256"
-fetch_verified "$LIBUSB_URL" "$LIBUSB_ARCHIVE" "$LIBUSB_SHA256"
-
 mkdir -p "$WORK_DIR/src"
 tar -xf "$WORK_DIR/downloads/$JPEG_ARCHIVE" -C "$WORK_DIR/src"
-tar -xf "$WORK_DIR/downloads/$SPICE_GTK_ARCHIVE" -C "$WORK_DIR/src"
-tar -xf "$WORK_DIR/downloads/$USBREDIR_ARCHIVE" -C "$WORK_DIR/src"
-tar -xf "$WORK_DIR/downloads/$LIBUSB_ARCHIVE" -C "$WORK_DIR/src"
 
 readonly arch="arm64"
-    arch_dir="$WORK_DIR/build/$arch"
-    prefix="$arch_dir/prefix"
-    mkdir -p "$arch_dir" "$prefix"
+arch_dir="$WORK_DIR/build/$arch"
+prefix="$arch_dir/prefix"
+mkdir -p "$arch_dir" "$prefix"
 
-    env -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS \
-    cmake -S "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION" \
-        -B "$arch_dir/jpeg" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_OSX_ARCHITECTURES="$arch" \
-        -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
-        -DCMAKE_OSX_SYSROOT="$SDK_PATH" \
-        -DCMAKE_INSTALL_PREFIX="$prefix/jpeg" \
-        -DENABLE_SHARED=OFF \
-        -DWITH_JAVA=OFF \
-        -DWITH_SIMD=OFF \
-        -DWITH_TESTS=OFF \
-        -DWITH_TOOLS=OFF
-    cmake --build "$arch_dir/jpeg" --target install --parallel
+# AArch64 uses upstream Neon intrinsics, with no external assembler. Fail if
+# CMake cannot enable that backend instead of silently producing scalar code.
+# Pin BUILD as well: upstream otherwise embeds the date of configuration.
+env -u CFLAGS -u CPPFLAGS -u CXXFLAGS -u LDFLAGS \
+cmake -S "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION" \
+    -B "$arch_dir/jpeg" \
+    -DCMAKE_C_COMPILER="$CLANG" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD="$JPEG_VERSION" \
+    -DCMAKE_OSX_ARCHITECTURES="$arch" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+    -DCMAKE_OSX_SYSROOT="$SDK_PATH" \
+    -DCMAKE_INSTALL_PREFIX="$prefix/jpeg" \
+    -DENABLE_SHARED=OFF \
+    -DWITH_JAVA=OFF \
+    -DWITH_SIMD=ON \
+    -DREQUIRE_SIMD=ON \
+    -DWITH_TESTS=OFF \
+    -DWITH_TOOLS=OFF
+cmake --build "$arch_dir/jpeg" --target install --parallel
+
+artifact_stage="$WORK_DIR/artifacts"
+mkdir -p "$artifact_stage/CTurboJPEG/Headers"
+# Apple's ar otherwise stores build time/uid/gid in the archive. Repack with
+# deterministic metadata even when reusing an existing CMake build directory.
+ZERO_AR_DATE=1 /usr/bin/libtool -static -D \
+    -o "$artifact_stage/CTurboJPEG/libCTurboJPEG.a" "$prefix/jpeg/lib/libturbojpeg.a"
+cp "$ROOT_DIR/Sources/CTurboJPEG/shim.h" "$artifact_stage/CTurboJPEG/Headers/"
+cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/src/turbojpeg.h" "$artifact_stage/CTurboJPEG/Headers/"
+write_framework_module_map "$artifact_stage/CTurboJPEG/Headers" CTurboJPEG shim.h turbojpeg.h
+mkdir -p "$OUTPUT_DIR"
+create_static_xcframework CTurboJPEG "$artifact_stage/CTurboJPEG"
+mkdir -p "$OUTPUT_DIR/CTurboJPEG.xcframework/Licenses"
+cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/LICENSE.md" \
+    "$OUTPUT_DIR/CTurboJPEG.xcframework/Licenses/libjpeg-turbo-LICENSE.md"
+{
+    printf 'Source: %s\nSHA-256: %s\n' "$JPEG_URL" "$JPEG_SHA256"
+    printf 'Configuration: Release; arm64; BUILD=%s; macOS=%s; WITH_SIMD=ON; REQUIRE_SIMD=ON; deterministic archive (libtool -static -D, ZERO_AR_DATE=1); ENABLE_SHARED=OFF; WITH_JAVA=OFF; WITH_TESTS=OFF; WITH_TOOLS=OFF\n' "$JPEG_VERSION" "$MACOS_DEPLOYMENT_TARGET"
+    "$CLANG" --version | head -1
+    printf 'macOS SDK: %s\nCMake: %s\n' "$(xcrun --sdk macosx --show-sdk-version)" "$(cmake --version | head -1)"
+    shasum -a 256 "$OUTPUT_DIR/CTurboJPEG.xcframework/macos-arm64/CTurboJPEG.framework/Versions/A/CTurboJPEG" | awk '{print "Archive SHA-256: " $1}'
+} >"$OUTPUT_DIR/CTurboJPEG.xcframework/BUILD_PROVENANCE.txt"
+
+if [[ "${1:-}" == "--jpeg-only" ]]; then
+    "$ROOT_DIR/Scripts/verify-native-closure.sh" --artifacts-only
+    exit 0
+fi
+
+fetch_verified "$USBREDIR_URL" "$USBREDIR_ARCHIVE" "$USBREDIR_SHA256"
+fetch_verified "$LIBUSB_URL" "$LIBUSB_ARCHIVE" "$LIBUSB_SHA256"
+tar -xf "$WORK_DIR/downloads/$USBREDIR_ARCHIVE" -C "$WORK_DIR/src"
+tar -xf "$WORK_DIR/downloads/$LIBUSB_ARCHIVE" -C "$WORK_DIR/src"
 
     libusb_build="$arch_dir/libusb"
     mkdir -p "$libusb_build"
     (
         cd "$libusb_build"
+        # SDK 27 declares pipe2, but our macOS 26 deployment target cannot use it.
+        ac_cv_func_pipe2=no \
         CC="$CLANG" \
         CFLAGS="-arch $arch -isysroot $SDK_PATH -mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET -O2" \
         LDFLAGS="-arch $arch -isysroot $SDK_PATH -mmacosx-version-min=$MACOS_DEPLOYMENT_TARGET" \
@@ -207,94 +243,10 @@ readonly arch="arm64"
     "$AR" crs "$usbredir_build/libusbredir.a" "${usbredir_objects[@]}"
     "$RANLIB" "$usbredir_build/libusbredir.a"
 
-    quic_src="$WORK_DIR/src/spice-gtk-$SPICE_GTK_VERSION/subprojects/spice-common/common"
-    quic_build="$arch_dir/quic"
-    mkdir -p "$quic_build/src/spice"
-    cp "$quic_src/quic.c" "$quic_src/quic_tmpl.c" "$quic_src/quic_family_tmpl.c" \
-        "$quic_build/src/"
-    printf '%s\n' \
-        '#pragma once' \
-        '#include <assert.h>' \
-        '#define SPICE_VERIFY(value) _Static_assert((value), "SPICE verification failed")' \
-        '#define spice_assert(value) assert(value)' \
-        '#define spice_extra_assert(value) assert(value)' \
-        '#define spice_return_if_fail(value) do { if (!(value)) return; } while (0)' \
-        '#define spice_warn_if_reached() ((void)0)' \
-        '#define G_UNLIKELY(value) __builtin_expect(!!(value), 0)' \
-        '#define SPICE_ATTR_PACKED __attribute__((packed))' \
-        '#define SPICE_GNUC_UNUSED __attribute__((unused))' \
-        '#define SPICE_CONSTRUCTOR_FUNC(name) static void __attribute__((constructor)) name(void)' \
-        '#define GUINT32_TO_LE(value) (value)' \
-        '#define GUINT32_FROM_LE(value) (value)' \
-        '#define TRUE 1' \
-        '#define FALSE 0' \
-        >"$quic_build/src/log.h"
-    printf '%s\n' \
-        '#pragma once' \
-        '#include <stdint.h>' \
-        '#define SPICE_BEGIN_DECLS' \
-        '#define SPICE_END_DECLS' \
-        '#define SPICE_GNUC_NORETURN __attribute__((noreturn))' \
-        '#define SPICE_GNUC_PRINTF(format_index, argument_index) __attribute__((format(printf, format_index, argument_index)))' \
-        'typedef enum { QUIC_IMAGE_TYPE_INVALID, QUIC_IMAGE_TYPE_GRAY, QUIC_IMAGE_TYPE_RGB16, QUIC_IMAGE_TYPE_RGB24, QUIC_IMAGE_TYPE_RGB32, QUIC_IMAGE_TYPE_RGBA } QuicImageType;' \
-        '#define QUIC_ERROR -1' \
-        '#define QUIC_OK 0' \
-        'typedef void *QuicContext;' \
-        'typedef struct QuicUsrContext QuicUsrContext;' \
-        'struct QuicUsrContext {' \
-        '  SPICE_GNUC_NORETURN SPICE_GNUC_PRINTF(2, 3) void (*error)(QuicUsrContext *, const char *, ...);' \
-        '  SPICE_GNUC_PRINTF(2, 3) void (*warn)(QuicUsrContext *, const char *, ...);' \
-        '  SPICE_GNUC_PRINTF(2, 3) void (*info)(QuicUsrContext *, const char *, ...);' \
-        '  void *(*malloc)(QuicUsrContext *, int);' \
-        '  void (*free)(QuicUsrContext *, void *);' \
-        '  int (*more_space)(QuicUsrContext *, uint32_t **, int);' \
-        '  int (*more_lines)(QuicUsrContext *, uint8_t **);' \
-        '};' \
-        'int quic_encode(QuicContext *, QuicImageType, int, int, uint8_t *, unsigned int, int, uint32_t *, unsigned int);' \
-        'int quic_decode_begin(QuicContext *, uint32_t *, unsigned int, QuicImageType *, int *, int *);' \
-        'int quic_decode(QuicContext *, QuicImageType, uint8_t *, int);' \
-        'QuicContext *quic_create(QuicUsrContext *);' \
-        'void quic_destroy(QuicContext *);' \
-        >"$quic_build/src/quic.h"
-    printf '%s\n' \
-        '#pragma once' \
-        '#include <stddef.h>' \
-        '#include <stdint.h>' \
-        '#include <string.h>' \
-        '#define SPICE_BEGIN_DECLS' \
-        '#define SPICE_END_DECLS' \
-        '#define MEMCLEAR(pointer, size) memset((pointer), 0, (size))' \
-        >"$quic_build/src/quic_config.h"
-    printf '%s\n' '#define ENABLE_EXTRA_CHECKS 0' >"$quic_build/src/config.h"
-    printf '%s\n' '#pragma pack(push, 1)' >"$quic_build/src/spice/start-packed.h"
-    printf '%s\n' '#pragma pack(pop)' >"$quic_build/src/spice/end-packed.h"
-    "$CLANG" -c "$quic_build/src/quic.c" -o "$quic_build/quic.o" \
-        -std=c11 -O2 -DNDEBUG -arch "$arch" -isysroot "$SDK_PATH" \
-        -mmacosx-version-min="$MACOS_DEPLOYMENT_TARGET" -I"$quic_build/src"
-    "$AR" crs "$quic_build/libspicequic.a" "$quic_build/quic.o"
-    "$RANLIB" "$quic_build/libspicequic.a"
-
-    /usr/bin/libtool -static -o "$arch_dir/libCUSBRedir.a" \
+    ZERO_AR_DATE=1 /usr/bin/libtool -static -D -o "$arch_dir/libCUSBRedir.a" \
         "$usbredir_build/libusbredir.a" "$prefix/libusb/lib/libusb-1.0.a"
-    cp "$prefix/jpeg/lib/libturbojpeg.a" "$arch_dir/libCTurboJPEG.a"
-    cp "$quic_build/libspicequic.a" "$arch_dir/libCSpiceQUIC.a"
 
-artifact_stage="$WORK_DIR/artifacts"
-mkdir -p "$artifact_stage/CTurboJPEG/Headers" \
-    "$artifact_stage/CSpiceQUIC/Headers" \
-    "$artifact_stage/CUSBRedir/Headers"
-
-cp "$WORK_DIR/build/arm64/libCTurboJPEG.a" \
-    "$artifact_stage/CTurboJPEG/libCTurboJPEG.a"
-cp "$ROOT_DIR/Sources/CTurboJPEG/shim.h" "$artifact_stage/CTurboJPEG/Headers/"
-cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/src/turbojpeg.h" "$artifact_stage/CTurboJPEG/Headers/"
-write_framework_module_map "$artifact_stage/CTurboJPEG/Headers" \
-    CTurboJPEG shim.h turbojpeg.h
-
-cp "$WORK_DIR/build/arm64/libCSpiceQUIC.a" \
-    "$artifact_stage/CSpiceQUIC/libCSpiceQUIC.a"
-cp "$ROOT_DIR/Sources/CSpiceQUIC/shim.h" "$artifact_stage/CSpiceQUIC/Headers/"
-write_framework_module_map "$artifact_stage/CSpiceQUIC/Headers" CSpiceQUIC shim.h
+mkdir -p "$artifact_stage/CUSBRedir/Headers"
 
 cp "$WORK_DIR/build/arm64/libCUSBRedir.a" \
     "$artifact_stage/CUSBRedir/libCUSBRedir.a"
@@ -310,21 +262,14 @@ write_framework_module_map "$artifact_stage/CUSBRedir/Headers" \
     CUSBRedir usbredirhost.h libusb.h usbredirfilter.h usbredirparser.h usbredirproto.h
 
 mkdir -p "$OUTPUT_DIR"
-for module in CTurboJPEG CSpiceQUIC CUSBRedir; do
-    create_static_xcframework "$module" "$artifact_stage/$module"
-done
-
-mkdir -p "$OUTPUT_DIR/CTurboJPEG.xcframework/Licenses" \
-    "$OUTPUT_DIR/CSpiceQUIC.xcframework/Licenses" \
-    "$OUTPUT_DIR/CUSBRedir.xcframework/Licenses"
-cp "$WORK_DIR/src/libjpeg-turbo-$JPEG_VERSION/LICENSE.md" \
-    "$OUTPUT_DIR/CTurboJPEG.xcframework/Licenses/libjpeg-turbo-LICENSE.md"
-cp "$WORK_DIR/src/spice-gtk-$SPICE_GTK_VERSION/subprojects/spice-common/COPYING" \
-    "$OUTPUT_DIR/CSpiceQUIC.xcframework/Licenses/spice-common-COPYING"
+create_static_xcframework CUSBRedir "$artifact_stage/CUSBRedir"
+mkdir -p "$OUTPUT_DIR/CUSBRedir.xcframework/Licenses"
 cp "$WORK_DIR/src/usbredir-$USBREDIR_VERSION/COPYING.LIB" \
     "$OUTPUT_DIR/CUSBRedir.xcframework/Licenses/usbredir-COPYING.LIB"
 cp "$WORK_DIR/src/libusb-$LIBUSB_VERSION/COPYING" \
     "$OUTPUT_DIR/CUSBRedir.xcframework/Licenses/libusb-COPYING"
+
+"$ROOT_DIR/Scripts/build-quic-native.sh"
 
 "$ROOT_DIR/Scripts/verify-native-closure.sh" --artifacts-only
 echo "Native dependency artifacts rebuilt in $OUTPUT_DIR"

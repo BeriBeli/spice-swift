@@ -87,6 +87,9 @@ package final class TurboJPEGDecoderHandle: @unchecked Sendable {
             guard let cBytesPerRow = Int32(exactly: bytesPerRow) else {
                 return .failure(.invalidDestination("BGRA row stride exceeds TurboJPEG limits"))
             }
+            // Keep accurate integer IDCT and fancy chroma upsampling for both
+            // JPEG and MJPEG. The native Neon backend accelerates those exact
+            // algorithms; enabling SIMD does not require FASTDCT/FASTUPSAMPLE.
             let flags = Int32(TJFLAG_STOPONWARNING)
             guard let outputBase = destination.baseAddress?.assumingMemoryBound(to: UInt8.self)
             else {

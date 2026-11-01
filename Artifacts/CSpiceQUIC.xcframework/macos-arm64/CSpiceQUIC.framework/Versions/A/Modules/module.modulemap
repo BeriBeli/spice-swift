@@ -1,4 +1,5 @@
 framework module CSpiceQUIC {
   header "shim.h"
+  header "quic.h"
   export *
 }

@@ -1,41 +1,24 @@
 #ifndef SPICE_SWIFT_QUIC_SHIM_H
 #define SPICE_SWIFT_QUIC_SHIM_H
 
+#include "quic.h"
+#include <limits.h>
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef void *SpiceSwiftQuicContext;
-
-typedef enum {
-    SPICE_SWIFT_QUIC_INVALID = 0,
-    SPICE_SWIFT_QUIC_GRAY = 1,
-    SPICE_SWIFT_QUIC_RGB16 = 2,
-    SPICE_SWIFT_QUIC_RGB24 = 3,
-    SPICE_SWIFT_QUIC_RGB32 = 4,
-    SPICE_SWIFT_QUIC_RGBA = 5,
-} SpiceSwiftQuicImageType;
-
-typedef struct SpiceSwiftQuicUsrContext SpiceSwiftQuicUsrContext;
-struct SpiceSwiftQuicUsrContext {
-    void (*error)(SpiceSwiftQuicUsrContext *usr, const char *format, ...);
-    void (*warn)(SpiceSwiftQuicUsrContext *usr, const char *format, ...);
-    void (*info)(SpiceSwiftQuicUsrContext *usr, const char *format, ...);
-    void *(*malloc)(SpiceSwiftQuicUsrContext *usr, int size);
-    void (*free)(SpiceSwiftQuicUsrContext *usr, void *ptr);
-    int (*more_space)(SpiceSwiftQuicUsrContext *usr, uint32_t **io_ptr, int rows_completed);
-    int (*more_lines)(SpiceSwiftQuicUsrContext *usr, uint8_t **lines);
-};
-
-int quic_decode_begin(SpiceSwiftQuicContext *quic, uint32_t *io_ptr,
-                      unsigned int num_io_words, SpiceSwiftQuicImageType *type,
-                      int *width, int *height);
-int quic_decode(SpiceSwiftQuicContext *quic, SpiceSwiftQuicImageType type,
-                uint8_t *buf, int stride);
-SpiceSwiftQuicContext *quic_create(SpiceSwiftQuicUsrContext *usr);
-void quic_destroy(SpiceSwiftQuicContext *quic);
+// Preserve the package bridge's names while sharing the public QUIC ABI.
+typedef QuicContext SpiceSwiftQuicContext;
+typedef QuicImageType SpiceSwiftQuicImageType;
+typedef QuicUsrContext SpiceSwiftQuicUsrContext;
+#define SPICE_SWIFT_QUIC_INVALID QUIC_IMAGE_TYPE_INVALID
+#define SPICE_SWIFT_QUIC_GRAY QUIC_IMAGE_TYPE_GRAY
+#define SPICE_SWIFT_QUIC_RGB16 QUIC_IMAGE_TYPE_RGB16
+#define SPICE_SWIFT_QUIC_RGB24 QUIC_IMAGE_TYPE_RGB24
+#define SPICE_SWIFT_QUIC_RGB32 QUIC_IMAGE_TYPE_RGB32
+#define SPICE_SWIFT_QUIC_RGBA QUIC_IMAGE_TYPE_RGBA
 
 typedef enum {
     SPICE_SWIFT_QUIC_OK = 0,
@@ -49,9 +32,10 @@ typedef struct {
     SpiceSwiftQuicUsrContext usr;
     jmp_buf jump;
     int warned;
+    int allocation_failed;
 } SpiceSwiftQuicBridge;
 
-static inline void spice_swift_quic_error(
+static inline __attribute__((noreturn, format(printf, 2, 3))) void spice_swift_quic_error(
     SpiceSwiftQuicUsrContext *usr,
     const char *format,
     ...
@@ -84,9 +68,10 @@ static inline void *spice_swift_quic_malloc(
     SpiceSwiftQuicUsrContext *usr,
     int size
 ) {
-    (void)usr;
-    if (size <= 0) return NULL;
-    return malloc((size_t)size);
+    SpiceSwiftQuicBridge *bridge = (SpiceSwiftQuicBridge *)usr;
+    void *memory = size > 0 ? malloc((size_t)size) : NULL;
+    if (!memory) bridge->allocation_failed = 1;
+    return memory;
 }
 
 static inline void spice_swift_quic_free(
@@ -131,7 +116,8 @@ static inline SpiceSwiftQuicStatus spice_swift_quic_decode(
     if (!encoded || !output_bgra || !decoded_type || !decoded_width ||
         !decoded_height || encoded_size == 0 ||
         encoded_size % sizeof(uint32_t) != 0 ||
-        expected_width <= 0 || expected_height <= 0) {
+        expected_width <= 0 || expected_height <= 0 || expected_width > INT_MAX / 4 ||
+        encoded_size / sizeof(uint32_t) > UINT_MAX) {
         return SPICE_SWIFT_QUIC_BAD_INPUT;
     }
     size_t pixel_count = (size_t)expected_width * (size_t)expected_height;
@@ -178,7 +164,8 @@ static inline SpiceSwiftQuicStatus spice_swift_quic_decode(
     if (begin_result != 0 || bridge.warned) {
         quic_destroy(context);
         free(aligned_input);
-        return SPICE_SWIFT_QUIC_BAD_INPUT;
+        return bridge.allocation_failed ? SPICE_SWIFT_QUIC_ALLOCATION_FAILED
+                                        : SPICE_SWIFT_QUIC_BAD_INPUT;
     }
     *decoded_type = (int)type;
     *decoded_width = width;
@@ -207,27 +194,24 @@ static inline SpiceSwiftQuicStatus spice_swift_quic_decode(
             expected_width * 4
         );
     } else if (type == SPICE_SWIFT_QUIC_GRAY) {
-        uint8_t *gray = malloc(pixel_count);
-        if (!gray) {
-            quic_destroy(context);
-            free(aligned_input);
-            return SPICE_SWIFT_QUIC_ALLOCATION_FAILED;
-        }
+        // Decode into the existing output prefix, then expand backwards. No
+        // temporary allocation can be abandoned by the C longjmp error path.
         decode_result = quic_decode(
             context,
             SPICE_SWIFT_QUIC_GRAY,
-            gray,
+            output_bgra,
             expected_width
         );
         if (decode_result == 0 && !bridge.warned) {
-            for (size_t index = 0; index < pixel_count; index++) {
-                output_bgra[index * 4] = gray[index];
-                output_bgra[index * 4 + 1] = gray[index];
-                output_bgra[index * 4 + 2] = gray[index];
+            for (size_t remaining = pixel_count; remaining > 0; --remaining) {
+                size_t index = remaining - 1;
+                uint8_t value = output_bgra[index];
+                output_bgra[index * 4] = value;
+                output_bgra[index * 4 + 1] = value;
+                output_bgra[index * 4 + 2] = value;
                 output_bgra[index * 4 + 3] = 0;
             }
         }
-        free(gray);
     } else {
         quic_destroy(context);
         free(aligned_input);
@@ -236,7 +220,8 @@ static inline SpiceSwiftQuicStatus spice_swift_quic_decode(
 
     SpiceSwiftQuicStatus status = decode_result == 0 && !bridge.warned
         ? SPICE_SWIFT_QUIC_OK
-        : SPICE_SWIFT_QUIC_BAD_INPUT;
+        : bridge.allocation_failed ? SPICE_SWIFT_QUIC_ALLOCATION_FAILED
+                                   : SPICE_SWIFT_QUIC_BAD_INPUT;
     quic_destroy(context);
     free(aligned_input);
     return status;

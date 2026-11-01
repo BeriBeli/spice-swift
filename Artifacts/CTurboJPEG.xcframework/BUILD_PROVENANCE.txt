@@ -1,0 +1,7 @@
+Source: https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.1/libjpeg-turbo-3.2.1.tar.gz
+SHA-256: c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f
+Configuration: Release; arm64; BUILD=3.2.1; macOS=26.0; WITH_SIMD=ON; REQUIRE_SIMD=ON; deterministic archive (libtool -static -D, ZERO_AR_DATE=1); ENABLE_SHARED=OFF; WITH_JAVA=OFF; WITH_TESTS=OFF; WITH_TOOLS=OFF
+Apple clang version 21.0.0 (clang-2100.3.34.2)
+macOS SDK: 27.0
+CMake: cmake version 4.4.5
+Archive SHA-256: b19be7bdfab410faaceccc996114c2da1d61647b07731b6dc5c4a00857aff861
