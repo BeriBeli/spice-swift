@@ -67,6 +67,9 @@ latency, or interoperability. For those investigations, connect `spice-probe` or
 the actual client to an explicitly selected endpoint and profile that session.
 The repository does not provision or manage remote test machines.
 
+For a runnable real-session workload, including marker-correlated synthetic
+input to drawable presentation, see [Session/README.md](Session/README.md).
+
 ## Input provenance
 
 `SpiceBenchmarks/Fixtures` contains:

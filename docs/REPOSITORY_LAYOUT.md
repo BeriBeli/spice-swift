@@ -36,6 +36,8 @@ in `.build/` and must remain ignored.
   opt-in. Keep small independent correctness fixtures beside their tests.
 - Use `spice-probe` against an explicitly configured live endpoint; do not add
   machine-specific VM provisioning or remote campaign orchestration to the package.
+- `spice-session-benchmark` uses the same explicit-endpoint rule. Its standalone
+  guest marker fixture and measurement guide live in `Benchmarks/Session/`.
 - Put stable project documentation in `docs/` and use descriptive filenames.
   Remove superseded plans and stale stage logs instead of carrying their task
   IDs and acceptance checklists into current guidance. Keep status tied to

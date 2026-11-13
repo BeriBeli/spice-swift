@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwiftSpice guest interaction marker</title>
+<style>
+  html, body { margin: 0; background: #eee; font: 18px system-ui; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+  form { position: relative; margin: 100px 32px; max-width: 650px; }
+  input, button { font: inherit; padding: 10px; }
+  p { line-height: 1.5; }
+</style>
+<canvas id="screen"></canvas>
+<form id="setup">
+  <h1>Guest interaction marker</h1>
+  <p>Enter the same 16-digit hexadecimal base token used by
+    <code>spice-session-benchmark --marker-base</code>. Arm the page, keep it
+    fullscreen and focused, then start the host benchmark. Each Space keydown
+    advances exactly one marker. Reload to reset before another run.</p>
+  <input id="token" value="1234567800000000" pattern="[0-9a-fA-F]{16}" maxlength="16" required aria-label="Base token">
+  <button>Arm and enter fullscreen</button>
+</form>
+<script src="marker-grid.js"></script>
+<script>
+"use strict";
+const canvas = document.getElementById("screen");
+const context = canvas.getContext("2d", { alpha: false });
+const setup = document.getElementById("setup");
+let base = 0n, revision = 0n, received = 0n, armed = false;
+const nowNs = () => BigInt(Math.round(performance.now() * 1000000));
+
+function draw() {
+  const width = Math.round(innerWidth * devicePixelRatio);
+  const height = Math.round(innerHeight * devicePixelRatio);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    context.fillStyle = "#eeeeee";
+    context.fillRect(0, 0, width, height);
+  }
+  if (!armed) return;
+  context.fillStyle = "#eeeeee";
+  context.fillRect(16, 60, 700, 90);
+  context.fillStyle = "#222222";
+  context.font = "24px sans-serif";
+  context.fillText("SwiftSpice interaction sample " + revision, 16, 90);
+  context.fillText("Keep this page fullscreen and focused. Reload to reset.", 16, 130);
+  // This is the guest marker draw-issue boundary, not compositor or physical
+  // screen completion. Both guest timestamps use performance.now(), never host time.
+  const grids = SpiceSessionMarker.encode(base + revision, revision, received, nowNs());
+  grids.forEach((bits, grid) => bits.forEach((bit, index) => {
+    context.fillStyle = bit ? "#000000" : "#ffffff";
+    context.fillRect(16 + (index % 88) * 4, 16 + grid * 12 + Math.floor(index / 88) * 4, 4, 4);
+  }));
+}
+
+setup.addEventListener("submit", async event => {
+  event.preventDefault();
+  base = BigInt("0x" + document.getElementById("token").value);
+  revision = 0n;
+  received = nowNs();
+  armed = true;
+  setup.hidden = true;
+  try { await document.documentElement.requestFullscreen(); }
+  catch { /* F11 is available when browser fullscreen permission is unavailable. */ }
+  draw();
+});
+document.addEventListener("keydown", event => {
+  if (!armed || event.code !== "Space") return;
+  event.preventDefault();
+  if (event.repeat || base + revision === 0xffffffffffffffffn) return;
+  received = nowNs();
+  revision++;
+  draw();
+});
+addEventListener("resize", draw);
+draw();
+</script>
+</html>

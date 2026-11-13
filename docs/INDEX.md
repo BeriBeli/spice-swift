@@ -17,6 +17,7 @@ or connect the library to a SPICE endpoint.
 | Document | Contents |
 | --- | --- |
 | [BENCHMARKS.md](../Benchmarks/BENCHMARKS.md) | Local Release workloads, baseline comparison, and input provenance |
+| [Real-session performance](../Benchmarks/Session/README.md) | Direct `.vv` connections, session observations and marker-correlated input/presentation JSONL |
 | [Native JPEG measurements](../Benchmarks/NativeJPEG/README.md) | Scalar/Neon correctness, native ASan, and same-load decode measurements |
 | [QUIC codec contract](../Sources/CSpiceQUIC/README.md) | spice-gtk C codec, bounded application bridge, provenance and native validation |
 | [NATIVE_DEPENDENCIES.md](../Artifacts/NATIVE_DEPENDENCIES.md) | Reproducible native XCFramework inputs |

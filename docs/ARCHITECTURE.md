@@ -78,6 +78,7 @@ The session model has three consequences:
 | `SwiftSpice` | Public session API, demand-driven desktop source, and optional macOS host integrations |
 | `SpiceViewer` | Bundled SwiftUI/AppKit macOS client |
 | `SpiceProbe` | Live listener and protocol integration probe |
+| `SpiceSessionBenchmark` | Live-session observations and opt-in marker-correlated synthetic interaction capture |
 | `SpiceTestSupport` | Deterministic transports and shared test fixtures |
 
 Lower-level targets must not import the public facade or application target.

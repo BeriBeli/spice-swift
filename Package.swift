@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "SwiftSpice", targets: ["SwiftSpice"]),
         .executable(name: "spice-probe", targets: ["SpiceProbe"]),
         .executable(name: "spice-viewer", targets: ["SpiceViewer"]),
+        .executable(name: "spice-session-benchmark", targets: ["SpiceSessionBenchmark"]),
     ],
     targets: [
         .target(
@@ -137,6 +138,10 @@ let package = Package(
             dependencies: ["SpiceRenderer", "SwiftSpice"]
         ),
         .executableTarget(
+            name: "SpiceSessionBenchmark",
+            dependencies: ["SwiftSpice"]
+        ),
+        .executableTarget(
             name: "SpiceProtocolGenerator"
         ),
         .plugin(
@@ -234,11 +239,15 @@ let package = Package(
             name: "SpiceViewerTests",
             dependencies: ["SpiceViewer", "SwiftSpice"]
         ),
+        .testTarget(
+            name: "SpiceSessionBenchmarkTests",
+            dependencies: ["SpiceSessionBenchmark", "SwiftSpice", "SpiceChannels"]
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
 
-// Local performance tools are opt-in and never dependencies of SwiftSpice.
+// Local microbenchmarks are opt-in and never dependencies of SwiftSpice.
 if Context.environment["SWIFTSPICE_BENCHMARKS"] == "1" {
     package.dependencies.append(.package(
         url: "https://github.com/ordo-one/benchmark.git",

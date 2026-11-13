@@ -48,6 +48,8 @@ package struct SpiceInteractionMarkerPayload: Sendable, Equatable {
     package let token: String
     package let markerRevision: UInt64
     package let checksum: UInt32
+    package var guestReceivedNs: UInt64? = nil
+    package var guestMarkerDrawnNs: UInt64? = nil
 
     package init(token: String, markerRevision: UInt64, checksum: UInt32) {
         self.token = token
@@ -82,6 +84,9 @@ package struct SpiceInteractionMarkerPlacement: Sendable, Equatable {
 /// storage. The guest marker revision is payload, never a host revision alias.
 package enum SpiceInteractionMarkerROIDetector {
     package static let magic: UInt16 = 0xA5C3
+    /// Optional second grid, one cell below the original marker. It carries
+    /// guest-clock evidence in the same immutable frame as the event token.
+    package static let guestTimingMagic: UInt16 = 0xA5C4
     package static let cellSize = 4
     package static let columns = 88
     package static let rows = 2
@@ -188,7 +193,7 @@ package enum SpiceInteractionMarkerROIDetector {
                     through: maximumX,
                     by: cellSize
                 ) {
-                    guard let payload = decode(
+                    guard var payload = decode(
                         base: base,
                         bytesPerRow: bytesPerRow,
                         originX: originX,
@@ -198,6 +203,23 @@ package enum SpiceInteractionMarkerROIDetector {
                        payload.checksum == expectedChecksum
                     else {
                         continue
+                    }
+                    let timingY = originY + markerHeight + cellSize
+                    if timingY + markerHeight <= frame.height {
+                        let (endOffset, overflow) = (timingY + markerHeight)
+                            .multipliedReportingOverflow(by: bytesPerRow)
+                        if !overflow, endOffset <= byteCount,
+                           let timing = decode(
+                               base: base,
+                               bytesPerRow: bytesPerRow,
+                               originX: originX,
+                               originY: timingY,
+                               expectedMagic: guestTimingMagic
+                           ), timing.checksum == expectedChecksum,
+                           let received = UInt64(timing.token, radix: 16) {
+                            payload.guestReceivedNs = received
+                            payload.guestMarkerDrawnNs = timing.markerRevision
+                        }
                     }
                     matches.append(payload)
                 }
@@ -217,7 +239,8 @@ package enum SpiceInteractionMarkerROIDetector {
         base: UnsafePointer<UInt8>,
         bytesPerRow: Int,
         originX: Int,
-        originY: Int
+        originY: Int,
+        expectedMagic: UInt16 = magic
     ) -> SpiceInteractionMarkerPayload? {
         var bits = [Bool]()
         bits.reserveCapacity(bitCount)
@@ -240,7 +263,7 @@ package enum SpiceInteractionMarkerROIDetector {
         }
 
         var cursor = 0
-        guard read(bits, cursor: &cursor, count: 16) == UInt64(magic) else {
+        guard read(bits, cursor: &cursor, count: 16) == UInt64(expectedMagic) else {
             return nil
         }
         let token = read(bits, cursor: &cursor, count: 64)
@@ -844,6 +867,11 @@ package final class SpiceInteractionTraceAssembler: Sendable {
             let identity = state.selectedIdentity
             let selectedFrame = state.selectedFrame
             let candidatePayload = selectedFrame?.payload
+            // Embedded guest evidence belongs to the selected marker delivery,
+            // never to an unrelated frame or a host-clock approximation.
+            let guestReceivedNs = state.guestReceivedNs ?? candidatePayload?.guestReceivedNs
+            let guestMarkerDrawnNs = state.guestMarkerDrawnNs
+                ?? candidatePayload?.guestMarkerDrawnNs
             let markerRevision: UInt64?
             if let guestMarkerRevision = state.guestMarkerRevision,
                let candidatePayload,
@@ -869,8 +897,8 @@ package final class SpiceInteractionTraceAssembler: Sendable {
                 sendStartedNs: state.sendStartedNs,
                 sendCompletedNs: state.sendCompletedNs,
                 motionAckNs: state.motionAckNs,
-                guestReceivedNs: state.guestReceivedNs,
-                guestMarkerDrawnNs: state.guestMarkerDrawnNs,
+                guestReceivedNs: guestReceivedNs,
+                guestMarkerDrawnNs: guestMarkerDrawnNs,
                 displayReceiveNs: selectedFrame?.displayReceiveNs,
                 surfaceReadyNs: selectedFrame?.surfaceReadyNs,
                 selectedRevisionReadyNs: state.selectedRevisionReadyNs,

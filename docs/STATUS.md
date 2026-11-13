@@ -119,6 +119,32 @@ same-machine baseline comparisons. `spice-probe`, viewer presentation diagnostic
 and local frame-correlation tests remain available for live-session investigation.
 Local timings do not establish end-to-end interaction latency or peer interoperability.
 
+### Real-session performance tool (2026-11-13)
+
+`spice-session-benchmark` adds direct TCP/TLS endpoint and `.vv` connections,
+headless or production-view observation, process CPU/high-water memory snapshots,
+and structured JSON diagnostics. Opt-in synthetic keyboard capture reuses the
+existing exact marker/delivery/Metal-presented trace and atomic JSONL writer.
+The standalone browser fixture embeds guest-clock timing in an additional grid;
+no host/guest clock synchronization or telemetry server is required. See the
+[session guide](../Benchmarks/Session/README.md) for setup and measurement limits.
+
+Local warnings-as-errors validation passed all **737** tests. The **45** focused
+benchmark and interaction tests also passed AddressSanitizer, including decoding
+the independent JavaScript guest marker into a valid correlated trace and
+rejecting truncated, mismatched or non-monotonic embedded guest evidence.
+A user-supplied direct TLS `.vv` with custom CA and complete subject validation
+successfully connected and observed a real 1920×1080 desktop for ten seconds.
+A subsequent five-second visible-window check with the layer-backed AppKit host
+recorded **1** confirmed Metal-presented frame and **0** CPU fallback frames.
+These were Debug smoke checks on a mostly static desktop, not comparative
+performance measurements.
+
+The report distinguishes confirmed Metal presentation, CPU fallback and
+`no_confirmed_presentation` explicitly. Live marker-to-presented capture still
+requires the guest fixture. No real input-to-visible latency or performance
+improvement is claimed by the local tests or connection/presentation smoke checks.
+
 ## JPEG/MJPEG Neon backend (2026-10-30)
 
 The first follow-up batch to the 0.4.4 source comparison enables and requires

@@ -2,7 +2,8 @@
 
 SwiftSpice is a native Swift 6 SPICE client for Apple Silicon Macs.
 The repository contains a reusable library, a SwiftUI/AppKit
-viewer, and a command-line integration probe. It does not depend on GLib.
+viewer, a command-line integration probe, and a real-session performance tool.
+It does not depend on GLib.
 
 The protocol baseline is `spice-protocol` 0.14.5. The project currently covers
 the core desktop path, compressed display formats, audio and Agent integration,
@@ -254,7 +255,18 @@ trust. The `--tls-insecure-for-testing-only` option remains limited to
 self-signed local test servers.
 
 The probe connects to an endpoint you supply; the repository does not provision
-remote VMs. For repeatable local performance comparisons, use
+remote VMs. For real-session CPU/rendering observations and marker-correlated
+input-to-presentation latency, use [the session performance tool](Benchmarks/Session/README.md):
+
+```sh
+swift run spice-session-benchmark connection.vv --observe-seconds 30
+```
+
+It accepts direct TCP/TLS `.vv` files or `HOST PORT`, emits a JSON report, and
+optionally captures interaction JSONL using the production Metal presenter.
+Proxy-based connection files are not supported.
+
+For repeatable local performance comparisons, use
 [the benchmark suite](Benchmarks/BENCHMARKS.md):
 
 ```sh
