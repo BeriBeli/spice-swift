@@ -39,6 +39,13 @@ Display boundary.
 See [Project status](docs/STATUS.md) for the detailed evidence and
 pending gates.
 
+The current beta is **0.4.6-beta.1**, on `codex/beta-0.4.6`. It is a source
+prerelease and leaves the stable GitHub Latest release unchanged. SwiftPM
+consumers should explicitly pin `.package(url: "https://github.com/BeriBeli/spice-swift.git",
+exact: "0.4.6-beta.1")` to opt in. The beta includes native video transaction and
+admission changes plus expanded diagnostics; vertical color-transition boundaries
+and the earlier isolated long presentation stall remain open investigations.
+
 ## Requirements
 
 - Apple Silicon (arm64); Intel Macs are not supported

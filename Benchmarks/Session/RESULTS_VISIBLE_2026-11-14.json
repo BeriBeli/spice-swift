@@ -1,0 +1,277 @@
+{
+  "scope": "Visible Maspice Release app; aggregate best-effort diagnostics from AX. Counters are window differences; timing summaries are session-cumulative and rounded. No per-key input-to-photon measurement. Display bytes exclude TLS/TCP overhead and include read-ahead.",
+  "marker": {
+    "display": [
+      100060,
+      511,
+      0
+    ],
+    "imageTypes": [
+      0,
+      0,
+      0,
+      507
+    ],
+    "copy": [
+      1011916800,
+      122
+    ],
+    "present": [
+      118,
+      124,
+      385
+    ],
+    "streams": [
+      0,
+      0
+    ],
+    "gpuCopyWaitTotalMilliseconds": 140.6,
+    "gpuCopyWaitMeanMilliseconds": 1.1524590163934425,
+    "cumulativeTimingAtEnd": {
+      "currentDrawable acquisition p95 / max": "0.5 / 1.8 ms",
+      "Receive → surface ready p95 / max": "2.0 / 8.7 ms",
+      "Revision request → presented p95 / max": "32.8 / 32.8 ms",
+      "Send p95 / max": "0.5 / 0.6 ms",
+      "Queue wait p95 / max": "0.2 / 40.0 ms"
+    },
+    "inputAtEnd": "84 / 84 / 0",
+    "errorsAtEnd": {
+      "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+      "Readbacks / pool exhausted / GPU errors": "0 / 0 / 0",
+      "Send failures": "0"
+    },
+    "visuallyConfirmedGuestCount": 40
+  },
+  "motion": {
+    "display": [
+      276723485,
+      12330,
+      0
+    ],
+    "imageTypes": [
+      0,
+      0,
+      0,
+      12328
+    ],
+    "copy": [
+      0,
+      0
+    ],
+    "present": [
+      2476,
+      2480,
+      9848
+    ],
+    "streams": [
+      0,
+      0
+    ],
+    "gpuCopyWaitTotalMilliseconds": 0.0,
+    "gpuCopyWaitMeanMilliseconds": null,
+    "cumulativeTimingAtEnd": {
+      "currentDrawable acquisition p95 / max": "1.0 / 10.0 ms",
+      "Receive → surface ready p95 / max": "2.0 / 8.7 ms",
+      "Revision request → presented p95 / max": "33.0 / 41.1 ms",
+      "Send p95 / max": "0.5 / 0.8 ms",
+      "Queue wait p95 / max": "0.2 / 40.0 ms"
+    },
+    "inputAtEnd": "232 / 230 / 2",
+    "errorsAtEnd": {
+      "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+      "Readbacks / pool exhausted / GPU errors": "1 / 0 / 0",
+      "Send failures": "0"
+    },
+    "window": {
+      "start": 1794596155319,
+      "end": 1794596176399,
+      "hostInputIntervalSeconds": 21.08
+    },
+    "approximateDisplayReadMegabitsPerSecond": 105.01840037950664
+  },
+  "video": {
+    "display": [
+      98241296,
+      30434,
+      0
+    ],
+    "imageTypes": [
+      0,
+      15583,
+      0,
+      14849
+    ],
+    "copy": [
+      2786918400,
+      336
+    ],
+    "present": [
+      2031,
+      2034,
+      28376
+    ],
+    "streams": [
+      0,
+      0
+    ],
+    "gpuCopyWaitTotalMilliseconds": 390.25,
+    "gpuCopyWaitMeanMilliseconds": 1.1614583333333333,
+    "cumulativeTimingAtEnd": {
+      "currentDrawable acquisition p95 / max": "1.0 / 12.2 ms",
+      "Receive → surface ready p95 / max": "1.0 / 28.4 ms",
+      "Revision request → presented p95 / max": "33.0 / 41.1 ms",
+      "Send p95 / max": "0.4 / 0.4 ms",
+      "Queue wait p95 / max": "36.9 / 36.9 ms"
+    },
+    "inputAtEnd": "10 / 9 / 1",
+    "errorsAtEnd": {
+      "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+      "Readbacks / pool exhausted / GPU errors": "1 / 0 / 0",
+      "Send failures": "0"
+    },
+    "window": {
+      "start": 1794596304274,
+      "end": 1794596325517,
+      "hostInputIntervalSeconds": 21.243
+    },
+    "approximateDisplayReadMegabitsPerSecond": 36.99714578920115
+  },
+  "video30": {
+    "display": [
+      286093657,
+      52245,
+      0
+    ],
+    "imageTypes": [
+      0,
+      27268,
+      0,
+      24977
+    ],
+    "copy": [
+      0,
+      0
+    ],
+    "present": [
+      2958,
+      2963,
+      49263
+    ],
+    "streams": [
+      0,
+      0
+    ],
+    "gpuCopyWaitTotalMilliseconds": 0.0,
+    "gpuCopyWaitMeanMilliseconds": null,
+    "cumulativeTimingAtEnd": {
+      "currentDrawable acquisition p95 / max": "0.2 / 10.4 ms",
+      "Receive → surface ready p95 / max": "1.0 / 15.8 ms",
+      "Revision request → presented p95 / max": "33.0 / 47.8 ms",
+      "Send p95 / max": "0.5 / 0.5 ms",
+      "Queue wait p95 / max": "41.5 / 41.5 ms"
+    },
+    "inputAtEnd": "6 / 5 / 1",
+    "errorsAtEnd": {
+      "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+      "Readbacks / pool exhausted / GPU errors": "0 / 0 / 0",
+      "Send failures": "0"
+    },
+    "window": {
+      "baselineObserved": 1794596481447,
+      "playRequested": 1794596482369,
+      "endObserved": 1794596507860,
+      "observationIntervalSeconds": 26.413
+    },
+    "approximateDisplayReadMegabitsPerSecond": 86.65237784424336
+  },
+  "videoFixtures": {
+    "video": {
+      "codec": "H.264",
+      "width": 320,
+      "height": 180,
+      "fps": 10,
+      "seconds": 2,
+      "looped": true
+    },
+    "video30": {
+      "codec": "H.264",
+      "width": 160,
+      "height": 90,
+      "fps": 30,
+      "seconds": 0.5,
+      "looped": true
+    },
+    "purpose": "Guest HTML video playback classification; both upscaled to fullscreen. Neither tests native 1080p/4K video decode or quality."
+  },
+  "fileTransfer": {
+    "largeFixture": {
+      "result": "timeout",
+      "lastStage": "sending",
+      "sentBytes": 32000,
+      "timeoutSeconds": 25
+    },
+    "smallFixtures": "Both completed. Chunk/token/root cause remains unisolated; no file-transfer retry or runtime flow-control change."
+  },
+  "columns": {
+    "display": [
+      "acceptedReadBytes",
+      "decodedMessages",
+      "copyBitsRequests"
+    ],
+    "imageTypes": [
+      "bitmap",
+      "quic",
+      "jpeg",
+      "lzFamily"
+    ],
+    "copy": [
+      "gpuCopyBytes",
+      "synchronizationAttempts"
+    ],
+    "present": [
+      "metalPresented",
+      "commandBuffersCommitted",
+      "supersededBeforeDraw"
+    ],
+    "streams": [
+      "streamCreateRequests",
+      "streamDataMessages"
+    ]
+  },
+  "validation": {
+    "SwiftSpiceTests": 743,
+    "MaspiceTests": 57,
+    "warningsAsErrors": true,
+    "releaseAppAssembly": true,
+    "signatureAndDependencyAudit": true,
+    "runtimePerformanceFix": false
+  },
+  "provenance": {
+    "swiftSpiceBase": "006d2aacc8ee6f7bab1d61975bab8eae20b8c5e5",
+    "maspiceBase": "a905c1ee3bb8263f924caf6140ba0aa992b9ae49",
+    "runtime": "Initial instrumented Release Maspice build using editable SwiftSpice; subsequent migration accounting refinement validated by tests/build, no migration in live runs.",
+    "installedAppReplaced": false,
+    "connectionConfiguration": "linuxlite.vv; CA/full subject validation unchanged",
+    "restoredGuest": "Original fullscreen marker, count 0"
+  },
+  "subsequentServerInspection": {
+    "source": "User-reported remote server inspection after the live client measurements; not independently executed by this agent.",
+    "management": "QEMU direct startup",
+    "streamingVideoOptionPresent": false,
+    "documentedDefaultVideoDetection": "off",
+    "acceptedEncoder": "spice:mjpeg",
+    "rejectedEncoder": "gstreamer:h264",
+    "reportedRejectionReason": "SPICE library lacks GStreamer encoder support",
+    "rawServerLogsCollected": false,
+    "serverVersionAndBinaryHashesCollected": false,
+    "references": [
+      "https://www.qemu.org/docs/master/system/invocation.html",
+      "https://www.spice-space.org/spice-user-manual.html#_host_video_encoding"
+    ],
+    "interpretation": "The reported default off accounts for absent video streams. Enabling detection alone cannot provide H.264 encoding in this SPICE build. The historical one-second presentation stall remains unexplained.",
+    "nextComparison": "Desktop drawing (off) versus native MJPEG streaming (all), followed by filter/all comparison under matched workload and network conditions. Require nonzero MJPEG stream and decoder counters.",
+    "nextComparisonRun": false,
+    "serverOrClientRuntimeConfigurationChanged": false,
+    "futureH264Gate": "SPICE server built with GStreamer support plus an available compatible H.264 encoder; require actual H.264 stream/decode evidence and separately confirm client hardware use."
+  }
+}

@@ -259,9 +259,35 @@ fallible GPU/native-video work still requires a distinct candidate. Lagging
 slots catch up from bounded revision damage history with at most 64 losslessly
 coalesced rectangles. An exact union-area check makes damage covering at least
 half the surface a full upload without inflating touching L-shaped regions.
+Native video also retains committed clip damage, including pending CPU changes,
+so a known candidate can catch up with regional GPU blits from the canonical
+slot. New, aborted or history-expired candidates require a full copy; the
+fallible compositor still writes a separate candidate and commits after GPU
+completion. Copy counters record the actual encoded rectangle bytes.
+Asynchronous MJPEG draws that are already decoded can share one bounded
+transaction per Surface, with at most eight members. A single owned manager
+drains ready work without a timer or waiting for missing streams. Each existing
+per-stream task waits for its result before decoding again, retaining the same
+stream and decoder-pool bounds. Wire order, desktop barriers and geometry are
+validated per member; encoding/GPU failure aborts the accepted batch. Successful
+members share one catch-up, GPU completion and canonical revision, which is
+submitted for publication once. Native-frame counters continue counting accepted
+fragments, rather than distinct batch revisions. Stream cancellation resolves
+queued draws; connection close cancels and drains active managers before closing
+their decoders and Surfaces. Decoder leases and shared destination texture views
+remain alive through command completion.
+If native candidate checkout fails while matching non-source slots are leased,
+the Surface transaction can wait for a consumer lease to release, with a 16 ms
+timeout deadline, then retry checkout. The pool registers and checks availability
+under its existing mutex, signals outside it, and removes waiters on cancellation,
+retirement or timeout. No pool mutex spans an await. Permanent capacity with no
+eligible leased candidate returns immediately. The three-slot/budget limits and
+separate fallible candidate remain; native failure still falls back after the
+bounded attempt. Recovery counters count batches, while native fallback counts
+affected fragments. The deadline does not bound scheduler resumption exactly.
 Only a successfully completed GPU candidate becomes canonical. Pool
-exhaustion, unavailable Metal/IOSurface support, or GPU failure returns to the
-bounded Data path without blocking Display. SwiftSpice itself supports only
+exhaustion after recovery, unavailable Metal/IOSurface support, or GPU failure
+returns to the bounded Data path. SwiftSpice itself supports only
 Apple Silicon; the Data path remains a required fallback on that architecture.
 
 VideoToolbox native frames and CoreVideo handles remain package-only. The
@@ -289,10 +315,14 @@ snapshot and pauses again when no work remains. The `MTKView` uses explicit
 drawing, obtains no drawable while idle, and renders directly from a cached
 IOSurface texture using one full-screen triangle. Texture wrappers are bounded
 to three; 1:1 and integer magnification use nearest filtering, other scales use
-linear filtering. The final drawable is always completely covered because its
+MPS Lanczos filtering. The final drawable is always completely covered because its
 previous contents are not preserved. At most two GPU commands are in flight;
 a busy GPU skips a tick without blocking the main actor, and frame leases live
-through command completion.
+through command completion. That GPU budget does not bound compositor-owned
+drawable lifetime: `currentDrawable` acquisition remains synchronous and can
+wait independently of GPU completion. Presentation diagnostics separate frame
+preparation, drawable acquisition, encoding/presentation scheduling and the
+`commit()` call from GPU completion and confirmed drawable presentation.
 
 Absolute remote cursors use cached `NSCursor` images. Relative cursors use a
 cached Core Animation overlay whose position can change without redrawing the
@@ -322,6 +352,11 @@ starts from clipboard or directory scanning.
 The Main Channel seeds a session-wide monotonic multimedia clock. Display video
 and Playback use that shared timeline. Playback delay reports from the actual
 host sink correct the clock rather than relying only on server hints.
+MJPEG uses multimedia deadlines only while a playback delay anchor exists.
+Without that anchor, it presents the latest admitted frame immediately and
+reports a zero timing margin; minor transport/encoding age must not starve a live
+desktop stream. Per-stream replacement and Surface mutation/order guards still
+bound work and reject stale writes. Advanced inter-frame video timing is unchanged.
 
 Playback and Record queues are duration-bounded. Overflow, underrun, capture
 permission, mute state, and device failure are observable application events.

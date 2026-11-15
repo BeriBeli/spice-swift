@@ -1,0 +1,145 @@
+{
+  "date": "2026-11-15",
+  "hostCompletedMillis": 1794710523078,
+  "allOwnedTestProcessesExitedBeforeDeletion": true,
+  "removed": [
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/cocoaspice-comparison-20261114",
+      "files": 4634,
+      "bytes": 204563451,
+      "kind": "task-owned-test-package-and-cache"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/spicy-comparison-20261114",
+      "files": 305,
+      "bytes": 6323658,
+      "kind": "task-owned-test-package-and-cache"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/spicy-gtk-native",
+      "files": 24,
+      "bytes": 270680,
+      "kind": "task-owned-test-package-and-cache"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/spicy-visual-20261115",
+      "files": 99,
+      "bytes": 40040114,
+      "kind": "task-owned-test-package-and-cache"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/KnownMetricLabels.h",
+      "bytes": 2453,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/NativeWindowBench",
+      "bytes": 93472,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/NativeWindowBench.m",
+      "bytes": 29328,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence-package/native/KnownMetricLabels.h",
+      "bytes": 2453,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence-package/native/NativeWindowBench.m",
+      "bytes": 29328,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence-package-scan-selfmatch/native/KnownMetricLabels.h",
+      "bytes": 2453,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence-package-scan-selfmatch/native/NativeWindowBench.m",
+      "bytes": 29328,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/KnownMetricLabels.h",
+      "bytes": 2453,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/VisibleCapture",
+      "bytes": 108128,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/VisibleCapture.m",
+      "bytes": 25865,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/WindowControl",
+      "bytes": 78272,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/WindowControl.m",
+      "bytes": 29339,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/__pycache__/run-video.cpython-315.pyc",
+      "bytes": 3106,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/evidence-package-visible/bench/KnownMetricLabels.h",
+      "bytes": 2453,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/evidence-package-visible/bench/VisibleCapture.m",
+      "bytes": 25865,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/evidence-package-visible/bench/WindowControl.m",
+      "bytes": 29339,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/evidence-package-visible/bench/run-video.py",
+      "bytes": 1403,
+      "kind": "window-control-helper"
+    },
+    {
+      "path": "/Users/beribeli/Workarea/spice-mac/.build/visible-performance-20261115/run-video.py",
+      "bytes": 1403,
+      "kind": "window-control-helper"
+    }
+  ],
+  "removedBytesApproximate": 251694344,
+  "removedMiBApproximate": 240.03443145751953,
+  "remainingWorkingControlHelpers": [],
+  "preservedArchives": {
+    "spice-native-client-comparison-2026-11-15.zip": "8c0fc20af5f39cb062b27848192d90a6ece2e4d1949e457122cbe5f347b8627d",
+    "spice-native-visible-2026-11-15.zip": "af6ce2315f43abdf3179e3e368f12799cf21db244e4345b7157365f3ddf0ffe9",
+    "spice-spicy-visual-2026-11-15.zip": "9acfd79f6a5338d3b8ac561b74ce84020da1cfec1c35833c9b7e2c5b08024b6f"
+  },
+  "archivesRetainedAsHistoricalEvidence": true,
+  "newSpicyArchiveContainsControlScripts": false,
+  "installedMaspicePreserved": true,
+  "installedMaspiceSHA256": "cacc21837587f5a3b4ce47e6da66b5814d2a99657bcf32882ccc3a5087043fa1",
+  "sharedHomebrewLibrariesModified": false,
+  "productionSourcesModified": false,
+  "serverDefaultRestoredBeforeCleanup": "off",
+  "serverPIDAfterRestore": 224502,
+  "guestMarkerZeroRestored": false,
+  "originalMaspiceConnectionState": "Original process exited before marker restoration completed; no further GUI retries or tests.",
+  "serverAndGuestCleanup": {
+    "serverSSHReturnCode": 255,
+    "connectionRefused": false,
+    "timeout": false,
+    "authenticationFailed": false
+  }
+}

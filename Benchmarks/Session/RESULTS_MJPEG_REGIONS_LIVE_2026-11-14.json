@@ -1,0 +1,546 @@
+{
+  "date": "2026-11-14",
+  "userTimeZone": "Asia/Singapore",
+  "scope": "Visible Release Maspice A/B/A comparison of region-aware video commit validation, Linux Lite 1920x1080, original TLS linuxlite.vv.",
+  "localImplementationRecord": "RESULTS_MJPEG_REGIONS_2026-11-14.json",
+  "testOrder": [
+    "control",
+    "fixed",
+    "control-return"
+  ],
+  "clientBuilds": {
+    "control": {
+      "executableSHA256": "4f41f9f2467c59faf2fe43895f336cc3dd4b06933efbb6357dd0145390fe6f0f",
+      "scope": "Prior clock-admission correction, before region-ordering changes"
+    },
+    "fixed": {
+      "binarySHA256": "fb0b122f4c2eebd9d028a20de1b16f66ec53f020c38a19e66a18478b6ce0b420",
+      "bundle": "/Users/beribeli/Workarea/spice-mac/build/Maspice.app",
+      "release": true,
+      "closureAuditPassed": true,
+      "signatureVerified": true,
+      "productionChange": "Region-aware stale MJPEG commit validation; transactional GPU ownership unchanged"
+    }
+  },
+  "serverTransitionIntoTest": {
+    "oldLinuxLitePID": 68650,
+    "newLinuxLitePID": 88854,
+    "streamingVideo": "all",
+    "explicitModeOption": true,
+    "display": "gtk,gl=off",
+    "videoDevice": "virtio-vga,xres=1920,yres=1080",
+    "centosPID": 26919,
+    "tlsRelayPID": 3368,
+    "gracefulStop": true,
+    "forcedTermination": false
+  },
+  "serverAndConnectionControls": {
+    "verifiedOnRestoredPID": 89994,
+    "memoryMiB": "6144",
+    "vCPUs": "4",
+    "display": "gtk,gl=off",
+    "virtio1920x1080": true,
+    "defaultStreamingOff": true,
+    "qemuVersion": "QEMU emulator version 11.1.2",
+    "qemuSHA256": "a2250f5e2b3b07c754473c0817df1cccf6c3c2443fc616dc474c4c311fa6ef1c",
+    "spicePackage": "spice 0.16.0-4",
+    "spiceLibrary": "/usr/lib/libspice-server.so.1.15.0",
+    "spiceLibrarySHA256": "0110bf9597c44cd477b4d47b4a0021415c97426f01657fbd4d68f2e52240608a",
+    "connection": {
+      "file": "~/Downloads/linuxlite.vv",
+      "type": "spice",
+      "tlsPortPresent": true,
+      "caPresent": true,
+      "fullHostSubjectPresent": true
+    }
+  },
+  "sameQEMUProcessForAllTestWindows": true,
+  "fixture": {
+    "file": "/home/lab/Desktop/spice-fullfield-20261114.html",
+    "bytes": 750,
+    "sha256": "f48393b4a9b7cced1cce29fc7af837901f762986f22c5a2d87002610c7e62e2b",
+    "hostObservedMillis": 1794616553367
+  },
+  "fixtureContract": {
+    "requestedFPS": 30,
+    "canvasSourcePixels": [
+      160,
+      90
+    ],
+    "guestSurfacePixels": [
+      1920,
+      1080
+    ],
+    "finiteCallbackCount": 5400,
+    "nominalDurationSeconds": 180,
+    "verifiedOutputFPS": null
+  },
+  "fixedControls": [
+    "streaming-video=all",
+    "virtio-vga,xres=1920,yres=1080",
+    "gtk,gl=off",
+    "four vCPUs and 6144 MiB",
+    "original CA and full certificate subject validation",
+    "one visible viewer at a time",
+    "same finite full-field fixture bytes",
+    "unchanged desktop compression and codec policy options"
+  ],
+  "fullfield": {
+    "control": {
+      "rawStart": "control-video-start.json",
+      "rawEnd": "control-video-end.json",
+      "hostObservationSeconds": 65.192,
+      "counterDifferences": {
+        "displayBytesMessagesCopyBits": [
+          171164082,
+          59716,
+          0
+        ],
+        "drawCopyBitmapQuicJpegLZ": [
+          0,
+          0,
+          0,
+          10089
+        ],
+        "gpuCopyBytesSynchronizationAttempts": [
+          290494771200,
+          35023
+        ],
+        "gpuCopyWaitTotalMilliseconds": 19704.16,
+        "metalPresentedCommittedSuperseded": [
+          5482,
+          5482,
+          37501
+        ],
+        "streamCreateDataMessages": [
+          0,
+          49627
+        ],
+        "streamRequestsMJPEGH264H265": [
+          0,
+          0,
+          0
+        ],
+        "mjpegDecodedIOSurfaceDataFallback": [
+          49627,
+          49627,
+          0
+        ],
+        "nativeFramesCPUFallbackMetalDisabled": [
+          32861,
+          0,
+          0
+        ],
+        "readbacksPoolExhaustedGPUErrors": [
+          6,
+          46,
+          0
+        ]
+      },
+      "approximateDisplayMegabitsPerSecond": 21.004305068106518,
+      "gpuCopyGiBPerSecond": 4.149962238101583,
+      "gpuCopyWaitMeanMillisecondsInWindow": 0.5626062872969192,
+      "cumulativeTimingAtEnd": {
+        "Queue wait p95 / max": "0.2 / 38.4 ms",
+        "Send p95 / max": "1.0 / 1.1 ms",
+        "Framed-receive batch gap p95 / max": "50.0 / 11,500.2 ms",
+        "Receive → surface ready p95 / max": "12.0 / 18.9 ms",
+        "Surface ready → publisher p95 / max": "0.2 / 1.0 ms",
+        "Snapshot preparation p95 / max": "12.0 / 17.5 ms",
+        "Desktop ready → revision selection p95 / max": "12.0 / 35.8 ms",
+        "Revision selection → Metal commit p95 / max": "1.0 / 9.6 ms",
+        "Drawable preparation p95 / max": "0.2 / 0.4 ms",
+        "currentDrawable acquisition p95 / max": "0.5 / 9.5 ms",
+        "Drawable → commit p95 / max": "0.2 / 0.6 ms",
+        "Synchronous commit call p95 / max": "0.1 / 0.1 ms",
+        "Metal commit → completion p95 / max": "4.0 / 5.3 ms",
+        "Revision request → presented p95 / max": "33.0 / 45.7 ms",
+        "MJPEG late before decode / max lateness (ms)": "0 / 0"
+      },
+      "errorsAndResourcesAtEnd": {
+        "Send failures": "0",
+        "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+        "Readbacks / pool exhausted / GPU errors": "12 / 53 / 0",
+        "MJPEG handles / IOSurface allocations / peak decode": "59 / 59 / 2",
+        "MJPEG superseded before decode": "0",
+        "CPU presentation fallback / command failure": "0 / 0"
+      },
+      "processResources": {
+        "client": {
+          "pid": 34123,
+          "sampleSeconds": 50.168056,
+          "cpuSeconds": 34.710411959,
+          "cpuPercentOfOneCore": 69.18827382707434,
+          "residentBytesAtEnd": 322240512,
+          "physicalFootprintBytesAtEnd": 289064136
+        },
+        "server": {
+          "pid": 88854,
+          "sampleSeconds": 50.149221687,
+          "cpuSeconds": 27.41,
+          "cpuPercentOfOneCore": 54.65688016271925,
+          "residentBytesAtEnd": 2561441792
+        }
+      },
+      "nativeCommitsPerDecodedFragment": 0.6621597114473976,
+      "decodedMinusNativeCommits": 16766,
+      "decodedFragmentsPerObservationSecond": 761.2437108847712,
+      "nativeCommitsPerObservationSecond": 504.0649159406063,
+      "accountedBytesPerCanonicalCopyAttempt": 8294400.0,
+      "warmupUntilFirstObservationSeconds": 21.077,
+      "screenshots": [
+        "control-video-observation-start.jpg",
+        "control-video-mid.jpg",
+        "control-video-observation-end.jpg"
+      ]
+    },
+    "fixed": {
+      "rawStart": "fixed-video-start.json",
+      "rawEnd": "fixed-video-end.json",
+      "hostObservationSeconds": 74.865,
+      "counterDifferences": {
+        "displayBytesMessagesCopyBits": [
+          260655155,
+          91508,
+          0
+        ],
+        "drawCopyBitmapQuicJpegLZ": [
+          0,
+          0,
+          0,
+          15340
+        ],
+        "gpuCopyBytesSynchronizationAttempts": [
+          656286105600,
+          79124
+        ],
+        "gpuCopyWaitTotalMilliseconds": 33701.14,
+        "metalPresentedCommittedSuperseded": [
+          7137,
+          7137,
+          84367
+        ],
+        "streamCreateDataMessages": [
+          0,
+          76168
+        ],
+        "streamRequestsMJPEGH264H265": [
+          0,
+          0,
+          0
+        ],
+        "mjpegDecodedIOSurfaceDataFallback": [
+          76168,
+          76168,
+          0
+        ],
+        "nativeFramesCPUFallbackMetalDisabled": [
+          75742,
+          0,
+          0
+        ],
+        "readbacksPoolExhaustedGPUErrors": [
+          74,
+          421,
+          0
+        ]
+      },
+      "approximateDisplayMegabitsPerSecond": 27.853352567955653,
+      "gpuCopyGiBPerSecond": 8.164216463658022,
+      "gpuCopyWaitMeanMillisecondsInWindow": 0.42592816338911077,
+      "cumulativeTimingAtEnd": {
+        "Queue wait p95 / max": "1.0 / 38.6 ms",
+        "Send p95 / max": "0.5 / 0.5 ms",
+        "Framed-receive batch gap p95 / max": "33.0 / 11,045.8 ms",
+        "Receive → surface ready p95 / max": "16.0 / 29.5 ms",
+        "Surface ready → publisher p95 / max": "0.2 / 0.8 ms",
+        "Snapshot preparation p95 / max": "16.0 / 26.7 ms",
+        "Desktop ready → revision selection p95 / max": "12.0 / 20.6 ms",
+        "Revision selection → Metal commit p95 / max": "0.5 / 16.9 ms",
+        "Drawable preparation p95 / max": "0.2 / 0.4 ms",
+        "currentDrawable acquisition p95 / max": "0.5 / 16.8 ms",
+        "Drawable → commit p95 / max": "0.2 / 0.6 ms",
+        "Synchronous commit call p95 / max": "0.1 / 0.1 ms",
+        "Metal commit → completion p95 / max": "2.0 / 7.0 ms",
+        "Revision request → presented p95 / max": "33.0 / 49.5 ms",
+        "MJPEG late before decode / max lateness (ms)": "0 / 0"
+      },
+      "errorsAndResourcesAtEnd": {
+        "Send failures": "0",
+        "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+        "Readbacks / pool exhausted / GPU errors": "104 / 540 / 0",
+        "MJPEG handles / IOSurface allocations / peak decode": "61 / 61 / 2",
+        "MJPEG superseded before decode": "0",
+        "CPU presentation fallback / command failure": "0 / 0"
+      },
+      "processResources": {
+        "client": {
+          "pid": 34341,
+          "sampleSeconds": 56.081518,
+          "cpuSeconds": 39.275686625,
+          "cpuPercentOfOneCore": 70.03320884609435,
+          "residentBytesAtEnd": 294354944,
+          "physicalFootprintBytesAtEnd": 313689288
+        },
+        "server": {
+          "pid": 88854,
+          "sampleSeconds": 56.074881387,
+          "cpuSeconds": 33.23,
+          "cpuPercentOfOneCore": 59.26004510052125,
+          "residentBytesAtEnd": 3658440704
+        }
+      },
+      "nativeCommitsPerDecodedFragment": 0.9944071000945279,
+      "decodedMinusNativeCommits": 426,
+      "decodedFragmentsPerObservationSecond": 1017.4046617244373,
+      "nativeCommitsPerObservationSecond": 1011.7144192880519,
+      "accountedBytesPerCanonicalCopyAttempt": 8294400.0,
+      "warmupUntilFirstObservationSeconds": 29.811,
+      "screenshots": [
+        "fixed-video-observation-start.jpg",
+        "fixed-video-mid.jpg",
+        "fixed-video-observation-end.jpg"
+      ]
+    },
+    "control-return": {
+      "rawStart": "control-return-video-start.json",
+      "rawEnd": "control-return-video-end.json",
+      "hostObservationSeconds": 69.655,
+      "counterDifferences": {
+        "displayBytesMessagesCopyBits": [
+          178550125,
+          62520,
+          0
+        ],
+        "drawCopyBitmapQuicJpegLZ": [
+          0,
+          0,
+          0,
+          10509
+        ],
+        "gpuCopyBytesSynchronizationAttempts": [
+          317658931200,
+          38298
+        ],
+        "gpuCopyWaitTotalMilliseconds": 22296.879999999997,
+        "metalPresentedCommittedSuperseded": [
+          5997,
+          5995,
+          40496
+        ],
+        "streamCreateDataMessages": [
+          0,
+          52011
+        ],
+        "streamRequestsMJPEGH264H265": [
+          0,
+          0,
+          0
+        ],
+        "mjpegDecodedIOSurfaceDataFallback": [
+          52011,
+          52011,
+          0
+        ],
+        "nativeFramesCPUFallbackMetalDisabled": [
+          35904,
+          0,
+          0
+        ],
+        "readbacksPoolExhaustedGPUErrors": [
+          37,
+          75,
+          0
+        ]
+      },
+      "approximateDisplayMegabitsPerSecond": 20.506797789103437,
+      "gpuCopyGiBPerSecond": 4.247260550639368,
+      "gpuCopyWaitMeanMillisecondsInWindow": 0.5821943704632095,
+      "cumulativeTimingAtEnd": {
+        "Queue wait p95 / max": "36.4 / 36.4 ms",
+        "Send p95 / max": "0.0 / 0.0 ms",
+        "Framed-receive batch gap p95 / max": "50.0 / 1,050.6 ms",
+        "Receive → surface ready p95 / max": "16.0 / 20.1 ms",
+        "Surface ready → publisher p95 / max": "0.2 / 0.9 ms",
+        "Snapshot preparation p95 / max": "12.0 / 18.7 ms",
+        "Desktop ready → revision selection p95 / max": "8.0 / 77.3 ms",
+        "Revision selection → Metal commit p95 / max": "1.0 / 12.2 ms",
+        "Drawable preparation p95 / max": "0.2 / 0.5 ms",
+        "currentDrawable acquisition p95 / max": "1.0 / 11.9 ms",
+        "Drawable → commit p95 / max": "0.2 / 0.8 ms",
+        "Synchronous commit call p95 / max": "0.1 / 0.1 ms",
+        "Metal commit → completion p95 / max": "4.0 / 4.6 ms",
+        "Revision request → presented p95 / max": "33.0 / 41.1 ms",
+        "MJPEG late before decode / max lateness (ms)": "0 / 0"
+      },
+      "errorsAndResourcesAtEnd": {
+        "Send failures": "0",
+        "Drawable miss / GPU busy / presentation error": "0 / 0 / 0",
+        "Readbacks / pool exhausted / GPU errors": "58 / 183 / 0",
+        "MJPEG handles / IOSurface allocations / peak decode": "50 / 50 / 2",
+        "MJPEG superseded before decode": "0",
+        "CPU presentation fallback / command failure": "0 / 0"
+      },
+      "processResources": {
+        "client": {
+          "pid": 34464,
+          "sampleSeconds": 56.990073,
+          "cpuSeconds": 40.245409667,
+          "cpuPercentOfOneCore": 70.61828060300958,
+          "residentBytesAtEnd": 310411264,
+          "physicalFootprintBytesAtEnd": 276104368
+        },
+        "server": {
+          "pid": 88854,
+          "sampleSeconds": 56.991964569,
+          "cpuSeconds": 31.08,
+          "cpuPercentOfOneCore": 54.53400358285866,
+          "residentBytesAtEnd": 3643453440
+        }
+      },
+      "nativeCommitsPerDecodedFragment": 0.6903155101805387,
+      "decodedMinusNativeCommits": 16107,
+      "decodedFragmentsPerObservationSecond": 746.6944225109468,
+      "nativeCommitsPerObservationSecond": 515.454741224607,
+      "accountedBytesPerCanonicalCopyAttempt": 8294400.0,
+      "warmupUntilFirstObservationSeconds": 31.53,
+      "screenshots": [
+        "control-return-video-observation-start.jpg",
+        "control-return-video-mid.jpg",
+        "control-return-video-observation-end.jpg"
+      ]
+    }
+  },
+  "markers": {
+    "control": {
+      "realSpacePresses": 40,
+      "keyHoldMilliseconds": 100,
+      "visuallyConfirmedCounts": [
+        0,
+        20,
+        40
+      ],
+      "displayReceivedBytes": 96692,
+      "streamDataMessages": 0,
+      "localQueueP95MaxAtStart": "38.4 / 38.4 ms",
+      "localQueueP95MaxAtEnd": "0.1 / 38.4 ms",
+      "localSendP95MaxAtEnd": "0.5 / 0.6 ms",
+      "sendFailuresAtEnd": "0",
+      "inputCountersAtEnd": "84 / 84 / 0",
+      "screenshots": [
+        "control-marker-zero.jpg",
+        "control-marker-20.jpg",
+        "control-marker-40.jpg"
+      ],
+      "measurementLimit": "Local cumulative queue/send timing and visible input delivery; no per-key presented or input-to-photon measurement."
+    },
+    "fixed": {
+      "realSpacePresses": 40,
+      "keyHoldMilliseconds": 100,
+      "visuallyConfirmedCounts": [
+        0,
+        20,
+        40
+      ],
+      "displayReceivedBytes": 98213,
+      "streamDataMessages": 0,
+      "localQueueP95MaxAtStart": "38.6 / 38.6 ms",
+      "localQueueP95MaxAtEnd": "0.1 / 38.6 ms",
+      "localSendP95MaxAtEnd": "0.5 / 0.5 ms",
+      "sendFailuresAtEnd": "0",
+      "inputCountersAtEnd": "84 / 84 / 0",
+      "screenshots": [
+        "fixed-marker-zero.jpg",
+        "fixed-marker-20.jpg",
+        "fixed-marker-40.jpg"
+      ],
+      "measurementLimit": "Local cumulative queue/send timing and visible input delivery; no per-key presented or input-to-photon measurement."
+    }
+  },
+  "visualObservations": {
+    "control": "Many narrow vertical strips at different phases in all three saved steady-window observations.",
+    "fixed": "Narrow-strip pattern substantially reduced in saved observations; one or a few broader phase boundaries remain. No atomic complete-frame or quality-score acceptance.",
+    "control-return": "Narrow vertical phase strips reappear after returning to the preserved control executable on the same running VM.",
+    "pixelAlignedReferenceAvailable": false,
+    "objectiveQualityScore": null
+  },
+  "methodLimits": [
+    "Sequential A/B/A, with one fixed-build window and two control windows. This is not a randomized or repeated statistical benchmark.",
+    "The VM stays running across all three test windows; viewer reconnection resets decoder and server stream state. Every steady window has zero additional stream-create messages.",
+    "Actual Display observation windows and CPU intervals differ; rates use their own recorded timestamps. CPU uses same-host monotonic intervals, never cross-host clock subtraction.",
+    "AX counters are periodically sampled and best effort across actors; native/decoded is an approximate composition ratio, not exact per-fragment rejection attribution.",
+    "Timing p95/max values are cumulative session histograms; no percentile or maximum subtraction is performed. Framed-receive idle gaps include deliberate pauses between test actions.",
+    "The source requests 30 FPS with a finite 5400-callback timer. Its scheduling and the QEMU capture cadence are not verified output FPS; automatic server bitrate/quality and fragment arrival rate can vary.",
+    "GPU bytes count canonical copy work, not measured hardware bandwidth utilization. Copy waits include GPU queue/completion and actor resumption.",
+    "Native commits and stream messages count fragments. Metal presentations can repeat a partially updated Surface; no complete-frame FPS or per-key photon latency is inferred.",
+    "Screenshot color phases are unaligned; visible band reduction is qualitative. No pixel-quality score or source-frame age is established.",
+    "Pool exhaustion and readbacks are lifetime/delta diagnostics; they are retained as remaining resource pressure, not silently discarded.",
+    "The CPU fallback field in Native / CPU fallback / Metal disabled counts advanced-video fallback. MJPEG Data fallback counts decoder output storage, not all possible composition fallbacks. The native-video fallback counter was not captured in AX; the residual decoded-minus-native gap remains unclassified.",
+    "Process memory endpoints are gauges after different warmups and do not establish a peak-memory improvement."
+  ],
+  "liveValidation": {
+    "comparisonCompleted": true,
+    "realMarkerDelivery": "80/80",
+    "newProductionEditsDuringComparison": false,
+    "additionalTestRunsDuringComparison": false,
+    "sourceHashesMatchedPriorLocalValidationRecord": true,
+    "localChecksPreviouslyPassed": {
+      "swiftSpiceTests": 749,
+      "addressSanitizerTests": 749,
+      "maspiceTests": 57,
+      "releaseClosureSignature": "passed"
+    }
+  },
+  "historicalOneSecondStall": {
+    "reproduced": false,
+    "rootCauseEstablished": false,
+    "fixClaim": false
+  },
+  "restoration": {
+    "serverTransition": {
+      "oldLinuxLitePID": 88854,
+      "newLinuxLitePID": 89994,
+      "streamingVideo": "off",
+      "explicitModeOption": false,
+      "display": "gtk,gl=off",
+      "videoDevice": "virtio-vga,xres=1920,yres=1080",
+      "centosPID": 26919,
+      "tlsRelayPID": 3368,
+      "gracefulStop": true,
+      "forcedTermination": false
+    },
+    "verification": {
+      "hostObservedMillis": 1794617097249,
+      "server": {
+        "linuxPID": 89994,
+        "streamingVideo": "off-default",
+        "explicitModeOption": false,
+        "display": "gtk,gl=off",
+        "centosPID": 26919,
+        "tlsRelayPID": 3368,
+        "otherProcessesPreserved": true,
+        "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393"
+      },
+      "clientPID": 34856,
+      "clientExecutable": "/Applications/Maspice.app/Contents/MacOS/Maspice",
+      "installedExecutableSHA256": "cacc21837587f5a3b4ce47e6da66b5814d2a99657bcf32882ccc3a5087043fa1",
+      "diagnosticApplicationsRunning": false,
+      "markerCountVisuallyVerified": 0,
+      "guestFullscreenVisuallyVerified": true,
+      "uiObservation": {
+        "hostObservedMillis": 1794617069516,
+        "application": "/Applications/Maspice.app",
+        "window": "Linux Lite 6.6 — Letty test environment",
+        "intendedMarkerCount": 0,
+        "guestFullscreen": true
+      },
+      "screenshot": "restored-installed-marker-zero.jpg",
+      "remoteLauncherChangedThisLiveFollowup": false
+    },
+    "fixturePageUnloaded": true,
+    "installedClientReplaced": false,
+    "serverLauncherEditedDuringThisLiveFollowup": false
+  },
+  "recommendation": "Keep the region correctness fix and retain server default off. Next reduce repeated full-Surface copies and per-fragment synchronization with bounded composition batching or safe candidate catch-up; preserve clip/wire-order/lifecycle validation and immutable published snapshots.",
+  "evidenceArchive": "spice-swift-mjpeg-regions-live-2026-11-14.zip"
+}

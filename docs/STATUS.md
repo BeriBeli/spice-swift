@@ -141,9 +141,221 @@ These were Debug smoke checks on a mostly static desktop, not comparative
 performance measurements.
 
 The report distinguishes confirmed Metal presentation, CPU fallback and
-`no_confirmed_presentation` explicitly. Live marker-to-presented capture still
-requires the guest fixture. No real input-to-visible latency or performance
-improvement is claimed by the local tests or connection/presentation smoke checks.
+`no_confirmed_presentation` explicitly. Live marker-to-presented capture uses
+the guest fixture. These local tests and connection/presentation smoke checks
+alone do not establish interaction latency or a performance improvement.
+
+### Drawable latency investigation (2026-11-13)
+
+The subsequent Release marker campaign on M4 Pro and a 1920×1080 Linux desktop
+produced two complete 200-sample runs and three incomplete runs. One incomplete
+run recorded a **1,007.6 ms** selection-to-commit interval followed by no accepted
+drawable presentation. Its aggregate timing did not separate preparation,
+drawable acquisition and encoding; the historical cause remains unconfirmed.
+
+A follow-up investigation completed **1,200/1,200** measured samples in six
+runs: three temporary stage-probe runs with 100 warmup inputs, two byte-identical
+original-binary controls and one bounded-metrics run with 50 warmup inputs.
+Each run used 200 measured inputs, a 100 ms post-transaction interval, the same
+1920×1080 guest, and a 1024×768-point production-view host at backing scale 2.
+The one-second stall did not recur in either the original binary or the
+instrumented builds. The bounded-metrics run's drawable acquisition maximum,
+including readiness and warmup, was **17.16 ms**. ProMotion remained enabled;
+the reported 120 Hz maximum is not a fixed measured display cadence.
+
+Presentation diagnostics now split preparation, the `currentDrawable` getter,
+encoding/presentation scheduling, and the synchronous `commit()` call into
+separate bounded histograms, exported by the session benchmark. Release
+warnings-as-errors compilation and the complete **737** tests passed. Rendering
+behavior is unchanged. A runtime root-cause fix and its before/after validation
+remain pending a reproduced stall with component timing and process-stack
+evidence; no performance improvement is claimed.
+
+### Four follow-up measurements (2026-11-13)
+
+The [follow-up report](PERFORMANCE_FOLLOWUP_2026-11-13.md) records current 3.2.1
+JPEG cost/quality, finite GPU measurements, controlled source-pixel exports and
+actual Maspice input under shaped transport. The settled live reference pixels
+matched the generator exactly below the HUD. Two motion variants under both
+codec policies produced desktop updates with **zero video decodes**, leaving
+live MJPEG/H.264 quality recovery unvalidated.
+
+The shipped decoder used median 4.083 / 16.720 CPU ms per quality-80 4:2:0 frame
+at 1080p / 4K. The finite GPU tool measured a 33,177,600-byte revision copy for a
+64×64 partial native video update on a retained 4K surface; composition p50 was
+1.338 ms. These are operation costs with retained correctness checks, not a
+runtime optimization or a diagnosis of the historical one-second stall.
+
+The installed Maspice 0.6.1 completed forty real Space presses in each of three
+profiles: unrestricted, 50±20 ms each direction with 20 Mbit/s, and 25±10 ms with
+2 Mbit/s. All final guest counters were forty; input FIFO peak was two and send
+failures were zero. Low bandwidth delayed visual echo after the local queue had
+emptied. Actual-viewer per-key presentation latency remains unmeasured.
+
+Opt-in fixture transfer, post-window PNG export, quality/pipeline tools and a
+bounded loopback shaper make these checks repeatable. Release warnings-as-errors
+builds, all **741** package tests, four fixture tests under AddressSanitizer, and
+the relay integration check passed. No production rendering/input behavior or
+installed application was changed. The original marker/session was restored.
+
+### Visible-window measurements and server findings (2026-11-14)
+
+The [visible-window report](PERFORMANCE_VISIBLE_2026-11-14.md) adds actual Maspice
+copy/traffic diagnostics and fullscreen MP4 playback. Forty marker presses were
+all visible. The 30 FPS playback observation received approximately 86.7 Mbit/s
+of Display read data, using QUIC/LZ desktop drawing with zero stream creation
+and video decoding. Drawable acquisition did not reproduce the historical
+one-second stall. SwiftSpice's **743** tests and Maspice's **57** tests passed;
+the installed app was preserved and the original marker restored.
+
+Subsequent **user-reported** remote inspection found direct QEMU startup without
+`streaming-video` (documented default `off`), and a SPICE library accepting native
+MJPEG but rejecting the GStreamer H.264 encoder. This explains the video-path
+setup limitation. At that record's cutoff, the MJPEG comparison and independent
+server version/hash collection were still pending. H.264 needs a server
+encoder/build change first; the historical one-second stall remains unresolved.
+
+### Actual-server MJPEG comparison and admission correction (2026-11-14)
+
+The [actual-server comparison](PERFORMANCE_MJPEG_AB_2026-11-14.md) independently
+confirmed QEMU 11.1.2, SPICE package 0.16.0-4, original default-off arguments and
+binary hashes. Graceful Linux Lite restarts compared `all`, `filter` and `off`
+with the same corrected Release client; the other VM and TLS relay stayed running.
+All three marker checks passed forty real inputs, **120/120** total.
+
+A full-field fixture triggered 50 MJPEG streams. Before the correction, minor
+negative multimedia margins discarded 4,988 of 5,558 frames before decode despite
+no synchronized playback anchor. MJPEG now bypasses that deadline when there is
+no playback anchor, preserving active-audio scheduling and bounded replacement.
+The final `all` window decoded 22,970/22,970 received fragments directly into
+IOSurface, with zero such clock drops. SwiftSpice's **744** tests, Maspice's **57**
+tests, the Release app build, native closure and signature verification passed.
+
+The synthetic full-field workload received about 52.6 / 15.4 / 13.6 Mbit/s under
+`off` / `all` / `filter`, but canonical GPU copy traffic was 0.71 / 3.07 / 2.80 GiB/s.
+Streaming still showed vertical phase bands, and native composition counts lagged
+decode counts. Multi-stream region ordering, rejection attribution and full-Surface
+copy amplification remain open. These are not complete-frame FPS, codec-quality
+or per-key latency results. Keep default `off`; the historical one-second drawable
+stall was not reproduced or explained. Server defaults, the installed client and
+fullscreen marker at zero were restored; no release was published.
+
+### MJPEG disjoint-region ordering correction (2026-11-14)
+
+The [region-ordering follow-up](PERFORMANCE_MJPEG_REGIONS_2026-11-14.md) reproduced
+two client fragment-loss cases: a newer video commit or desktop command on one
+region invalidated a delayed video frame on a disjoint region. Bounded coverage
+records now permit disjoint writes while preserving overlapping wire order,
+desktop overwrite protection, lifecycle checks and transactional GPU ownership.
+
+All **749** SwiftSpice tests passed normally and under Address Sanitizer; all
+**57** Maspice tests and its Release build/closure/signature checks passed.
+The subsequent [live A/B/A comparison](PERFORMANCE_MJPEG_REGIONS_LIVE_2026-11-14.md)
+used the preserved control and corrected Release builds on the same running VM
+under `all`. Native commits/decoded fragments were **66.2% / 99.4% / 69.0%**;
+narrow phase strips diminished in the corrected observations and reappeared on
+return to the control. Broader boundaries and the residual commit gap remain.
+
+Canonical copy traffic was **4.15 / 8.16 / 4.25 GiB/s**, with a full 8,294,400-byte
+Surface per counted copy. Pool exhaustion/readbacks also increased in the
+corrected window. Forty marker inputs per A/B build passed, **80/80** total;
+no per-key presented-latency gain or complete-frame FPS is established. The
+historical one-second stall remains unexplained. Keep the correctness fix and
+prioritize bounded composition/candidate-copy work next. Default `off`, the
+installed viewer and fullscreen marker at zero were restored; no release was
+published. No new production edits or test runs occurred during this live check.
+
+### MJPEG incremental candidate copies (2026-11-14)
+
+The [candidate-copy follow-up](PERFORMANCE_MJPEG_COPY_2026-11-14.md) reuses the
+bounded revision damage history for GPU region catch-up. Unknown, expired and
+aborted candidates retain full repair. Native commits include pending CPU damage;
+published snapshots remain immutable. All **752** SwiftSpice tests passed normally
+and under ASan; Maspice's **57** tests and Release closure/signature checks passed.
+
+Real A/B/A on the same running VM under `all` reduced mean copy bytes **82.3%**,
+from **8,294,400** to **1,469,794**. Accounted copy traffic was **6.50 / 1.08 / 5.59
+GiB/s**, and mean copy wait **0.601 / 0.485 / 0.702 ms**. Native commits remained
+**98.94% / 98.73% / 99.17%** of decoded fragments; forty marker inputs per A/B
+build passed. GPU errors remained zero.
+
+Overall performance acceptance remains pending: client CPU was **70.95% / 81.81%
+/ 74.33%** of one core, with different fragment/presentation rates and higher
+candidate-window pool/readback pressure. No CPU or per-key latency improvement
+is established. Keep the implementation unreleased and server default `off`;
+profile CPU and reduce repeated fragment synchronization next. The historical
+one-second stall remains unexplained. Default server startup, the original
+installed viewer and fullscreen marker at zero were restored; no release was
+published. Earlier reports and archives remain unchanged.
+
+### MJPEG bounded ready batches (2026-11-14)
+
+The [ready-batch follow-up](PERFORMANCE_MJPEG_BATCH_2026-11-14.md) combines at
+most eight already-decoded native MJPEG draws into one Surface transaction,
+sharing candidate catch-up, composition completion and one publication request.
+It adds no timer or wait for missing streams. Per-member clip, lifecycle,
+desktop-barrier and overlapping wire-order validation remains; failure publishes
+neither accepted pixels nor staged guards. Snapshot immutability and close/drain
+ownership are covered by tests. All **755** SwiftSpice tests passed normally and
+under ASan; **57** Maspice tests and Release closure/signature checks passed.
+
+Real A/B on the same running VM under `all`, with bounded sixty-second CPU
+windows, measured **85.55% → 71.95%** client CPU on a one-core basis. Per accepted
+native fragment, synchronization requests fell **76.09%** and mutation submission
+requests **64.00%**. Copy wait per observation second fell **51.85%**; QEMU CPU
+remained about **55.8%**. Both builds delivered forty real marker inputs and
+recorded zero GPU errors. Native counters continue counting fragments, while
+accepted batches share one revision; timing population and pool-checkout
+granularity differ from the control.
+
+This single pair supports the direction, without general latency or hardware
+acceptance. Readbacks rose **2.93 → 4.48/s**, and approximate native acceptance
+fell **97.67% → 96.49%**; these remain the next bottleneck to investigate.
+Keep the change unreleased and server default `off`. The historical one-second
+stall remains unexplained. Default server startup, original installed viewer
+and fullscreen marker at zero were restored. Prior reports/archives are unchanged.
+
+### Native candidate lease recovery (2026-11-14)
+
+The [readback follow-up](PERFORMANCE_MJPEG_READBACK_2026-11-14.md) identifies
+temporary candidate ownership and per-member batch fallback as a material source
+of readback/native losses. A matching non-source consumer lease can now release
+before a 16 ms admission deadline; cancellation, retirement, timeout and permanent
+capacity retain bounded cleanup/fallback. The ring and budget are unchanged.
+Both builds expose native fallback fragments and batch recovery counters.
+
+Real A/B on the same running VM under `all` measured **1.96 → 0.91 readbacks/s**
+and **98.26% → 99.22%** approximate native acceptance. B recovered **91 of 168**
+checkout attempts; remaining 77 failed checkouts retained CPU fallback. Client
+CPU was **64.59% → 56.69%** of one core, with **10.10% fewer delivered fragments/s**;
+the CPU saving is not fully attributable to the policy. Both builds delivered
+forty real marker inputs and recorded zero GPU errors. All **757** SwiftSpice
+tests passed normally/ASan, **57** application tests and Release checks passed.
+
+Vertical color boundaries remain in both builds; cross-stream source/publication
+coherence needs separate measurement. The historical one-second stall remains
+unexplained. Keep the change unreleased and server default `off`. Original viewer,
+default startup and fullscreen marker at zero were restored at this experiment's
+endpoint. Prior evidence remains unchanged; separately requested external-client
+comparisons are not included in this A/B result.
+
+## Native visible-response supplement (2026-11-15)
+
+The subsequent [Spicy visual check](SPICY_VISUAL_ARTIFACTS_2026-11-15.md)
+also observed vertical color discontinuities. Spicy is excluded from performance
+ranking. Temporary CocoaSpice/Spicy packages and working window-control tools were
+removed at the user's request; reports and archived evidence remain available.
+
+The [real-window supplement](PERFORMANCE_NATIVE_VISIBLE_2026-11-15.md) adds 100
+Space and 100 mouse samples per primary client. Both completed without timeout.
+Cocoa TLS backport's consistent-region p50 was about 15–18ms lower, while keyboard
+p95 was similar (163ms versus Maspice's 162ms). Maspice's observed coded-region
+consistency rate was 8.27/s, with mixed states occupying 75.09% of the sampled
+window. Cocoa's dynamic code fields failed in three quarters of the image even
+at original-resolution capture; complete-image FPS remains unranked, not 0FPS.
+This is a new synthetic workload with measured observer overhead, not a conversion
+of the earlier CPU result into speed. No product source changed. Original viewer,
+fullscreen marker0 and default server mode were restored; prior archives remain.
 
 ## JPEG/MJPEG Neon backend (2026-10-30)
 

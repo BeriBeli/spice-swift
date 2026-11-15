@@ -1,0 +1,854 @@
+{
+  "schemaVersion": 2,
+  "date": "2026-11-15",
+  "status": "two-client formal CPU comparison completed; Spicy preflight incomplete; environment restored",
+  "serverDuringMeasurements": {
+    "linuxPID": 160169,
+    "streamingVideo": "all",
+    "memoryMiB": 6144,
+    "vCPUs": 4,
+    "display": "gtk,gl=off",
+    "virtio1920x1080": true,
+    "qemuSHA256": "a2250f5e2b3b07c754473c0817df1cccf6c3c2443fc616dc474c4c311fa6ef1c",
+    "spiceLibrarySHA256": "0110bf9597c44cd477b4d47b4a0021415c97426f01657fbd4d68f2e52240608a",
+    "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393",
+    "guestFixture": {
+      "bytes": 750,
+      "sha256": "f48393b4a9b7cced1cce29fc7af837901f762986f22c5a2d87002610c7e62e2b"
+    },
+    "centosPID": 26919,
+    "tlsRelayPID": 3368
+  },
+  "workload": {
+    "requestedFPS": 30,
+    "callbackLimit": 5400,
+    "nominalSeconds": 180,
+    "guestConfiguredPixels": [
+      1920,
+      1080
+    ],
+    "hostFramePoints": [
+      1024,
+      768
+    ],
+    "sourceAgeTargetsSeconds": [
+      90,
+      150
+    ],
+    "anchorMeaning": "Host mouse-down dispatch, not guest callback or physical presentation"
+  },
+  "maspice": {
+    "status": "single_formal_CPU_window_completed",
+    "clientPID": 32406,
+    "serverPID": 160169,
+    "cpu": {
+      "basis": "100 percent equals one logical CPU",
+      "clientCPUPercent": 46.56506632908079,
+      "qemuCPUPercent": 52.258724009528876,
+      "clientCPUSeconds": 27.936162542,
+      "qemuCPUSeconds": 31.36,
+      "clientIntervalSeconds": 59.993821,
+      "serverIntervalSeconds": 60.009119232,
+      "clientResidentMiBAtEnd": 330.5,
+      "clientFootprintMiBAtEnd": 278.00121307373047,
+      "invocationBrackets": [
+        {
+          "endpoint": "start",
+          "targetSourceAgeSeconds": 90,
+          "invocationStartSourceAgeSeconds": 90.00388133779052,
+          "invocationEndSourceAgeSeconds": 90.28389642178081,
+          "invocationHostMillis": 1794700290939,
+          "collectorReturnCode": 0
+        },
+        {
+          "endpoint": "end",
+          "targetSourceAgeSeconds": 150,
+          "invocationStartSourceAgeSeconds": 150.00406421278603,
+          "invocationEndSourceAgeSeconds": 150.29580979677849,
+          "invocationHostMillis": 1794700350939,
+          "collectorReturnCode": 0
+        }
+      ],
+      "clockRule": "Each host monotonic separately; no cross-host subtraction"
+    },
+    "marker": {
+      "requestedSpacePresses": 40,
+      "holdMilliseconds": 100,
+      "observations": [
+        {
+          "observedGuestCount": 0,
+          "evidence": "maspice-marker0-motion-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        },
+        {
+          "observedGuestCount": 20,
+          "evidence": "maspice-marker20-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        },
+        {
+          "observedGuestCount": 40,
+          "evidence": "maspice-marker40-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        }
+      ],
+      "guest40Of40Verified": true,
+      "perKeyLatencyMilliseconds": null
+    },
+    "visibleVerticalBoundaries": true,
+    "postCPUContinuousScreenshots": {
+      "count": 10,
+      "sourceAgeSeconds": [
+        163.229,
+        165.851
+      ],
+      "outsideFormalCPUWindow": true
+    },
+    "completeDeliveredFPS": null,
+    "GPUTimeMilliseconds": null,
+    "alignmentEvidence": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence/maspice-20261115-video-01/alignment.json",
+    "binarySHA256": "a96a051b6903d582af31632f220ad299570474870acbe66247561f80aefecbc4",
+    "diagnosticsWindowDuringFormalCPU": "closed; product disables diagnostics collection on dismissal",
+    "otherOwnedWindow": "Occluded launcher window existed behind the remote session.",
+    "actualMetalDrawablePixelsMeasuredThisRun": null,
+    "capturePixelLimit": "2048x1536 is a whole-window screenshot, not a measured Metal drawable.",
+    "widerDisplayCounters": null,
+    "counterLimit": "Native AX whitelist extraction returned no rows; no raw AX text or clipboard was retained. Previous-day counters are not substituted."
+  },
+  "cocoaSpiceTLSBackport": {
+    "status": "single_formal_CPU_window_completed",
+    "clientPID": 31419,
+    "serverPID": 160169,
+    "cpu": {
+      "basis": "100 percent equals one logical CPU",
+      "clientCPUPercent": 27.8098816086013,
+      "qemuCPUPercent": 56.56838524329248,
+      "clientCPUSeconds": 16.512071875,
+      "qemuCPUSeconds": 33.58,
+      "clientIntervalSeconds": 59.374837,
+      "serverIntervalSeconds": 59.361779297,
+      "clientResidentMiBAtEnd": 157.5,
+      "clientFootprintMiBAtEnd": 291.4229507446289,
+      "invocationBrackets": [
+        {
+          "endpoint": "start",
+          "targetSourceAgeSeconds": 90,
+          "invocationStartSourceAgeSeconds": 90.00515277354862,
+          "invocationEndSourceAgeSeconds": 90.92320660655969,
+          "invocationHostMillis": 1794699127198,
+          "collectorReturnCode": 0
+        },
+        {
+          "endpoint": "end",
+          "targetSourceAgeSeconds": 150,
+          "invocationStartSourceAgeSeconds": 150.0045808145369,
+          "invocationEndSourceAgeSeconds": 150.27543823156157,
+          "invocationHostMillis": 1794699187198,
+          "collectorReturnCode": 0
+        }
+      ],
+      "clockRule": "Each host monotonic separately; no cross-host subtraction"
+    },
+    "marker": {
+      "requestedSpacePresses": 40,
+      "holdMilliseconds": 100,
+      "observations": [
+        {
+          "observedGuestCount": 0,
+          "evidence": "cocoa-tls-marker0-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        },
+        {
+          "observedGuestCount": 20,
+          "evidence": "cocoa-tls-marker20-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        },
+        {
+          "observedGuestCount": 40,
+          "evidence": "cocoa-tls-marker40-20261115.png",
+          "observationMethod": "Root visual inspection of the actual owned-client window"
+        }
+      ],
+      "guest40Of40Verified": true,
+      "perKeyLatencyMilliseconds": null
+    },
+    "visibleVerticalBoundaries": true,
+    "postCPUContinuousScreenshots": {
+      "count": 10,
+      "sourceAgeSeconds": [
+        174.509,
+        177.078
+      ],
+      "outsideFormalCPUWindow": true
+    },
+    "completeDeliveredFPS": null,
+    "GPUTimeMilliseconds": null,
+    "alignmentEvidence": "/Users/beribeli/Workarea/spice-mac/.build/native-window-bench-20261115/evidence/cocoa-tls-20261115-video-01/alignment.json",
+    "variant": "Official CocoaSpice + UTM native + official spice-gtk v0.43 one-line TLS buffered-read backport",
+    "CocoaSpiceSourceCommit": "d8d29fc810047a3ddcebb351cdadc8fe4b4f308d",
+    "nativeSourceCommit": "2776f6346090aca7dd4087dd59848cd5f79deb90",
+    "trackedNativeSourceChange": "One line: TLS && SSL_has_pending(ssl)",
+    "viewPoints": [
+      1024,
+      736
+    ],
+    "measuredDrawablePixels": [
+      2048,
+      1472
+    ],
+    "requestedDisplayFPS": 120,
+    "initialOutputLimit": "Initial partial/black output; complete output verified after Ctrl+R reload.",
+    "connectionBeforeRootQuit": {
+      "rootRequestedQuitHostMillis": 1794699429994,
+      "channelsClosedBeforeRootQuit": false,
+      "observedConnectionSpanBeforeRootQuitSeconds": 670.0199062824249,
+      "pid": 31419
+    },
+    "widerDisplayDiagnostics": {
+      "startEvidence": "cocoa-diagnostics-p31419-0004.json",
+      "endEvidence": "cocoa-diagnostics-p31419-0005.json",
+      "intervalSeconds": 212.219,
+      "displayReadBytesDelta": 685662280,
+      "aggregateReadBytesDelta": 685662862,
+      "canvasCopyRequestsDelta": 16033,
+      "accountedCanvasCopyBytesDelta": 83732839752,
+      "MTKViewDrawCallbacksDelta": 25429,
+      "scope": "Wider than the process CPU interval. These counters cannot normalize the CPU interval or be interpreted as complete frames/presentations. Read bytes exclude TLS/network overhead."
+    },
+    "CPUCanvasVsGPU": {
+      "dynamicCPUImages": [
+        "cocoa-cpu-canvas-p31419-0007.png",
+        "cocoa-cpu-canvas-p31419-0008.png"
+      ],
+      "observation": "CPU images visually smooth while separately timed GPU images showed bands.",
+      "sameRevisionOrSameInstant": false,
+      "screenshotPerturbation": "PNG encoding/writing runs synchronously on CSMain and pauses its other callbacks.",
+      "GPUOnlyCauseProved": false,
+      "sourceAudit": "/Users/beribeli/Workarea/spice-mac/.build/cocoaspice-comparison-20261114/tls-buffered/evidence/cpu-screenshot-path-audit.json"
+    }
+  },
+  "cocoaSpiceUnpatched": {
+    "formalCPUPercent": null,
+    "status": "two real preflights failed around 60 seconds",
+    "sameMetadataControl": {
+      "status": "complete_unpatched_approximately_60s_close_reproduced_with_current_metadata",
+      "clientPID": 30439,
+      "observationHostMillis": 1794698276781,
+      "eventEvidence": "cocoa-connection-events-p30439.json",
+      "metadataComparison": {
+        "NSLocalNetworkUsageDescription": {
+          "unpatched": "Connect to the virtual machine in your selected SPICE connection file for local benchmark tests.",
+          "patched": "Connect to the virtual machine in your selected SPICE connection file for local benchmark tests.",
+          "equal": true
+        },
+        "LSMinimumSystemVersion": {
+          "unpatched": "26.0",
+          "patched": "26.0",
+          "equal": true
+        },
+        "NSHighResolutionCapable": {
+          "unpatched": true,
+          "patched": true,
+          "equal": true
+        },
+        "NSPrincipalClass": {
+          "unpatched": "NSApplication",
+          "patched": "NSApplication",
+          "equal": true
+        },
+        "CFBundleVersion": {
+          "unpatched": "1",
+          "patched": "1",
+          "equal": true
+        },
+        "CFBundleShortVersionString": {
+          "unpatched": "0.1",
+          "patched": "0.1",
+          "equal": true
+        }
+      },
+      "behavioralMetadataEqual": true,
+      "intentionalIdentityDifferences": {
+        "CFBundleExecutable": {
+          "unpatched": "CocoaSpiceBench",
+          "patched": "CocoaTLSBench"
+        },
+        "CFBundleIdentifier": {
+          "unpatched": "local.benchmark.CocoaSpiceBench",
+          "patched": "local.benchmark.CocoaSpiceTLSBench"
+        },
+        "CFBundleName": {
+          "unpatched": "CocoaSpice Benchmark",
+          "patched": "CocoaSpice TLS Backport"
+        }
+      },
+      "current": {
+        "openedChannels": [
+          {
+            "channelType": 1,
+            "channelID": 0,
+            "openedHostMillis": 1794698180821
+          },
+          {
+            "channelType": 2,
+            "channelID": 0,
+            "openedHostMillis": 1794698180947
+          },
+          {
+            "channelType": 3,
+            "channelID": 0,
+            "openedHostMillis": 1794698180960
+          },
+          {
+            "channelType": 4,
+            "channelID": 0,
+            "openedHostMillis": 1794698180955
+          }
+        ],
+        "closedChannels": [
+          {
+            "channelType": 4,
+            "channelID": 0,
+            "openedHostMillis": 1794698180955,
+            "closedHostMillis": 1794698240870,
+            "openToCloseSeconds": 59.915,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 3,
+            "channelID": 0,
+            "openedHostMillis": 1794698180960,
+            "closedHostMillis": 1794698240872,
+            "openToCloseSeconds": 59.912,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 2,
+            "channelID": 0,
+            "openedHostMillis": 1794698180947,
+            "closedHostMillis": 1794698240873,
+            "openToCloseSeconds": 59.926,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 1,
+            "channelID": 0,
+            "openedHostMillis": 1794698180821,
+            "closedHostMillis": 1794698240874,
+            "openToCloseSeconds": 60.053,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          }
+        ],
+        "delegateErrors": [],
+        "delegateDisconnects": [
+          1794698240875,
+          1794698240876
+        ]
+      },
+      "previousP11806": {
+        "openedChannels": [
+          {
+            "channelType": 1,
+            "channelID": 0,
+            "openedHostMillis": 1794670207508
+          },
+          {
+            "channelType": 2,
+            "channelID": 0,
+            "openedHostMillis": 1794670207603
+          },
+          {
+            "channelType": 3,
+            "channelID": 0,
+            "openedHostMillis": 1794670207614
+          },
+          {
+            "channelType": 4,
+            "channelID": 0,
+            "openedHostMillis": 1794670207610
+          }
+        ],
+        "closedChannels": [
+          {
+            "channelType": 4,
+            "channelID": 0,
+            "openedHostMillis": 1794670207610,
+            "closedHostMillis": 1794670267669,
+            "openToCloseSeconds": 60.059,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 3,
+            "channelID": 0,
+            "openedHostMillis": 1794670207614,
+            "closedHostMillis": 1794670267671,
+            "openToCloseSeconds": 60.057,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 1,
+            "channelID": 0,
+            "openedHostMillis": 1794670207508,
+            "closedHostMillis": 1794670267672,
+            "openToCloseSeconds": 60.164,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          },
+          {
+            "channelType": 2,
+            "channelID": 0,
+            "openedHostMillis": 1794670207603,
+            "closedHostMillis": 1794670267675,
+            "openToCloseSeconds": 60.072,
+            "hasError": 0,
+            "errorDomain": "NONE",
+            "errorCode": 0
+          }
+        ],
+        "delegateErrors": [],
+        "delegateDisconnects": [
+          1794670267673,
+          1794670267674
+        ]
+      },
+      "diagnostics": [
+        {
+          "file": "cocoa-diagnostics-p30439-0001.json",
+          "hostObservedMillis": 1794698198846,
+          "connected": true,
+          "status": "connected",
+          "guestPixels": [
+            1920,
+            1080
+          ],
+          "viewPoints": [
+            1024,
+            736
+          ],
+          "drawablePixels": [
+            2048,
+            1472
+          ],
+          "windowFramePoints": [
+            244,
+            128,
+            1024,
+            768
+          ],
+          "inputAvailable": 1,
+          "inputsDisabled": false,
+          "nativeSpiceSourceCommit": "2776f6346090aca7dd4087dd59848cd5f79deb90",
+          "TLSCAAndFullSubjectConfigured": true,
+          "shaderBootstrapLoaderRestored": true
+        },
+        {
+          "file": "cocoa-diagnostics-p30439-0002.json",
+          "hostObservedMillis": 1794698263097,
+          "connected": false,
+          "status": "disconnected",
+          "guestPixels": [
+            1920,
+            1080
+          ],
+          "viewPoints": [
+            1024,
+            736
+          ],
+          "drawablePixels": [
+            2048,
+            1472
+          ],
+          "windowFramePoints": [
+            244,
+            128,
+            1024,
+            768
+          ],
+          "inputAvailable": 0,
+          "inputsDisabled": false,
+          "nativeSpiceSourceCommit": "2776f6346090aca7dd4087dd59848cd5f79deb90",
+          "TLSCAAndFullSubjectConfigured": true,
+          "shaderBootstrapLoaderRestored": true
+        }
+      ],
+      "interpretation": "Unpatched current-metadata control reproduces the approximately 60-second orderly close. LocalNetwork purpose-description addition alone did not eliminate this failure. This strengthens the control for the upcoming TLS-buffered variant but does not yet prove the pending-data root cause; patched live outcome remains pending.",
+      "rootConfirmedNoVoluntaryDisconnect": true,
+      "rootConfirmationRecordedHostMillis": 1794698306302,
+      "allPlistFieldsOtherThanIntentionalIdentityEqual": true,
+      "nonIdentityMetadataDifferences": {},
+      "comparisonToP11806": {
+        "sameAllChannelsOrderlyClosePattern": true,
+        "currentLifetimeRangeSeconds": [
+          59.912,
+          60.053
+        ],
+        "previousLifetimeRangeSeconds": [
+          60.057,
+          60.164
+        ],
+        "currentAndPreviousNativeErrorEventsAbsent": true
+      },
+      "patchedLiveOutcome": "pending"
+    }
+  },
+  "spicy": {
+    "generatedAtUTC": "2026-11-15T00:07:55.355321+00:00",
+    "stage": "this_round_spicy_attempts_ended_without_valid_performance_baseline",
+    "latestOriginalRun": {
+      "pid": 34203,
+      "originalFileAcceptedAndReadCompleted": true,
+      "channels": [
+        {
+          "channelType": 1,
+          "name": "main",
+          "openedMonotonicMicroseconds": 173479056717,
+          "closedMonotonicMicroseconds": 173634726442,
+          "lifetimeSeconds": 155.669725,
+          "closeEvent": 12,
+          "closeErrorDomainKind": "none",
+          "closeErrorCode": 0
+        },
+        {
+          "channelType": 2,
+          "name": "display",
+          "openedMonotonicMicroseconds": 173479195141,
+          "closedMonotonicMicroseconds": 173634726783,
+          "lifetimeSeconds": 155.531642,
+          "closeEvent": 12,
+          "closeErrorDomainKind": "none",
+          "closeErrorCode": 0
+        },
+        {
+          "channelType": 3,
+          "name": "inputs",
+          "openedMonotonicMicroseconds": 173479367375,
+          "closedMonotonicMicroseconds": 173634725998,
+          "lifetimeSeconds": 155.358623,
+          "closeEvent": 12,
+          "closeErrorDomainKind": "none",
+          "closeErrorCode": 0
+        },
+        {
+          "channelType": 4,
+          "name": "cursor",
+          "openedMonotonicMicroseconds": 173479365441,
+          "closedMonotonicMicroseconds": 173634725676,
+          "lifetimeSeconds": 155.360235,
+          "closeEvent": 12,
+          "closeErrorDomainKind": "none",
+          "closeErrorCode": 0
+        }
+      ],
+      "fourChannelOverlapSeconds": 155.358301,
+      "exitCause": null
+    },
+    "pidMappingLimit": "Channel lines do not contain PID; three main OPENED sequences match in order with PID-tagged AcceptedOriginal records and root-confirmed run IDs.",
+    "latestRootUIObservation": {
+      "pid": 34203,
+      "initialFrameLogicalPoints": [
+        320,
+        297
+      ],
+      "requestedFrameLogicalPoints": [
+        1024,
+        768
+      ],
+      "correctedMouseMotionUsed": true,
+      "firstResizeFrameRemainedInitial": true,
+      "guestLinuxMenuOpenedDuringFirstGesture": true,
+      "secondAttempt": "public AXSize if supported, otherwise normal final-half-pixel border drag",
+      "followingHelperSnapshot": {
+        "finishedLaunching": false,
+        "windows": []
+      },
+      "nextInspectReportedProcessAbsent": true,
+      "rootRequestedQuit": false,
+      "exitCauseKnown": false
+    },
+    "gtkNativeChooserCandidate": {
+      "pid": 33706,
+      "filePanelRecords": [
+        {
+          "processID": 33706,
+          "phase": "gtkNativeFilePanelWillPresent",
+          "acceptedOriginalFile": false,
+          "gtkNativeChooser": true,
+          "valuesLogged": false
+        }
+      ],
+      "originalFileAccepted": false,
+      "originalFileReadCompleted": false,
+      "realOpenedEvents": 0,
+      "onlyChannelEventWasOfflineSyntheticNONE": true,
+      "termination": "Root reported exact task-owned executable-path verification followed by SIGTERM",
+      "terminationPerformedByChild": false,
+      "rendererDecoderAndPerformanceWereNotTested": true
+    },
+    "earlierOriginalRuns": [
+      {
+        "pid": 12193,
+        "originalFileAcceptedAndReadCompleted": true,
+        "channels": [
+          {
+            "channelType": 1,
+            "name": "main",
+            "openedMonotonicMicroseconds": 152269061665,
+            "closedMonotonicMicroseconds": 155781505891,
+            "lifetimeSeconds": 3512.444226,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 2,
+            "name": "display",
+            "openedMonotonicMicroseconds": 152269195623,
+            "closedMonotonicMicroseconds": 155781503057,
+            "lifetimeSeconds": 3512.307434,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 3,
+            "name": "inputs",
+            "openedMonotonicMicroseconds": 152269400719,
+            "closedMonotonicMicroseconds": 155766505488,
+            "lifetimeSeconds": 3497.104769,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 4,
+            "name": "cursor",
+            "openedMonotonicMicroseconds": 152269401140,
+            "closedMonotonicMicroseconds": 155766506005,
+            "lifetimeSeconds": 3497.104865,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          }
+        ],
+        "fourChannelOverlapSeconds": 3497.104348,
+        "exitCause": null
+      },
+      {
+        "pid": 29065,
+        "originalFileAcceptedAndReadCompleted": true,
+        "channels": [
+          {
+            "channelType": 1,
+            "name": "main",
+            "openedMonotonicMicroseconds": 170629693880,
+            "closedMonotonicMicroseconds": 170790459512,
+            "lifetimeSeconds": 160.765632,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 2,
+            "name": "display",
+            "openedMonotonicMicroseconds": 170629838426,
+            "closedMonotonicMicroseconds": 170790460699,
+            "lifetimeSeconds": 160.622273,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 3,
+            "name": "inputs",
+            "openedMonotonicMicroseconds": 170630029134,
+            "closedMonotonicMicroseconds": 170790458907,
+            "lifetimeSeconds": 160.429773,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          },
+          {
+            "channelType": 4,
+            "name": "cursor",
+            "openedMonotonicMicroseconds": 170630024635,
+            "closedMonotonicMicroseconds": 170790458801,
+            "lifetimeSeconds": 160.434166,
+            "closeEvent": 12,
+            "closeErrorDomainKind": "none",
+            "closeErrorCode": 0
+          }
+        ],
+        "fourChannelOverlapSeconds": 160.429667,
+        "exitCause": null
+      }
+    ],
+    "historicalAggregate": {
+      "snapshots": [
+        {
+          "hostObservedMillis": 1794679717784,
+          "hostMonotonicMicroseconds": 152430650102,
+          "activeChannels": 4,
+          "allChannelReceivedBytes": 401271,
+          "displayReceivedBytes": 94632,
+          "primaryWidth": 1920,
+          "primaryHeight": 1080
+        }
+      ],
+      "belongsToEarlierPID12193": true,
+      "notLatestRunOrFinalSessionCounters": true,
+      "notContinuousTrafficOrVisiblePresentationProof": true
+    },
+    "measurement": {
+      "CPU": null,
+      "FPS": null,
+      "requested40SpaceDelivery": null,
+      "inputLatency": null,
+      "verticalLineObservation": null,
+      "comparableViewportEstablished": false,
+      "performanceRankingAllowed": false
+    },
+    "attributionLimits": {
+      "oldMouseHelperMissingMotionConfoundsEarlierSpicyInputFailures": true,
+      "MaspiceClickRecoveredAfterMotionFix": true,
+      "latestMotionCorrectedAttemptStillDoesNotProveGTKRootCause": true,
+      "stockSourceDoesNotExplicitlyLockMainWindowTo320": true,
+      "cannotInferThatSpicyIsUnableToResize": true,
+      "cannotInferThatResizeCausedExit": true
+    },
+    "packaging": {
+      "originalPackageUnmodifiedByChildDuringFinalization": true,
+      "recordedSpiceGtkLibrariesStillMatchOriginal": [
+        {
+          "path": "/opt/homebrew/Cellar/spice-gtk/0.43_1/lib/libspice-client-gtk-3.0.5.dylib",
+          "sha256": "56b73e8286c17954041b82418bf75f9d63f4a4924e60d3c57f3f92f2c499dbaf",
+          "matchesOriginal": true
+        },
+        {
+          "path": "/opt/homebrew/Cellar/spice-gtk/0.43_1/lib/libspice-client-glib-2.0.8.dylib",
+          "sha256": "2c6056c80dfd333f9643f9ba387ba6e467557f90d9107d56f253c53089d9217f",
+          "matchesOriginal": true
+        }
+      ],
+      "stockMachineInstructionsRetained": true,
+      "oldEvidencePreserved": true,
+      "ticketCAOrSubjectCopiedOrLogged": false
+    },
+    "restoration": {
+      "owner": "root",
+      "rootReportedStarted": true,
+      "targets": [
+        "server default streaming-video off",
+        "original /Applications/Maspice.app"
+      ],
+      "verifiedByChild": false
+    },
+    "childActionsDuringFinalization": {
+      "UI": false,
+      "build": false,
+      "signals": false,
+      "restart": false,
+      "connection": false,
+      "serverChange": false
+    }
+  },
+  "observedCPURelation": {
+    "cocoaClientPercentLowerThanMaspice": 40.2773714267567,
+    "equalOutputOrQualityProved": false,
+    "causalProductOptimizationClaimAllowed": false
+  },
+  "comparabilityLimits": [
+    "One formal run per measured client; no confidence interval or broad workload ranking.",
+    "Same finite requested 30 FPS workload does not prove equal decoded or complete presented frame counts.",
+    "Decode quality, late-frame policy, native capabilities, batching and instrumentation differ.",
+    "Maspice diagnostics window was closed; do not treat historical 58.9 percent versus fresh 46.6 percent as a product optimization effect.",
+    "Cocoa performance belongs to the explicit one-line-backport minimal test host, not unpatched CocoaSpice or the complete UTM app.",
+    "Cocoa wider display counters do not coincide with its CPU window and cannot normalize it.",
+    "Whole-window screenshot pixels are not proof of Metal drawable dimensions or complete output FPS.",
+    "Both clients have dynamic vertical phase boundaries; no evidence yet uniquely isolates server, stream scheduling or texture upload.",
+    "Spicy did not establish comparable viewport/input preflight; its CPU/FPS/latency remain null."
+  ],
+  "inputObservationCorrections": {
+    "date": "2026-11-15",
+    "excludedBeforeFormalRun": [
+      "maspice-marker0-20261115.png",
+      "maspice-marker0-settled-20261115.png",
+      "maspice-fixture-url-20261115.png"
+    ],
+    "reason": "Initial click helper omitted mouse motion before button-down; QEMU source snapshot showed marker setup still visible. Diagnostic window later owned keyboard focus during first fixture-url attempt. Both corrected before the formal run.",
+    "correctedHelper": "Before target click, HID mouseMoved +150ms; foreground PID guard; mouse-down dispatch timestamp separately recorded.",
+    "validMaspiceMarkerEvidence": [
+      "maspice-marker0-motion-20261115.png",
+      "maspice-marker20-20261115.png",
+      "maspice-marker40-20261115.png"
+    ],
+    "validMaspiceVideoPreparation": [
+      "maspice-fixture-url-focused-20261115.png",
+      "maspice-video-ready-20261115.png",
+      "maspice-video-start-20261115.png"
+    ],
+    "cocoaLimit": "Earlier Cocoa start lacked explicit mouseMoved, but actual fullfield fullscreen update and 0/20/40 screenshots were verified; no unobserved successful click assumed.",
+    "spicyLimit": "PID29065 input failure/exit observations used the earlier click helper. They do not independently establish an upstream Spicy input/GTK defect. New native-chooser test will use corrected pointer motion."
+  },
+  "restoration": {
+    "hostObservedMillis": 1794701297248,
+    "clientPID": 34599,
+    "clientExecutable": "/Applications/Maspice.app/Contents/MacOS/Maspice",
+    "clientVersion": "0.6.1",
+    "clientExecutableSHA256": "cacc21837587f5a3b4ce47e6da66b5814d2a99657bcf32882ccc3a5087043fa1",
+    "onlyOwnedViewerRunning": true,
+    "allComparisonHostsExited": true,
+    "originalFileUsedByNormalOpenWith": true,
+    "connectionFileParsedByVerifier": false,
+    "server": {
+      "linuxPID": 212333,
+      "explicitStreamingVideoOption": false,
+      "effectiveStreamingVideo": "off",
+      "display": "gtk,gl=off",
+      "guestConfiguredPixels": [
+        1920,
+        1080
+      ],
+      "memoryMiB": 6144,
+      "vCPUs": 4,
+      "centosPID": 26919,
+      "tlsRelayPID": 3368,
+      "otherVMAndRelayStillRunning": true,
+      "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393"
+    },
+    "visibleMarkerObservation": {
+      "evidence": "restored-marker-zero-20261115.png",
+      "clientPID": 34599,
+      "observationMethod": "Root visual inspection of an owned-window native screenshot.",
+      "fullScreenMarkerCount": 0,
+      "guestPageFullscreen": true,
+      "singleChromeTabObserved": true,
+      "hostWindowFullscreen": false,
+      "limit": "Visible guest state, not per-key latency or complete output FPS."
+    },
+    "visibleMarkerEvidence": "restored-marker-zero-20261115.png",
+    "visibleMarkerEvidenceSHA256": "903720c1a062537ce78da29fc27c152bb455f78c3a55677570e09b3c5428ac29"
+  },
+  "nextEvidenceNeeded": [
+    "Record stream rectangles/mm_time and compare an immutable CPU snapshot with GPU readback for the exact same revision.",
+    "Separate source/stream phase differences from upload/publication consistency before changing the render policy.",
+    "For a pure CPU attribution experiment, match decoder quality/late-frame policy and record simultaneous receive/decode/presentation counters."
+  ],
+  "evidenceArchive": {
+    "file": "spice-native-client-comparison-2026-11-15.zip",
+    "separateChecksumFile": "spice-native-client-comparison-2026-11-15.zip.sha256",
+    "includesConnectionFileOrBinaries": false,
+    "offlineVerifier": "tools/verify-offline.py"
+  }
+}

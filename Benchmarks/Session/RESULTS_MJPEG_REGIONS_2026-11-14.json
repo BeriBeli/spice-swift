@@ -1,0 +1,114 @@
+{
+  "date": "2026-11-14",
+  "scope": "Local correction of false rejection of asynchronous video writes to disjoint regions",
+  "predecessor": "RESULTS_MJPEG_AB_2026-11-14.json",
+  "liveComparison": {
+    "status": "pending_manual_Mac_unlock",
+    "started": false,
+    "newPerformanceMeasurements": null,
+    "phaseBandImprovementEstablished": false,
+    "historicalOneSecondStallExplained": false,
+    "perFragmentRejectionAttributionCollected": false
+  },
+  "reproducedBeforeRepair": {
+    "test": "delayedVideoPreservesDisjointWrites",
+    "cases": 4,
+    "failedDisjointCases": 2,
+    "failedAssertions": 4,
+    "passingOverlapCases": 2,
+    "rawLog": "mjpeg-region-regression-before.log"
+  },
+  "fix": {
+    "videoWireOrder": "Surface-wide sequence with comparison only against intersecting committed video coverage",
+    "desktopProtection": "Reject delayed video only for newer intersecting desktop writes",
+    "historyRectangleLimitPerDomain": 256,
+    "domainsPerSurface": 2,
+    "historyEviction": "Conservatively reject observations older than retained coverage",
+    "transactionalGPUCandidatesPreserved": true,
+    "compositionBatchingAdded": false,
+    "fullSurfaceCandidateCopiesRemoved": false
+  },
+  "builds": {
+    "control": {
+      "executableSHA256": "4f41f9f2467c59faf2fe43895f336cc3dd4b06933efbb6357dd0145390fe6f0f",
+      "scope": "Prior clock-admission correction, before region-ordering changes"
+    },
+    "corrected": {
+      "binarySHA256": "fb0b122f4c2eebd9d028a20de1b16f66ec53f020c38a19e66a18478b6ce0b420",
+      "bundle": "/Users/beribeli/Workarea/spice-mac/build/Maspice.app",
+      "release": true,
+      "closureAuditPassed": true,
+      "signatureVerified": true,
+      "productionChange": "Region-aware stale MJPEG commit validation; transactional GPU ownership unchanged"
+    }
+  },
+  "sourceSHA256": {
+    "Sources/SpiceRenderer/SurfaceStore.swift": "a1f6f7de19310ff911df4117a090796241abc6f628a722954b794543e40c942a",
+    "Sources/SpiceRenderer/SurfaceWriteHistory.swift": "bd9aa26429e7016100fd0a82ba0093c3a4db39f49486603caa27372b4ed8b2ea",
+    "Tests/SpiceRendererTests/SurfaceStoreTests.swift": "331b246b650272f23413dcfe5d703bc9136a6089b5d037b734795dcc070d5fe7",
+    "Tests/SpiceRendererTests/SurfaceWriteHistoryTests.swift": "9a50f86203d82c98a4e85267bb19abd0d344f3261c3ddfafc16c5dd9047b7755",
+    "Tests/SpiceCoreTests/DisplayChannelTests.swift": "a06e71b973917b4f7902f9333da53c4548fc54c24309661c07ef3626db8bfb97"
+  },
+  "checks": {
+    "swiftTests": {
+      "passed": true,
+      "tests": 749,
+      "testExecutables": 11,
+      "rawLog": "mjpeg-regions-final-tests.log"
+    },
+    "addressSanitizer": {
+      "passed": true,
+      "tests": 749,
+      "testExecutables": 11,
+      "rawLog": "mjpeg-regions-final-asan.log"
+    },
+    "maspiceTests": {
+      "passed": true,
+      "tests": 57,
+      "warningsAsErrors": true,
+      "rawLog": "maspice-tests.log"
+    },
+    "releaseBuild": {
+      "passed": true,
+      "command": "PACKAGE=0 ./Scripts/build-app.sh",
+      "nativeClosureAuditPassed": true,
+      "adHocSignatureVerified": true,
+      "rawLog": "build-release.log"
+    }
+  },
+  "preLiveState": {
+    "recordedAtUTC": "2026-11-14T00:11:07.462992+00:00",
+    "server": {
+      "linuxPID": 68650,
+      "streamingVideo": "off-default",
+      "display": "gtk,gl=off",
+      "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393",
+      "centosPID": 26919,
+      "centosAlive": true,
+      "tlsRelayAlive": true
+    },
+    "maspiceProcesses": [
+      "20382 /Applications/Maspice.app/Contents/MacOS/Maspice"
+    ],
+    "guiAttempt": "Computer Use reported Mac locked; manual unlock requested; live comparison not started",
+    "remoteMutationsThisFollowup": false,
+    "installedApplicationReplaced": false
+  },
+  "nextLiveControls": {
+    "streamingVideo": "all",
+    "guestResolution": [
+      1920,
+      1080
+    ],
+    "fixture": "Benchmarks/Session/guest-fullfield.html",
+    "fixtureSHA256": "f48393b4a9b7cced1cce29fc7af837901f762986f22c5a2d87002610c7e62e2b",
+    "finiteCallbackCount": 5400,
+    "requestedFPS": 30,
+    "realMarkerInputsPerBuild": 40,
+    "TLSValidation": "existing CA and full subject unchanged",
+    "restoreServerMode": "off-default",
+    "restoreClient": "existing installed app",
+    "restoreMarkerCount": 0
+  },
+  "evidenceArchive": "spice-swift-mjpeg-regions-local-2026-11-14.zip"
+}

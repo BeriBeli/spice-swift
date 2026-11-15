@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SwiftSpice quality and motion workload</title>
+<style>
+html,body { margin:0; overflow:hidden; background:#eee; font:18px system-ui; }
+canvas { position:fixed; inset:0; width:100vw; height:100vh; }
+form { position:relative; margin:120px 32px; max-width:700px; background:white; padding:24px; }
+button { font:inherit; padding:12px; }
+</style>
+<canvas id="screen"></canvas>
+<form id="setup">
+<h1>SwiftSpice quality / motion workload</h1>
+<p>30 FPS deterministic moving pattern. Space: marker; M: motion;
+F: freeze reference at phase zero; R: reset marker. Reload to rebuild after resizing.</p>
+<button>Arm and enter fullscreen</button>
+</form>
+<script src="marker-grid.js"></script>
+<script>
+"use strict";
+const canvas=document.getElementById("screen"), context=canvas.getContext("2d",{alpha:false});
+const setup=document.getElementById("setup");
+const base=0x1234567800000000n;
+let revision=0n, received=0n, phase=0, moving=false, armed=false, last=0;
+let baseImage, liveImage;
+const nowNs=()=>BigInt(Math.round(performance.now()*1e6));
+function prepare() {
+  canvas.width=Math.round(innerWidth*devicePixelRatio);
+  canvas.height=Math.round(innerHeight*devicePixelRatio);
+  const image=context.createImageData(canvas.width,canvas.height), p=image.data;
+  for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width;x++){
+    const i=(y*canvas.width+x)*4, edge=x%23<2||y%19<2?255:0;
+    const noise=(Math.imul(x,1664525)^Math.imul(y,1013904223))>>>24;
+    p[i]=edge^Math.floor(x*255/canvas.width);
+    p[i+1]=edge^Math.floor(y*255/canvas.height);
+    p[i+2]=((Math.floor(x/64)+Math.floor(y/64))&1?noise:x+y)&255;
+    p[i+3]=255;
+  }
+  baseImage=image; liveImage=context.createImageData(canvas.width,canvas.height);
+}
+function draw(){
+  // Upload a changing bitmap instead of reusing an offscreen pixmap through
+  // drawImage/COPY_BITS. A stream is still selected by the SPICE server.
+  const stride=canvas.width*4;
+  for(let y=0;y<canvas.height;y++){
+    const row=y*stride, split=row+phase*4;
+    liveImage.data.set(baseImage.data.subarray(split,row+stride),row);
+    if(phase)liveImage.data.set(baseImage.data.subarray(row,split),row+stride-phase*4);
+  }
+  context.putImageData(liveImage,0,0);
+  context.fillStyle="#eeeeee"; context.fillRect(0,0,canvas.width,170);
+  context.fillStyle="#222222"; context.font="24px sans-serif";
+  context.fillText("SwiftSpice interaction sample "+revision,16,90);
+  context.fillText("30 FPS | "+(moving?"motion":"paused phase "+phase)+" | Space / M / F / R",16,130);
+  const grids=SpiceSessionMarker.encode(base+revision,revision,received,nowNs());
+  grids.forEach((bits,g)=>bits.forEach((bit,i)=>{
+    context.fillStyle=bit?"#000000":"#ffffff";
+    context.fillRect(16+i%88*4,16+g*12+Math.floor(i/88)*4,4,4);
+  }));
+}
+function animate(t){
+  if(armed&&moving&&t-last>=1000/30){phase=(phase+3)%canvas.width;draw();last=t;}
+  requestAnimationFrame(animate);
+}
+setup.addEventListener("submit",async event=>{
+  event.preventDefault(); setup.hidden=true;
+  try{await document.documentElement.requestFullscreen();}catch{}
+  prepare(); armed=true; received=nowNs(); draw(); requestAnimationFrame(animate);
+});
+document.addEventListener("keydown",event=>{
+  if(!armed||event.repeat)return;
+  if(event.code==="Space"){
+    event.preventDefault();if(base+revision===0xffffffffffffffffn)return;
+    revision++;received=nowNs();draw();
+  }else if(event.code==="KeyM"){moving=!moving;draw();}
+  else if(event.code==="KeyF"){moving=false;phase=0;draw();}
+  else if(event.code==="KeyR"){revision=0n;received=nowNs();draw();}
+});
+</script>
+</html>

@@ -37,10 +37,13 @@ separate validation claims.
   Reactivation replaces accumulated state. Stream/surface destruction and reset
   discard it. Connection replacement clears it until the target activates a
   new window, even when surfaces and decoders survive migration.
-- Match spice-gtk's **arrival** statistics: count regular and sized stream
-  messages; count negative wrapping multimedia-time margins as late arrivals.
-  Decode completion, queue coalescing and host presentation are different
-  measurements. Do not describe report frame counts as displayed FPS.
+- Sample **arrival** statistics before decoding: count regular and sized stream
+  messages. For clock-scheduled video, count negative wrapping multimedia-time
+  margins as late arrivals. MJPEG without a playback delay anchor instead uses
+  a zero timing margin, matching its immediate latest-frame presentation policy;
+  it has no audio deadline to miss. This is an intentional policy difference from
+  the original spice-gtk comparison. Decode completion, queue coalescing and host
+  presentation are different measurements. Report counts are not displayed FPS.
 - Send a report at the server's frame-count threshold, monotonic timeout checked
   on a subsequent arrival, or three consecutive negative margins. Reset the
   window after emitting. Zero thresholds report on each arrival, as upstream
@@ -52,8 +55,9 @@ separate validation claims.
 - Sample before decoding, then send after MJPEG admission so the current frame
   can decode while the report is written. Use the originating connection for
   writes, propagate send errors, and reject stale state after clock awaits.
-- Keep existing MJPEG coalescing, pre-decode late drops, admitted-late-frame
-  publication, stream order, generation checks and Surface mutation barriers.
+- Keep existing MJPEG coalescing, admitted-late-frame publication, stream order,
+  generation checks and Surface mutation barriers. Pre-decode late drops and
+  multimedia waits apply to MJPEG only while a playback delay anchor exists.
 
 ## Validation
 
@@ -77,3 +81,8 @@ extended streaming fixture, 54 accepted reports triggered 12 bitrate increases
 and JPEG quality ultimately recovered from 20 to 80. The server also sent sized
 frames. Details and the still-pending remote-session visual check are recorded
 in [STATUS.md](STATUS.md). No installed application update is part of this change.
+
+The later [actual-server comparison](PERFORMANCE_MJPEG_AB_2026-11-14.md) records
+the no-playback MJPEG admission correction against SPICE 0.16.0. It validates
+nonzero decode activity, while multi-stream phase bands and full-Surface copy
+amplification still prevent accepting streaming as a quality/latency improvement.

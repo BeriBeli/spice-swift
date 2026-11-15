@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "status": "awaiting_spicy_original_file_selection; three-client performance comparison incomplete",
+  "serverAndFixture": {
+    "linuxPID": 160169,
+    "streamingVideo": "all",
+    "memoryMiB": 6144,
+    "vCPUs": 4,
+    "display": "gtk,gl=off",
+    "virtio1920x1080": true,
+    "qemuSHA256": "a2250f5e2b3b07c754473c0817df1cccf6c3c2443fc616dc474c4c311fa6ef1c",
+    "spiceLibrarySHA256": "0110bf9597c44cd477b4d47b4a0021415c97426f01657fbd4d68f2e52240608a",
+    "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393",
+    "guestFixture": {
+      "bytes": 750,
+      "sha256": "f48393b4a9b7cced1cce29fc7af837901f762986f22c5a2d87002610c7e62e2b"
+    },
+    "centosPID": 26919,
+    "tlsRelayPID": 3368
+  },
+  "cpuBasis": "100 percent equals one fully used logical CPU; each host uses its own monotonic interval",
+  "maspice": {
+    "status": "measured",
+    "binarySHA256": "a96a051b6903d582af31632f220ad299570474870acbe66247561f80aefecbc4",
+    "marker": {
+      "requestedSpacePresses": 40,
+      "observedGuestCounts": [
+        0,
+        20,
+        40
+      ],
+      "holdMilliseconds": 100,
+      "latencyLimit": "Delivery check, not per-key RTT or photon latency."
+    },
+    "cpu": {
+      "clientPID": 4836,
+      "clientIntervalSeconds": 60.460544,
+      "clientCPUSeconds": 35.609909376,
+      "clientCPUPercentOneCoreBasis": 58.89776541871671,
+      "serverPID": 160169,
+      "serverIntervalSeconds": 60.106888946,
+      "serverCPUSeconds": 32.71,
+      "serverCPUPercentOneCoreBasis": 54.41971889343108,
+      "clientResidentMiBAtEnd": 290.046875,
+      "sourceAgeAtStartSeconds": 91.396,
+      "sourceAgeAtEndSeconds": 151.661
+    },
+    "widerDisplayWindow": {
+      "intervalSeconds": 127.774,
+      "sourceAgeAtStartSeconds": 38.348,
+      "sourceAgeAtEndSeconds": 166.122,
+      "displayReceivedBytes": 321010380,
+      "displayReceivedMiBPerSecond": 2.395944047347743,
+      "displayMessages": 111428,
+      "copyBits": 0,
+      "additionalStreamCreates": 0,
+      "streamDataFragments": 92426,
+      "mjpegDecodedFragments": 92430,
+      "nativeAcceptedFragments": 91795,
+      "nativeAcceptancePercent": 99.31299361679109,
+      "readbacks": 94,
+      "readbacksPerSecond": 0.7356739242725437,
+      "poolExhaustions": 94,
+      "gpuErrors": 0,
+      "nativeFallbackFragments": 631,
+      "poolWaits": 265,
+      "poolWaitRecoveries": 171,
+      "limit": "This wider interval includes the CPU window but is not a simultaneous CPU-normalization denominator."
+    },
+    "visibleVerticalPhaseBoundaries": true
+  },
+  "cocoaSpice": {
+    "status": "real TLS/desktop preflight reached; connection stability failed",
+    "sourceCommit": "d8d29fc810047a3ddcebb351cdadc8fe4b4f308d",
+    "nativeSourceCommit": "2776f6346090aca7dd4087dd59848cd5f79deb90",
+    "formalCPUPercent": null,
+    "formalOutputFPS": null,
+    "guestMarkerFortyVerified": false,
+    "successfulOriginalFileReadViaOpenPanel": true,
+    "openedChannelTypes": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "channelLifetimeSeconds": {
+      "1": 60.164,
+      "2": 60.072,
+      "3": 60.057,
+      "4": 60.059
+    },
+    "eventEvidence": "cocoa-connection-events-p11806.json",
+    "closure": "All four channels reported CLOSED with no GError; server logs include unresponsive.",
+    "rootCause": "Unresolved; server monitoring can detect blocked send/ACK or unanswered PING. No socat timeout flag found.",
+    "limit": "Minimal host using upstream CocoaSpice/UTM native sources and Homebrew dependencies; not an official complete UTM app benchmark."
+  },
+  "spicy": {
+    "status": "awaiting original file selection in normal NSOpenPanel, PID 12193",
+    "version": "Homebrew spice-gtk 0.43 revision 1, GTK 3.24.52",
+    "formalCPUPercent": null,
+    "guestMarkerFortyVerified": false,
+    "verticalBoundaryObservation": null,
+    "priorFailures": [
+      "GIO EHOSTUNREACH before TLS in earlier wrapper identity.",
+      "Downloads open blocked with matching TCC request evidence in subsequent identity."
+    ],
+    "currentPanelStack": "Normal NSOpenPanel modal AppKit event wait; not currently blocked in file open.",
+    "nativeChooserCandidate": "GtkFileChooserNative alternative built offline, not installed or launched."
+  },
+  "comparabilityLimits": [
+    "No CocoaSpice/Spicy CPU ranking is supported by the current evidence.",
+    "Same requested 30 FPS source does not guarantee equal decoded/presented work.",
+    "Native libjpeg quality/late-frame behavior differs from our accurate-DCT/fancy-upsampling path.",
+    "Cocoa draw callbacks are not completed guest frames or confirmed Metal presentations.",
+    "Maspice wider display counters must remain separate from its roughly 60-second CPU interval."
+  ],
+  "continuation": {
+    "cpuWindowTargetSourceAgeSeconds": [
+      90,
+      150
+    ],
+    "temporaryServerStreamingVideo": "all",
+    "restorationPendingWhileUserHandoffIsOpen": true,
+    "next": [
+      "Complete original file choice in Spicy and verify a stable connection longer than 75 seconds.",
+      "If stable, perform marker delivery and aligned CPU/display acquisition.",
+      "Capture Cocoa worker/transport state before the 60-second monitor closure.",
+      "After tests, restore default off and original Maspice marker zero."
+    ]
+  }
+}

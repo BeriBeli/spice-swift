@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-15",
+  "scope": "Spicy visual-artifact check only; performance comparisons remain SwiftSpice versus CocoaSpice",
+  "status": "completed-and-test-packages-cleaned",
+  "verticalColorDiscontinuitiesObserved": true,
+  "configuredGuestPixels": [
+    1920,
+    1080
+  ],
+  "fullscreenWindowPoints": [
+    1920,
+    1080
+  ],
+  "nativePNGDimensions": [
+    3840,
+    2224
+  ],
+  "guestROI": [
+    0,
+    64,
+    3840,
+    2160
+  ],
+  "serverDuringObservation": {
+    "linuxPID": 222182,
+    "streamingVideo": "all",
+    "memoryMiB": 6144,
+    "vCPUs": 4,
+    "display": "gtk,gl=off",
+    "virtio1920x1080": true,
+    "qemuSHA256": "a2250f5e2b3b07c754473c0817df1cccf6c3c2443fc616dc474c4c311fa6ef1c",
+    "spiceLibrarySHA256": "0110bf9597c44cd477b4d47b4a0021415c97426f01657fbd4d68f2e52240608a",
+    "launcherSHA256": "01ae930b3d51ffa7b906b292cec0b8a185852941a410a39c76adc922f0e6e393",
+    "guestFixture": {
+      "bytes": 1438,
+      "sha256": "32a9125a3ae49d2bf5b1047cb1f54cfb95d476be655a43a0578094cbf30fbc06"
+    },
+    "centosPID": 26919,
+    "tlsRelayPID": 3368
+  },
+  "sourceRequestedTimerFPS": 30,
+  "sourceFiniteSeconds": 120,
+  "clientFPSMeasured": false,
+  "clientCPUOrLatencyMeasured": false,
+  "manualHandoff": "User opened fixture and armed fullscreen; root sent one Space to start finite animation.",
+  "dynamicSamples": 24,
+  "earlyHostAnchorAgeSeconds": [
+    10.000700792006683,
+    15.569111916993279
+  ],
+  "laterHostAnchorAgeSeconds": [
+    101.3105596670066,
+    106.61240745900432
+  ],
+  "settledHostAnchorAgeSeconds": 142.31127008399926,
+  "strongCandidateDynamicImages": 15,
+  "partialCandidateDynamicImages": 18,
+  "staticInitialMaxSpanChannelDifference": 3,
+  "dynamicMaxSpanChannelDifference": 61,
+  "settledMaxSpanChannelDifference": 2,
+  "edgeAuditMethod": {
+    "colorSpace": "8-bit PNG as converted by native sips to BMP for offline scalar analysis",
+    "horizontalSpanNativePixels": 8,
+    "minimumMaxChannelDifference": 24,
+    "sampledRows": "9 equally spaced rows from 15% through85% of guest height",
+    "strongColumnSupport": "at least7 of9 rows",
+    "partialColumnSupport": "at least3 of9 rows",
+    "excludedHorizontalMarginNativePixels": 32,
+    "meaning": "Candidates corroborate visual vertical discontinuities; neither root cause nor physical scanout proof. Threshold fixed before animation capture."
+  },
+  "archive": {
+    "path": "/Users/beribeli/.codex/visualizations/2026/11/13/01a1d38a-15ea-7ed0-972e-9943ba463118/spice-spicy-visual-2026-11-15.zip",
+    "sha256": "9acfd79f6a5338d3b8ac561b74ce84020da1cfec1c35833c9b7e2c5b08024b6f",
+    "containsControlScripts": false
+  },
+  "existingEvidenceQualitativeComparison": {
+    "worstObserved": "CocoaSpice TLS benchmark variant",
+    "swiftSpiceVersusSpicyOrder": "not-established",
+    "basis": "Existing representative gradient screenshots; Cocoa has dense column phase differences across most dynamic area; SwiftSpice and Spicy both show discontinuities. Not a synchronized quantitative ranking."
+  },
+  "noRetestAfterUserInstruction": true,
+  "productSourceModified": false,
+  "cleanupRecord": "CLEANUP_NATIVE_COMPARISONS_2026-11-15.json"
+}

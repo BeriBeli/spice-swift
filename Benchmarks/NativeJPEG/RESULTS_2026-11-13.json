@@ -1,0 +1,492 @@
+{
+  "dependency": "libjpeg-turbo 3.2.1; shipped Neon archive",
+  "warmup_frames_per_trial": 5,
+  "timed_frames_per_trial": 30,
+  "cases": [
+    {
+      "name": "1920x1080-0-q40",
+      "width": 1920,
+      "height": 1080,
+      "sampling": "444",
+      "quality": 40,
+      "encoded_bytes": 554882,
+      "jpeg_sha256": "410f838bb7ef2b9316b0ca7d51d51df0777404af53e90970fb6776d16f6b8239",
+      "bgra_sha256": "3303b78ebc22f02cbf6f2f391019fedfcbb6f467ce21d67b0fd6740793174221",
+      "trials": [
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.889567,
+          "wall_ms_per_frame": 4.895
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.7643,
+          "wall_ms_per_frame": 4.7679
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.8991,
+          "wall_ms_per_frame": 4.904133
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.708967,
+          "wall_ms_per_frame": 4.7112
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.789467,
+          "wall_ms_per_frame": 4.792133
+        }
+      ],
+      "median_cpu_ms": 4.789467,
+      "median_wall_ms": 4.792133,
+      "quality_measurement": {
+        "rgb_mse": 171.32888776363168,
+        "rgb_psnr_db": 25.79249765336101,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "1920x1080-0-q80",
+      "width": 1920,
+      "height": 1080,
+      "sampling": "444",
+      "quality": 80,
+      "encoded_bytes": 984476,
+      "jpeg_sha256": "49aab576d7c07836b3700b76d8143a465d4f5d56911d0c260b79355f85527887",
+      "bgra_sha256": "3761cbc32d597611c0ad8903eb220dd0bd2f23cc73310f90431c00a9a910f055",
+      "trials": [
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 6.563067,
+          "wall_ms_per_frame": 6.566667
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 6.599,
+          "wall_ms_per_frame": 6.605067
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 6.6005,
+          "wall_ms_per_frame": 6.605467
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 6.579567,
+          "wall_ms_per_frame": 6.587967
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 6.572133,
+          "wall_ms_per_frame": 6.576467
+        }
+      ],
+      "median_cpu_ms": 6.579567,
+      "median_wall_ms": 6.587967,
+      "quality_measurement": {
+        "rgb_mse": 33.819651813271605,
+        "rgb_psnr_db": 32.839112288171044,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "1920x1080-2-q40",
+      "width": 1920,
+      "height": 1080,
+      "sampling": "420",
+      "quality": 40,
+      "encoded_bytes": 329135,
+      "jpeg_sha256": "3e92fa14554c04036557c1346043bfe688243956b99ea596affc5e93000eb096",
+      "bgra_sha256": "7af7f8cb778f94ec92c7310173044974efe7820f71f6f231f50e1d59aeb72439",
+      "trials": [
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 3.0892,
+          "wall_ms_per_frame": 3.0905
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 3.0515,
+          "wall_ms_per_frame": 3.0529
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 3.093767,
+          "wall_ms_per_frame": 3.095267
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 3.1252,
+          "wall_ms_per_frame": 3.128867
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 3.146233,
+          "wall_ms_per_frame": 3.151767
+        }
+      ],
+      "median_cpu_ms": 3.093767,
+      "median_wall_ms": 3.095267,
+      "quality_measurement": {
+        "rgb_mse": 1143.2764652456276,
+        "rgb_psnr_db": 17.549290973910878,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "1920x1080-2-q80",
+      "width": 1920,
+      "height": 1080,
+      "sampling": "420",
+      "quality": 80,
+      "encoded_bytes": 573642,
+      "jpeg_sha256": "5ea5924b11180cc7636c4608b4ab3e889bf6c03f6d47cfa93ae8bf18eba89c67",
+      "bgra_sha256": "82158588ab1cd16dbe3877863c25da7b2b2e16c9fb51ecbc2cfb2b9f683dcb75",
+      "trials": [
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.180433,
+          "wall_ms_per_frame": 4.187567
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.083433,
+          "wall_ms_per_frame": 4.085633
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.088167,
+          "wall_ms_per_frame": 4.090067
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.055067,
+          "wall_ms_per_frame": 4.056833
+        },
+        {
+          "width": 1920,
+          "height": 1080,
+          "stride": 7680,
+          "frames": 30,
+          "cpu_ms_per_frame": 4.035967,
+          "wall_ms_per_frame": 4.040433
+        }
+      ],
+      "median_cpu_ms": 4.083433,
+      "median_wall_ms": 4.085633,
+      "quality_measurement": {
+        "rgb_mse": 1003.3771175733025,
+        "rgb_psnr_db": 18.11616168327028,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "3840x2160-0-q40",
+      "width": 3840,
+      "height": 2160,
+      "sampling": "444",
+      "quality": 40,
+      "encoded_bytes": 2214341,
+      "jpeg_sha256": "3f2973074703bbc2125681910d87fe811cf8e1f34b85f2536620309366c8b1b5",
+      "bgra_sha256": "96b69637dacf6ba28a9da8789bd5a9e628751104fce92ad333f2e74ca7339038",
+      "trials": [
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 19.5075,
+          "wall_ms_per_frame": 19.519433
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 20.308167,
+          "wall_ms_per_frame": 20.422867
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 19.567367,
+          "wall_ms_per_frame": 19.5756
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 19.637067,
+          "wall_ms_per_frame": 19.6542
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 19.730933,
+          "wall_ms_per_frame": 19.7547
+        }
+      ],
+      "median_cpu_ms": 19.637067,
+      "median_wall_ms": 19.6542,
+      "quality_measurement": {
+        "rgb_mse": 171.0493345309285,
+        "rgb_psnr_db": 25.799589719703768,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "3840x2160-0-q80",
+      "width": 3840,
+      "height": 2160,
+      "sampling": "444",
+      "quality": 80,
+      "encoded_bytes": 3922253,
+      "jpeg_sha256": "0d02b4f6cfc07acc4807940b5f946e8a6ce2d582c1d0c51a1fab172ff1d0f234",
+      "bgra_sha256": "78a6e8a9b329116aeee161b73441cf42103f4f0ef641c4a11a24552f4f4cbff1",
+      "trials": [
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 26.855967,
+          "wall_ms_per_frame": 26.8718
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 26.783733,
+          "wall_ms_per_frame": 26.805433
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 26.9418,
+          "wall_ms_per_frame": 26.9579
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 27.013333,
+          "wall_ms_per_frame": 27.038967
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 26.9598,
+          "wall_ms_per_frame": 26.976733
+        }
+      ],
+      "median_cpu_ms": 26.9418,
+      "median_wall_ms": 26.9579,
+      "quality_measurement": {
+        "rgb_mse": 33.67133740837191,
+        "rgb_psnr_db": 32.858199941816125,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "3840x2160-2-q40",
+      "width": 3840,
+      "height": 2160,
+      "sampling": "420",
+      "quality": 40,
+      "encoded_bytes": 1306303,
+      "jpeg_sha256": "507d53fed4899240e30bde2421c8792fa20438a20fcc1a70e935b7f16b5a9e59",
+      "bgra_sha256": "f6e44debe2d9af13d6c3e32f4e7fd2a0b4ee1a4c2023f5e91c0f45d9d6d61387",
+      "trials": [
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 12.544567,
+          "wall_ms_per_frame": 12.5502
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 12.557933,
+          "wall_ms_per_frame": 12.5669
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 12.548833,
+          "wall_ms_per_frame": 12.556967
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 12.568633,
+          "wall_ms_per_frame": 12.575233
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 12.628567,
+          "wall_ms_per_frame": 12.6348
+        }
+      ],
+      "median_cpu_ms": 12.557933,
+      "median_wall_ms": 12.5669,
+      "quality_measurement": {
+        "rgb_mse": 1137.6183675331147,
+        "rgb_psnr_db": 17.57083765479862,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    },
+    {
+      "name": "3840x2160-2-q80",
+      "width": 3840,
+      "height": 2160,
+      "sampling": "420",
+      "quality": 80,
+      "encoded_bytes": 2277288,
+      "jpeg_sha256": "ddbc968614121dbfac91e21630ab487507f222b0f92c875b13215fccfbfcb0bc",
+      "bgra_sha256": "6bd422aa0dc93cba83d9569d383234a85614ec4cfba0aaeb6ec242d3b3a70b22",
+      "trials": [
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 16.727067,
+          "wall_ms_per_frame": 16.746833
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 16.740133,
+          "wall_ms_per_frame": 16.752233
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 16.720067,
+          "wall_ms_per_frame": 16.734667
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 16.631767,
+          "wall_ms_per_frame": 16.642033
+        },
+        {
+          "width": 3840,
+          "height": 2160,
+          "stride": 15360,
+          "frames": 30,
+          "cpu_ms_per_frame": 16.676067,
+          "wall_ms_per_frame": 16.6871
+        }
+      ],
+      "median_cpu_ms": 16.720067,
+      "median_wall_ms": 16.734667,
+      "quality_measurement": {
+        "rgb_mse": 997.4533370707948,
+        "rgb_psnr_db": 18.141877732276065,
+        "reference": "exact RGB generator in jpeg-check.c; alpha excluded; no scaling"
+      }
+    }
+  ],
+  "environment": {
+    "architecture": "arm64",
+    "date": "2026-11-13",
+    "thermal_power_conditions": "No system power, thermal, or refresh-rate settings changed. Other user applications remained open; no claim of a controlled idle laboratory.",
+    "swift": "Apple Swift version 6.4.2 (swiftlang-6.4.2.1.9 clang-2100.4.1.1)\nTarget: arm64-apple-macosx27.2.0",
+    "xcode": "Xcode 27.2\nBuild version 27B52",
+    "clang": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+    "cpu": "Apple M4 Pro"
+  },
+  "archive_sha256": "b19be7bdfab410faaceccc996114c2da1d61647b07731b6dc5c4a00857aff861",
+  "source_sha256": "c27ad72a68da151177929aa969ae773a2da5ac2af9ce946079314fdac8cece7f",
+  "harness_sha256": "8a7ebd5d4be7385c33f6dc76c8524c0614fe93a455882406986e5b66a20750ef",
+  "measurement": "CLOCK_PROCESS_CPUTIME_ID, five trials, same JPEG per trial; allocation and file I/O excluded"
+}

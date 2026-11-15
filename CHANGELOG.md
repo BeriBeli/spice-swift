@@ -7,6 +7,33 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.6-beta.1] — 2026-11-15
+
+### Changed
+
+- Batch ready native video fragments into bounded Surface transactions and one
+  Metal command buffer, reducing synchronization and duplicate publication.
+- Copy only the candidate regions needed to preserve immutable snapshots. Track
+  disjoint writes so unrelated fragments do not invalidate each other; recover
+  native admission with a bounded, cancellation-aware wait for released leases.
+- Add display traffic, GPU copy/wait, native admission and MJPEG lateness metrics,
+  and split Metal timings around drawable acquisition, encoding and commit.
+- Extend opt-in session and pipeline benchmarks with deterministic guest fixtures,
+  connection shaping, quality analysis and recorded real-session comparisons.
+  See [the performance evidence index](Benchmarks/Session/README.md).
+- Support beta release metadata and publish beta tags as GitHub prereleases
+  without replacing the stable Latest release.
+
+### Known limitations
+
+- Color transitions can still show vertical phase boundaries. The same workload
+  also exposed artifacts in CocoaSpice and Spicy; this beta does not promise
+  complete-frame coherence or establish a precise cross-client FPS ranking.
+- The earlier isolated one-second presentation stall has not been assigned a
+  unique root cause. Additional drawable and commit timings improve diagnosis.
+- Hardware H.264/H.265 decoding depends on the server actually offering those
+  codecs. The measured QEMU/SPICE installation only offered MJPEG encoding.
+
 ## [0.4.5] — 2026-11-01
 
 ### Fixed
@@ -498,7 +525,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Published the initial native Swift SPICE client library, viewer, probe, protocol codecs, and checked-in native dependencies.
 
-[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/BeriBeli/spice-swift/compare/v0.4.6-beta.1...HEAD
+[0.4.6-beta.1]: https://github.com/BeriBeli/spice-swift/compare/v0.4.5...v0.4.6-beta.1
 [0.4.5]: https://github.com/BeriBeli/spice-swift/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/BeriBeli/spice-swift/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/BeriBeli/spice-swift/compare/v0.4.2...v0.4.3

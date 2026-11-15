@@ -136,3 +136,56 @@ ctest --test-dir "$work/upstream-tests" --output-on-failure
 ```
 
 Keep wanted JSON/log evidence, then remove the owned directory with `rm -rf "$work"`.
+
+## Current codec cost and quality (2026-11-13)
+
+The [new eight-case record](RESULTS_2026-11-13.json) measures the shipped
+libjpeg-turbo **3.2.1** Neon archive on M4 Pro, macOS 27.2.1, with a harness
+compiled by Xcode 27.2 / Clang 21.0.0 (`clang-2100.4.1.1`). Its archive hash is
+`b19be7bdfab410faaceccc996114c2da1d61647b07731b6dc5c4a00857aff861`.
+The archive's own build toolchain is recorded separately in its provenance.
+The 2026-10-30 scalar/Neon comparison above remains historical evidence.
+
+Five trials per case decode thirty complete frames after five warmup frames,
+using one persistent handle per trial and header parsing per measured frame.
+Allocation and file I/O are excluded. Accurate integer IDCT and fancy upsampling
+remain enabled. Alpha, padding and guard assertions passed in the C harness.
+
+| Size | Sampling | JPEG quality | Median CPU ms/frame | RGB PSNR dB |
+| --- | --- | ---: | ---: | ---: |
+| 1920×1080 | 4:4:4 | 40 | 4.789 | 25.79 |
+| 1920×1080 | 4:4:4 | 80 | 6.580 | 32.84 |
+| 1920×1080 | 4:2:0 | 40 | 3.094 | 17.55 |
+| 1920×1080 | 4:2:0 | 80 | 4.083 | 18.12 |
+| 3840×2160 | 4:4:4 | 40 | 19.637 | 25.80 |
+| 3840×2160 | 4:4:4 | 80 | 26.942 | 32.86 |
+| 3840×2160 | 4:2:0 | 40 | 12.558 | 17.57 |
+| 3840×2160 | 4:2:0 | 80 | 16.720 | 18.14 |
+
+PSNR compares decoded RGB to the exact `jpeg-check.c` generator before scaling;
+alpha is excluded. This deliberately chromatic, fine-line/noisy pattern exposes
+subsampling loss. Its score does not predict general desktop/text quality.
+JPEG quality is an encoder setting, not a universal fidelity score. The tested
+4K quality-80 4:2:0 decoder alone consumes about a 60 Hz frame budget; this is a
+local synthetic cost, not evidence that the live peer selected that codec.
+There is no same-version scalar control or decoder optimization claim here.
+
+Reproduce with the checked-in artifact, Python 3 and Node.js:
+
+```sh
+mkdir -p .build/jpeg-quality
+xcrun clang -O3 -std=c17 -Wall -Wextra -Werror -arch arm64 \
+  -mmacosx-version-min=26.0 \
+  -I Artifacts/CTurboJPEG.xcframework/macos-arm64/CTurboJPEG.framework/Headers \
+  Benchmarks/NativeJPEG/jpeg-check.c \
+  Artifacts/CTurboJPEG.xcframework/macos-arm64/CTurboJPEG.framework/Versions/A/CTurboJPEG \
+  -o .build/jpeg-quality/jpeg-check
+python3 Benchmarks/NativeJPEG/measure-quality.py \
+  .build/jpeg-quality/jpeg-check .build/jpeg-quality
+node Benchmarks/NativeJPEG/measure-quality.mjs .build/jpeg-quality
+```
+
+The output owns generated JPEG/BGRA files and `results.json`. Hashes and all
+per-trial timings are retained in the record. Retain wanted evidence separately;
+the generated BGRA files need not be committed. The same JPEGs are inputs to the
+[GPU pipeline measurement](../Pipeline/README.md).
