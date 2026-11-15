@@ -38,11 +38,36 @@ public struct SpicePresentationMetrics: Sendable, Equatable {
     public internal(set) var desktopImmediateSelections: UInt64 = 0
     package var desktopReadyToDisplayLinkHistogram = SpiceTimingHistogram()
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
+    package var metalDrawablePreparationHistogram = SpiceTimingHistogram()
+    package var metalDrawableAcquisitionHistogram = SpiceTimingHistogram()
+    package var metalDrawableToCommitHistogram = SpiceTimingHistogram()
+    package var metalCommitCallHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
     package var metalRequestToPresentedHistogram = SpiceTimingHistogram()
 
     public var viewUpdateToMetalCommit: SpiceTimingSummary {
         viewUpdateToMetalCommitHistogram.summary
+    }
+
+    /// Selection through frame preparation, before requesting the drawable.
+    public var metalDrawablePreparation: SpiceTimingSummary {
+        metalDrawablePreparationHistogram.summary
+    }
+
+    /// Synchronous MTKView.currentDrawable acquisition, including nil results.
+    public var metalDrawableAcquisition: SpiceTimingSummary {
+        metalDrawableAcquisitionHistogram.summary
+    }
+
+    /// Encoding and presentation scheduling after acquisition, before commit.
+    public var metalDrawableToCommit: SpiceTimingSummary {
+        metalDrawableToCommitHistogram.summary
+    }
+
+    /// Synchronous commit submission, including timestamp publication before
+    /// MTLCommandBuffer.commit(). This is separate from GPU execution.
+    public var metalCommitCall: SpiceTimingSummary {
+        metalCommitCallHistogram.summary
     }
 
     /// Time from the selected latest desktop revision becoming ready until the
@@ -288,6 +313,23 @@ public final class SpicePresentationDiagnostics: Sendable {
 
     package func recordViewUpdateToMetalCommit(_ duration: Duration) {
         update { $0.viewUpdateToMetalCommitHistogram.record(duration) }
+    }
+
+    package func recordMetalDrawableAcquisition(
+        preparation: Duration,
+        acquisition: Duration
+    ) {
+        update {
+            $0.metalDrawablePreparationHistogram.record(preparation)
+            $0.metalDrawableAcquisitionHistogram.record(acquisition)
+        }
+    }
+
+    package func recordMetalSubmission(encoding: Duration, commitCall: Duration) {
+        update {
+            $0.metalDrawableToCommitHistogram.record(encoding)
+            $0.metalCommitCallHistogram.record(commitCall)
+        }
     }
 
     package func recordMetalCommitToCompletion(

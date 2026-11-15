@@ -12,6 +12,55 @@ import Testing
 
 @Suite("Display Channel wire execution")
 struct DisplayChannelTests {
+    @Test func trafficCountsReadAheadOnceAndSeparatesJPEGImagesFromMJPEGStreams() async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 2, height: 1, format: 32, flags: 1
+            )),
+            encodeMini(id: 304, body: drawJPEGCopyBody(payload: Data([1]))),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7, streamWidth: 2, streamHeight: 1,
+                sourceWidth: 2, sourceHeight: 1,
+                destination: (top: 0, left: 0, bottom: 1, right: 2), clipRectangles: nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 100, data: Data([2])
+            )),
+        ]
+        let bytes = inbound.reduce(into: Data()) { $0.append($1) }
+        let transport = FakeTransport(inbound: [.success(bytes)])
+        try await transport.connect()
+        let decoder = CountingPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: .init(type: 2, id: 0), transport: transport, headerMode: .mini
+            ),
+            jpegDecoder: decoder,
+            multimediaClock: RecordingDisplayMultimediaClock(initialTime: 100)
+        )
+        _ = try await channel.processNext()
+        let first = await channel.diagnosticsSnapshot()
+        #expect(first.traffic.receivedBytes == UInt64(bytes.count))
+        #expect(first.traffic.messages == 1)
+
+        _ = try await channel.processNext()
+        let desktop = await channel.diagnosticsSnapshot()
+        #expect(desktop.traffic.jpegImages == 1)
+        #expect(desktop.traffic.streamCreateMessages == 0)
+        #expect(await decoder.decodeCount == 1)
+
+        for _ in 0..<2 { _ = try await channel.processNext() }
+        let video = await channel.diagnosticsSnapshot()
+        #expect(video.traffic.receivedBytes == UInt64(bytes.count))
+        #expect(video.traffic.messages == 4)
+        #expect(video.traffic.jpegImages == 1)
+        #expect(video.traffic.mjpegStreamRequests == 1)
+        #expect(video.traffic.h264StreamRequests == 0)
+        #expect(video.traffic.streamDataMessages == 1)
+        #expect(await decoder.decodeCount == 2)
+        await channel.close()
+    }
+
     @Test func streamFeedbackCoversSizedLateFramesAndActivationLifecycle() async throws {
         let create = streamCreateBody(
             streamID: 7, streamWidth: 2, streamHeight: 2,
@@ -46,7 +95,9 @@ struct DisplayChannelTests {
         let decoder = CountingPatternJPEGDecoder()
         let channel = DisplayChannel(
             connection: ChannelConnection(key: .init(type: 2, id: 0), transport: transport, headerMode: .mini),
-            jpegDecoder: decoder, multimediaClock: RecordingDisplayMultimediaClock(initialTime: 100)
+            jpegDecoder: decoder, multimediaClock: RecordingDisplayMultimediaClock(
+                initialTime: 100, playbackDelay: 50
+            )
         )
         for _ in inbound { _ = try await channel.processNext() }
         let reports = try await transport.outbound.map(decodeStreamReport)
@@ -54,12 +105,12 @@ struct DisplayChannelTests {
             SpiceMsgcDisplayStreamReport(
                 streamID: 7, uniqueID: 42, startFrameMultimediaTime: 100,
                 endFrameMultimediaTime: 99, frameCount: 2, dropCount: 1,
-                lastFrameDelay: -1, audioDelay: .max
+                lastFrameDelay: -1, audioDelay: 50
             ),
             SpiceMsgcDisplayStreamReport(
                 streamID: 7, uniqueID: 43, startFrameMultimediaTime: 100,
                 endFrameMultimediaTime: 100, frameCount: 1, dropCount: 0,
-                lastFrameDelay: 0, audioDelay: .max
+                lastFrameDelay: 0, audioDelay: 50
             ),
         ])
         #expect(await decoder.decodeCount == 5) // late frame still skipped before decode
@@ -95,7 +146,7 @@ struct DisplayChannelTests {
             .success(frame),
         ])
         try await target.connect()
-        _ = try await channel.replaceConnection(with: ChannelConnection(
+        let sourceConnection = try await channel.replaceConnection(with: ChannelConnection(
             key: .init(type: 2, id: 0), transport: target, headerMode: .mini
         ))
         _ = try await channel.processNext()
@@ -106,6 +157,17 @@ struct DisplayChannelTests {
         #expect(reports.count == 1)
         #expect(reports.first?.uniqueID == 99)
         #expect(await transport.outbound.isEmpty)
+        let diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.traffic.messages == 6)
+        #expect(diagnostics.traffic.mjpegStreamRequests == 1)
+        #expect(diagnostics.traffic.streamDataMessages == 2)
+        #expect(diagnostics.traffic.receivedBytes > UInt64(frame.count * 2))
+        // Rollback reuses the original connection. Its earlier reads must not
+        // be counted again when it becomes active or is retired a second time.
+        let targetConnection = try await channel.replaceConnection(with: sourceConnection)
+        #expect(await channel.diagnosticsSnapshot().traffic.receivedBytes == diagnostics.traffic.receivedBytes)
+        _ = try await channel.replaceConnection(with: targetConnection)
+        #expect(await channel.diagnosticsSnapshot().traffic.receivedBytes == diagnostics.traffic.receivedBytes)
         await channel.close()
     }
 
@@ -116,6 +178,83 @@ struct DisplayChannelTests {
         let report = try SpiceMsgcDisplayStreamReport.decode(from: &reader)
         try reader.requireFullyConsumed()
         return report
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+    func nativeMJPEGReadyDrawsDrainOnStreamDestroyAndClose(destroyBeforeClose: Bool) async throws {
+        guard (try? SpiceMetalCompositor()) != nil else { return }
+        struct Fixture: Decodable { let width: Int; let height: Int; let jpegBase64: String }
+        let url = try #require(Bundle.module.url(
+            forResource: "native-batch-jpeg-8x8", withExtension: "json"
+        ))
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        let jpeg = try #require(Data(base64Encoded: fixture.jpegBase64))
+        let streamCount = 32
+        var inbound = try [encodeMini(SpiceMsgDisplaySurfaceCreate(
+            surfaceID: 1, width: UInt32(streamCount * fixture.width),
+            height: UInt32(fixture.height), format: 32, flags: 1
+        ))]
+        for index in 0..<streamCount {
+            inbound.append(encodeMini(id: 122, body: streamCreateBody(
+                streamID: UInt32(index + 1),
+                streamWidth: UInt32(fixture.width), streamHeight: UInt32(fixture.height),
+                sourceWidth: UInt32(fixture.width), sourceHeight: UInt32(fixture.height),
+                destination: (top: 0, left: Int32(index * fixture.width),
+                    bottom: Int32(fixture.height), right: Int32((index + 1) * fixture.width)),
+                clipRectangles: nil
+            )))
+        }
+        for index in 0..<streamCount {
+            inbound.append(encodeMini(id: 123, body: streamDataBody(
+                streamID: UInt32(index + 1), multimediaTime: 1, data: jpeg
+            )))
+        }
+        let readyReadCount = inbound.count
+        if destroyBeforeClose {
+            for index in 0..<streamCount {
+                inbound.append(encodeMini(id: 125, body: streamDestroyBody(
+                    streamID: UInt32(index + 1)
+                )))
+            }
+            inbound.append(try encodeMini(SpiceMsgDisplaySurfaceDestroy(surfaceID: 1)))
+        }
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: readyReadCount)
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(key: ChannelKey(type: 2, id: 0),
+                transport: transport, headerMode: .mini),
+            framePublicationInterval: .zero
+        )
+        // Only signals cross this stream: it cannot retain published frame leases.
+        let events = AsyncStream.makeStream(of: Bool.self)
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { event in
+                switch event {
+                case let .frame(frame) where frame.snapshot.revision > 0:
+                    events.continuation.yield(true)
+                case .surfaceDestroyed(1): events.continuation.yield(false)
+                default: break
+                }
+            }
+        }
+        var iterator = events.stream.makeAsyncIterator()
+        let first = await iterator.next()
+        #expect(first == true)
+        if first == true, destroyBeforeClose {
+            await transport.releaseRemainingReads()
+            var destroyed = false
+            while let signal = await iterator.next() {
+                if !signal { destroyed = true; break }
+            }
+            #expect(destroyed)
+        }
+        runTask.cancel()
+        await channel.close()
+        _ = try? await runTask.value
+        let diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.surfaces.nativeVideoFrames > 0)
+        #expect(diagnostics.surfaces.gpuErrors == 0)
     }
 
     @Test(arguments: [false, true])
@@ -425,7 +564,7 @@ struct DisplayChannelTests {
         let decoder = GatedPatternJPEGDecoder()
         let clock = RecordingDisplayMultimediaClock(
             initialTime: 0,
-            forcedLateWaitTargets: [1, 2]
+            forcedLateWaitTargets: [1, 2], playbackDelay: 50
         )
         let channel = DisplayChannel(
             connection: ChannelConnection(
@@ -618,6 +757,83 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
+    @Test(arguments: [false, true])
+    func disjointStreamsSurviveReversedDecodeCompletion(streamsShareDestination: Bool) async throws {
+        let inbound = try [
+            encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 4, height: 2, format: 32, flags: 1
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7, streamWidth: 2, streamHeight: 2,
+                sourceWidth: 2, sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: streamsShareDestination ? 4 : 2),
+                clipRectangles: streamsShareDestination ? [(top: 0, left: 0, bottom: 2, right: 2)] : nil
+            )),
+            encodeMini(id: 122, body: streamCreateBody(
+                streamID: 8, streamWidth: 2, streamHeight: 2,
+                sourceWidth: 2, sourceHeight: 2,
+                destination: (top: 0, left: streamsShareDestination ? 0 : 2, bottom: 2, right: 4),
+                clipRectangles: streamsShareDestination ? [(top: 0, left: 2, bottom: 2, right: 4)] : nil
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: 1, data: Data([1])
+            )),
+            encodeMini(id: 123, body: streamDataBody(
+                streamID: 8, multimediaTime: 2, data: Data([2])
+            )),
+        ]
+        let transport = GatedDisplayTransport(inbound: inbound, gateAfterReads: 4)
+        try await transport.connect()
+        let decoder = GatedPatternJPEGDecoder()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: ChannelKey(type: 2, id: 0), transport: transport, headerMode: .mini
+            ),
+            jpegDecoder: decoder, framePublicationInterval: .zero
+        )
+        let events = AsyncStream.makeStream(of: SpiceChannelEvent.self)
+        let runTask = Task {
+            defer { events.continuation.finish() }
+            try await channel.run { _ = events.continuation.yield($0) }
+        }
+        // End observation on failure as well as success, then release the
+        // decoder before closing the channel so cleanup cannot await its gate.
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            events.continuation.finish()
+        }
+        await decoder.waitUntilFirstDecodeStarts()
+        await transport.releaseRemainingReads()
+        var iterator = events.stream.makeAsyncIterator()
+        var first: FrameSnapshot?
+        while let event = await iterator.next() {
+            guard case let .frame(published) = event,
+                  published.snapshot.revision == 1 else { continue }
+            first = published.snapshot
+            break
+        }
+        await decoder.releaseFirstDecode()
+        var final: FrameSnapshot?
+        while let event = await iterator.next() {
+            guard case let .frame(published) = event,
+                  published.snapshot.revision == 2 else { continue }
+            final = published.snapshot
+            break
+        }
+        timeout.cancel()
+        runTask.cancel()
+        _ = try? await runTask.value
+        await channel.close()
+
+        // Retained revisions remain immutable after the delayed commit.
+        #expect(first?.pixels.first == 0)
+        // The shared destination scales source column 1 into surface column 2.
+        let expectedRight: UInt8 = streamsShareDestination ? 60 : 50
+        #expect(first?.pixels[8] == expectedRight)
+        #expect(final?.pixels.first == 10)
+        #expect(final?.pixels[8] == expectedRight)
+    }
+
     @Test func surfaceVideoSequenceRejectsLateFrameFromAnotherStream() async throws {
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
@@ -656,7 +872,7 @@ struct DisplayChannelTests {
         let decoder = GatedPatternJPEGDecoder()
         let clock = RecordingDisplayMultimediaClock(
             initialTime: 0,
-            forcedLateWaitTargets: [2]
+            forcedLateWaitTargets: [2], playbackDelay: 50
         )
         let channel = DisplayChannel(
             connection: ChannelConnection(
@@ -1232,8 +1448,52 @@ struct DisplayChannelTests {
         await channel.close()
     }
 
-    @Test func schedulesFutureMJPEGAndDropsLateFrameBeforeDecode() async throws {
+    @Test(arguments: [UInt32(99), UInt32(110)])
+    func presentsMJPEGWithoutAudioDeadline(multimediaTime: UInt32) async throws {
         let clock = RecordingDisplayMultimediaClock(initialTime: 100)
+        let decoder = CountingPatternJPEGDecoder()
+        let transport = FakeTransport(inbound: try [
+            .success(encodeMini(SpiceMsgDisplaySurfaceCreate(
+                surfaceID: 1, width: 2, height: 2, format: 32, flags: 1
+            ))),
+            .success(encodeMini(id: 122, body: streamCreateBody(
+                streamID: 7, streamWidth: 2, streamHeight: 2,
+                sourceWidth: 2, sourceHeight: 2,
+                destination: (top: 0, left: 0, bottom: 2, right: 2), clipRectangles: nil
+            ))),
+            .success(encodeMini(SpiceMsgDisplayStreamActivateReport(
+                streamID: 7, uniqueID: 42, maximumWindowSize: 1, timeoutMilliseconds: .max
+            ))),
+            .success(encodeMini(id: 123, body: streamDataBody(
+                streamID: 7, multimediaTime: multimediaTime, data: Data([1])
+            ))),
+        ])
+        try await transport.connect()
+        let channel = DisplayChannel(
+            connection: ChannelConnection(
+                key: .init(type: 2, id: 0), transport: transport, headerMode: .mini
+            ),
+            jpegDecoder: decoder, multimediaClock: clock
+        )
+        for _ in 0..<3 { _ = try await channel.processNext() }
+        #expect(try await channel.processNext() == frameChanged(surfaceID: 1, revision: 1))
+        #expect(await decoder.decodeCount == 1)
+        #expect(await clock.waitedTargets.isEmpty)
+        let snapshot = try await channel.snapshot(surfaceID: 1)
+        #expect(pixel(snapshot, x: 0, y: 0) == [10, 0, 0, 255])
+        #expect(try await transport.outbound.map(decodeStreamReport) == [
+            SpiceMsgcDisplayStreamReport(
+                streamID: 7, uniqueID: 42, startFrameMultimediaTime: multimediaTime,
+                endFrameMultimediaTime: multimediaTime, frameCount: 1, dropCount: 0,
+                lastFrameDelay: 0, audioDelay: .max
+            ),
+        ])
+        #expect(await channel.diagnosticsSnapshot().mjpeg.lateBeforeDecode == 0)
+        await channel.close()
+    }
+
+    @Test func schedulesFutureMJPEGAndDropsLateFrameBeforeDecode() async throws {
+        let clock = RecordingDisplayMultimediaClock(initialTime: 100, playbackDelay: 50)
         let decoder = CountingPatternJPEGDecoder()
         let inbound = try [
             encodeMini(SpiceMsgDisplaySurfaceCreate(
@@ -1290,13 +1550,16 @@ struct DisplayChannelTests {
         #expect(await clock.waitedTargets == [100, 110])
         #expect(await decoder.decodeCount == 2)
         #expect(try await channel.snapshot(surfaceID: 1) == beforeLateFrame)
+        let diagnostics = await channel.diagnosticsSnapshot()
+        #expect(diagnostics.mjpeg.lateBeforeDecode == 1)
+        #expect(diagnostics.mjpeg.maximumLatenessMilliseconds == 1)
     }
 
     @Test(arguments: [false, true])
     func presentsMJPEGThatBecomesLateDuringDecodeOrWait(advanceDuringDecode: Bool) async throws {
         let clock = RecordingDisplayMultimediaClock(
             initialTime: 100,
-            forcedLateWaitTargets: advanceDuringDecode ? [] : [110]
+            forcedLateWaitTargets: advanceDuringDecode ? [] : [110], playbackDelay: 50
         )
         let decoder = GatedPatternJPEGDecoder()
         let inbound = try [
@@ -5481,11 +5744,16 @@ private actor CountingPatternJPEGDecoder: SpiceImageDecoder {
 private actor RecordingDisplayMultimediaClock: MultimediaClockScheduling {
     private var currentTime: UInt32
     private let forcedLateWaitTargets: Set<UInt32>
+    private var playbackDelay: UInt32?
     private(set) var waitedTargets: [UInt32] = []
 
-    init(initialTime: UInt32, forcedLateWaitTargets: Set<UInt32> = []) {
+    init(
+        initialTime: UInt32, forcedLateWaitTargets: Set<UInt32> = [],
+        playbackDelay: UInt32? = nil
+    ) {
         currentTime = initialTime
         self.forcedLateWaitTargets = forcedLateWaitTargets
+        self.playbackDelay = playbackDelay
     }
 
     func reset(to multimediaTime: UInt32) {
@@ -5494,7 +5762,10 @@ private actor RecordingDisplayMultimediaClock: MultimediaClockScheduling {
 
     func synchronize(playbackTime: UInt32, delayMilliseconds: UInt32) {
         currentTime = playbackTime &- delayMilliseconds
+        playbackDelay = delayMilliseconds
     }
+
+    func playbackDelayMilliseconds() -> UInt32? { playbackDelay }
 
     func timing(for multimediaTime: UInt32) -> MultimediaFrameTiming {
         MultimediaTimestamp.timing(current: currentTime, target: multimediaTime)

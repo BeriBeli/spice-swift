@@ -233,10 +233,10 @@ package struct SurfaceDamageJournal: Sendable, Equatable {
     }
 }
 
-/// Retains enough committed damage to advance a released ring slot without a
-/// full IOSurface-to-IOSurface blit. A normal three-slot ring can lag by at
-/// most three committed publications; a slower candidate outside this bounded
-/// history safely degrades to a full upload from the CPU reference backing.
+/// Retains committed damage for CPU uploads and GPU candidate catch-up. The
+/// caller supplies the current canonical pixels; native commits include both
+/// pending CPU damage and video clips. Candidates outside this bounded history
+/// require a full copy. Opaque canonical mutations reset its baseline.
 package struct SurfaceRevisionDamageHistory: Sendable, Equatable {
     private static let maximumCommittedRevisions = 3
 

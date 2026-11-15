@@ -18,31 +18,45 @@ die() {
 }
 
 version="${1:-}"
-[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || die "usage: release.sh X.Y.Z [--yes]"
+[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]] \
+    || die "usage: release.sh X.Y.Z[-beta.N] [--yes]"
 
 assume_yes=0
 [[ "${2:-}" == "--yes" ]] && assume_yes=1
 [[ "${SWIFTSPICE_ASSUME_YES:-0}" == "1" ]] && assume_yes=1
 tag="v$version"
+release_branch=main
+if [[ "$version" == *-beta.* ]]; then
+    release_branch="codex/beta-${version%%-beta.*}"
+fi
 
 log "preflight"
 command -v git >/dev/null 2>&1 || die "git is unavailable"
 [[ -z "$(git status --porcelain)" ]] || die "working tree is dirty — commit or stash first"
-[[ "$(git branch --show-current)" == "main" ]] || die "release must run from main"
+[[ "$(git branch --show-current)" == "$release_branch" ]] || die "release must run from $release_branch"
 
-git fetch origin main --tags --prune
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] \
-    || die "local main must exactly match origin/main"
+git fetch origin "$release_branch" --tags --prune
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$release_branch")" ]] \
+    || die "local branch must exactly match origin/$release_branch"
 if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     die "tag $tag already exists"
 fi
 
 "$ROOT_DIR/Scripts/check-version.sh"
 current_version="$(tr -d '[:space:]' <"$VERSION_FILE")"
-[[ "$version" != "$current_version" \
-    && "$(printf '%s\n%s\n' "$current_version" "$version" | sort -V | tail -1)" == "$version" ]] \
-    || die "version $version must be greater than $current_version"
+current_base="${current_version%%-beta.*}"
+next_base="${version%%-beta.*}"
+if [[ "$current_base" == "$next_base" ]]; then
+    [[ "$current_version" == *-beta.* ]] \
+        || die "version $version must be greater than $current_version"
+    if [[ "$version" == *-beta.* ]]; then
+        (( ${version##*-beta.} > ${current_version##*-beta.} )) \
+            || die "beta number must increase from $current_version"
+    fi
+else
+    [[ "$(printf '%s\n%s\n' "$current_base" "$next_base" | sort -V | tail -1)" == "$next_base" ]] \
+        || die "version $version must be greater than $current_version"
+fi
 
 unreleased_notes="$(awk '
     /^## \[Unreleased\]/{capture = 1; next}
@@ -92,6 +106,9 @@ swift package --allow-writing-to-package-directory generate-spice-protocol --che
 log "analyzing owned C shims"
 "$ROOT_DIR/Scripts/analyze-c-shims.sh"
 
+log "validating the shipped QUIC artifact"
+"$ROOT_DIR/Scripts/validate-quic.sh"
+
 log "building package"
 "$ROOT_DIR/Scripts/build-lib.sh"
 
@@ -111,14 +128,14 @@ log "running AddressSanitizer tests"
 log "checking code coverage"
 "$ROOT_DIR/Scripts/check-code-coverage.sh"
 
-log "rechecking main and tags after validation"
+log "rechecking release branch and tags after validation"
 unexpected_changes="$(git status --porcelain \
     | grep -Ev '^ M (CHANGELOG\.md|VERSION)$' || true)"
 [[ -z "$unexpected_changes" ]] \
     || die "validation changed unexpected files:\n$unexpected_changes"
-git fetch origin main --tags --prune
-[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] \
-    || die "origin/main changed during validation — restore release files and rerun"
+git fetch origin "$release_branch" --tags --prune
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$release_branch")" ]] \
+    || die "origin/$release_branch changed during validation — restore release files and rerun"
 if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
     die "tag $tag was created during validation"
 fi
@@ -126,7 +143,7 @@ fi
 log "prepared $tag at $(git rev-parse --short HEAD)"
 git --no-pager diff --stat -- "$VERSION_FILE" "$CHANGELOG"
 if [[ "$assume_yes" -ne 1 ]]; then
-    printf '\033[1;33mPublish %s — commit version files, push main, and push the tag? [y/N] \033[0m' \
+    printf '\033[1;33mPublish %s — commit version files, push the release branch, and push the tag? [y/N] \033[0m' \
         "$tag" >&2
     read -r reply || reply=n
     case "$reply" in
@@ -142,7 +159,7 @@ fi
 
 git add -- "$VERSION_FILE" "$CHANGELOG"
 git commit -m "Release $version"
-git push origin main
+git push origin "$release_branch"
 git tag -a "$tag" -m "SwiftSpice $version"
 log "pushing $tag"
 git push origin "$tag"

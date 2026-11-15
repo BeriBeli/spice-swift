@@ -91,6 +91,15 @@ final class SessionBenchmark {
         // resource measurements describe the same observation window.
         measurementStart = nil
         let diagnostics = await session.diagnosticsSnapshot()
+        // Export outside the measured window and after the diagnostic snapshot:
+        // this explicit CPU readback must not contaminate presentation metrics.
+        if let destination = configuration.snapshotURL {
+            do {
+                try writeBenchmarkSnapshot(latestSnapshot?.frame?.frame, to: destination)
+            } catch {
+                failure = SessionBenchmarkError.outputFailed.rawValue
+            }
+        }
         desktopTask.cancel()
         subscription.setDemand(.none)
         subscription.cancel()

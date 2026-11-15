@@ -190,6 +190,10 @@ struct DiagnosticReport: Encodable {
             "publisher_emit": Timing(snapshot.publisherEmitDuration),
             "ready_to_selection": Timing(snapshot.desktopReadyToDisplayLink),
             "view_to_commit": Timing(snapshot.viewUpdateToMetalCommit),
+            "drawable_preparation": Timing(snapshot.metalDrawablePreparation),
+            "drawable_acquisition": Timing(snapshot.metalDrawableAcquisition),
+            "drawable_to_commit": Timing(snapshot.metalDrawableToCommit),
+            "commit_call": Timing(snapshot.metalCommitCall),
             "commit_to_completion": Timing(snapshot.metalCommitToCompletion),
             "request_to_presented": Timing(snapshot.metalRequestToPresented),
         ]

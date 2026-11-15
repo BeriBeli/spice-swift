@@ -1,0 +1,174 @@
+{
+  "environment": {
+    "architecture": "arm64",
+    "date": "2026-11-13",
+    "thermal_power_conditions": "No system power, thermal, or refresh-rate settings changed. Other user applications remained open; no claim of a controlled idle laboratory.",
+    "swift": "Apple Swift version 6.4.2 (swiftlang-6.4.2.1.9 clang-2100.4.1.1)\nTarget: arm64-apple-macosx27.2.0",
+    "xcode": "Xcode 27.2\nBuild version 27B52",
+    "clang": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.2.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+    "cpu": "Apple M4 Pro"
+  },
+  "archive_sha256": "b19be7bdfab410faaceccc996114c2da1d61647b07731b6dc5c4a00857aff861",
+  "warmup_updates_per_case": 5,
+  "timed_updates_per_case": 30,
+  "cases": [
+    {
+      "composition": {
+        "maximumMilliseconds": 2.746959,
+        "p50Milliseconds": 0.530084,
+        "p95Milliseconds": 0.871459,
+        "samples": 30
+      },
+      "coverage": "full",
+      "directIOSurfaceWriteBytes": 0,
+      "gpuCopyBytesPerFrame": 0,
+      "height": 1080,
+      "maximumPixelError": 0,
+      "offscreenPresentation": [
+        {
+          "commitToCompletion": {
+            "maximumMilliseconds": 0.466542,
+            "p50Milliseconds": 0.270916,
+            "p95Milliseconds": 0.300208,
+            "samples": 30
+          },
+          "encoding": {
+            "maximumMilliseconds": 0.0115,
+            "p50Milliseconds": 0.005958,
+            "p95Milliseconds": 0.007667,
+            "samples": 30
+          },
+          "gpuExecution": {
+            "maximumMilliseconds": 0.16062500071711838,
+            "p50Milliseconds": 0.1253749942407012,
+            "p95Milliseconds": 0.130749998788815,
+            "samples": 30
+          },
+          "height": 1080,
+          "scale": 1,
+          "width": 1920
+        },
+        {
+          "commitToCompletion": {
+            "maximumMilliseconds": 3.190584,
+            "p50Milliseconds": 0.445958,
+            "p95Milliseconds": 1.277541,
+            "samples": 30
+          },
+          "encoding": {
+            "maximumMilliseconds": 0.037708,
+            "p50Milliseconds": 0.007958,
+            "p95Milliseconds": 0.034834,
+            "samples": 30
+          },
+          "gpuExecution": {
+            "maximumMilliseconds": 3.0134166663629003,
+            "p50Milliseconds": 0.2631250026752241,
+            "p95Milliseconds": 1.0487499966984615,
+            "samples": 30
+          },
+          "height": 1152,
+          "scale": 1.0666666666666667,
+          "width": 2048
+        },
+        {
+          "commitToCompletion": {
+            "maximumMilliseconds": 1.628417,
+            "p50Milliseconds": 0.500416,
+            "p95Milliseconds": 1.425833,
+            "samples": 30
+          },
+          "encoding": {
+            "maximumMilliseconds": 0.042375,
+            "p50Milliseconds": 0.010125,
+            "p95Milliseconds": 0.0415,
+            "samples": 30
+          },
+          "gpuExecution": {
+            "maximumMilliseconds": 1.2333333361311816,
+            "p50Milliseconds": 0.34666666033444926,
+            "p95Milliseconds": 1.1583750019781291,
+            "samples": 30
+          },
+          "height": 864,
+          "scale": 0.8,
+          "width": 1536
+        }
+      ],
+      "processCPUMillisecondsPerFrame": 0.20063333333333322,
+      "publication": {
+        "maximumMilliseconds": 0.001791,
+        "p50Milliseconds": 0.000625,
+        "p95Milliseconds": 0.0015,
+        "samples": 30
+      },
+      "width": 1920
+    },
+    {
+      "composition": {
+        "maximumMilliseconds": 1.419375,
+        "p50Milliseconds": 0.56925,
+        "p95Milliseconds": 0.8415,
+        "samples": 30
+      },
+      "coverage": "64x64",
+      "directIOSurfaceWriteBytes": 0,
+      "gpuCopyBytesPerFrame": 8294400,
+      "height": 1080,
+      "maximumPixelError": 0,
+      "offscreenPresentation": [],
+      "processCPUMillisecondsPerFrame": 0.31523333333333314,
+      "publication": {
+        "maximumMilliseconds": 0.006416,
+        "p50Milliseconds": 0.000459,
+        "p95Milliseconds": 0.000917,
+        "samples": 30
+      },
+      "width": 1920
+    },
+    {
+      "composition": {
+        "maximumMilliseconds": 3.744208,
+        "p50Milliseconds": 0.780375,
+        "p95Milliseconds": 1.531459,
+        "samples": 30
+      },
+      "coverage": "full",
+      "directIOSurfaceWriteBytes": 0,
+      "gpuCopyBytesPerFrame": 0,
+      "height": 2160,
+      "maximumPixelError": 0,
+      "offscreenPresentation": [],
+      "processCPUMillisecondsPerFrame": 0.4345666666666673,
+      "publication": {
+        "maximumMilliseconds": 0.001666,
+        "p50Milliseconds": 0.000459,
+        "p95Milliseconds": 0.001625,
+        "samples": 30
+      },
+      "width": 3840
+    },
+    {
+      "composition": {
+        "maximumMilliseconds": 3.140959,
+        "p50Milliseconds": 1.338375,
+        "p95Milliseconds": 1.975292,
+        "samples": 30
+      },
+      "coverage": "64x64",
+      "directIOSurfaceWriteBytes": 0,
+      "gpuCopyBytesPerFrame": 33177600,
+      "height": 2160,
+      "maximumPixelError": 0,
+      "offscreenPresentation": [],
+      "processCPUMillisecondsPerFrame": 0.8719666666666643,
+      "publication": {
+        "maximumMilliseconds": 0.000834,
+        "p50Milliseconds": 0.0005,
+        "p95Milliseconds": 0.000667,
+        "samples": 30
+      },
+      "width": 3840
+    }
+  ]
+}

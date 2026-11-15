@@ -27,6 +27,23 @@ import SpiceChannels
 /// `maximumSurfaceBytes` is its configured limit rather than a peak value.
 public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var displayChannelCount: Int = 0
+    /// Display-channel transport read bytes after authentication, including
+    /// SPICE headers and read-ahead; excludes TLS/TCP overhead. Other Display
+    /// counters count decoded peer messages before successful execution.
+    public internal(set) var displayReceivedBytes: UInt64 = 0
+    public internal(set) var displayMessages: UInt64 = 0
+    public internal(set) var displayCopyBitsMessages: UInt64 = 0
+    public internal(set) var displayBitmapImages: UInt64 = 0
+    public internal(set) var displayQUICImages: UInt64 = 0
+    public internal(set) var displayJPEGImages: UInt64 = 0
+    public internal(set) var displayLZImages: UInt64 = 0
+    public internal(set) var displayCachedImages: UInt64 = 0
+    public internal(set) var displaySurfaceImages: UInt64 = 0
+    public internal(set) var displayStreamCreateMessages: UInt64 = 0
+    public internal(set) var displayMJPEGStreamRequests: UInt64 = 0
+    public internal(set) var displayH264StreamRequests: UInt64 = 0
+    public internal(set) var displayH265StreamRequests: UInt64 = 0
+    public internal(set) var displayStreamDataMessages: UInt64 = 0
     public internal(set) var damageOperations: UInt64 = 0
     public internal(set) var damageBytes: UInt64 = 0
     public internal(set) var snapshots: UInt64 = 0
@@ -42,9 +59,17 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var revisionedAllocatedBytes: Int = 0
     public internal(set) var totalIOSurfaceAllocatedBytes: Int = 0
     public internal(set) var gpuCopyBytes: UInt64 = 0
+    /// Distinct canonical-slot synchronization attempts and elapsed wait.
+    /// Includes failed attempts, GPU queue/completion and actor resumption.
+    public internal(set) var gpuCopySynchronizationCount: UInt64 = 0
+    public internal(set) var gpuCopySynchronizationNanoseconds: UInt64 = 0
     public internal(set) var gpuErrors: UInt64 = 0
     public internal(set) var nativeVideoFrames: UInt64 = 0
     public internal(set) var nativeVideoFallbacks: UInt64 = 0
+    /// Native batch checkout pressure and successful recovery after a bounded
+    /// wait for a consumer lease. Counts batches, not affected fragments.
+    public internal(set) var nativeVideoPoolWaits: UInt64 = 0
+    public internal(set) var nativeVideoPoolRecoveries: UInt64 = 0
     public internal(set) var recommendedMaximumWorkingSetSize: UInt64 = 0
     public internal(set) var currentMetalAllocatedSize: UInt64 = 0
     public internal(set) var publisherSubmissions: UInt64 = 0
@@ -90,6 +115,10 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var mjpegPeakBuffersInUse: Int = 0
     public internal(set) var mjpegPeakConcurrentDecodes: Int = 0
     public internal(set) var mjpegFramesSupersededBeforeDecode: UInt64 = 0
+    /// Frames discarded before decoding because an active playback clock was late.
+    public internal(set) var mjpegFramesLateBeforeDecode: UInt64 = 0
+    /// Session maximum for those discarded frames; this is not an end-to-end latency.
+    public internal(set) var mjpegMaximumLatenessMilliseconds: UInt32 = 0
     public internal(set) var advancedCPUFallbackFrames: UInt64 = 0
     public internal(set) var metalGenerationDisableCount: UInt64 = 0
     public internal(set) var firstMetalGenerationDisableReason: String?
@@ -120,6 +149,10 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
     public internal(set) var desktopImmediateSelections: UInt64 = 0
     package var desktopReadyToDisplayLinkHistogram = SpiceTimingHistogram()
     package var viewUpdateToMetalCommitHistogram = SpiceTimingHistogram()
+    package var metalDrawablePreparationHistogram = SpiceTimingHistogram()
+    package var metalDrawableAcquisitionHistogram = SpiceTimingHistogram()
+    package var metalDrawableToCommitHistogram = SpiceTimingHistogram()
+    package var metalCommitCallHistogram = SpiceTimingHistogram()
     package var metalCommitToCompletionHistogram = SpiceTimingHistogram()
     package var metalRequestToPresentedHistogram = SpiceTimingHistogram()
 
@@ -166,6 +199,27 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         viewUpdateToMetalCommitHistogram.summary
     }
 
+    /// Selection through frame preparation, before requesting the drawable.
+    public var metalDrawablePreparation: SpiceTimingSummary {
+        metalDrawablePreparationHistogram.summary
+    }
+
+    /// Synchronous MTKView.currentDrawable acquisition, including nil results.
+    public var metalDrawableAcquisition: SpiceTimingSummary {
+        metalDrawableAcquisitionHistogram.summary
+    }
+
+    /// Encoding and presentation scheduling after acquisition, before commit.
+    public var metalDrawableToCommit: SpiceTimingSummary {
+        metalDrawableToCommitHistogram.summary
+    }
+
+    /// Synchronous commit submission, including timestamp publication before
+    /// MTLCommandBuffer.commit(). This is separate from GPU execution.
+    public var metalCommitCall: SpiceTimingSummary {
+        metalCommitCallHistogram.summary
+    }
+
     /// Time from the ready timestamp of the latest accepted desktop revision
     /// that is actually selected until the AppKit presentation scheduler makes
     /// that selection. This is not the first update in its coalescing window;
@@ -188,6 +242,20 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
         let video = diagnostics.advancedVideo
 
         displayChannelCount += 1
+        displayReceivedBytes &+= diagnostics.traffic.receivedBytes
+        displayMessages &+= diagnostics.traffic.messages
+        displayCopyBitsMessages &+= diagnostics.traffic.copyBitsMessages
+        displayBitmapImages &+= diagnostics.traffic.bitmapImages
+        displayQUICImages &+= diagnostics.traffic.quicImages
+        displayJPEGImages &+= diagnostics.traffic.jpegImages
+        displayLZImages &+= diagnostics.traffic.lzImages
+        displayCachedImages &+= diagnostics.traffic.cachedImages
+        displaySurfaceImages &+= diagnostics.traffic.surfaceImages
+        displayStreamCreateMessages &+= diagnostics.traffic.streamCreateMessages
+        displayMJPEGStreamRequests &+= diagnostics.traffic.mjpegStreamRequests
+        displayH264StreamRequests &+= diagnostics.traffic.h264StreamRequests
+        displayH265StreamRequests &+= diagnostics.traffic.h265StreamRequests
+        displayStreamDataMessages &+= diagnostics.traffic.streamDataMessages
         damageOperations &+= surface.damageOperations
         damageBytes &+= surface.damageBytes
         snapshots &+= surface.snapshots
@@ -208,9 +276,13 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
             surface.revisionedAllocatedBytes
         )
         gpuCopyBytes &+= surface.gpuCopyBytes
+        gpuCopySynchronizationCount &+= surface.gpuCopySynchronizationCount
+        gpuCopySynchronizationNanoseconds &+= surface.gpuCopySynchronizationNanoseconds
         gpuErrors &+= surface.gpuErrors
         nativeVideoFrames &+= surface.nativeVideoFrames
         nativeVideoFallbacks &+= surface.nativeVideoFallbacks
+        nativeVideoPoolWaits &+= surface.nativeVideoPoolWaits
+        nativeVideoPoolRecoveries &+= surface.nativeVideoPoolRecoveries
         recommendedMaximumWorkingSetSize = max(
             recommendedMaximumWorkingSetSize,
             surface.recommendedMaximumWorkingSetSize
@@ -271,6 +343,10 @@ public struct SpiceSessionDiagnostics: Sendable, Equatable {
             diagnostics.mjpeg.peakConcurrentDecodes
         )
         mjpegFramesSupersededBeforeDecode &+= diagnostics.mjpeg.supersededBeforeDecode
+        mjpegFramesLateBeforeDecode &+= diagnostics.mjpeg.lateBeforeDecode
+        mjpegMaximumLatenessMilliseconds = max(
+            mjpegMaximumLatenessMilliseconds, diagnostics.mjpeg.maximumLatenessMilliseconds
+        )
         advancedCPUFallbackFrames &+= diagnostics.advancedCPUFallbackFrames
         metalGenerationDisableCount &+= diagnostics.metalGenerationDisableCount
         if firstMetalGenerationDisableReason == nil {

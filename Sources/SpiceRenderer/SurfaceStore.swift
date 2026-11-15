@@ -68,15 +68,15 @@ package struct SurfaceRevision: Sendable, Hashable {
 
 /// Identifies the latest non-video mutation applied to a surface. Stream frames
 /// may advance the public revision without invalidating later frames from the
-/// same wire-ordered stream, while any subsequent draw/copy command changes
-/// this barrier and makes an older asynchronous decode stale.
+/// same wire-ordered stream. A later overlapping draw/copy command makes an
+/// older asynchronous decode stale; disjoint writes remain independent.
 package struct SurfaceMutationBarrier: Sendable, Hashable {
     package let surfaceID: UInt32
     package let lifecycleGeneration: UInt64
     package let generation: UInt64
 }
 
-/// Surface-wide wire order shared by every video stream targeting the surface.
+/// Surface-wide wire order, compared only against overlapping committed video.
 package struct SurfaceVideoSequence: Sendable, Hashable {
     package let surfaceID: UInt32
     package let lifecycleGeneration: UInt64
@@ -137,12 +137,16 @@ package struct SurfaceStoreMetrics: Sendable, Equatable {
     package let revisionedAllocatedFrames: Int
     package let revisionedAllocatedBytes: Int
     package let gpuCopyBytes: UInt64
+    package let gpuCopySynchronizationCount: UInt64
+    package let gpuCopySynchronizationNanoseconds: UInt64
     package let gpuErrors: UInt64
     package let compositorErrors: UInt64
     package let recommendedMaximumWorkingSetSize: UInt64
     package let currentMetalAllocatedSize: UInt64
     package let nativeVideoFrames: UInt64
     package let nativeVideoFallbacks: UInt64
+    package let nativeVideoPoolWaits: UInt64
+    package let nativeVideoPoolRecoveries: UInt64
 }
 
 package typealias SurfaceOperationWaiterObserver = @Sendable (
@@ -558,6 +562,36 @@ extension SurfaceVideoCompositionError: CustomStringConvertible {
     }
 }
 
+/// An already-decoded native draw; the frame owns its decoder lease until the
+/// bounded GPU transaction completes. Wire/desktop guards remain per member.
+package struct SurfaceNativeVideoDraw: Sendable {
+    package let destination: PixelRect
+    package let frame: any SpiceDecodedVideoFrame
+    package let source: PixelRect
+    package let topDown: Bool
+    package let clippedDestinations: [PixelRect]
+    package let isAdvancedVideo: Bool
+    package let expectedMutationBarrier: SurfaceMutationBarrier?
+    package let videoSequence: SurfaceVideoSequence?
+
+    package init(
+        destination: PixelRect, frame: any SpiceDecodedVideoFrame,
+        source: PixelRect, topDown: Bool, clippedDestinations: [PixelRect],
+        isAdvancedVideo: Bool = false,
+        expectedMutationBarrier: SurfaceMutationBarrier? = nil,
+        videoSequence: SurfaceVideoSequence? = nil
+    ) {
+        self.destination = destination
+        self.frame = frame
+        self.source = source
+        self.topDown = topDown
+        self.clippedDestinations = clippedDestinations
+        self.isAdvancedVideo = isAdvancedVideo
+        self.expectedMutationBarrier = expectedMutationBarrier
+        self.videoSequence = videoSequence
+    }
+}
+
 package actor SurfaceStore {
     private enum SurfaceOperationWaitOutcome: Sendable {
         case acquired
@@ -620,7 +654,8 @@ package actor SurfaceStore {
         let memoryLease: SurfaceMemoryLease
         var revision: UInt64
         var mutationGeneration: UInt64
-        var latestVideoSequence: UInt64
+        var videoWrites = SurfaceWriteHistory()
+        var desktopWrites = SurfaceWriteHistory()
         var latestAdvancedVideoRevision: UInt64?
         var storage: SurfaceStorage
 
@@ -671,8 +706,12 @@ package actor SurfaceStore {
     private var poolExhaustions: UInt64 = 0
     private var nativeVideoFrames: UInt64 = 0
     private var nativeVideoFallbacks: UInt64 = 0
+    private var nativeVideoPoolWaits: UInt64 = 0
+    private var nativeVideoPoolRecoveries: UInt64 = 0
     private var compositorErrors: UInt64 = 0
     private var gpuCopyBytes: UInt64 = 0
+    private var gpuCopySynchronizationCount: UInt64 = 0
+    private var gpuCopySynchronizationNanoseconds: UInt64 = 0
     private var revisionedGPUErrors: UInt64 = 0
     private var activeSurfaceOperations: Set<UInt32> = []
     private var surfaceOperationWaiters: [UInt32: [UInt64]] = [:]
@@ -766,7 +805,6 @@ package actor SurfaceStore {
             memoryLease: memoryLease,
             revision: 0,
             mutationGeneration: 0,
-            latestVideoSequence: 0,
             latestAdvancedVideoRevision: nil,
             storage: SurfaceStorage(
                 pixels: Data(repeating: 0, count: byteCount),
@@ -872,6 +910,7 @@ package actor SurfaceStore {
         try prepareForMutation(&surface)
         surface.revision = nextRevision
         surface.mutationGeneration = nextMutationGeneration
+        surface.desktopWrites.record(version: nextMutationGeneration, rectangles: [rectangle])
         fillPixels(in: &surface, rectangle: rectangle, colorBGRA: colorBGRA)
         surface.storage.recordDamage(rectangle, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
@@ -947,6 +986,7 @@ package actor SurfaceStore {
         )
         surface.revision = nextRevision
         surface.mutationGeneration = nextMutationGeneration
+        surface.desktopWrites.record(version: nextMutationGeneration, rectangles: [destination])
         surface.storage.recordDamage(destination, revision: surface.revision)
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = surface
@@ -1056,6 +1096,7 @@ package actor SurfaceStore {
         {
             surface.revision = nextRevision
             surface.mutationGeneration = nextMutationGeneration
+            surface.desktopWrites.record(version: nextMutationGeneration, rectangles: [fullSurface])
             unified.current = committed
             unified.damageJournal.clear()
             unified.damageHistory.reset(at: nextRevision)
@@ -1071,6 +1112,7 @@ package actor SurfaceStore {
         try prepareForMutation(&surface)
         surface.revision = nextRevision
         surface.mutationGeneration = nextMutationGeneration
+        surface.desktopWrites.record(version: nextMutationGeneration, rectangles: [destination])
         surface.pixels.withUnsafeMutableBytes { destinationBytes in
             guard let destinationBase = destinationBytes.baseAddress else { return }
             copyRawBitmap(
@@ -1179,6 +1221,9 @@ package actor SurfaceStore {
         )
         destinationSurface.revision = nextRevision
         destinationSurface.mutationGeneration = nextMutationGeneration
+        destinationSurface.desktopWrites.record(
+            version: nextMutationGeneration, rectangles: [destination]
+        )
         destinationSurface.storage.recordDamage(
             destination,
             revision: destinationSurface.revision
@@ -1397,6 +1442,9 @@ package actor SurfaceStore {
             {
                 surface.revision = nextRevision
                 surface.mutationGeneration = nextMutationGeneration
+                surface.desktopWrites.record(
+                    version: nextMutationGeneration, rectangles: [fullSurface]
+                )
                 unified.current = committed
                 unified.damageJournal.clear()
                 unified.damageHistory.reset(at: nextRevision)
@@ -1554,14 +1602,6 @@ package actor SurfaceStore {
         try await acquireSurfaceOperation(surfaceID: surfaceID)
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         var surface = try surface(id: surfaceID)
-        if let expectedMutationBarrier,
-           mutationBarrier(of: surface) != expectedMutationBarrier
-        {
-            return nil
-        }
-        if let videoSequence, !canCommit(videoSequence, to: surface) {
-            return nil
-        }
         try validate(destination, in: surface)
         guard source.x >= 0, source.y >= 0,
               source.width > 0, source.height > 0,
@@ -1606,11 +1646,16 @@ package actor SurfaceStore {
             return nil
         }
 
+        guard canCommitVideo(
+            to: surface, rectangles: clippedDestinations,
+            mutationBarrier: expectedMutationBarrier, sequence: videoSequence
+        ) else { return nil }
+
         let nextRevision = try advancedRevision(surface.revision)
         try prepareForMutation(&surface)
         surface.revision = nextRevision
         if let videoSequence {
-            surface.latestVideoSequence = videoSequence.value
+            surface.videoWrites.record(version: videoSequence.value, rectangles: clippedDestinations)
         }
         let destinationBytesPerRow = surface.bytesPerRow
         let preservesAlpha = surface.format == .argb8888 && bitmap.format == .argb8888
@@ -1656,9 +1701,10 @@ package actor SurfaceStore {
         return surfaceRevision(of: surface)
     }
 
-    /// Transactionally composites an opaque decoder frame into a writable
-    /// IOSurface candidate. The candidate becomes canonical only after every
-    /// Metal command has completed successfully.
+    package static let maximumNativeVideoBatchSize = 8
+
+    /// Transactionally composes one frame. The batch entry point preserves the
+    /// same validation and immutable-candidate contract for already-ready work.
     @discardableResult
     package func drawNativeVideoFrame(
         surfaceID: UInt32,
@@ -1671,209 +1717,237 @@ package actor SurfaceStore {
         expectedMutationBarrier: SurfaceMutationBarrier? = nil,
         videoSequence: SurfaceVideoSequence? = nil
     ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
-        guard let compositor = metalCompositor else {
-            throw videoFallback(metalCompositorInitializationError ?? .unsupportedDevice)
+        let results = await drawNativeVideoFrames(surfaceID: surfaceID, draws: [
+            SurfaceNativeVideoDraw(
+                destination: destination, frame: frame, source: source,
+                topDown: topDown, clippedDestinations: clippedDestinations,
+                isAdvancedVideo: isAdvancedVideo,
+                expectedMutationBarrier: expectedMutationBarrier, videoSequence: videoSequence
+            )
+        ])
+        return try results[0].get()
+    }
+
+    /// A bounded ordered transaction shares one candidate, catch-up and GPU
+    /// completion. Stale/invalid members are rejected individually before encode.
+    /// An encoding/GPU failure aborts every accepted member without publication.
+    package func drawNativeVideoFrames(
+        surfaceID: UInt32,
+        draws: [SurfaceNativeVideoDraw]
+    ) async -> [Result<SurfaceRevision?, SurfaceVideoCompositionError>] {
+        guard !draws.isEmpty else { return [] }
+        guard draws.count <= Self.maximumNativeVideoBatchSize else {
+            return draws.map { _ in .failure(.render(.invalidRectangle)) }
         }
         do {
             try await acquireSurfaceOperation(surfaceID: surfaceID)
-        } catch let error {
-            throw .render(error)
+        } catch {
+            return draws.map { _ in .failure(.render(error)) }
         }
         defer { releaseSurfaceOperation(surfaceID: surfaceID) }
         guard let surface = surfaces[surfaceID] else {
-            throw .staleSurface
+            return draws.map { _ in .failure(.staleSurface) }
         }
-        if let expectedMutationBarrier,
-           mutationBarrier(of: surface) != expectedMutationBarrier
-        {
-            throw .staleSurface
-        }
-        if let videoSequence, !canCommit(videoSequence, to: surface) {
-            throw .staleSurface
-        }
-        do {
-            try validate(destination, in: surface)
-            let (sourceRight, sourceRightOverflow) = source.x.addingReportingOverflow(
-                source.width
-            )
-            let (sourceBottom, sourceBottomOverflow) = source.y.addingReportingOverflow(
-                source.height
-            )
-            guard source.x >= 0, source.y >= 0,
-                  source.width > 0, source.height > 0,
-                  !sourceRightOverflow, !sourceBottomOverflow,
-                  sourceRight <= frame.width,
-                  sourceBottom <= frame.height
-            else {
-                throw RenderError.invalidBitmap
+        guard let compositor = metalCompositor else {
+            return draws.map { _ in
+                .failure(videoFallback(metalCompositorInitializationError ?? .unsupportedDevice))
             }
-            let destinationRight = destination.x + destination.width
-            let destinationBottom = destination.y + destination.height
-            for clipped in clippedDestinations {
-                try validate(clipped, in: surface)
-                let clippedRight = clipped.x + clipped.width
-                let clippedBottom = clipped.y + clipped.height
-                guard clipped.x >= destination.x,
-                      clipped.y >= destination.y,
-                      clippedRight <= destinationRight,
-                      clippedBottom <= destinationBottom
-                else {
-                    throw RenderError.invalidRectangle
-                }
-            }
-        } catch let error as RenderError {
-            throw .render(error)
-        } catch {
-            throw .render(.invalidRectangle)
-        }
-        guard !clippedDestinations.isEmpty else {
-            return nil
-        }
-        guard let unified = surface.storage.unifiedBacking else {
-            throw videoFallback(.unsupportedDevice)
-        }
-        let requested = surfaceRevision(of: surface)
-        guard let writable = unified.pool.checkoutWritable(
-            namespace: unified.namespace,
-            surfaceID: surfaceID,
-            width: surface.width,
-            height: surface.height,
-            source: unified.current
-        ) else {
-            poolExhaustions &+= 1
-            throw videoFallback(
-                .invalidDestination("revisioned IOSurface pool is exhausted")
-            )
         }
 
-        let fullSurface = PixelRect(
-            x: 0,
-            y: 0,
-            width: surface.width,
-            height: surface.height
+        var results = [Result<SurfaceRevision?, SurfaceVideoCompositionError>](
+            repeating: .success(nil), count: draws.count
         )
-        let overwritesFullSurface = destination == fullSurface
-            && clippedDestinations == [fullSurface]
-        var uploadedBytes: UInt64 = 0
-        if !overwritesFullSurface {
-            let synchronizesRevision = unified.current != nil
-            guard await writable.synchronizeFromSource() else {
-                revisionedGPUErrors &+= 1
-                nativeVideoFallbacks &+= 1
-                throw .compositor(
-                    .commandExecutionFailed("candidate revision synchronization failed")
+        var accepted: [Int] = []
+        var validatedSurface = surface
+        for (index, draw) in draws.enumerated() {
+            do {
+                try validateNativeVideo(draw, in: surface)
+            } catch {
+                results[index] = .failure(.render(error))
+                continue
+            }
+            guard !draw.clippedDestinations.isEmpty else { continue }
+            guard canCommitVideo(
+                to: validatedSurface, rectangles: draw.clippedDestinations,
+                mutationBarrier: draw.expectedMutationBarrier, sequence: draw.videoSequence
+            ) else {
+                results[index] = .failure(.staleSurface)
+                continue
+            }
+            accepted.append(index)
+            if let sequence = draw.videoSequence {
+                validatedSurface.videoWrites.record(
+                    version: sequence.value, rectangles: draw.clippedDestinations
                 )
             }
-            if synchronizesRevision {
-                gpuCopyBytes &+= UInt64(surface.width * surface.height * 4)
-            }
-            guard isCurrent(requested) else {
-                throw .staleSurface
-            }
+        }
+        guard let firstIndex = accepted.first else { return results }
 
+        func failed(_ error: SurfaceVideoCompositionError)
+            -> [Result<SurfaceRevision?, SurfaceVideoCompositionError>] {
+            var failedResults = results
+            for index in accepted { failedResults[index] = .failure(error) }
+            return failedResults
+        }
+        func fallback(_ error: SpiceMetalCompositorError)
+            -> [Result<SurfaceRevision?, SurfaceVideoCompositionError>] {
+            nativeVideoFallbacks &+= UInt64(accepted.count - 1)
+            return failed(videoFallback(error))
+        }
+        guard let unified = surface.storage.unifiedBacking else {
+            return fallback(.unsupportedDevice)
+        }
+        let requested = surfaceRevision(of: surface)
+        var candidate = unified.pool.checkoutWritable(
+            namespace: unified.namespace, surfaceID: surfaceID,
+            width: surface.width, height: surface.height, source: unified.current
+        )
+        if candidate == nil {
+            nativeVideoPoolWaits &+= 1
+            let available = await unified.pool.waitForReusableSlot(
+                namespace: unified.namespace, surfaceID: surfaceID,
+                width: surface.width, height: surface.height, excluding: unified.current,
+                until: ContinuousClock.now.advanced(by: .milliseconds(16))
+            )
+            guard !Task.isCancelled, isCurrent(requested) else { return failed(.staleSurface) }
+            if available {
+                candidate = unified.pool.checkoutWritable(
+                    namespace: unified.namespace, surfaceID: surfaceID,
+                    width: surface.width, height: surface.height, source: unified.current
+                )
+                if candidate != nil { nativeVideoPoolRecoveries &+= 1 }
+            }
+        }
+        guard let writable = candidate else {
+            poolExhaustions &+= 1
+            return fallback(.invalidDestination("revisioned IOSurface pool is exhausted"))
+        }
+        let fullSurface = PixelRect(x: 0, y: 0, width: surface.width, height: surface.height)
+        let firstDraw = draws[firstIndex]
+        let overwritesFullSurface = firstDraw.destination == fullSurface
+            && firstDraw.clippedDestinations == [fullSurface]
+        var uploadedBytes: UInt64 = 0
+        if !overwritesFullSurface {
+            let catchUp = unified.damageHistory.catchUpJournal(
+                from: writable.destinationRevision,
+                pending: SurfaceDamageJournal(width: surface.width, height: surface.height)
+            )
+            let copyRectangles = catchUp.copyRectangles.map {
+                IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+            }
+            guard await synchronizeRevision(
+                writable, rectangles: catchUp.isFullFrame ? nil : copyRectangles
+            ) else {
+                revisionedGPUErrors &+= 1
+                nativeVideoFallbacks &+= UInt64(accepted.count)
+                return failed(.compositor(
+                    .commandExecutionFailed("candidate revision synchronization failed")
+                ))
+            }
+            if unified.current != nil {
+                gpuCopyBytes &+= copyRectangles.reduce(UInt64(0)) {
+                    $0 + UInt64($1.width * $1.height * 4)
+                }
+            }
+            guard isCurrent(requested) else { return failed(.staleSurface) }
             if !unified.damageJournal.isEmpty {
                 let rectangles = unified.damageJournal.copyRectangles.map {
                     IOSurfaceCopyRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
                 }
                 guard let copiedBytes = writable.copyPackedPixels(
-                    surface.pixels,
-                    sourceBytesPerRow: surface.bytesPerRow,
+                    surface.pixels, sourceBytesPerRow: surface.bytesPerRow,
                     rectangles: rectangles
-                ) else {
-                    throw videoFallback(.destinationTextureMappingFailed)
-                }
+                ) else { return fallback(.destinationTextureMappingFailed) }
                 uploadedBytes = copiedBytes
             }
         }
-
-        let destinationSurface = writable.withIOSurface { $0 }
-        let metalSource = SpiceMetalVideoRectangle(
-            x: source.x,
-            y: source.y,
-            width: source.width,
-            height: source.height
-        )
-        let metalDestination = SpiceMetalVideoRectangle(
-            x: destination.x,
-            y: destination.y,
-            width: destination.width,
-            height: destination.height
-        )
+        let metalDraws = accepted.map { index in
+            let draw = draws[index]
+            return SpiceMetalVideoDraw(
+                frame: draw.frame,
+                sourceRect: SpiceMetalVideoRectangle(
+                    x: draw.source.x, y: draw.source.y,
+                    width: draw.source.width, height: draw.source.height
+                ),
+                orientation: draw.topDown ? .topDown : .bottomUp,
+                destinationRect: SpiceMetalVideoRectangle(
+                    x: draw.destination.x, y: draw.destination.y,
+                    width: draw.destination.width, height: draw.destination.height
+                ),
+                clips: draw.clippedDestinations.map {
+                    SpiceMetalVideoRectangle(x: $0.x, y: $0.y, width: $0.width, height: $0.height)
+                }
+            )
+        }
         do {
             compositorAttempt &+= 1
             if let injectedError = compositorFailureForAttempt(compositorAttempt) {
-                throw videoFallback(injectedError)
+                return fallback(injectedError)
             }
             try await compositor.composite(
-                frame: frame,
-                sourceRect: metalSource,
-                orientation: topDown ? .topDown : .bottomUp,
-                into: destinationSurface,
-                destinationRect: metalDestination,
-                clips: clippedDestinations.map { clipped in
-                    SpiceMetalVideoRectangle(
-                        x: clipped.x,
-                        y: clipped.y,
-                        width: clipped.width,
-                        height: clipped.height
-                    )
-                }
+                draws: metalDraws, into: writable.withIOSurface { $0 }
             )
-            guard isCurrent(requested) else {
-                throw SurfaceVideoCompositionError.staleSurface
-            }
-        } catch let error as SurfaceVideoCompositionError {
-            throw error
-        } catch let error as SpiceMetalCompositorError {
-            throw videoFallback(error)
         } catch {
-            throw videoFallback(.commandExecutionFailed(String(describing: error)))
+            return fallback(error)
         }
-
         let nextRevision: UInt64
-        do {
-            nextRevision = try advancedRevision(surface.revision)
-        } catch {
-            throw .render(error)
-        }
+        do { nextRevision = try advancedRevision(surface.revision) }
+        catch { return failed(.render(error)) }
         guard isCurrent(requested),
               let committedRevision = writable.finish(revision: nextRevision),
               var liveSurface = surfaces[surfaceID],
               liveSurface.lifecycleGeneration == surface.lifecycleGeneration,
               liveSurface.revision == surface.revision,
               var liveUnified = liveSurface.storage.unifiedBacking
-        else {
-            throw .staleSurface
-        }
+        else { return failed(.staleSurface) }
 
         liveSurface.revision = nextRevision
-        if let videoSequence {
-            liveSurface.latestVideoSequence = videoSequence.value
-        }
-        if isAdvancedVideo {
+        liveSurface.videoWrites = validatedSurface.videoWrites
+        if accepted.contains(where: { draws[$0].isAdvancedVideo }) {
             liveSurface.latestAdvancedVideoRevision = nextRevision
         }
         liveUnified.current = committedRevision
-        liveUnified.damageJournal.clear()
-        liveUnified.damageHistory.reset(at: nextRevision)
-        liveSurface.storage.unifiedBacking = liveUnified
-        for clipped in clippedDestinations {
-            liveSurface.storage.recordPublicationDamage(clipped)
+        var committedDamage = unified.damageJournal
+        for index in accepted {
+            for clipped in draws[index].clippedDestinations {
+                committedDamage.append(clipped)
+                liveSurface.storage.recordPublicationDamage(clipped)
+                recordDamage(clipped)
+            }
         }
+        liveUnified.damageHistory.commit(committedDamage, revision: nextRevision)
+        liveUnified.damageJournal.clear()
+        liveSurface.storage.unifiedBacking = liveUnified
         currentFramePixelStorage[surfaceID] = nil
         surfaces[surfaceID] = liveSurface
         if uploadedBytes > 0 {
-            if unified.damageJournal.isFullFrame {
-                fullFrameCopyBytes &+= uploadedBytes
-            } else {
-                partialFrameCopyBytes &+= uploadedBytes
-            }
+            if unified.damageJournal.isFullFrame { fullFrameCopyBytes &+= uploadedBytes }
+            else { partialFrameCopyBytes &+= uploadedBytes }
         }
-        for clipped in clippedDestinations {
-            recordDamage(clipped)
+        nativeVideoFrames &+= UInt64(accepted.count)
+        let committed = surfaceRevision(of: liveSurface)
+        for index in accepted { results[index] = .success(committed) }
+        return results
+    }
+
+    private func validateNativeVideo(
+        _ draw: SurfaceNativeVideoDraw, in surface: Surface
+    ) throws(RenderError) {
+        try validate(draw.destination, in: surface)
+        let (right, rightOverflow) = draw.source.x.addingReportingOverflow(draw.source.width)
+        let (bottom, bottomOverflow) = draw.source.y.addingReportingOverflow(draw.source.height)
+        guard draw.source.x >= 0, draw.source.y >= 0,
+              draw.source.width > 0, draw.source.height > 0,
+              !rightOverflow, !bottomOverflow,
+              right <= draw.frame.width, bottom <= draw.frame.height
+        else { throw .invalidBitmap }
+        for clipped in draw.clippedDestinations {
+            try validate(clipped, in: surface)
+            guard clipped.x >= draw.destination.x, clipped.y >= draw.destination.y,
+                  clipped.x + clipped.width <= draw.destination.x + draw.destination.width,
+                  clipped.y + clipped.height <= draw.destination.y + draw.destination.height
+            else { throw .invalidRectangle }
         }
-        nativeVideoFrames &+= 1
-        return surfaceRevision(of: liveSurface)
     }
 
     package func snapshot(surfaceID: UInt32) async throws(RenderError) -> FrameSnapshot {
@@ -2016,6 +2090,27 @@ package actor SurfaceStore {
         )
     }
 
+    /// Elapsed wait for copies between distinct canonical revision slots.
+    /// Includes GPU queue/completion and actor resumption, not just GPU execution.
+    /// In-place/no-source synchronization is excluded. Failed attempts count.
+    private func synchronizeRevision(
+        _ writable: RevisionedIOSurfaceWritableFrame,
+        rectangles: [IOSurfaceCopyRectangle]? = nil
+    ) async -> Bool {
+        guard writable.requiresSourceSynchronization, rectangles?.isEmpty != true else {
+            return await writable.synchronizeFromSource(rectangles: rectangles)
+        }
+        let clock = ContinuousClock()
+        let start = clock.now
+        let succeeded = await writable.synchronizeFromSource(rectangles: rectangles)
+        let duration = start.duration(to: clock.now).components
+        let nanoseconds = UInt64(duration.seconds) * 1_000_000_000
+            + UInt64(duration.attoseconds / 1_000_000_000)
+        Self.saturatingAdd(1, to: &gpuCopySynchronizationCount)
+        Self.saturatingAdd(nanoseconds, to: &gpuCopySynchronizationNanoseconds)
+        return succeeded
+    }
+
     package func metrics() -> SurfaceStoreMetrics {
         let materializations = materializationMetrics.snapshot()
         let poolMetrics = framePool.metrics()
@@ -2041,13 +2136,17 @@ package actor SurfaceStore {
             revisionedAllocatedFrames: revisionedMetrics?.allocatedFrames ?? 0,
             revisionedAllocatedBytes: revisionedMetrics?.allocatedBytes ?? 0,
             gpuCopyBytes: gpuCopyBytes,
+            gpuCopySynchronizationCount: gpuCopySynchronizationCount,
+            gpuCopySynchronizationNanoseconds: gpuCopySynchronizationNanoseconds,
             gpuErrors: revisionedGPUErrors &+ compositorErrors,
             compositorErrors: compositorErrors,
             recommendedMaximumWorkingSetSize:
                 revisionedMetrics?.recommendedMaximumWorkingSetSize ?? 0,
             currentMetalAllocatedSize: revisionedMetrics?.currentMetalAllocatedSize ?? 0,
             nativeVideoFrames: nativeVideoFrames,
-            nativeVideoFallbacks: nativeVideoFallbacks
+            nativeVideoFallbacks: nativeVideoFallbacks,
+            nativeVideoPoolWaits: nativeVideoPoolWaits,
+            nativeVideoPoolRecoveries: nativeVideoPoolRecoveries
         )
     }
 
@@ -2335,18 +2434,27 @@ package actor SurfaceStore {
         )
     }
 
-    private func mutationBarrier(of surface: Surface) -> SurfaceMutationBarrier {
-        SurfaceMutationBarrier(
-            surfaceID: surface.id,
-            lifecycleGeneration: surface.lifecycleGeneration,
-            generation: surface.mutationGeneration
-        )
-    }
-
-    private func canCommit(_ sequence: SurfaceVideoSequence, to surface: Surface) -> Bool {
-        sequence.surfaceID == surface.id
-            && sequence.lifecycleGeneration == surface.lifecycleGeneration
-            && sequence.value > surface.latestVideoSequence
+    private func canCommitVideo(
+        to surface: Surface, rectangles: [PixelRect],
+        mutationBarrier: SurfaceMutationBarrier?, sequence: SurfaceVideoSequence?
+    ) -> Bool {
+        if let mutationBarrier {
+            guard mutationBarrier.surfaceID == surface.id,
+                  mutationBarrier.lifecycleGeneration == surface.lifecycleGeneration,
+                  mutationBarrier.generation <= surface.mutationGeneration,
+                  surface.desktopWrites.permits(
+                    after: mutationBarrier.generation, rectangles: rectangles
+                  )
+            else { return false }
+        }
+        if let sequence {
+            guard sequence.surfaceID == surface.id,
+                  sequence.lifecycleGeneration == surface.lifecycleGeneration,
+                  sequence.value > 0,
+                  surface.videoWrites.permits(after: sequence.value - 1, rectangles: rectangles)
+            else { return false }
+        }
+        return true
     }
 
     private func isCurrent(_ requested: SurfaceRevision) -> Bool {
@@ -2603,7 +2711,7 @@ package actor SurfaceStore {
         }
         let copiesCanonicalSource = writable.requiresSourceSynchronization
 
-        guard await writable.synchronizeFromSource() else {
+        guard await synchronizeRevision(writable) else {
             revisionedGPUErrors &+= 1
             return .fallback
         }
@@ -2639,6 +2747,9 @@ package actor SurfaceStore {
 
         liveSurface.revision = nextRevision
         liveSurface.mutationGeneration = nextMutationGeneration
+        liveSurface.desktopWrites.record(
+            version: nextMutationGeneration, rectangles: Array(mutation.region)
+        )
         liveUnified.current = committed
         liveUnified.damageJournal.clear()
         liveUnified.damageHistory.reset(at: nextRevision)
@@ -2694,7 +2805,7 @@ package actor SurfaceStore {
             return .fallback
         }
         let copiesCanonicalDestination = writable.requiresSourceSynchronization
-        guard await writable.synchronizeFromSource() else {
+        guard await synchronizeRevision(writable) else {
             revisionedGPUErrors &+= 1
             return .fallback
         }
@@ -2751,6 +2862,9 @@ package actor SurfaceStore {
 
         liveDestination.revision = nextRevision
         liveDestination.mutationGeneration = nextMutationGeneration
+        liveDestination.desktopWrites.record(
+            version: nextMutationGeneration, rectangles: Array(region)
+        )
         liveDestinationUnified.current = committed
         liveDestinationUnified.damageJournal.clear()
         liveDestinationUnified.damageHistory.reset(at: nextRevision)
@@ -3219,6 +3333,7 @@ package actor SurfaceStore {
     ) -> SurfaceRevision {
         surface.revision = revision
         surface.mutationGeneration = mutationGeneration
+        surface.desktopWrites.record(version: mutationGeneration, rectangles: Array(region))
         for rectangle in region {
             surface.storage.recordDamage(rectangle, revision: revision)
         }

@@ -55,7 +55,12 @@ private final class BenchmarkApplicationDelegate: NSObject, NSApplicationDelegat
             signalSources.append(source)
         }
         task = Task {
-            let success = await SessionBenchmark(configuration: configuration).run()
+            let success: Bool
+            if let fixture = configuration.fixtureURL {
+                success = await transferFixture(fixture, configuration: configuration)
+            } else {
+                success = await SessionBenchmark(configuration: configuration).run()
+            }
             signalSources.forEach { $0.cancel() }
             Darwin.exit(success ? EXIT_SUCCESS : EXIT_FAILURE)
         }

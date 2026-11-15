@@ -767,12 +767,22 @@ struct SpiceSessionTests {
 
         session.presentationDiagnostics.recordMetalPresentedFrame(isAdvancedVideo: true)
         session.presentationDiagnostics.recordCPUFallback(.textureCreationFailed)
+        session.presentationDiagnostics.recordMetalDrawableAcquisition(
+            preparation: .milliseconds(1), acquisition: .milliseconds(1_007)
+        )
+        session.presentationDiagnostics.recordMetalSubmission(
+            encoding: .milliseconds(2), commitCall: .microseconds(10)
+        )
         let presentationDiagnostics = await session.diagnosticsSnapshot()
         #expect(presentationDiagnostics.metalPresentedFrames == 1)
         #expect(presentationDiagnostics.advancedVideoPresentedFrames == 1)
         #expect(presentationDiagnostics.cpuFallbackFrames == 1)
         #expect(presentationDiagnostics.textureCreationFailedFallbackFrames == 1)
         #expect(presentationDiagnostics.lastCPUFallbackReason == .textureCreationFailed)
+        #expect(presentationDiagnostics.metalDrawablePreparation.maximumMilliseconds == 1)
+        #expect(presentationDiagnostics.metalDrawableAcquisition.maximumMilliseconds == 1_007)
+        #expect(presentationDiagnostics.metalDrawableToCommit.maximumMilliseconds == 2)
+        #expect(presentationDiagnostics.metalCommitCall.maximumMilliseconds == 0.01)
 
         await session.disconnect()
         #expect(!(await mainTransport.isConnected))

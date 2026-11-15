@@ -15,6 +15,7 @@ package enum DisplayEvent: Sendable, Equatable {
 }
 
 package struct DisplayChannelDiagnostics: Sendable, Equatable {
+    package let traffic: DisplayTrafficDiagnostics
     package let surfaces: SurfaceStoreMetrics
     package let publisher: DisplayFramePublisherMetrics
     package let advancedVideo: SpiceAdvancedVideoDecoderDiagnostics
@@ -36,6 +37,8 @@ package struct DisplayMJPEGDiagnostics: Sendable, Equatable {
     package var peakBuffersInUse: Int = 0
     package var peakConcurrentDecodes: Int = 0
     package var supersededBeforeDecode: UInt64 = 0
+    package var lateBeforeDecode: UInt64 = 0
+    package var maximumLatenessMilliseconds: UInt32 = 0
 
     package mutating func accumulate(_ diagnostics: SpiceMJPEGDecoderDiagnostics) {
         handleCreations &+= diagnostics.handleCreationCount
@@ -103,7 +106,17 @@ package actor DisplayChannel: SpiceManagedChannel {
         let receivedAt: ContinuousClock.Instant
     }
 
+    private struct PendingNativeVideoDraw: Sendable {
+        let streamID: UInt32
+        let streamGeneration: UInt64
+        let runGeneration: UInt64
+        let draw: SurfaceNativeVideoDraw
+        let continuation: CheckedContinuation<Result<SurfaceRevision?, SurfaceVideoCompositionError>, Never>
+    }
+
     private var connection: ChannelConnection
+    private var traffic = DisplayTrafficDiagnostics()
+    private var retiredConnectionReceivedBytes: UInt64 = 0
     private let surfaces: SurfaceStore
     private let imageCache: DisplayImageCache
     private let ownsImageCache: Bool
@@ -129,9 +142,14 @@ package actor DisplayChannel: SpiceManagedChannel {
     private var asynchronousMJPEGRunConnections: [UInt64: ChannelConnection] = [:]
     private var pendingMJPEGFrames: [UInt32: PendingMJPEGFrame] = [:]
     private var mjpegFrameTasks: [UInt32: Task<Void, Never>] = [:]
+    private var pendingNativeVideoDraws: [UInt32: [PendingNativeVideoDraw]] = [:]
+    private var nativeVideoBatchTasks: [UInt32: Task<Void, Never>] = [:]
+    private var lastSubmittedMJPEGRevisions: [UInt32: SurfaceRevision] = [:]
     private var nextSurfaceVideoSequences: [UInt32: UInt64] = [:]
     private var asynchronousFailure: ChannelError?
     private var mjpegFramesSupersededBeforeDecode: UInt64 = 0
+    private var mjpegFramesLateBeforeDecode: UInt64 = 0
+    private var mjpegMaximumLatenessMilliseconds: UInt32 = 0
     private var nextStreamGeneration: UInt64 = 1
     private var framePublishers: [ObjectIdentifier: DisplayFramePublisher] = [:]
     private var completedPublisherMetrics = DisplayFramePublisherMetrics()
@@ -322,6 +340,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             throw .wire(error)
         }
 
+        traffic.record(message)
         switch message {
         case let .displaySurfaceCreate(create):
             do {
@@ -337,6 +356,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .surfaceCreated(create.surfaceID)
         case let .displaySurfaceDestroy(destroy):
+            lastSubmittedMJPEGRevisions.removeValue(forKey: destroy.surfaceID)
             let removedStreams = streams.values.filter { $0.surfaceID == destroy.surfaceID }
             streams = streams.filter { $0.value.surfaceID != destroy.surfaceID }
             for stream in removedStreams {
@@ -352,6 +372,7 @@ package actor DisplayChannel: SpiceManagedChannel {
             try await acknowledgeIfNeeded()
             return .surfaceDestroyed(destroy.surfaceID)
         case .displayReset:
+            lastSubmittedMJPEGRevisions.removeAll(keepingCapacity: true)
             palettes.removeAll(keepingCapacity: true)
             let removedStreams = Array(streams.values)
             streams.removeAll(keepingCapacity: true)
@@ -628,10 +649,24 @@ package actor DisplayChannel: SpiceManagedChannel {
                     data: pending.data,
                     expectedMutationBarrier: pending.expectedMutationBarrier,
                     videoSequence: pending.videoSequence,
-                    clipOverride: pending.clip
+                    clipOverride: pending.clip,
+                    batchRunGeneration: pending.runGeneration
                 ) else {
                     continue
                 }
+                guard !Task.isCancelled,
+                      asynchronousMJPEGRunGeneration == pending.runGeneration,
+                      connection === pending.originConnection,
+                      streams[streamID]?.generation == streamGeneration
+                else { continue }
+                // A native batch returns one immutable revision to all of its
+                // members. Submit that revision once, before the actor hop.
+                guard !framePublishers.isEmpty else { continue }
+                if let last = lastSubmittedMJPEGRevisions[revision.surfaceID],
+                   last.lifecycleGeneration > revision.lifecycleGeneration
+                    || (last.lifecycleGeneration == revision.lifecycleGeneration
+                        && last.revision >= revision.revision) { continue }
+                lastSubmittedMJPEGRevisions[revision.surfaceID] = revision
                 let timing = DisplayFrameSourceTiming(
                     messageReceivedAt: pending.receivedAt,
                     surfaceReadyAt: diagnosticsClock.now
@@ -659,6 +694,70 @@ package actor DisplayChannel: SpiceManagedChannel {
         if streams[streamID]?.generation == streamGeneration {
             mjpegFrameTasks.removeValue(forKey: streamID)
         }
+    }
+
+    /// One decoded draw per stream can wait here: that stream's existing task
+    /// awaits its result before decoding another. The original stream limit and
+    /// decoder leases therefore bound this queue without another frame mailbox.
+    private func composeScheduledNativeVideo(
+        surfaceID: UInt32, streamID: UInt32, streamGeneration: UInt64,
+        runGeneration: UInt64, draw: SurfaceNativeVideoDraw
+    ) async throws(SurfaceVideoCompositionError) -> SurfaceRevision? {
+        guard asynchronousMJPEGRunGeneration == runGeneration,
+              streams[streamID]?.generation == streamGeneration,
+              !Task.isCancelled
+        else { throw .staleSurface }
+        let result: Result<SurfaceRevision?, SurfaceVideoCompositionError> =
+            await withCheckedContinuation { continuation in
+                pendingNativeVideoDraws[surfaceID, default: []].append(PendingNativeVideoDraw(
+                    streamID: streamID, streamGeneration: streamGeneration,
+                    runGeneration: runGeneration, draw: draw, continuation: continuation
+                ))
+                startNativeVideoBatchIfNeeded(surfaceID: surfaceID)
+            }
+        return try result.get()
+    }
+
+    private func startNativeVideoBatchIfNeeded(surfaceID: UInt32) {
+        guard nativeVideoBatchTasks[surfaceID] == nil,
+              pendingNativeVideoDraws[surfaceID]?.isEmpty == false,
+              asynchronousMJPEGRunGeneration != nil
+        else { return }
+        nativeVideoBatchTasks[surfaceID] = Task { [weak self] in
+            await self?.drainNativeVideoBatches(surfaceID: surfaceID)
+        }
+    }
+
+    /// No timer or wait for missing streams. Start with the ready prefix; while
+    /// it is in flight, other stream tasks can queue their decoded draws.
+    private func drainNativeVideoBatches(surfaceID: UInt32) async {
+        while !Task.isCancelled {
+            guard let queued = pendingNativeVideoDraws[surfaceID], !queued.isEmpty else { break }
+            let count = min(queued.count, SurfaceStore.maximumNativeVideoBatchSize)
+            let batch = Array(queued.prefix(count))
+            pendingNativeVideoDraws[surfaceID] = count == queued.count
+                ? nil : Array(queued.dropFirst(count))
+            var ready: [PendingNativeVideoDraw] = []
+            for pending in batch {
+                if asynchronousMJPEGRunGeneration == pending.runGeneration,
+                   streams[pending.streamID]?.generation == pending.streamGeneration {
+                    ready.append(pending)
+                } else {
+                    pending.continuation.resume(returning: .failure(.staleSurface))
+                }
+            }
+            guard !ready.isEmpty else { continue }
+            let results = await surfaces.drawNativeVideoFrames(
+                surfaceID: surfaceID, draws: ready.map(\.draw)
+            )
+            for (pending, result) in zip(ready, results) {
+                pending.continuation.resume(returning: result)
+            }
+        }
+        nativeVideoBatchTasks.removeValue(forKey: surfaceID)
+        // A new connection run may have queued work while an old cancelled
+        // transaction completed. Keep exactly one owned manager per Surface.
+        startNativeVideoBatchIfNeeded(surfaceID: surfaceID)
     }
 
     private func reserveVideoSequence(
@@ -689,6 +788,14 @@ package actor DisplayChannel: SpiceManagedChannel {
     private func cancelScheduledMJPEG(streamID: UInt32) {
         pendingMJPEGFrames.removeValue(forKey: streamID)
         mjpegFrameTasks.removeValue(forKey: streamID)?.cancel()
+        for surfaceID in Array(pendingNativeVideoDraws.keys) {
+            guard let queued = pendingNativeVideoDraws[surfaceID] else { continue }
+            let retained = queued.filter { $0.streamID != streamID }
+            pendingNativeVideoDraws[surfaceID] = retained.isEmpty ? nil : retained
+            for pending in queued where pending.streamID == streamID {
+                pending.continuation.resume(returning: .failure(.staleSurface))
+            }
+        }
     }
 
     private func beginAsynchronousMJPEGScheduling() -> UInt64 {
@@ -716,10 +823,20 @@ package actor DisplayChannel: SpiceManagedChannel {
             task.cancel()
         }
         mjpegFrameTasks.removeAll(keepingCapacity: false)
+        let queuedNative = pendingNativeVideoDraws.values.flatMap { $0 }
+        pendingNativeVideoDraws.removeAll(keepingCapacity: false)
+        lastSubmittedMJPEGRevisions.removeAll(keepingCapacity: false)
+        for pending in queuedNative {
+            pending.continuation.resume(returning: .failure(.staleSurface))
+        }
+        // Keep active managers owned until their GPU transaction returns.
+        for task in nativeVideoBatchTasks.values { task.cancel() }
     }
 
     package func close() async {
         stopAsynchronousMJPEGScheduling()
+        let nativeBatches = Array(nativeVideoBatchTasks.values)
+        for task in nativeBatches { await task.value }
         await connection.close()
         if ownsImageCache {
             await imageCache.close()
@@ -755,7 +872,19 @@ package actor DisplayChannel: SpiceManagedChannel {
             mjpeg.accumulate(await decoder.diagnosticsSnapshot())
         }
         mjpeg.supersededBeforeDecode = mjpegFramesSupersededBeforeDecode
+        mjpeg.lateBeforeDecode = mjpegFramesLateBeforeDecode
+        mjpeg.maximumLatenessMilliseconds = mjpegMaximumLatenessMilliseconds
+        // Capture the connection and retired total together before the await.
+        // Retirement drains the connection's counter. If this crosses that
+        // suspension boundary, retain the preceding sample until the next poll.
+        let sampledConnection = connection
+        var sampledTraffic = traffic
+        let retiredBytes = retiredConnectionReceivedBytes
+        let receivedBytes = retiredBytes &+ (await sampledConnection.receivedByteCount)
+        traffic.receivedBytes = max(traffic.receivedBytes, receivedBytes)
+        sampledTraffic.receivedBytes = traffic.receivedBytes
         return DisplayChannelDiagnostics(
+            traffic: sampledTraffic,
             surfaces: await surfaces.metrics(),
             publisher: publisherMetrics,
             advancedVideo: advancedVideo,
@@ -780,6 +909,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         await previous.supersede(
             preservingSerialBarrier: previous.sharesSerialBarrier(with: replacement)
         )
+        retiredConnectionReceivedBytes &+= await previous.takeReceivedByteCount()
         connection = replacement
         // Report IDs/windows belong to the sending peer, not the preserved
         // Surface or decoder. Wait for activation from the migration target.
@@ -798,8 +928,14 @@ package actor DisplayChannel: SpiceManagedChannel {
         else { return nil }
         let origin = connection
         let receivedAt = currentMessageReceivedAt ?? diagnosticsClock.now
-        let margin = await multimediaClock.timing(for: multimediaTime).streamReportMargin
-        let audioDelay = await multimediaClock.playbackDelayMilliseconds() ?? UInt32.max
+        let playbackDelay = await multimediaClock.playbackDelayMilliseconds()
+        let margin: Int32
+        if stream.codec == .mjpeg, playbackDelay == nil {
+            margin = 0
+        } else {
+            margin = await multimediaClock.timing(for: multimediaTime).streamReportMargin
+        }
+        let audioDelay = playbackDelay ?? UInt32.max
         guard connection === origin,
               var current = streams[streamID], current.generation == stream.generation,
               current.reportWindow?.activation == activation
@@ -935,7 +1071,8 @@ package actor DisplayChannel: SpiceManagedChannel {
         data: Data,
         expectedMutationBarrier: SurfaceMutationBarrier? = nil,
         videoSequence: SurfaceVideoSequence? = nil,
-        clipOverride: SpiceClip? = nil
+        clipOverride: SpiceClip? = nil,
+        batchRunGeneration: UInt64? = nil
     ) async throws(ChannelError) -> SurfaceRevision? {
         guard var stream = streams[streamID] else {
             throw .protocolViolation("data for unknown stream \(streamID)")
@@ -947,14 +1084,30 @@ package actor DisplayChannel: SpiceManagedChannel {
         stream.nextFrameSequence = frameSequence
         streams[streamID] = stream
 
+        // Without an audio playback anchor, MJPEG is a live desktop update.
+        // A send-time timestamp is already a few milliseconds old on arrival;
+        // treating it as a deadline can discard the entire stream. The bounded
+        // per-stream mailbox still replaces pending frames with the latest one.
+        let presentationClock: (any MultimediaClockScheduling)?
+        if stream.codec == .mjpeg,
+           await multimediaClock?.playbackDelayMilliseconds() == nil {
+            presentationClock = nil
+        } else {
+            presentationClock = multimediaClock
+        }
         let alreadyLate: Bool
-        if let multimediaClock, case .late = await multimediaClock.timing(for: multimediaTime) {
+        if let presentationClock,
+           case let .late(milliseconds) = await presentationClock.timing(for: multimediaTime) {
             alreadyLate = true
+            if stream.codec == .mjpeg {
+                mjpegFramesLateBeforeDecode &+= 1
+                mjpegMaximumLatenessMilliseconds = max(
+                    mjpegMaximumLatenessMilliseconds, milliseconds
+                )
+                return nil
+            }
         } else {
             alreadyLate = false
-        }
-        if alreadyLate, stream.codec == .mjpeg {
-            return nil
         }
 
         let frameWidth: Int
@@ -1031,7 +1184,7 @@ package actor DisplayChannel: SpiceManagedChannel {
         if alreadyLate {
             return nil
         }
-        if let multimediaClock {
+        if let multimediaClock = presentationClock {
             let timing: MultimediaFrameTiming
             do {
                 timing = try await multimediaClock.wait(until: multimediaTime)
@@ -1095,17 +1248,25 @@ package actor DisplayChannel: SpiceManagedChannel {
            !stream.metalCompositorDisabled
         {
             do {
-                surfaceRevision = try await surfaces.drawNativeVideoFrame(
-                    surfaceID: stream.surfaceID,
-                    destination: destination,
-                    frame: decodedFrame,
-                    source: source,
-                    topDown: stream.topDown,
-                    clippedDestinations: clipped,
-                    isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265,
-                    expectedMutationBarrier: expectedMutationBarrier,
-                    videoSequence: videoSequence
-                )
+                if let batchRunGeneration, stream.codec == .mjpeg {
+                    surfaceRevision = try await composeScheduledNativeVideo(
+                        surfaceID: stream.surfaceID, streamID: streamID,
+                        streamGeneration: stream.generation, runGeneration: batchRunGeneration,
+                        draw: SurfaceNativeVideoDraw(
+                            destination: destination, frame: decodedFrame, source: source,
+                            topDown: stream.topDown, clippedDestinations: clipped,
+                            expectedMutationBarrier: expectedMutationBarrier,
+                            videoSequence: videoSequence
+                        )
+                    )
+                } else {
+                    surfaceRevision = try await surfaces.drawNativeVideoFrame(
+                        surfaceID: stream.surfaceID, destination: destination, frame: decodedFrame,
+                        source: source, topDown: stream.topDown, clippedDestinations: clipped,
+                        isAdvancedVideo: stream.codec == .h264 || stream.codec == .h265,
+                        expectedMutationBarrier: expectedMutationBarrier, videoSequence: videoSequence
+                    )
+                }
                 usedNativeVideoPath = surfaceRevision != nil
             } catch {
                 switch error {

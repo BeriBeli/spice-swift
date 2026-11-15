@@ -30,6 +30,8 @@ struct BenchmarkConfiguration: Sendable {
     var readyTimeoutSeconds = 60
     var traceURL: URL?
     var label = "unlabelled"
+    var fixtureURL: URL?
+    var snapshotURL: URL?
 
     static let help = """
         usage: spice-session-benchmark HOST PORT [options]
@@ -40,6 +42,8 @@ struct BenchmarkConfiguration: Sendable {
                   [--interval-ms N] [--ready-timeout-seconds N]
         Common: --timeout-seconds N --label NAME --enable-h264|--enable-h265
                 --tls|--tls-insecure-for-testing-only (HOST PORT only)
+        Fixture: --transfer-fixture FILE (transfer only; no clipboard synchronization)
+        Observe: --snapshot FILE.png (writes the latest published guest pixels)
 
         JSON report goes to stdout; progress and fixed error categories go to stderr.
         SPICE_PASSWORD overrides the .vv ticket. Direct TCP/TLS .vv files are
@@ -63,6 +67,7 @@ struct BenchmarkConfiguration: Sendable {
         let values: Set<String> = [
             "--observe-seconds", "--marker-base", "--trace", "--samples", "--warmup",
             "--interval-ms", "--timeout-seconds", "--ready-timeout-seconds", "--label",
+            "--transfer-fixture", "--snapshot",
         ]
         var index = 0
         while index < arguments.count {
@@ -169,6 +174,19 @@ struct BenchmarkConfiguration: Sendable {
             .contains(where: { options[$0] != nil })
         {
             throw SessionBenchmarkError.usage
+        }
+        if let fixture = options["--transfer-fixture"] {
+            guard !fixture.isEmpty, configuration.markerBase == nil,
+                options["--observe-seconds"] == nil, options["--snapshot"] == nil
+            else { throw SessionBenchmarkError.usage }
+            configuration.fixtureURL = URL(fileURLWithPath: fixture)
+            configuration.headless = true
+        }
+        if let snapshot = options["--snapshot"] {
+            guard !snapshot.isEmpty, configuration.markerBase == nil else {
+                throw SessionBenchmarkError.usage
+            }
+            configuration.snapshotURL = URL(fileURLWithPath: snapshot)
         }
         return configuration
     }

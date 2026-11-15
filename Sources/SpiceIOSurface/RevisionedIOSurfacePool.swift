@@ -35,6 +35,7 @@ package struct RevisionedIOSurfacePoolMetrics: Sendable, Equatable {
     package let allocatedFrames: Int
     package let allocatedBytes: Int
     package let inFlightLeases: Int
+    package let pendingLeaseWaiters: Int
     package let poolExhaustions: UInt64
     package let gpuCopies: UInt64
     package let gpuCopyBytes: UInt64
@@ -158,7 +159,8 @@ private final class IOSurfaceBlitter: @unchecked Sendable {
 
     func copy(
         source: RevisionedSurfaceSlot,
-        destination: RevisionedSurfaceSlot
+        destination: RevisionedSurfaceSlot,
+        rectangles: [IOSurfaceCopyRectangle]
     ) async -> Bool {
         guard source.key == destination.key,
               let sourceTexture = makeTexture(
@@ -177,21 +179,19 @@ private final class IOSurfaceBlitter: @unchecked Sendable {
             return false
         }
 
-        encoder.copy(
-            from: sourceTexture,
-            sourceSlice: 0,
-            sourceLevel: 0,
-            sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(
-                width: source.key.width,
-                height: source.key.height,
-                depth: 1
-            ),
-            to: destinationTexture,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-        )
+        for rectangle in rectangles {
+            encoder.copy(
+                from: sourceTexture,
+                sourceSlice: 0,
+                sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: rectangle.x, y: rectangle.y, z: 0),
+                sourceSize: MTLSize(width: rectangle.width, height: rectangle.height, depth: 1),
+                to: destinationTexture,
+                destinationSlice: 0,
+                destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: rectangle.x, y: rectangle.y, z: 0)
+            )
+        }
         encoder.endEncoding()
 
         return await withCheckedContinuation { continuation in
@@ -228,6 +228,19 @@ private final class IOSurfaceBlitter: @unchecked Sendable {
 /// a Metal texture. Callers must retain the Data backend when this initializer
 /// returns `nil`.
 package final class RevisionedIOSurfacePool: @unchecked Sendable {
+    private struct LeaseWaiter {
+        let namespace: RevisionedIOSurfaceNamespace
+        let surfaceID: UInt32
+        let key: RevisionedFrameKey
+        let excludedSlot: ObjectIdentifier?
+        let continuation: AsyncStream<Void>.Continuation
+
+        func matches(_ slot: RevisionedSurfaceSlot) -> Bool {
+            slot.namespace === namespace && slot.surfaceID == surfaceID
+                && slot.key == key && ObjectIdentifier(slot) != excludedSlot
+        }
+    }
+
     private struct SlotState {
         let slot: RevisionedSurfaceSlot
         var writer = false
@@ -250,6 +263,7 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
         var gpuErrors: UInt64 = 0
         var operationTails: [SurfaceKey: Task<Void, Never>] = [:]
         var operationSerials: [SurfaceKey: UInt64] = [:]
+        var leaseWaiters: [UUID: LeaseWaiter] = [:]
     }
 
     private let limits: RevisionedIOSurfacePoolLimits
@@ -516,11 +530,64 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
         )
     }
 
+    /// A failed native checkout can be temporary while presentation owns older
+    /// slots. Wait for that ownership to return, without polling, allocating a
+    /// fourth slot, or waiting on an impossible capacity/budget configuration.
+    /// The caller owns Surface serialization and retries checkout after wakeup.
+    package func waitForReusableSlot(
+        namespace: RevisionedIOSurfaceNamespace, surfaceID: UInt32,
+        width: Int, height: Int, excluding source: RevisionedIOSurfaceRevision?,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        guard !Task.isCancelled, ContinuousClock.now < deadline else { return false }
+        let identifier = UUID()
+        let signal = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let waiter = LeaseWaiter(
+            namespace: namespace, surfaceID: surfaceID,
+            key: RevisionedFrameKey(width: width, height: height, pixelFormat: kCVPixelFormatType_32BGRA),
+            excludedSlot: source.map { ObjectIdentifier($0.slot) },
+            continuation: signal.continuation
+        )
+        signal.continuation.onTermination = { [weak self] _ in
+            _ = self?.state.withLock { $0.leaseWaiters.removeValue(forKey: identifier) }
+        }
+        let available: Bool? = state.withLock { state in
+            let candidates = state.slots.values.filter {
+                waiter.matches($0.slot) && !$0.retired && !$0.writer
+            }
+            if candidates.contains(where: { $0.leaseCount == 0 }) { return true }
+            guard candidates.contains(where: { $0.leaseCount > 0 }) else { return false }
+            state.leaseWaiters[identifier] = waiter
+            return nil
+        }
+        if let available {
+            signal.continuation.finish()
+            return available && !Task.isCancelled
+        }
+        defer {
+            _ = state.withLock { $0.leaseWaiters.removeValue(forKey: identifier) }
+            signal.continuation.finish()
+        }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                var iterator = signal.stream.makeAsyncIterator()
+                return await iterator.next() != nil && !Task.isCancelled
+            }
+            group.addTask {
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                return false
+            }
+            let ready = await group.next() ?? false
+            group.cancelAll()
+            return ready && !Task.isCancelled
+        }
+    }
+
     package func retire(
         namespace: RevisionedIOSurfaceNamespace,
         surfaceID: UInt32
     ) {
-        state.withLock { state in
+        let cancelled = state.withLock { state in
             for identifier in Array(state.slots.keys) {
                 guard var slotState = state.slots[identifier],
                       slotState.slot.namespace === namespace,
@@ -535,7 +602,13 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
                     state.slots[identifier] = slotState
                 }
             }
+            let cancelled = state.leaseWaiters.filter {
+                $0.value.namespace === namespace && $0.value.surfaceID == surfaceID
+            }
+            for identifier in cancelled.keys { state.leaseWaiters.removeValue(forKey: identifier) }
+            return Array(cancelled.values)
         }
+        for waiter in cancelled { waiter.continuation.finish() }
     }
 
     package func metrics() -> RevisionedIOSurfacePoolMetrics {
@@ -545,6 +618,7 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
                 allocatedFrames: state.slots.count,
                 allocatedBytes: state.slots.values.reduce(0) { $0 + $1.slot.allocationSize },
                 inFlightLeases: state.slots.values.reduce(0) { $0 + $1.leaseCount },
+                pendingLeaseWaiters: state.leaseWaiters.count,
                 poolExhaustions: state.poolExhaustions,
                 gpuCopies: state.gpuCopies,
                 gpuCopyBytes: state.gpuCopyBytes,
@@ -557,8 +631,22 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
 
     fileprivate func synchronize(
         _ destination: RevisionedSurfaceSlot,
-        from source: RevisionedIOSurfaceRevision?
+        from source: RevisionedIOSurfaceRevision?,
+        rectangles: [IOSurfaceCopyRectangle]?
     ) async -> Bool {
+        let rectangles = rectangles ?? [IOSurfaceCopyRectangle(
+            x: 0, y: 0, width: destination.key.width, height: destination.key.height
+        )]
+        var copyBytes: UInt64 = 0
+        for rectangle in rectangles {
+            guard rectangle.isValid(width: destination.key.width, height: destination.key.height)
+            else { return false }
+            let (sum, overflow) = copyBytes.addingReportingOverflow(
+                UInt64(rectangle.width) * UInt64(rectangle.height) * 4
+            )
+            guard !overflow else { return false }
+            copyBytes = sum
+        }
         guard let source else {
             return clear(destination)
         }
@@ -568,18 +656,19 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
         guard source.slot.key == destination.key else {
             return false
         }
+        guard !rectangles.isEmpty else { return true }
 
         let operation = enqueue(
             namespace: destination.namespace,
             surfaceID: destination.surfaceID
         ) { [blitter] in
-            await blitter.copy(source: source.slot, destination: destination)
+            await blitter.copy(source: source.slot, destination: destination, rectangles: rectangles)
         }
         let succeeded = await operation.value
         state.withLock { state in
             if succeeded {
                 state.gpuCopies &+= 1
-                state.gpuCopyBytes &+= UInt64(destination.key.width * destination.key.height * 4)
+                state.gpuCopyBytes &+= copyBytes
             } else {
                 state.gpuErrors &+= 1
             }
@@ -671,10 +760,10 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
     }
 
     private func releaseLease(_ slot: RevisionedSurfaceSlot) {
-        state.withLock { state in
+        let ready: [LeaseWaiter] = state.withLock { state in
             let identifier = ObjectIdentifier(slot)
             guard var slotState = state.slots[identifier], slotState.leaseCount > 0 else {
-                return
+                return []
             }
             slotState.leaseCount -= 1
             if slotState.retired, !slotState.writer, slotState.leaseCount == 0 {
@@ -682,6 +771,16 @@ package final class RevisionedIOSurfacePool: @unchecked Sendable {
             } else {
                 state.slots[identifier] = slotState
             }
+            guard !slotState.retired, !slotState.writer, slotState.leaseCount == 0 else { return [] }
+            let ready = state.leaseWaiters.filter { $0.value.matches(slot) }
+            for identifier in ready.keys { state.leaseWaiters.removeValue(forKey: identifier) }
+            return Array(ready.values)
+        }
+        // Continuations can terminate synchronously; never invoke them while
+        // holding the pool mutex, which their cleanup also uses.
+        for waiter in ready {
+            waiter.continuation.yield(())
+            waiter.continuation.finish()
         }
     }
 
@@ -824,8 +923,14 @@ package final class RevisionedIOSurfaceWritableFrame: @unchecked Sendable {
         }
     }
 
-    package func synchronizeFromSource() async -> Bool {
-        await pool.synchronize(slot, from: source)
+    /// `nil` copies the entire source. Incremental rectangles require a known
+    /// destination revision and must cover every change since that revision.
+    /// An empty array leaves an already-current candidate untouched.
+    package func synchronizeFromSource(rectangles: [IOSurfaceCopyRectangle]? = nil) async -> Bool {
+        guard rectangles == nil || (destinationRevision != nil && source != nil) else {
+            return false
+        }
+        return await pool.synchronize(slot, from: source, rectangles: rectangles)
     }
 
     package func copyPackedPixels(

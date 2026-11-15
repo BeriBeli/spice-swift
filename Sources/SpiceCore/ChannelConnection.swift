@@ -27,6 +27,17 @@ package actor ChannelConnection {
     private var isSuperseded = false
     private var preservesSerialBarrierAfterSupersede = false
     private var terminalError: ChannelError?
+    /// Accepted transport read bytes since the last diagnostic retirement.
+    /// Includes SPICE headers and read-ahead after link/authentication;
+    /// excludes TLS/TCP overhead and superseded reads.
+    package private(set) var receivedByteCount: UInt64 = 0
+
+    /// The owning channel drains this after superseding a connection. A later
+    /// migration rollback can reuse it without recounting earlier reads.
+    package func takeReceivedByteCount() -> UInt64 {
+        defer { receivedByteCount = 0 }
+        return receivedByteCount
+    }
 
     package init(
         key: ChannelKey,
@@ -210,6 +221,7 @@ package actor ChannelConnection {
                 await fail(error)
                 throw error
             }
+            receivedByteCount &+= UInt64(bytes.count)
             do {
                 try framer.append(bytes)
             } catch let error {

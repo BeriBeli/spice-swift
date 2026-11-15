@@ -10,6 +10,113 @@ import Testing
 
 @Suite("SurfaceStore", .serialized)
 struct SurfaceStoreTests {
+    @Test(arguments: [false, true], [false, true])
+    func delayedVideoPreservesDisjointWrites(
+        newerWriteIsVideo: Bool, overlaps: Bool
+    ) async throws {
+        let store = SurfaceStore(backingPolicy: .dataOnly)
+        try await store.create(id: 1, width: 4, height: 1, format: 32)
+        let descriptor = try await store.descriptor(surfaceID: 1)
+        let left = PixelRect(x: 0, y: 0, width: 2, height: 1)
+        let newer = PixelRect(x: overlaps ? 0 : 2, y: 0, width: 2, height: 1)
+        let source = PixelRect(x: 0, y: 0, width: 1, height: 1)
+        func bitmap(_ blue: UInt8) -> RawBitmap {
+            RawBitmap(
+                format: .xRGB8888, width: 1, height: 1, stride: 4, topDown: true,
+                pixels: Data([blue, 0, 0, 255])
+            )
+        }
+        if newerWriteIsVideo {
+            _ = try #require(await store.drawScaledCopy(
+                surfaceID: 1, destination: newer, bitmap: bitmap(50), source: source,
+                clippedDestinations: [newer],
+                videoSequence: SurfaceVideoSequence(
+                    surfaceID: 1, lifecycleGeneration: descriptor.lifecycleGeneration, value: 2
+                )
+            ))
+        } else {
+            try await store.fill(surfaceID: 1, rectangle: newer, colorARGB: 50)
+        }
+        let retained = try await store.snapshot(surfaceID: 1)
+        let result = try await store.drawScaledCopy(
+            surfaceID: 1, destination: left, bitmap: bitmap(10), source: source,
+            clippedDestinations: [left], expectedMutationBarrier: descriptor.mutationBarrier,
+            videoSequence: SurfaceVideoSequence(
+                surfaceID: 1, lifecycleGeneration: descriptor.lifecycleGeneration, value: 1
+            )
+        )
+        #expect((result != nil) == !overlaps)
+        let after = try await store.snapshot(surfaceID: 1)
+        #expect(pixel(after, x: 0, y: 0) == (overlaps ? [50, 0, 0, 255] : [10, 0, 0, 255]))
+        if !overlaps { #expect(pixel(after, x: 2, y: 0) == [50, 0, 0, 255]) }
+        #expect(pixel(retained, x: newer.x, y: 0) == [50, 0, 0, 255])
+        #expect(pixel(retained, x: overlaps ? 2 : 0, y: 0) == [0, 0, 0, 0])
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func delayedNativeVideoPreservesDisjointWrites(
+        newerWriteIsVideo: Bool, overlaps: Bool
+    ) async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 1, width: 4, height: 2, format: 32)
+        let descriptor = try await store.descriptor(surfaceID: 1)
+        let left = PixelRect(x: 0, y: 0, width: 2, height: 2)
+        let newer = PixelRect(x: overlaps ? 0 : 2, y: 0, width: 2, height: 2)
+        let source = PixelRect(x: 0, y: 0, width: 2, height: 2)
+        func frame(luma: UInt8) throws -> SpiceVideoToolboxFrame {
+            try SpiceVideoToolboxFrame(
+                pixelBuffer: makeNV12PixelBuffer(
+                    width: 2, height: 2, luma: luma,
+                    matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                ),
+                expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+            )
+        }
+        if newerWriteIsVideo {
+            _ = try #require(await store.drawNativeVideoFrame(
+                surfaceID: 1, destination: newer, frame: frame(luma: 235),
+                source: source, topDown: true, clippedDestinations: [newer],
+                videoSequence: SurfaceVideoSequence(
+                    surfaceID: 1, lifecycleGeneration: descriptor.lifecycleGeneration, value: 2
+                )
+            ))
+        } else {
+            try await store.fill(surfaceID: 1, rectangle: newer, colorARGB: 0x00ff_ffff)
+        }
+        let retained = try await store.snapshot(surfaceID: 1)
+        if overlaps {
+            await #expect(throws: SurfaceVideoCompositionError.staleSurface) {
+                try await store.drawNativeVideoFrame(
+                    surfaceID: 1, destination: left, frame: frame(luma: 16),
+                    source: source, topDown: true, clippedDestinations: [left],
+                    expectedMutationBarrier: descriptor.mutationBarrier,
+                    videoSequence: SurfaceVideoSequence(
+                        surfaceID: 1, lifecycleGeneration: descriptor.lifecycleGeneration, value: 1
+                    )
+                )
+            }
+        } else {
+            _ = try #require(await store.drawNativeVideoFrame(
+                surfaceID: 1, destination: left, frame: frame(luma: 16),
+                source: source, topDown: true, clippedDestinations: [left],
+                expectedMutationBarrier: descriptor.mutationBarrier,
+                videoSequence: SurfaceVideoSequence(
+                    surfaceID: 1, lifecycleGeneration: descriptor.lifecycleGeneration, value: 1
+                )
+            ))
+        }
+        let after = try await store.snapshot(surfaceID: 1)
+        #expect(pixel(after, x: newer.x, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        if !overlaps {
+            #expect(pixel(after, x: 0, y: 0).prefix(3).allSatisfy { $0 <= 1 })
+        }
+        #expect(pixel(retained, x: newer.x, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        #expect(pixel(retained, x: overlaps ? 2 : 0, y: 0) == [0, 0, 0, 0])
+    }
+
     @Test func createsFillsCopiesAndDestroysSurface() async throws {
         let store = SurfaceStore(backingPolicy: .dataOnly)
         try await store.create(id: 7, width: 3, height: 2, format: 32)
@@ -1434,6 +1541,8 @@ struct SurfaceStoreTests {
         let metrics = await unified.metrics()
         #expect(metrics.gpuCopyBytes == 0)
         #expect(metrics.fullFrameCopyBytes == UInt64(64 * 64 * 4))
+        #expect(metrics.gpuCopySynchronizationCount == 0)
+        #expect(metrics.gpuCopySynchronizationNanoseconds == 0)
         #expect(metrics.partialFrameCopyBytes > 0)
         #expect(metrics.gpuErrors == 0)
     }
@@ -1693,6 +1802,55 @@ struct SurfaceStoreTests {
             source: revision2
         ))
         #expect(retried.destinationRevision == nil)
+        #expect(!(await retried.synchronizeFromSource(rectangles: [
+            IOSurfaceCopyRectangle(x: 0, y: 0, width: 1, height: 1)
+        ])))
+        #expect(await retried.synchronizeFromSource())
+        let recovered = try #require(retried.finish(revision: 3))
+        #expect(recovered.copyPixels() == Data(repeating: 0, count: 8))
+    }
+
+    @Test func incrementalGPUCopyValidatesAndCopiesEveryChangedRegion() async throws {
+        let namespace = RevisionedIOSurfaceNamespace()
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let first = try #require(pool.checkoutWritable(
+            namespace: namespace, surfaceID: 34, width: 4, height: 1, source: nil
+        ))
+        #expect(await first.synchronizeFromSource())
+        let revision1 = try #require(first.finish(revision: 1))
+        let second = try #require(pool.checkoutWritable(
+            namespace: namespace, surfaceID: 34, width: 4, height: 1, source: revision1
+        ))
+        #expect(await second.synchronizeFromSource())
+        let expected = Data([0, 0, 0, 0, 1, 2, 3, 255, 0, 0, 0, 0, 4, 5, 6, 255])
+        let rectangles = [
+            IOSurfaceCopyRectangle(x: 1, y: 0, width: 1, height: 1),
+            IOSurfaceCopyRectangle(x: 3, y: 0, width: 1, height: 1),
+        ]
+        #expect(second.copyPackedPixels(expected, sourceBytesPerRow: 16, rectangles: rectangles) == 8)
+        let revision2 = try #require(second.finish(revision: 2))
+        let candidate = try #require(pool.checkoutWritable(
+            namespace: namespace, surfaceID: 34, width: 4, height: 1, source: revision2
+        ))
+        #expect(candidate.destinationRevision == 1)
+        for invalid in [
+            IOSurfaceCopyRectangle(x: -1, y: 0, width: 1, height: 1),
+            IOSurfaceCopyRectangle(x: 4, y: 0, width: 1, height: 1),
+            IOSurfaceCopyRectangle(x: Int.max, y: 0, width: 1, height: 1),
+        ] {
+            #expect(!(await candidate.synchronizeFromSource(rectangles: [invalid])))
+        }
+        let before = pool.metrics()
+        #expect(await candidate.synchronizeFromSource(rectangles: []))
+        #expect(pool.metrics().gpuCopies == before.gpuCopies)
+        #expect(await candidate.synchronizeFromSource(rectangles: rectangles))
+        let revision3 = try #require(candidate.finish(revision: 3))
+        #expect(revision3.copyPixels() == expected)
+        #expect(revision2.copyPixels() == expected)
+        #expect(pool.metrics().gpuCopyBytes == before.gpuCopyBytes + 8)
+        #expect(pool.metrics().gpuErrors == 0)
     }
 
     @Test func retiredLeasesRemainInsidePerSurfaceThreeSlotLimit() async throws {
@@ -1960,6 +2118,7 @@ struct SurfaceStoreTests {
             expectedHeight: 2,
             maximumDecodedBytes: 16
         )
+        var retainedBeforeVideo: FrameSnapshot? = try await store.snapshot(surfaceID: 22)
         let beforeNoOp = try await store.descriptor(surfaceID: 22)
         let noOpRevision = try await store.drawNativeVideoFrame(
             surfaceID: 22,
@@ -1971,6 +2130,7 @@ struct SurfaceStoreTests {
         )
         #expect(noOpRevision == nil)
         #expect(try await store.descriptor(surfaceID: 22) == beforeNoOp)
+        #expect(await store.metrics().gpuCopySynchronizationCount == 0)
 
         let nativeRevision = try #require(await store.drawNativeVideoFrame(
             surfaceID: 22,
@@ -1982,10 +2142,14 @@ struct SurfaceStoreTests {
             isAdvancedVideo: true
         ))
         #expect(nativeRevision.revision == 2)
+        #expect(await store.metrics().gpuCopySynchronizationCount == 1)
+        #expect(await store.metrics().gpuCopySynchronizationNanoseconds > 0)
         let gpuSnapshot = try await store.snapshot(surfaceID: 22)
         #expect(gpuSnapshot.ioSurfaceFrame != nil)
         #expect(gpuSnapshot.isAdvancedVideoFrame)
         #expect(await store.metrics().cpuMaterializations == 0)
+        #expect(pixel(try #require(retainedBeforeVideo), x: 1, y: 1) == [0x33, 0x22, 0x11, 0xff])
+        retainedBeforeVideo = nil
         #expect(pixel(gpuSnapshot, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
         let white = pixel(gpuSnapshot, x: 1, y: 1)
         #expect(white.allSatisfy { $0 >= 254 })
@@ -2036,6 +2200,362 @@ struct SurfaceStoreTests {
         #expect(finalMetrics.nativeVideoFallbacks == 1)
     }
 
+    @Test(.timeLimit(.minutes(1)), arguments: [0, 1, 2])
+    func nativeCandidateWaitReleasesOnConsumerReturnCancellationAndRetirement(action: Int) async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 2, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let namespace = RevisionedIOSurfaceNamespace()
+        let first = try #require(pool.checkoutWritable(
+            namespace: namespace, surfaceID: 29, width: 2, height: 2, source: nil))
+        #expect(first.copyPackedPixels(Data(repeating: 17, count: 16),
+            sourceBytesPerRow: 8, rectangles: []) == 16)
+        let old = try #require(first.finish(revision: 1))
+        var heldOld: IOSurfaceFrame? = old.makeLease()
+        #expect(heldOld != nil)
+        let second = try #require(pool.checkoutWritable(
+            namespace: namespace, surfaceID: 29, width: 2, height: 2, source: old))
+        #expect(second.copyPackedPixels(Data(repeating: 31, count: 16),
+            sourceBytesPerRow: 8, rectangles: []) == 16)
+        let current = try #require(second.finish(revision: 2))
+        let heldCurrent = try #require(current.makeLease())
+        #expect(pool.checkoutWritable(namespace: namespace, surfaceID: 29,
+            width: 2, height: 2, source: current) == nil)
+        let wait = Task {
+            await pool.waitForReusableSlot(namespace: namespace, surfaceID: 29,
+                width: 2, height: 2, excluding: current,
+                until: ContinuousClock.now.advanced(by: .seconds(5)))
+        }
+        defer { wait.cancel() }
+        let failureDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while pool.metrics().pendingLeaseWaiters == 0 && ContinuousClock.now < failureDeadline {
+            await Task.yield()
+        }
+        guard pool.metrics().pendingLeaseWaiters == 1 else {
+            wait.cancel()
+            _ = await wait.value
+            Issue.record("The resource wait did not become observable before the failure bound")
+            return
+        }
+        if action == 0 { heldOld = nil }
+        else if action == 1 { wait.cancel() }
+        else { pool.retire(namespace: namespace, surfaceID: 29) }
+        #expect(await wait.value == (action == 0))
+        #expect(pool.metrics().pendingLeaseWaiters == 0)
+        if action == 0 {
+            let reused = try #require(pool.checkoutWritable(namespace: namespace, surfaceID: 29,
+                width: 2, height: 2, source: current))
+            #expect(reused.destinationRevision == 1)
+            #expect(current.copyPixels() == Data(repeating: 31, count: 16))
+        }
+        #expect(heldCurrent.copyPixels() == Data(repeating: 31, count: 16))
+        withExtendedLifetime(heldOld) {}
+    }
+
+    @Test func nativeCandidateWaitDeadlineAndPermanentCapacityRemainBounded() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 1, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 30, width: 16, height: 4, format: 32)
+        let white = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(width: 2, height: 2, luma: 235,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16)
+        let full = PixelRect(x: 0, y: 0, width: 16, height: 4)
+        let source = PixelRect(x: 0, y: 0, width: 2, height: 2)
+        _ = try await store.drawNativeVideoFrame(surfaceID: 30, destination: full,
+            frame: white, source: source, topDown: true, clippedDestinations: [full])
+        let retained = try await store.snapshot(surfaceID: 30)
+        let baseline = await store.metrics()
+        let regions = (0..<4).map { PixelRect(x: $0 * 4, y: 0, width: 4, height: 4) }
+        let results = await store.drawNativeVideoFrames(surfaceID: 30, draws: regions.map {
+            SurfaceNativeVideoDraw(destination: $0, frame: white, source: source,
+                topDown: true, clippedDestinations: [$0])
+        })
+        #expect(results.count == 4)
+        for result in results {
+            if case let .failure(error) = result { #expect(!error.disablesStreamGeneration) }
+            else { Issue.record("One permanent capacity failure must account for every batch member") }
+        }
+        let pressure = await store.metrics()
+        #expect(pressure.nativeVideoFallbacks - baseline.nativeVideoFallbacks == 4)
+        #expect(pressure.poolExhaustions - baseline.poolExhaustions == 1)
+        #expect(pressure.nativeVideoPoolWaits - baseline.nativeVideoPoolWaits == 1)
+        #expect(pressure.nativeVideoPoolRecoveries == 0)
+        let black = RawBitmap(format: .xRGB8888, width: 2, height: 2, stride: 8,
+            topDown: true, pixels: Data(repeating: 0, count: 16))
+        for region in regions {
+            _ = try await store.drawScaledCopy(surfaceID: 30, destination: region,
+                bitmap: black, source: source, clippedDestinations: [region])
+        }
+        #expect(await store.metrics().cpuMaterializations - baseline.cpuMaterializations == 1)
+        #expect(pixel(retained, x: 0, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        let final = try await store.snapshot(surfaceID: 30)
+        #expect(pixel(final, x: 0, y: 0) == [0, 0, 0, 255])
+        #expect(pool.metrics().allocatedFrames == 1)
+        #expect(pool.metrics().pendingLeaseWaiters == 0)
+
+        let namespace = RevisionedIOSurfaceNamespace()
+        guard let two = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 2, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let a = try #require(two.checkoutWritable(namespace: namespace, surfaceID: 1,
+            width: 2, height: 2, source: nil)?.finish(revision: 1))
+        let lease = try #require(a.makeLease())
+        let b = try #require(two.checkoutWritable(namespace: namespace, surfaceID: 1,
+            width: 2, height: 2, source: a)?.finish(revision: 2))
+        #expect(await two.waitForReusableSlot(namespace: namespace, surfaceID: 1,
+            width: 2, height: 2, excluding: b,
+            until: ContinuousClock.now.advanced(by: .milliseconds(1))) == false)
+        #expect(two.metrics().pendingLeaseWaiters == 0)
+        withExtendedLifetime(lease) {}
+    }
+
+    @Test func nativeBatchSharesSynchronizationAndPreservesClippedWireOrder() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 27, width: 64, height: 4, format: 32)
+        try await store.fill(
+            surfaceID: 27, rectangle: PixelRect(x: 0, y: 0, width: 64, height: 4),
+            colorARGB: 0x0011_2233
+        )
+        let retained = try await store.snapshot(surfaceID: 27)
+        let before = try await store.descriptor(surfaceID: 27)
+        let baseline = await store.metrics()
+        let white = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(width: 2, height: 2, luma: 235,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+        )
+        let black = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(width: 2, height: 2, luma: 16,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+        )
+        let left = PixelRect(x: 0, y: 0, width: 4, height: 4)
+        let right = PixelRect(x: 16, y: 0, width: 4, height: 4)
+        let clip = PixelRect(x: 18, y: 0, width: 2, height: 4)
+        func draw(_ rectangle: PixelRect, _ frame: SpiceVideoToolboxFrame,
+                  sequence: UInt64, clips: [PixelRect]? = nil) -> SurfaceNativeVideoDraw {
+            SurfaceNativeVideoDraw(
+                destination: rectangle, frame: frame,
+                source: PixelRect(x: 0, y: 0, width: 2, height: 2), topDown: true,
+                clippedDestinations: clips ?? [rectangle],
+                expectedMutationBarrier: before.mutationBarrier,
+                videoSequence: SurfaceVideoSequence(surfaceID: 27,
+                    lifecycleGeneration: before.lifecycleGeneration, value: sequence)
+            )
+        }
+        let results = await store.drawNativeVideoFrames(surfaceID: 27, draws: [
+            draw(left, white, sequence: 2), draw(right, black, sequence: 3),
+            draw(left, black, sequence: 1), draw(right, white, sequence: 4, clips: [clip])
+        ])
+        let firstRevision = try results[0].get()
+        let revision = try #require(firstRevision)
+        #expect(try results[1].get() == revision)
+        #expect(try results[3].get() == revision)
+        if case let .failure(error) = results[2] { #expect(error == .staleSurface) }
+        else { Issue.record("An older overlapping draw must be rejected within the batch") }
+        #expect(revision.revision == before.revision + 1)
+        let metrics = await store.metrics()
+        #expect(metrics.nativeVideoFrames - baseline.nativeVideoFrames == 3)
+        #expect(metrics.gpuCopySynchronizationCount - baseline.gpuCopySynchronizationCount == 1)
+        #expect(metrics.cpuMaterializations == baseline.cpuMaterializations)
+        let frame = try await store.snapshot(surfaceID: 27)
+        #expect(pixel(frame, x: 0, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        #expect(pixel(frame, x: 16, y: 0).prefix(3).allSatisfy { $0 <= 1 })
+        #expect(pixel(frame, x: 18, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        #expect(pixel(frame, x: 24, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        #expect(pixel(retained, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        // The batch records overlap guards for subsequent transactions too.
+        await #expect(throws: SurfaceVideoCompositionError.staleSurface) {
+            _ = try await store.drawNativeVideoFrame(
+                surfaceID: 27, destination: right, frame: black,
+                source: PixelRect(x: 0, y: 0, width: 2, height: 2), topDown: true,
+                clippedDestinations: [clip], expectedMutationBarrier: before.mutationBarrier,
+                videoSequence: SurfaceVideoSequence(surfaceID: 27,
+                    lifecycleGeneration: before.lifecycleGeneration, value: 3)
+            )
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func nativeBatchFailureDoesNotPublishPixelsOrWireGuards(lateEncodingFailure: Bool) async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(
+            backingPolicy: .revisionedIOSurface(pool),
+            compositorFailureForAttempt: { attempt in
+                !lateEncodingFailure && attempt == 1 ? .commandExecutionFailed("injected batch failure") : nil
+            }
+        )
+        try await store.create(id: 28, width: 16, height: 4, format: 32)
+        try await store.fill(surfaceID: 28,
+            rectangle: PixelRect(x: 0, y: 0, width: 16, height: 4), colorARGB: 0x0011_2233)
+        let retained = try await store.snapshot(surfaceID: 28)
+        let before = try await store.descriptor(surfaceID: 28)
+        let white = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(width: 2, height: 2, luma: 235,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+        )
+        // Data frames have valid geometry but cannot be bound by the native
+        // compositor. The first draw has already encoded when this one fails.
+        let unmappable = SpiceDecodedImage(width: 2, height: 2, bytesPerRow: 8,
+            pixelsBGRA: Data(repeating: 0, count: 16))
+        let second: any SpiceDecodedVideoFrame = lateEncodingFailure ? unmappable : white
+        let left = PixelRect(x: 0, y: 0, width: 4, height: 4)
+        let right = PixelRect(x: 8, y: 0, width: 4, height: 4)
+        let results = await store.drawNativeVideoFrames(surfaceID: 28, draws: [
+            SurfaceNativeVideoDraw(destination: left, frame: white,
+                source: PixelRect(x: 0, y: 0, width: 2, height: 2), topDown: true,
+                clippedDestinations: [left], videoSequence: SurfaceVideoSequence(
+                    surfaceID: 28, lifecycleGeneration: before.lifecycleGeneration, value: 100)),
+            SurfaceNativeVideoDraw(destination: right, frame: second,
+                source: PixelRect(x: 0, y: 0, width: 2, height: 2), topDown: true,
+                clippedDestinations: [right], videoSequence: SurfaceVideoSequence(
+                    surfaceID: 28, lifecycleGeneration: before.lifecycleGeneration, value: 101))
+        ])
+        for result in results {
+            if case let .failure(error) = result {
+                #expect(error.disablesStreamGeneration == !lateEncodingFailure)
+            } else { Issue.record("A failed native batch must publish none of its accepted members") }
+        }
+        #expect(try await store.descriptor(surfaceID: 28) == before)
+        #expect(await store.metrics().nativeVideoFrames == 0)
+        let unchanged = try await store.snapshot(surfaceID: 28)
+        #expect(pixel(unchanged, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        #expect(pixel(retained, x: 8, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        _ = try #require(await store.drawNativeVideoFrame(
+            surfaceID: 28, destination: left, frame: white,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 2), topDown: true,
+            clippedDestinations: [left], videoSequence: SurfaceVideoSequence(
+                surfaceID: 28, lifecycleGeneration: before.lifecycleGeneration, value: 1)
+        ))
+        let recovered = try await store.snapshot(surfaceID: 28)
+        #expect(pixel(recovered, x: 0, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        #expect(pixel(recovered, x: 8, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        #expect(pixel(retained, x: 0, y: 0) == [0x33, 0x22, 0x11, 0xff])
+    }
+
+    @Test func nativeCandidateCatchUpIncludesPendingCPUVideoDamage() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 2, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 26, width: 64, height: 4, format: 32)
+        try await store.fill(
+            surfaceID: 26, rectangle: PixelRect(x: 0, y: 0, width: 64, height: 4),
+            colorARGB: 0x0011_2233
+        )
+        let white = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(
+                width: 2, height: 2, luma: 235,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+            ),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+        )
+        let source = PixelRect(x: 0, y: 0, width: 2, height: 2)
+        let left = PixelRect(x: 0, y: 0, width: 4, height: 4)
+        _ = try #require(await store.drawNativeVideoFrame(
+            surfaceID: 26, destination: left, frame: white, source: source,
+            topDown: true, clippedDestinations: [left]
+        ))
+        let cpuVideo = PixelRect(x: 16, y: 0, width: 4, height: 4)
+        _ = try #require(await store.drawScaledCopy(
+            surfaceID: 26, destination: cpuVideo,
+            bitmap: RawBitmap(
+                format: .xRGB8888, width: 1, height: 1, stride: 4, topDown: true,
+                pixels: Data([50, 0, 0, 255])
+            ),
+            source: PixelRect(x: 0, y: 0, width: 1, height: 1),
+            clippedDestinations: [cpuVideo]
+        ))
+        // The second native commit reuses a slot from before the CPU write.
+        for x in [8, 12] {
+            let strip = PixelRect(x: x, y: 0, width: 4, height: 4)
+            _ = try #require(await store.drawNativeVideoFrame(
+                surfaceID: 26, destination: strip, frame: white, source: source,
+                topDown: true, clippedDestinations: [strip]
+            ))
+        }
+        #expect(await store.metrics().cpuMaterializations == 1)
+        let final = try await store.snapshot(surfaceID: 26)
+        #expect(pixel(final, x: 16, y: 0) == [50, 0, 0, 255])
+        #expect(pixel(final, x: 32, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        for x in [0, 8, 12] {
+            #expect(pixel(final, x: x, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        }
+    }
+
+    @Test func nativeStripsCatchUpCandidatesWithoutRepeatedFullSurfaceCopies() async throws {
+        guard let pool = RevisionedIOSurfacePool.makeIfSupported(
+            limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
+        ) else { return }
+        let store = SurfaceStore(backingPolicy: .revisionedIOSurface(pool))
+        try await store.create(id: 26, width: 64, height: 4, format: 32)
+        try await store.fill(
+            surfaceID: 26, rectangle: PixelRect(x: 0, y: 0, width: 64, height: 4),
+            colorARGB: 0x0011_2233
+        )
+        var retained: FrameSnapshot? = try await store.snapshot(surfaceID: 26)
+        var laggingCandidateLease: FrameSnapshot?
+        for index in 0..<32 {
+            let white = (index % 2 == 0) == (index < 16)
+            let frame = try SpiceVideoToolboxFrame(
+                pixelBuffer: makeNV12PixelBuffer(
+                    width: 2, height: 2, luma: white ? 235 : 16,
+                    matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+                ),
+                expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+            )
+            let strip = PixelRect(x: index % 16 * 4, y: 0, width: 4, height: 4)
+            _ = try #require(await store.drawNativeVideoFrame(
+                surfaceID: 26, destination: strip, frame: frame,
+                source: PixelRect(x: 0, y: 0, width: 2, height: 2),
+                topDown: true, clippedDestinations: [strip]
+            ))
+            if index == 30 { laggingCandidateLease = try await store.snapshot(surfaceID: 26) }
+        }
+        let metrics = await store.metrics()
+        #expect(metrics.nativeVideoFrames == 32)
+        // Bound the actual copy work, including first-use initialization.
+        #expect(metrics.gpuCopyBytes < UInt64(32 * 64 * 4 * 4 / 4))
+        #expect(metrics.cpuMaterializations == 0)
+        let final = try await store.snapshot(surfaceID: 26)
+        for strip in 0..<16 {
+            let value = pixel(final, x: strip * 4, y: 0).prefix(3)
+            #expect(value.allSatisfy { strip % 2 == 0 ? $0 <= 1 : $0 >= 254 })
+            #expect(pixel(try #require(retained), x: strip * 4, y: 0) == [0x33, 0x22, 0x11, 0xff])
+        }
+        // Hold both recent slots, then release the initial slot. Its revision
+        // is outside the bounded history, so the next strip needs full repair.
+        retained = nil
+        let white = try SpiceVideoToolboxFrame(
+            pixelBuffer: makeNV12PixelBuffer(
+                width: 2, height: 2, luma: 235,
+                matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+            ),
+            expectedWidth: 2, expectedHeight: 2, maximumDecodedBytes: 16
+        )
+        let left = PixelRect(x: 0, y: 0, width: 4, height: 4)
+        _ = try #require(await store.drawNativeVideoFrame(
+            surfaceID: 26, destination: left, frame: white,
+            source: PixelRect(x: 0, y: 0, width: 2, height: 2),
+            topDown: true, clippedDestinations: [left]
+        ))
+        #expect(await store.metrics().gpuCopyBytes == metrics.gpuCopyBytes + 64 * 4 * 4)
+        let repaired = try await store.snapshot(surfaceID: 26)
+        #expect(pixel(repaired, x: 0, y: 0).prefix(3).allSatisfy { $0 >= 254 })
+        #expect(pixel(repaired, x: 8, y: 0).prefix(3).allSatisfy { $0 <= 1 })
+        #expect(pixel(try #require(laggingCandidateLease), x: 0, y: 0).prefix(3).allSatisfy { $0 <= 1 })
+        #expect(pixel(final, x: 0, y: 0).prefix(3).allSatisfy { $0 <= 1 })
+    }
+
     @Test func fullSurfaceNativeVideoSkipsRedundantSourceBlit() async throws {
         guard let pool = RevisionedIOSurfacePool.makeIfSupported(
             limits: .init(maximumFramesPerSurface: 3, maximumBytes: 1_024 * 1_024)
@@ -2075,6 +2595,8 @@ struct SurfaceStoreTests {
         let metrics = await store.metrics()
         #expect(metrics.nativeVideoFrames == 1)
         #expect(metrics.gpuCopyBytes == 0)
+        #expect(metrics.gpuCopySynchronizationCount == 0)
+        #expect(metrics.gpuCopySynchronizationNanoseconds == 0)
         #expect(metrics.cpuMaterializations == 0)
         let newFrame = try await store.snapshot(surfaceID: 26)
         #expect(!newFrame.isAdvancedVideoFrame)

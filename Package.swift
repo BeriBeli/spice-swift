@@ -248,6 +248,18 @@ let package = Package(
 )
 
 // Local microbenchmarks are opt-in and never dependencies of SwiftSpice.
+if Context.environment["SWIFTSPICE_PIPELINE_BENCHMARKS"] == "1" {
+    package.products.append(.executable(
+        name: "spice-pipeline-benchmark", targets: ["SpicePipelineBenchmark"]
+    ))
+    package.targets.append(.executableTarget(
+        name: "SpicePipelineBenchmark",
+        dependencies: ["SpiceCodecs", "SpiceRenderer", "SwiftSpice"],
+        path: "Benchmarks/Pipeline",
+        exclude: ["README.md", "RESULTS_2026-11-13.json"]
+    ))
+}
+
 if Context.environment["SWIFTSPICE_BENCHMARKS"] == "1" {
     package.dependencies.append(.package(
         url: "https://github.com/ordo-one/benchmark.git",

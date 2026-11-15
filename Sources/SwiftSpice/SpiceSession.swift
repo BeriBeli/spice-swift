@@ -736,6 +736,13 @@ public actor SpiceSession {
             presentation.desktopReadyToDisplayLinkHistogram
         result.viewUpdateToMetalCommitHistogram =
             presentation.viewUpdateToMetalCommitHistogram
+        result.metalDrawablePreparationHistogram =
+            presentation.metalDrawablePreparationHistogram
+        result.metalDrawableAcquisitionHistogram =
+            presentation.metalDrawableAcquisitionHistogram
+        result.metalDrawableToCommitHistogram =
+            presentation.metalDrawableToCommitHistogram
+        result.metalCommitCallHistogram = presentation.metalCommitCallHistogram
         result.metalCommitToCompletionHistogram =
             presentation.metalCommitToCompletionHistogram
         result.metalRequestToPresentedHistogram =

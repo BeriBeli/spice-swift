@@ -554,7 +554,14 @@ package final class SpiceMetalFrameView: MTKView {
         _ pending: PendingPresentation
     ) -> SpiceMetalFramePresentationResult {
         isHidden = false
-        guard let drawable = currentDrawable else {
+        let acquisitionStartedAt = clock.now
+        let acquiredDrawable = currentDrawable
+        let acquisitionEndedAt = clock.now
+        presentationDiagnostics?.recordMetalDrawableAcquisition(
+            preparation: pending.requestedAt.duration(to: acquisitionStartedAt),
+            acquisition: acquisitionStartedAt.duration(to: acquisitionEndedAt)
+        )
+        guard let drawable = acquiredDrawable else {
             presentationDiagnostics?.recordMetalDrawableMiss()
             return .drawableUnavailable
         }
@@ -676,10 +683,15 @@ package final class SpiceMetalFrameView: MTKView {
         let commitCallBoundary = clock.now
         committedAt.withLock { $0 = commitCallBoundary }
         commandBuffer.commit()
+        let commitReturnedAt = clock.now
         // Presented callbacks only mutate view-owned trace state after hopping
         // back to this MainActor, so they cannot overtake this commit evidence.
         presentationDiagnostics?.recordViewUpdateToMetalCommit(
             pending.requestedAt.duration(to: commitCallBoundary)
+        )
+        presentationDiagnostics?.recordMetalSubmission(
+            encoding: acquisitionEndedAt.duration(to: commitCallBoundary),
+            commitCall: commitCallBoundary.duration(to: commitReturnedAt)
         )
         if let interactionIdentity = pending.interactionContext?.identity,
            let committedNanoseconds = SpiceInteractionHostClock.nanoseconds(

@@ -26,6 +26,29 @@ package struct SpiceMetalVideoRectangle: Sendable, Equatable {
     }
 }
 
+/// One already-decoded update in an ordered, bounded Surface transaction.
+package struct SpiceMetalVideoDraw: Sendable {
+    package let frame: any SpiceDecodedVideoFrame
+    package let sourceRect: SpiceMetalVideoRectangle?
+    package let orientation: SpiceMetalVideoOrientation
+    package let destinationRect: SpiceMetalVideoRectangle
+    package let clips: [SpiceMetalVideoRectangle]
+
+    package init(
+        frame: any SpiceDecodedVideoFrame,
+        sourceRect: SpiceMetalVideoRectangle? = nil,
+        orientation: SpiceMetalVideoOrientation,
+        destinationRect: SpiceMetalVideoRectangle,
+        clips: [SpiceMetalVideoRectangle]
+    ) {
+        self.frame = frame
+        self.sourceRect = sourceRect
+        self.orientation = orientation
+        self.destinationRect = destinationRect
+        self.clips = clips
+    }
+}
+
 package enum SpiceMetalCompositorFallback: Sendable, Equatable {
     /// The native binding or metadata for this frame cannot be used by Metal.
     /// The stream generation may try the GPU path again on its next frame.
@@ -234,29 +257,50 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         destinationRect: SpiceMetalVideoRectangle,
         clips: [SpiceMetalVideoRectangle]
     ) async throws(SpiceMetalCompositorError) {
-        let pixelBuffer: CVPixelBuffer
-        if let frame = frame as? SpiceVideoToolboxFrame {
-            pixelBuffer = frame.pixelBuffer
-        } else if let frame = frame as? SpiceMJPEGFrame {
-            pixelBuffer = frame.pixelBuffer
-        } else {
-            throw .unsupportedPixelFormat(0)
+        try await composite(draws: [SpiceMetalVideoDraw(
+            frame: frame, sourceRect: sourceRect, orientation: orientation,
+            destinationRect: destinationRect, clips: clips
+        )], into: destination)
+    }
+
+    /// Already-ready updates share one command buffer and completion. Every
+    /// mapping/geometry check finishes before commit; any failure leaves the
+    /// candidate untouched. Retain the decoder leases through GPU completion.
+    package func composite(
+        draws: [SpiceMetalVideoDraw],
+        into destination: IOSurfaceRef
+    ) async throws(SpiceMetalCompositorError) {
+        guard !draws.isEmpty else { return }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
         }
-        // In particular, SpiceMJPEGFrame owns the pool lease that prevents a
-        // decoder from reusing this pixel buffer. Keep the frame itself alive
-        // through Metal completion, not only its CVPixelBuffer view.
-        defer { withExtendedLifetime(frame) {} }
-        try await composite(
-            pixelBuffer: pixelBuffer,
-            pixelFormat: frame.pixelFormat,
-            colorMatrix: frame.colorMatrix,
-            colorRange: frame.colorRange,
-            sourceRect: sourceRect,
-            orientation: orientation,
-            into: destination,
-            destinationRect: destinationRect,
-            clips: clips
-        )
+        defer { withExtendedLifetime(draws) {} }
+        var resources: [RetainedResources] = []
+        resources.reserveCapacity(draws.count)
+        var sharedDestination: (any MTLTexture)?
+        for draw in draws {
+            let pixelBuffer: CVPixelBuffer
+            if let frame = draw.frame as? SpiceVideoToolboxFrame {
+                pixelBuffer = frame.pixelBuffer
+            } else if let frame = draw.frame as? SpiceMJPEGFrame {
+                pixelBuffer = frame.pixelBuffer
+            } else {
+                throw .unsupportedPixelFormat(0)
+            }
+            if let retained = try encode(
+                pixelBuffer: pixelBuffer, pixelFormat: draw.frame.pixelFormat,
+                colorMatrix: draw.frame.colorMatrix, colorRange: draw.frame.colorRange,
+                sourceRect: draw.sourceRect, orientation: draw.orientation,
+                into: destination, destinationRect: draw.destinationRect,
+                clips: draw.clips, commandBuffer: commandBuffer,
+                sharedDestination: sharedDestination
+            ) {
+                sharedDestination = retained.destinationTexture
+                resources.append(retained)
+            }
+        }
+        guard !resources.isEmpty else { return }
+        try await complete(commandBuffer, retaining: resources)
     }
 
     package func composite(
@@ -294,16 +338,43 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
         destinationRect: SpiceMetalVideoRectangle,
         clips: [SpiceMetalVideoRectangle]
     ) async throws(SpiceMetalCompositorError) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+        guard let resources = try encode(
+            pixelBuffer: pixelBuffer, pixelFormat: pixelFormat,
+            colorMatrix: colorMatrix, colorRange: colorRange,
+            sourceRect: requestedSourceRect, orientation: orientation,
+            into: destination, destinationRect: destinationRect, clips: clips,
+            commandBuffer: commandBuffer
+        ) else { return }
+        try await complete(commandBuffer, retaining: [resources])
+    }
+
+    private func encode(
+        pixelBuffer: CVPixelBuffer,
+        pixelFormat: SpiceDecodedVideoPixelFormat,
+        colorMatrix: SpiceVideoColorMatrix,
+        colorRange: SpiceVideoColorRange,
+        sourceRect requestedSourceRect: SpiceMetalVideoRectangle? = nil,
+        orientation: SpiceMetalVideoOrientation,
+        into destination: IOSurfaceRef,
+        destinationRect: SpiceMetalVideoRectangle,
+        clips: [SpiceMetalVideoRectangle],
+        commandBuffer: any MTLCommandBuffer,
+        sharedDestination: (any MTLTexture)? = nil
+    ) throws(SpiceMetalCompositorError) -> RetainedResources? {
         if pixelFormat == .bgra8 {
-            try await compositePackedBGRA(
+            return try encodePackedBGRA(
                 pixelBuffer: pixelBuffer,
                 sourceRect: requestedSourceRect,
                 orientation: orientation,
                 into: destination,
                 destinationRect: destinationRect,
-                clips: clips
+                clips: clips,
+                commandBuffer: commandBuffer,
+                sharedDestination: sharedDestination
             )
-            return
         }
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
@@ -400,9 +471,7 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             }
             clippedRectangles.append(clipped)
         }
-        guard !clippedRectangles.isEmpty else {
-            return
-        }
+        guard !clippedRectangles.isEmpty else { return nil }
 
         let colorConversion = try ColorConversion(
             matrix: colorMatrix,
@@ -413,15 +482,15 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             width: sourceWidth,
             height: sourceHeight
         )
-        let destinationTexture = try makeDestinationTexture(
-            surface: destination,
-            width: destinationWidth,
-            height: destinationHeight
-        )
-
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw .commandBufferUnavailable
+        let destinationTexture: any MTLTexture
+        if let sharedDestination {
+            destinationTexture = sharedDestination
+        } else {
+            destinationTexture = try makeDestinationTexture(
+                surface: destination, width: destinationWidth, height: destinationHeight
+            )
         }
+
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw .commandEncoderUnavailable
         }
@@ -475,34 +544,23 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             destinationSurface: destination,
             destinationTexture: destinationTexture
         )
-        let result: Result<Void, SpiceMetalCompositorError> = await withCheckedContinuation { continuation in
-            commandBuffer.addCompletedHandler { completedBuffer in
-                defer { withExtendedLifetime(retainedResources) {} }
-                if completedBuffer.status == .completed {
-                    continuation.resume(returning: .success(()))
-                } else {
-                    let reason = completedBuffer.error.map(String.init(describing:))
-                        ?? "command status \(completedBuffer.status.rawValue)"
-                    continuation.resume(returning: .failure(.commandExecutionFailed(reason)))
-                }
-            }
-            commandBuffer.commit()
-        }
-        try result.get()
+        return .nv12(retainedResources)
     }
 
     /// Copies an IOSurface-backed packed-BGRA stream frame into the candidate
     /// surface while applying the same orientation, nearest scaling, and clip
     /// semantics as the CPU SurfaceStore path. No intermediate texture or Data
     /// allocation is created.
-    private func compositePackedBGRA(
+    private func encodePackedBGRA(
         pixelBuffer: CVPixelBuffer,
         sourceRect requestedSourceRect: SpiceMetalVideoRectangle?,
         orientation: SpiceMetalVideoOrientation,
         into destination: IOSurfaceRef,
         destinationRect: SpiceMetalVideoRectangle,
-        clips: [SpiceMetalVideoRectangle]
-    ) async throws(SpiceMetalCompositorError) {
+        clips: [SpiceMetalVideoRectangle],
+        commandBuffer: any MTLCommandBuffer,
+        sharedDestination: (any MTLTexture)? = nil
+    ) throws(SpiceMetalCompositorError) -> RetainedResources? {
         let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
         let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
         let cvPixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
@@ -576,22 +634,20 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             }
             clippedRectangles.append(clipped)
         }
-        guard !clippedRectangles.isEmpty else {
-            return
-        }
+        guard !clippedRectangles.isEmpty else { return nil }
 
         let sourceTexture = try makePackedSourceTexture(
             pixelBuffer: pixelBuffer,
             width: sourceWidth,
             height: sourceHeight
         )
-        let destinationTexture = try makeDestinationTexture(
-            surface: destination,
-            width: destinationWidth,
-            height: destinationHeight
-        )
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw .commandBufferUnavailable
+        let destinationTexture: any MTLTexture
+        if let sharedDestination {
+            destinationTexture = sharedDestination
+        } else {
+            destinationTexture = try makeDestinationTexture(
+                surface: destination, width: destinationWidth, height: destinationHeight
+            )
         }
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw .commandEncoderUnavailable
@@ -644,10 +700,29 @@ package final class SpiceMetalCompositor: @unchecked Sendable {
             destinationSurface: destination,
             destinationTexture: destinationTexture
         )
+        return .packed(retainedResources)
+    }
+
+    private enum RetainedResources: Sendable {
+        case nv12(RetainedVideoResources)
+        case packed(RetainedPackedVideoResources)
+
+        var destinationTexture: any MTLTexture {
+            switch self {
+            case let .nv12(resources): resources.destinationTexture
+            case let .packed(resources): resources.destinationTexture
+            }
+        }
+    }
+
+    private func complete(
+        _ commandBuffer: any MTLCommandBuffer,
+        retaining resources: [RetainedResources]
+    ) async throws(SpiceMetalCompositorError) {
         let result: Result<Void, SpiceMetalCompositorError> = await withCheckedContinuation {
             continuation in
             commandBuffer.addCompletedHandler { completedBuffer in
-                defer { withExtendedLifetime(retainedResources) {} }
+                defer { withExtendedLifetime(resources) {} }
                 if completedBuffer.status == .completed {
                     continuation.resume(returning: .success(()))
                 } else {

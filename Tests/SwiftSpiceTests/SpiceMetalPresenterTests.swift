@@ -140,6 +140,12 @@ struct SpiceMetalPresenterTests {
         diagnostics.recordDesktopImmediateSelection()
         diagnostics.recordDesktopReadyToDisplayLink(.milliseconds(2))
         diagnostics.recordViewUpdateToMetalCommit(.milliseconds(3))
+        diagnostics.recordMetalDrawableAcquisition(
+            preparation: .microseconds(100), acquisition: .milliseconds(1_007)
+        )
+        diagnostics.recordMetalSubmission(
+            encoding: .microseconds(200), commitCall: .microseconds(10)
+        )
         diagnostics.recordMetalCommitToCompletion(.milliseconds(4))
         diagnostics.recordMetalRequestToPresented(.milliseconds(5))
 
@@ -166,6 +172,10 @@ struct SpiceMetalPresenterTests {
         #expect(metrics.desktopImmediateSelections == 1)
         #expect(metrics.desktopReadyToDisplayLink.p95Milliseconds == 2)
         #expect(metrics.viewUpdateToMetalCommit.p95Milliseconds == 3)
+        #expect(metrics.metalDrawablePreparation.maximumMilliseconds == 0.1)
+        #expect(metrics.metalDrawableAcquisition.maximumMilliseconds == 1_007)
+        #expect(metrics.metalDrawableToCommit.maximumMilliseconds == 0.2)
+        #expect(metrics.metalCommitCall.maximumMilliseconds == 0.01)
         #expect(metrics.metalCommitToCompletion.p95Milliseconds == 4)
         #expect(metrics.metalRequestToPresented.p95Milliseconds == 5)
 
@@ -520,6 +530,10 @@ struct SpiceMetalPresenterTests {
 
         let metrics = diagnostics.snapshot()
         #expect(metrics.metalCommandBuffersCommitted == 3)
+        #expect(metrics.metalDrawablePreparation.sampleCount == 3)
+        #expect(metrics.metalDrawableAcquisition.sampleCount == 3)
+        #expect(metrics.metalDrawableToCommit.sampleCount == 3)
+        #expect(metrics.metalCommitCall.sampleCount == 3)
         #expect(metrics.metalPresentationErrors == 0)
         #expect(metrics.cpuFallbackFrames == 0)
     }

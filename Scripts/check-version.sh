@@ -13,15 +13,15 @@ die() {
 
 project_version="$(tr -d '[:space:]' <"$VERSION_FILE" 2>/dev/null)" \
     || die "could not read $VERSION_FILE"
-[[ "$project_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
-    || die "VERSION is not stable SemVer: $project_version"
+[[ "$project_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.[1-9][0-9]*)?$ ]] \
+    || die "VERSION must be X.Y.Z or X.Y.Z-beta.N: $project_version"
 
-changelog_version="$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/p' "$CHANGELOG" | head -1)"
+changelog_version="$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+(-beta\.[1-9][0-9]*)?)\].*/\1/p' "$CHANGELOG" | head -1)"
 [[ -n "$changelog_version" ]] || die "no released version heading found in $CHANGELOG"
 
 [[ "$project_version" == "$changelog_version" ]] \
     || die "VERSION ($project_version) != latest CHANGELOG release ($changelog_version)"
-grep -qE "^\[$project_version\]: " "$CHANGELOG" \
+grep -qF "[$project_version]: " "$CHANGELOG" \
     || die "CHANGELOG has no [$project_version] compare-link footer"
 
 if [[ -n "${1:-}" ]]; then
